@@ -1,0 +1,16 @@
+[package]
+name = "kizz-trace-linux"
+version = "0.0.1"
+description = "The kizz tracer for Linux, built on ptrace and a seccomp-bpf filter."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kizz-trace = { path = "../kizz-trace", version = "0.0.1" }
