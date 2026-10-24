@@ -1,0 +1,368 @@
+# The paths that the coverage-test step must record under the task directory, and no others.
+#
+# Each entry is one line of fields separated by spaces:
+#
+#     PATH KINDS STATE PLATFORM SOURCE...
+#
+# PATH is relative to the task directory, as the tracer reports it: `.` components and repeated
+# separators are removed, and `..` components are kept.
+#
+# KINDS joins with `+` the access kinds that "What is recorded" names: read, probe, list, write and exec.
+#
+# STATE is the type of the path's state when the step ended, as "Path states" names it:
+#
+# * absent;
+# * file, a regular file that was only checked or written, without a hash;
+# * file+hash, a regular file that was read or run, with the hash of its content;
+# * dir, a directory that was only opened or checked;
+# * dir+listing, a directory that was listed, with its entries;
+# * fifo, socket, char-device or block-device;
+# * symlink:TARGET:POINTEE, a symbolic link with its target and the state of what it points to,
+#   which is recorded with the kinds of the link's own entry.
+#
+# PLATFORM is where the path is touched: all, every platform, for the portable core; linux, for the Linux
+# section; or linux-x86_64, for the code that the Linux section compiles only where a call exists that
+# aarch64 lacks, such as open, stat or getdents.
+#
+# Each SOURCE is a call that touches the path in the run, as ORIGIN:NAME:OUTCOME:KINDS.
+# ORIGIN is sys, for a tracked system call that coverage.c makes through syscall(); libc, for a function of
+# the C library; or kizz, for kizz's own start of the program with a traced execve.
+# OUTCOME is ok, or the error the call failed with; KINDS are the kinds the call adds.
+# A call that succeeds adds the kinds of "What is recorded", as the Linux tracer decodes them since Step 4:
+# opening for reading reads, opening for writing, creating or truncating writes, and O_DIRECTORY or O_PATH
+# only probes.
+# A call that fails, with ENOENT or another error, adds a probe of each of its paths, because its lookup
+# happened.
+#
+# The paths that the Linux section creates under out/linux/made-link, a symbolic link to out/linux/made, are
+# recorded under the link's name; the call that a group tests then works on the path under out/linux/made,
+# or on a descriptor that names it, so it is that path's only source.
+
+# The program, which kizz starts with execve and the portable core's child runs again with execv.
+coverage exec file+hash all kizz:execve:ok:exec libc:execv:ok:exec
+
+# Portable core: the output directories; out must not exist, and a second mkdir of out/core fails with EEXIST.
+out write dir all libc:mkdir:ok:write
+out/core probe+write dir all libc:mkdir:ok:write libc:mkdir:EEXIST:probe
+
+# Portable core: reads with a stream and with a descriptor, and a missing name.
+in/core/read.txt read file+hash all libc:fopen:ok:read
+in/core/open.txt read file+hash all libc:open:ok:read
+in/core/fopen-missing probe absent all libc:fopen:ENOENT:probe
+
+# Portable core: existence and metadata of a file and a directory that are only checked, of a missing name
+# and of a name below a missing directory, and of links to a file and to a directory, followed and not.
+in/core/checked.txt probe file all libc:stat:ok:probe
+in/core/checked-dir probe dir all libc:stat:ok:probe
+in/core/missing probe absent all libc:stat:ENOENT:probe
+in/core/no-dir/missing probe absent all libc:stat:ENOENT:probe
+in/core/access.txt probe file all libc:access:ok:probe
+in/core/file-link probe symlink:target.txt:file all libc:stat:ok:probe libc:lstat:ok:probe
+in/core/dir-link probe symlink:target-dir:dir all libc:stat:ok:probe libc:lstat:ok:probe
+
+# Portable core: a listing with opendir and readdir, which opens the directory and reads its entries.
+in/core/listed probe+list dir+listing all libc:opendir:ok:probe libc:readdir:ok:list
+
+# Portable core: changes under out/core, each a write of every path it names.
+out/core/written.txt write file all libc:fopen:ok:write
+out/core/rewritten.txt read+write file+hash all libc:fopen:ok:write libc:fopen:ok:read
+out/core/rename-from write absent all libc:fopen:ok:write libc:rename:ok:write
+out/core/rename-to write file all libc:rename:ok:write
+out/core/unlinked write absent all libc:fopen:ok:write libc:unlink:ok:write
+out/core/removed-dir write absent all libc:mkdir:ok:write libc:rmdir:ok:write
+out/core/symlink write symlink:written.txt:file all libc:symlink:ok:write libc:lchown:ok:write
+out/core/dangling read+probe+write symlink:nowhere:absent all libc:symlink:ok:write libc:lstat:ok:probe libc:readlink:ok:read
+out/core/link-from write file all libc:fopen:ok:write libc:link:ok:write
+out/core/link-to write file all libc:link:ok:write
+out/core/fifo write fifo all libc:mkfifo:ok:write
+out/core/truncated write file all libc:fopen:ok:write libc:truncate:ok:write
+out/core/mode-changed write file all libc:fopen:ok:write libc:chmod:ok:write
+out/core/owner-changed write file all libc:fopen:ok:write libc:chown:ok:write
+out/core/touched write file all libc:fopen:ok:write libc:utimes:ok:write
+
+# Portable core: the second thread's own read and write.
+in/core/thread.txt read file+hash all libc:fopen:ok:read
+out/core/thread.txt write file all libc:fopen:ok:write
+
+# Portable core: a child that changes its working directory, reads a relative path there, and runs the program
+# again with execv; that run reads its own file by an absolute path. A missing program fails with ENOENT.
+in/core/cwd probe dir all libc:chdir:ok:probe
+in/core/cwd/cwd.txt read file+hash all libc:fopen:ok:read
+in/core/child-core.txt read file+hash all libc:fopen:ok:read
+in/core/exec-missing probe absent all libc:execv:ENOENT:probe
+
+# Linux: the output directory, out/linux/made and the link to it, and the directory descriptors of
+# out/linux/made and in/linux/at.
+out/linux write dir linux sys:mkdirat:ok:write
+out/linux/made probe+write dir linux sys:mkdirat:ok:write sys:openat:ok:probe
+out/linux/made-link write symlink:made:dir linux sys:symlinkat:ok:write
+in/linux/at probe dir linux sys:openat:ok:probe
+
+# open: a read, and a missing name.
+in/linux/open.txt read file+hash linux-x86_64 sys:open:ok:read
+in/linux/open-missing probe absent linux-x86_64 sys:open:ENOENT:probe
+
+# openat: reads from the working directory and from a descriptor; a missing name, a name below a missing
+# directory and a name below a file; writing, truncating, an exclusive creation of an existing file, reading
+# and writing; O_DIRECTORY and O_PATH, which only probe; O_NOFOLLOW on a link, which fails with ELOOP;
+# and links to a file and to a directory, followed.
+in/linux/openat.txt read file+hash linux sys:openat:ok:read
+in/linux/at/openat.txt read file+hash linux sys:openat:ok:read
+in/linux/openat-missing probe absent linux sys:openat:ENOENT:probe
+out/linux/no-dir/openat probe absent linux sys:openat:ENOENT:probe
+in/linux/openat.txt/below probe absent linux sys:openat:ENOTDIR:probe
+out/linux/openat-wronly probe+write file linux sys:openat:ok:write sys:openat:EEXIST:probe
+out/linux/openat-rdwr read+write file+hash linux sys:openat:ok:read+write
+in/linux/openat-dir probe dir linux sys:openat:ok:probe
+in/linux/openat-path.txt probe file linux sys:openat:ok:probe
+in/linux/openat-nofollow-link probe symlink:target.txt:file linux sys:openat:ELOOP:probe
+in/linux/openat-file-link read symlink:target.txt:file+hash linux sys:openat:ok:read
+in/linux/openat-dir-link probe symlink:target-dir:dir linux sys:openat:ok:probe
+
+# openat: spellings, recorded without ./ and the repeated / and with .., and absolute paths from the working
+# directory and from a descriptor, which an absolute path ignores.
+in/linux/spelled.txt read file+hash linux sys:openat:ok:read
+in/linux/at/../parent.txt read file+hash linux sys:openat:ok:read
+in/linux/absolute.txt read file+hash linux sys:openat:ok:read
+in/linux/absolute-at.txt read file+hash linux sys:openat:ok:read
+
+# openat2: reads from the working directory and from a descriptor, and a missing name.
+# With RESOLVE_IN_ROOT, in/linux/root is the root: the link's target ../escape.txt and the absolute
+# path /inner.txt stay in it, and the link that the lookup followed is probed.
+in/linux/openat2.txt read file+hash linux sys:openat2:ok:read
+in/linux/at/openat2.txt read file+hash linux sys:openat2:ok:read
+in/linux/openat2-missing probe absent linux sys:openat2:ENOENT:probe
+in/linux/root probe dir linux sys:openat:ok:probe
+in/linux/root/escape-link probe symlink:../escape.txt:file linux sys:openat2:ok:probe
+in/linux/root/escape.txt read file+hash linux sys:openat2:ok:read
+in/linux/root/inner.txt read file+hash linux sys:openat2:ok:read
+
+# creat: a creation, and a name below a missing directory.
+out/linux/creat write file linux-x86_64 sys:creat:ok:write
+out/linux/no-dir/creat probe absent linux-x86_64 sys:creat:ENOENT:probe
+
+# stat and lstat: files, missing names, and links to a file and to a directory, followed by stat and not by
+# lstat.
+in/linux/stat.txt probe file linux-x86_64 sys:stat:ok:probe
+in/linux/stat-missing probe absent linux-x86_64 sys:stat:ENOENT:probe
+in/linux/stat-file-link probe symlink:target.txt:file linux-x86_64 sys:stat:ok:probe
+in/linux/stat-dir-link probe symlink:target-dir:dir linux-x86_64 sys:stat:ok:probe
+in/linux/lstat.txt probe file linux-x86_64 sys:lstat:ok:probe
+in/linux/lstat-missing probe absent linux-x86_64 sys:lstat:ENOENT:probe
+in/linux/lstat-file-link probe symlink:target.txt:file linux-x86_64 sys:lstat:ok:probe
+in/linux/lstat-dir-link probe symlink:target-dir:dir linux-x86_64 sys:lstat:ok:probe
+
+# newfstatat: from the working directory and from a descriptor; a missing name, a name below a missing
+# directory and a name below a file; a link with and without AT_SYMLINK_NOFOLLOW; and the empty path with
+# AT_EMPTY_PATH on a descriptor that openat opened with O_PATH.
+in/linux/newfstatat.txt probe file linux sys:newfstatat:ok:probe
+in/linux/at/newfstatat.txt probe file linux sys:newfstatat:ok:probe
+in/linux/newfstatat-missing probe absent linux sys:newfstatat:ENOENT:probe
+in/linux/no-dir/newfstatat probe absent linux sys:newfstatat:ENOENT:probe
+in/linux/newfstatat.txt/below probe absent linux sys:newfstatat:ENOTDIR:probe
+in/linux/newfstatat-link probe symlink:target.txt:file linux sys:newfstatat:ok:probe
+in/linux/newfstatat-empty.txt probe file linux sys:openat:ok:probe sys:newfstatat:ok:probe
+
+# statx: the same forms as newfstatat.
+in/linux/statx.txt probe file linux sys:statx:ok:probe
+in/linux/at/statx.txt probe file linux sys:statx:ok:probe
+in/linux/statx-missing probe absent linux sys:statx:ENOENT:probe
+in/linux/statx-dir-link probe symlink:target-dir:dir linux sys:statx:ok:probe
+in/linux/statx-empty.txt probe file linux sys:openat:ok:probe sys:statx:ok:probe
+
+# access, faccessat and faccessat2: files from the working directory and from a descriptor, missing names,
+# and for faccessat2 a link with and without AT_SYMLINK_NOFOLLOW and the empty path with AT_EMPTY_PATH.
+in/linux/access.txt probe file linux-x86_64 sys:access:ok:probe
+in/linux/access-missing probe absent linux-x86_64 sys:access:ENOENT:probe
+in/linux/faccessat.txt probe file linux sys:faccessat:ok:probe
+in/linux/at/faccessat.txt probe file linux sys:faccessat:ok:probe
+in/linux/faccessat-missing probe absent linux sys:faccessat:ENOENT:probe
+in/linux/faccessat2.txt probe file linux sys:faccessat2:ok:probe
+in/linux/at/faccessat2.txt probe file linux sys:faccessat2:ok:probe
+in/linux/faccessat2-missing probe absent linux sys:faccessat2:ENOENT:probe
+in/linux/faccessat2-link probe symlink:target.txt:file linux sys:faccessat2:ok:probe
+in/linux/faccessat2-empty.txt probe file linux sys:openat:ok:probe sys:faccessat2:ok:probe
+
+# readlink and readlinkat: reading a link reads its content, its target, so what it points to is hashed;
+# missing names; and readlinkat from a descriptor and on the empty path, which names a link that openat
+# opened with O_PATH and O_NOFOLLOW.
+in/linux/readlink-link read symlink:target.txt:file+hash linux-x86_64 sys:readlink:ok:read
+in/linux/readlink-missing probe absent linux-x86_64 sys:readlink:ENOENT:probe
+in/linux/readlinkat-link read symlink:target.txt:file+hash linux sys:readlinkat:ok:read
+in/linux/at/readlinkat-link read symlink:../target.txt:file+hash linux sys:readlinkat:ok:read
+in/linux/readlinkat-missing probe absent linux sys:readlinkat:ENOENT:probe
+in/linux/readlinkat-empty-link read+probe symlink:target.txt:file+hash linux sys:openat:ok:probe sys:readlinkat:ok:read
+
+# link and linkat: a hard link writes both names; missing sources; linkat from a descriptor, and on a link,
+# which it links itself without AT_SYMLINK_FOLLOW and its target with it.
+out/linux/link-from write file linux-x86_64 sys:openat:ok:write sys:link:ok:write
+out/linux/link-to write file linux-x86_64 sys:link:ok:write
+out/linux/link-missing probe absent linux-x86_64 sys:link:ENOENT:probe
+out/linux/link-missing-to probe absent linux-x86_64 sys:link:ENOENT:probe
+out/linux/linkat-from write file linux sys:openat:ok:write sys:linkat:ok:write
+out/linux/linkat-to write file linux sys:linkat:ok:write
+out/linux/made-link/linkat-at-from write file linux sys:openat:ok:write
+out/linux/made/linkat-at-from write file linux sys:linkat:ok:write
+out/linux/made/linkat-at-to write file linux sys:linkat:ok:write
+out/linux/linkat-symlink write symlink:linkat-from:file linux sys:symlinkat:ok:write sys:linkat:ok:write
+out/linux/linkat-nofollow write symlink:linkat-from:file linux sys:linkat:ok:write
+out/linux/linkat-follow write file linux sys:linkat:ok:write
+out/linux/linkat-missing probe absent linux sys:linkat:ENOENT:probe
+out/linux/linkat-missing-to probe absent linux sys:linkat:ENOENT:probe
+
+# symlink and symlinkat: links to nothing, one checked with lstat; symlinkat from a descriptor; names below
+# a missing directory.
+out/linux/symlink probe+write symlink:nowhere:absent linux-x86_64 sys:symlink:ok:write sys:lstat:ok:probe
+out/linux/no-dir/symlink probe absent linux-x86_64 sys:symlink:ENOENT:probe
+out/linux/made/symlinkat-at write symlink:nowhere:absent linux sys:symlinkat:ok:write
+out/linux/no-dir/symlinkat probe absent linux sys:symlinkat:ENOENT:probe
+
+# getdents and getdents64: listings of directories that openat opened with O_DIRECTORY.
+in/linux/getdents probe+list dir+listing linux-x86_64 sys:openat:ok:probe sys:getdents:ok:list
+in/linux/getdents64 probe+list dir+listing linux sys:openat:ok:probe sys:getdents64:ok:list
+
+# execve and execveat: children run the program through links to it, from the working directory and from a
+# descriptor, and through a copy of it on a descriptor with AT_EMPTY_PATH; each run reads its own file.
+# The copy is read through a link, so the Linux section never touches the program's own path.
+# execveat with AT_SYMLINK_NOFOLLOW on a link fails with ELOOP, and missing programs fail with ENOENT.
+out/linux/execve-link write+exec symlink:../../coverage:file+hash linux sys:symlinkat:ok:write sys:execve:ok:exec
+in/linux/child-execve.txt read file+hash linux sys:openat:ok:read
+in/linux/execve-missing probe absent linux sys:execve:ENOENT:probe
+out/linux/execveat-link probe+write+exec symlink:../../coverage:file+hash linux sys:symlinkat:ok:write sys:execveat:ok:exec sys:execveat:ELOOP:probe
+in/linux/child-execveat.txt read file+hash linux sys:openat:ok:read
+out/linux/made/execveat-at-link write+exec symlink:../../../coverage:file+hash linux sys:symlinkat:ok:write sys:execveat:ok:exec
+in/linux/child-execveat-at.txt read file+hash linux sys:openat:ok:read
+out/linux/execveat-copy-link read+write symlink:../../coverage:file+hash linux sys:symlinkat:ok:write sys:openat:ok:read
+out/linux/execveat-copy probe+write+exec file+hash linux sys:openat:ok:write sys:openat:ok:probe sys:execveat:ok:exec
+in/linux/child-execveat-empty.txt read file+hash linux sys:openat:ok:read
+in/linux/execveat-missing probe absent linux sys:execveat:ENOENT:probe
+
+# chdir and fchdir: children enter a directory, by name or by a descriptor that openat opened through a link
+# to it, and read a relative path there; a missing directory fails with ENOENT.
+in/linux/chdir probe dir linux sys:chdir:ok:probe
+in/linux/chdir/chdir.txt read file+hash linux sys:openat:ok:read
+in/linux/chdir-missing probe absent linux sys:chdir:ENOENT:probe
+in/linux/fchdir-link probe symlink:fchdir:dir linux sys:openat:ok:probe
+in/linux/fchdir probe dir linux sys:fchdir:ok:probe
+in/linux/fchdir/fchdir.txt read file+hash linux sys:openat:ok:read
+
+# rename, renameat and renameat2: a rename writes both names, from the working directory and from a
+# descriptor; missing sources fail with ENOENT and probe both names.
+out/linux/rename-from write absent linux-x86_64 sys:openat:ok:write sys:rename:ok:write
+out/linux/rename-to write file linux-x86_64 sys:rename:ok:write
+out/linux/rename-missing probe absent linux-x86_64 sys:rename:ENOENT:probe
+out/linux/rename-missing-to probe absent linux-x86_64 sys:rename:ENOENT:probe
+out/linux/renameat-from write absent linux sys:openat:ok:write sys:renameat:ok:write
+out/linux/renameat-to write file linux sys:renameat:ok:write
+out/linux/made-link/renameat-at-from write absent linux sys:openat:ok:write
+out/linux/made/renameat-at-from write absent linux sys:renameat:ok:write
+out/linux/made/renameat-at-to write file linux sys:renameat:ok:write
+out/linux/renameat-missing probe absent linux sys:renameat:ENOENT:probe
+out/linux/renameat-missing-to probe absent linux sys:renameat:ENOENT:probe
+out/linux/renameat2-from write absent linux sys:openat:ok:write sys:renameat2:ok:write
+out/linux/renameat2-to write file linux sys:renameat2:ok:write
+out/linux/made-link/renameat2-at-from write absent linux sys:openat:ok:write
+out/linux/made/renameat2-at-from write absent linux sys:renameat2:ok:write
+out/linux/made/renameat2-at-to write file linux sys:renameat2:ok:write
+out/linux/renameat2-missing probe absent linux sys:renameat2:ENOENT:probe
+out/linux/renameat2-missing-to probe absent linux sys:renameat2:ENOENT:probe
+
+# unlink, unlinkat and rmdir: removals of files and directories made through out/linux/made-link, unlinkat
+# with and without AT_REMOVEDIR and from a descriptor; missing names fail with ENOENT.
+out/linux/made-link/unlink write absent linux-x86_64 sys:openat:ok:write
+out/linux/made/unlink write absent linux-x86_64 sys:unlink:ok:write
+out/linux/unlink-missing probe absent linux-x86_64 sys:unlink:ENOENT:probe
+out/linux/made-link/unlinkat write absent linux sys:openat:ok:write
+out/linux/made/unlinkat write absent linux sys:unlinkat:ok:write
+out/linux/made-link/unlinkat-dir write absent linux sys:mkdirat:ok:write
+out/linux/made/unlinkat-dir write absent linux sys:unlinkat:ok:write
+out/linux/made-link/unlinkat-at write absent linux sys:openat:ok:write
+out/linux/made/unlinkat-at write absent linux sys:unlinkat:ok:write
+out/linux/unlinkat-missing probe absent linux sys:unlinkat:ENOENT:probe
+out/linux/made-link/rmdir write absent linux-x86_64 sys:mkdirat:ok:write
+out/linux/made/rmdir write absent linux-x86_64 sys:rmdir:ok:write
+out/linux/rmdir-missing probe absent linux-x86_64 sys:rmdir:ENOENT:probe
+
+# mkdir, mkdirat, mknod and mknodat: creations from the working directory and from a descriptor, a second
+# mkdir that fails with EEXIST, a FIFO and a regular file, and names below a missing directory.
+out/linux/mkdir probe+write dir linux-x86_64 sys:mkdir:ok:write sys:mkdir:EEXIST:probe
+out/linux/no-dir/mkdir probe absent linux-x86_64 sys:mkdir:ENOENT:probe
+out/linux/made/mkdirat-at write dir linux sys:mkdirat:ok:write
+out/linux/no-dir/mkdirat probe absent linux sys:mkdirat:ENOENT:probe
+out/linux/mknod-fifo write fifo linux-x86_64 sys:mknod:ok:write
+out/linux/no-dir/mknod probe absent linux-x86_64 sys:mknod:ENOENT:probe
+out/linux/mknodat-file write file linux sys:mknodat:ok:write
+out/linux/made/mknodat-at-fifo write fifo linux sys:mknodat:ok:write
+out/linux/no-dir/mknodat probe absent linux sys:mknodat:ENOENT:probe
+
+# truncate, chmod and fchmodat: changes of files made through out/linux/made-link, from the working directory
+# and from a descriptor; missing names fail with ENOENT.
+out/linux/made-link/truncate write file linux sys:openat:ok:write
+out/linux/made/truncate write file linux sys:truncate:ok:write
+out/linux/truncate-missing probe absent linux sys:truncate:ENOENT:probe
+out/linux/made-link/chmod write file linux-x86_64 sys:openat:ok:write
+out/linux/made/chmod write file linux-x86_64 sys:chmod:ok:write
+out/linux/chmod-missing probe absent linux-x86_64 sys:chmod:ENOENT:probe
+out/linux/made-link/fchmodat write file linux sys:openat:ok:write
+out/linux/made/fchmodat write file linux sys:fchmodat:ok:write
+out/linux/made-link/fchmodat-at write file linux sys:openat:ok:write
+out/linux/made/fchmodat-at write file linux sys:fchmodat:ok:write
+out/linux/fchmodat-missing probe absent linux sys:fchmodat:ENOENT:probe
+
+# chown, lchown and fchownat: changes of owners to the current ones; chown follows a link and lchown does not,
+# fchownat also with AT_SYMLINK_NOFOLLOW, from a descriptor, and on the empty path with AT_EMPTY_PATH;
+# missing names fail with ENOENT.
+out/linux/made-link/chown write file linux-x86_64 sys:openat:ok:write
+out/linux/made/chown write file linux-x86_64 sys:chown:ok:write
+out/linux/chown-missing probe absent linux-x86_64 sys:chown:ENOENT:probe
+out/linux/made-link/chown-link write symlink:chown:file linux-x86_64 sys:symlinkat:ok:write
+out/linux/made/chown-link write symlink:chown:file linux-x86_64 sys:chown:ok:write sys:lchown:ok:write
+out/linux/made-link/lchown write symlink:nowhere:absent linux-x86_64 sys:symlinkat:ok:write
+out/linux/made/lchown write symlink:nowhere:absent linux-x86_64 sys:lchown:ok:write
+out/linux/lchown-missing probe absent linux-x86_64 sys:lchown:ENOENT:probe
+out/linux/made-link/fchownat write file linux sys:openat:ok:write
+out/linux/made/fchownat write file linux sys:fchownat:ok:write
+out/linux/made-link/fchownat-at write file linux sys:openat:ok:write
+out/linux/made/fchownat-at write file linux sys:fchownat:ok:write
+out/linux/made-link/fchownat-link write symlink:nowhere:absent linux sys:symlinkat:ok:write
+out/linux/made/fchownat-link write symlink:nowhere:absent linux sys:fchownat:ok:write
+out/linux/made-link/fchownat-empty write file linux sys:openat:ok:write
+out/linux/made/fchownat-empty write file linux sys:fchownat:ok:write
+out/linux/fchownat-missing probe absent linux sys:fchownat:ENOENT:probe
+
+# utime, utimes, utimensat and futimesat: changes of times to now, from the working directory and from a
+# descriptor; utimensat also on a link with AT_SYMLINK_NOFOLLOW, on a descriptor with a null path and with the
+# empty path and AT_EMPTY_PATH, and futimesat on a descriptor with a null path; missing names fail with ENOENT.
+out/linux/made-link/utime write file linux-x86_64 sys:openat:ok:write
+out/linux/made/utime write file linux-x86_64 sys:utime:ok:write
+out/linux/utime-missing probe absent linux-x86_64 sys:utime:ENOENT:probe
+out/linux/made-link/utimes write file linux-x86_64 sys:openat:ok:write
+out/linux/made/utimes write file linux-x86_64 sys:utimes:ok:write
+out/linux/utimes-missing probe absent linux-x86_64 sys:utimes:ENOENT:probe
+out/linux/made-link/utimensat write file linux sys:openat:ok:write
+out/linux/made/utimensat write file linux sys:utimensat:ok:write
+out/linux/made-link/utimensat-at write file linux sys:openat:ok:write
+out/linux/made/utimensat-at write file linux sys:utimensat:ok:write
+out/linux/made-link/utimensat-link write symlink:nowhere:absent linux sys:symlinkat:ok:write
+out/linux/made/utimensat-link write symlink:nowhere:absent linux sys:utimensat:ok:write
+out/linux/made-link/utimensat-null write file linux sys:openat:ok:write
+out/linux/made/utimensat-null write file linux sys:utimensat:ok:write
+out/linux/made-link/utimensat-empty write file linux sys:openat:ok:write
+out/linux/made/utimensat-empty write file linux sys:utimensat:ok:write
+out/linux/utimensat-missing probe absent linux sys:utimensat:ENOENT:probe
+out/linux/made-link/futimesat write file linux-x86_64 sys:openat:ok:write
+out/linux/made/futimesat write file linux-x86_64 sys:futimesat:ok:write
+out/linux/made-link/futimesat-at write file linux-x86_64 sys:openat:ok:write
+out/linux/made/futimesat-at write file linux-x86_64 sys:futimesat:ok:write
+out/linux/made-link/futimesat-null write file linux-x86_64 sys:openat:ok:write
+out/linux/made/futimesat-null write file linux-x86_64 sys:futimesat:ok:write
+out/linux/futimesat-missing probe absent linux-x86_64 sys:futimesat:ENOENT:probe
+
+# ftruncate, fchmod and fchown: changes through descriptors of files that openat created through
+# out/linux/made-link, so each descriptor names the path under out/linux/made.
+out/linux/made-link/ftruncate write file linux sys:openat:ok:write
+out/linux/made/ftruncate write file linux sys:ftruncate:ok:write
+out/linux/made-link/fchmod write file linux sys:openat:ok:write
+out/linux/made/fchmod write file linux sys:fchmod:ok:write
+out/linux/made-link/fchown write file linux sys:openat:ok:write
+out/linux/made/fchown write file linux sys:fchown:ok:write

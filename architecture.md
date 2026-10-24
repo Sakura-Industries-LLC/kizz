@@ -977,6 +977,29 @@ Depends on phase 7.
 
 Acceptance: a written report of the measurements that lists any follow-up work.
 
+### Phase 10: tracer conformance test
+
+Depends on phases 7 and 8.
+
+* `tests/tracer-coverage/` is a fixture project.
+  It holds `coverage.c`, the inputs that the program uses, an expectation file and a `kizz.md`.
+* In the `kizz.md`, a `coverage-build` task compiles `coverage.c` with `cc`.
+  A cached `coverage-test` task runs the program.
+* `coverage.c` is plain C that makes every tracked system call, in several variants.
+  It checks the result of every call, and calls that only some platforms have are compiled only there.
+* The expectation file lists each path under the task directory that the run must record.
+  Each entry gives the path's access kinds, its state, the calls that touch it and its platforms.
+* An end-to-end test copies the fixture to a temporary directory and runs `kizz build coverage-build` there.
+  It then resets the copy's cache entries with `kizz cache reset` and runs `kizz build coverage-test`.
+  It compares the step that `coverage-test` recorded with the expectation file.
+
+Acceptance, end to end with the real tracer and a temporary cache:
+
+* The program reports that every call returned what it expected.
+* Each expected path for the platform is recorded with exactly its access kinds and state.
+* No other path under the task directory is recorded.
+* Each tracked system call has an expected entry that a tracer missing that call would record differently.
+
 ## Testing
 
 * Each crate has unit tests.
@@ -984,6 +1007,9 @@ Acceptance: a written report of the measurements that lists any follow-up work.
 * `kizz-core` tests use a fake tracer that performs scripted file operations and reports them.
 * End-to-end tests run the `kizz` binary on fixture trees with `KIZZ_CACHE_DIR` set to a temporary directory.
 * Explanations have golden-output tests.
+* The tracer conformance test of phase 10 needs a C compiler, `cc`, where the tests run.
+  Every tracer must pass it: the x86_64 Linux tracer now, and any later one, for aarch64, macOS or Windows.
+  Calls that only some platforms have are compiled only there, and their expected entries name those platforms.
 
 ## Open questions
 

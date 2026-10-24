@@ -18,6 +18,7 @@ DUPFD
 EACCES
 EBADF
 ECHILD
+EEXIST
 EFAULT
 EINTR
 EINVAL
@@ -47,6 +48,7 @@ fchown
 fchownat
 fcntl
 FDCWD
+fopen
 fprog
 fstat
 fstatat
@@ -95,6 +97,7 @@ nocapture
 NOCTTY
 nsec
 openat
+opendir
 openpt
 pids
 pipefail
@@ -111,6 +114,7 @@ readlink
 readlinkat
 readv
 regs
+REMOVEDIR
 renameat
 RESTARTBLOCK
 retarget
@@ -180,6 +184,7 @@ waitid
 waitpid
 WEXITED
 WEXITSTATUS
+Wextra
 WIFEXITED
 WIFSIGNALED
 WIFSTOPPED
