@@ -33,7 +33,12 @@ pub const DATABASE_DIR: &str = "db";
 ///
 /// Version 2 replaced the first step record with the full one: the step
 /// specification, the observations with their path states, and why the step ran.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Version 3 added the cache check's reasons, with the differences it found, when
+/// each record's observations were written, and the failure message of a missing
+/// or non-executable program. Version 4 added the reason a run's result was not
+/// cached, which marks a record that is never a cache hit, and the exit of a
+/// command that could not start.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]

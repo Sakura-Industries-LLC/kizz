@@ -774,8 +774,10 @@ fn a_file_that_was_only_checked_is_never_hashed() -> TestResult {
     for _ in 0..3 {
         steps.execute(&fixture.step(&["tool"]))?;
     }
-    // Only the program, once per run.
-    assert_eq!(engine.files_hashed(), 3);
+    // Three runs, and only the program hashed, once in the build: the build's
+    // cache of file states keeps its hash.
+    assert_eq!(tracer.requests().len(), 3);
+    assert_eq!(engine.files_hashed(), 1);
     for key in steps.keys() {
         let stored = record(&store, &key)?;
         assert_eq!(
@@ -1105,11 +1107,20 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
     );
     assert_eq!(stored.reason, RunReason::NeverRun);
 
+    // A new build with the same specification and unchanged inputs is a cache hit:
+    // nothing runs, and the record keeps why the step last ran.
+    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let replayed = engine.task(PROGRAM, fixture.dir()).execute(&step)?;
+    assert!(replayed.cached);
+    assert_eq!(replayed.termination, Termination::Exited(3));
+    assert_eq!(tracer.requests().len(), 1);
+    assert_eq!(record(&store, &key)?.reason, RunReason::NeverRun);
+    // `always` is not in the key, so the same record is found, and the step runs
+    // in a new build for that reason.
+    step.always = true;
     let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
     engine.task(PROGRAM, fixture.dir()).execute(&step)?;
-    assert_eq!(record(&store, &key)?.reason, RunReason::Unchecked);
-    step.always = true;
-    engine.task(PROGRAM, fixture.dir()).execute(&step)?;
+    assert_eq!(tracer.requests().len(), 2);
     assert_eq!(record(&store, &key)?.reason, RunReason::Always);
     Ok(())
 }

@@ -75,6 +75,9 @@ fn step_record(n: u8) -> StepRecord {
         duration_nanos: u64::from(n),
         ran_at_nanos: u64::from(n),
         reason: RunReason::NeverRun,
+        recorded_at_nanos: u64::from(n),
+        failure: None,
+        not_cached: None,
     }
 }
 

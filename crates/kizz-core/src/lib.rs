@@ -24,9 +24,15 @@
 //! * [`lookup`]: program lookup through the task environment's `PATH`.
 //! * [`patterns`]: the path patterns of `ignore` and `track`.
 //! * [`observe`](mod@observe): the recorded state of every path a step touched.
-//! * [`engine`]: the engine side of the step executor, which runs each step through the
-//!   tracer and stores its record.
+//! * [`states`]: the in-memory concurrent cache of file states and hashes of one build,
+//!   so a file is hashed once per build.
+//! * [`check`](mod@check): the cache check, which compares a step's recorded observations
+//!   with the file system.
+//! * [`engine`]: the engine side of the step executor, which checks the cache for each
+//!   step, replays a hit, and otherwise runs the step through the tracer and stores its
+//!   record, unless the result is not cached.
 
+pub mod check;
 pub mod discovery;
 pub mod dotenv;
 pub mod engine;
@@ -37,11 +43,13 @@ pub mod observe;
 pub mod patterns;
 pub mod project;
 pub mod runtime;
+pub mod states;
 pub mod step;
 pub mod targets;
 pub mod tasks;
 pub mod warning;
 
+pub use check::{Checked, RACY_WINDOW_NANOS, check};
 pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
 pub use dotenv::DotenvError;
 pub use engine::{Engine, TaskSteps};
@@ -55,6 +63,7 @@ pub use runtime::{
     PrintSink, ProgramHash, ProgramLoad, TaskFailure, TaskInfo, TaskProgram, TaskRun,
     UnexpectedExit,
 };
+pub use states::FileStates;
 pub use step::{StepError, StepExecutor, StepOutcome, StepSpec};
 pub use targets::{Selected, TARGET_NAME_RULE, TargetExpr, TargetExprError, is_valid_target};
 pub use tasks::{ParsedFile, TASK_LANGUAGE, Task, parse_tasks};

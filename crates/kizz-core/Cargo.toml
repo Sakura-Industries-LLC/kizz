@@ -16,6 +16,7 @@ workspace = true
 kizz-store = { path = "../kizz-store", version = "0.0.1" }
 kizz-trace = { path = "../kizz-trace", version = "0.0.1" }
 blake3 = { version = "1.8.2", features = ["rayon", "mmap"] }
+dashmap = "6.2.1"
 globset = "0.4.20"
 ignore = "0.4.33"
 minicbor = { version = "2.3.1", features = ["alloc", "derive"] }

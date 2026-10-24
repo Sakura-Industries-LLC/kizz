@@ -27,8 +27,8 @@ pub use records::{
     SchemaVersion, StepKey, StepPosition, TaskId, TaskRecord, database_key, path_prefix,
 };
 pub use step::{
-    AccessBits, Capture, ContentHash, DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES,
-    Observation, PathState, ProgramPath, RecordedOutput, RunReason, SpecialKind, StepExit,
-    StepRecord, StepSpecRecord,
+    AccessBits, Capture, Change, ContentHash, Difference, DirEntry, EntryKind, FileMeta, Listing,
+    MAX_LISTED_NAMES, NotCachedReason, Observation, PathState, ProgramPath, RecordedOutput,
+    RunReason, SpecialKind, StepExit, StepRecord, StepSpecRecord,
 };
 pub use store::{DATABASE_DIR, SCHEMA_VERSION, Store, StoreError, Txn};

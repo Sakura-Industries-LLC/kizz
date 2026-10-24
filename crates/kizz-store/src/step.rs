@@ -384,6 +384,10 @@ pub enum StepExit {
     /// The program exists but is not executable, so the command never started.
     #[n(3)]
     ProgramNotExecutable,
+    /// The command could not start, for a reason other than a missing or
+    /// non-executable program, so its result is not cached.
+    #[n(4)]
+    NotStarted,
 }
 
 /// A step's raw captured output, exactly as the command wrote it.
@@ -408,23 +412,180 @@ pub enum RecordedOutput {
     },
 }
 
+/// What changed about one recorded path, as a cache check found it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub enum Change {
+    /// Something exists where nothing did.
+    #[n(0)]
+    Appeared,
+    /// Nothing exists where something did.
+    #[n(1)]
+    Disappeared,
+    /// The type changed, such as a file that became a directory, or the path can or
+    /// can no longer be read.
+    #[n(2)]
+    Type,
+    /// A regular file's size changed, found without hashing.
+    #[n(3)]
+    Size {
+        /// The recorded size in bytes.
+        #[n(0)]
+        old: u64,
+        /// The current size in bytes.
+        #[n(1)]
+        new: u64,
+    },
+    /// A regular file that was read has the same size and different content, found
+    /// by hashing.
+    #[n(4)]
+    Content,
+    /// A regular file that was not read, and so has no hash, has the same size and
+    /// different metadata.
+    #[n(5)]
+    Metadata,
+    /// The entries of a listed directory changed.
+    #[n(6)]
+    Entries,
+    /// A symbolic link points somewhere else.
+    #[n(7)]
+    LinkTarget {
+        /// The recorded target.
+        #[cbor(n(0), with = "path_bytes")]
+        old: PathBuf,
+        /// The current target.
+        #[cbor(n(1), with = "path_bytes")]
+        new: PathBuf,
+    },
+}
+
+impl fmt::Display for Change {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        match self {
+            Self::Appeared => f.write_str("appeared"),
+            Self::Disappeared => f.write_str("disappeared"),
+            Self::Type => f.write_str("type changed"),
+            Self::Size { old, new } => write!(f, "size changed from {old} to {new} bytes"),
+            Self::Content => f.write_str("content changed"),
+            Self::Metadata => f.write_str("metadata changed"),
+            Self::Entries => f.write_str("directory entries changed"),
+            Self::LinkTarget { old, new } => {
+                write!(
+                    f,
+                    "link target changed from {} to {}",
+                    old.display(),
+                    new.display()
+                )
+            },
+        }
+    }
+}
+
+/// One recorded path that a cache check found changed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct Difference {
+    /// The absolute path.
+    #[cbor(n(0), with = "path_bytes")]
+    pub path: PathBuf,
+    /// What changed about it.
+    #[n(1)]
+    pub change: Change,
+}
+
+impl fmt::Display for Difference {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.change)
+    }
+}
+
+/// Why the result of a run was not cached.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub enum NotCachedReason {
+    /// A signal killed the command.
+    #[n(0)]
+    Signaled {
+        /// The signal number.
+        #[n(0)]
+        signal: i32,
+    },
+    /// The build was interrupted, and a signal stopped the command.
+    #[n(1)]
+    Interrupted {
+        /// The signal number.
+        #[n(0)]
+        signal: i32,
+    },
+    /// The tracer could not observe every access of the run.
+    #[n(2)]
+    Incomplete {
+        /// What the tracer could not observe.
+        #[n(0)]
+        detail: String,
+    },
+    /// The command could not start, for a reason other than a missing or
+    /// non-executable program.
+    #[n(3)]
+    StartFailed {
+        /// The error that starting the command reported.
+        #[n(0)]
+        message: String,
+    },
+}
+
+impl fmt::Display for NotCachedReason {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        match self {
+            Self::Signaled { signal } => write!(f, "killed by signal {signal}"),
+            Self::Interrupted { signal } => {
+                write!(f, "interrupted, and stopped by signal {signal}")
+            },
+            Self::Incomplete { detail } => write!(f, "incompletely traced: {detail}"),
+            Self::StartFailed { message } => write!(f, "could not start: {message}"),
+        }
+    }
+}
+
 /// Why a step ran.
 ///
-/// The cache check and the explanations add the reasons that compare a record with
-/// the current state.
+/// The explanations add the reasons that compare a step's specification with the
+/// one its task used last time at the same position.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum RunReason {
     /// There was no record for the step key: the step never ran with this exact
     /// specification.
     #[n(0)]
     NeverRun,
-    /// The step is marked `always`.
+    /// The step is marked `always`, and this was its one run in the build.
     #[n(1)]
     Always,
-    /// A record existed, and the step ran without comparing it, because this
-    /// engine has no cache check yet.
+    /// A record existed, and the cache check found these recorded paths changed.
     #[n(2)]
-    Unchecked,
+    InputsChanged {
+        /// Every difference, sorted by path.
+        #[n(0)]
+        differences: Vec<Difference>,
+    },
+    /// The step's previous run could not be cached, and the cache check found these
+    /// paths it touched changed since. In the build of that run, the check compares
+    /// the paths with their states after it; in a later build, with the states the
+    /// record of that run holds.
+    #[n(3)]
+    NotCached {
+        /// Why the previous run was not cached.
+        #[n(0)]
+        why: NotCachedReason,
+        /// Every difference, sorted by path.
+        #[n(1)]
+        differences: Vec<Difference>,
+    },
 }
 
 /// What is recorded about one run of a step, by step key.
@@ -438,7 +599,7 @@ pub struct StepRecord {
     #[n(1)]
     pub program: Option<ProgramPath>,
     /// Every touched path that no ignore pattern matched, sorted by path, with its
-    /// state when the step finished.
+    /// state when the step finished, or when a cache check last refreshed it.
     #[n(2)]
     pub observations: Vec<Observation>,
     /// The number of touched paths that ignore patterns left out.
@@ -459,6 +620,24 @@ pub struct StepRecord {
     /// Why the step ran.
     #[n(8)]
     pub reason: RunReason,
+    /// When kizz began writing the observations, before it read the state of any
+    /// path, in nanoseconds since the Unix epoch. A cache check that refreshes the
+    /// observations moves it to when that check began. A recorded modification time
+    /// within two seconds of it cannot prove a file unchanged.
+    #[n(9)]
+    pub recorded_at_nanos: u64,
+    /// For a program that was missing or not executable, the message of the task
+    /// failure, which a cache hit fails with again; for a command that could not
+    /// start, the message of its task failure.
+    #[n(10)]
+    pub failure: Option<String>,
+    /// Why the result of the run was not cached, or `None` when it was.
+    ///
+    /// A record with a reason here is never a cache hit: it replaces any older
+    /// record of the step key, so no older result is replayed, and the next build
+    /// runs the step again with this reason.
+    #[n(11)]
+    pub not_cached: Option<NotCachedReason>,
 }
 
 impl Record for StepRecord {
@@ -573,7 +752,153 @@ mod tests {
             duration_nanos: 10,
             ran_at_nanos: 11,
             reason: RunReason::NeverRun,
+            recorded_at_nanos: 12,
+            failure: Some("program `cc` is not executable".to_owned()),
+            not_cached: Some(NotCachedReason::Signaled { signal: 9 }),
         }
+    }
+
+    /// One run reason of each kind, with one difference of each kind.
+    fn reasons() -> Vec<RunReason> {
+        let differences: Vec<Difference> = [
+            Change::Appeared,
+            Change::Disappeared,
+            Change::Type,
+            Change::Size { old: 1, new: 2 },
+            Change::Content,
+            Change::Metadata,
+            Change::Entries,
+            Change::LinkTarget {
+                old: PathBuf::from("a"),
+                new: PathBuf::from("b\u{e9}"),
+            },
+        ]
+        .into_iter()
+        .map(|change| {
+            Difference {
+                path: PathBuf::from("/in"),
+                change,
+            }
+        })
+        .collect();
+        let whys = [
+            NotCachedReason::Signaled { signal: 9 },
+            NotCachedReason::Interrupted { signal: 2 },
+            NotCachedReason::Incomplete {
+                detail: "int 0x80".to_owned(),
+            },
+            NotCachedReason::StartFailed {
+                message: "out of memory".to_owned(),
+            },
+        ];
+        let mut reasons = vec![
+            RunReason::NeverRun,
+            RunReason::Always,
+            RunReason::InputsChanged {
+                differences: differences.clone(),
+            },
+        ];
+        reasons.extend(whys.into_iter().map(|why| {
+            RunReason::NotCached {
+                why,
+                differences: differences.clone(),
+            }
+        }));
+        reasons
+    }
+
+    #[test]
+    fn run_reasons_round_trip() {
+        for reason in reasons() {
+            let mut record = record();
+            record.reason = reason;
+            let bytes = minicbor::to_vec(&record).unwrap();
+            assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+        }
+    }
+
+    #[test]
+    fn exits_and_not_cached_markers_round_trip() {
+        let exits = [
+            StepExit::Exited { code: -1 },
+            StepExit::Signaled { signal: 2 },
+            StepExit::ProgramNotFound,
+            StepExit::ProgramNotExecutable,
+            StepExit::NotStarted,
+        ];
+        let markers = [
+            None,
+            Some(NotCachedReason::Interrupted { signal: 2 }),
+            Some(NotCachedReason::Incomplete {
+                detail: "int 0x80".to_owned(),
+            }),
+            Some(NotCachedReason::StartFailed {
+                message: "out of memory".to_owned(),
+            }),
+        ];
+        for exit in exits {
+            for not_cached in markers.clone() {
+                let mut record = record();
+                record.exit = exit;
+                record.not_cached = not_cached;
+                let bytes = minicbor::to_vec(&record).unwrap();
+                assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+            }
+        }
+    }
+
+    #[test]
+    fn changes_and_reasons_display() {
+        let shown: Vec<String> = [
+            Change::Appeared,
+            Change::Disappeared,
+            Change::Type,
+            Change::Size { old: 1, new: 2 },
+            Change::Content,
+            Change::Metadata,
+            Change::Entries,
+            Change::LinkTarget {
+                old: PathBuf::from("a"),
+                new: PathBuf::from("b"),
+            },
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(shown, [
+            "appeared",
+            "disappeared",
+            "type changed",
+            "size changed from 1 to 2 bytes",
+            "content changed",
+            "metadata changed",
+            "directory entries changed",
+            "link target changed from a to b",
+        ]);
+        let difference = Difference {
+            path: PathBuf::from("/in"),
+            change: Change::Content,
+        };
+        assert_eq!(difference.to_string(), "/in: content changed");
+        let whys: Vec<String> = [
+            NotCachedReason::Signaled { signal: 9 },
+            NotCachedReason::Interrupted { signal: 2 },
+            NotCachedReason::Incomplete {
+                detail: "lost a process".to_owned(),
+            },
+            NotCachedReason::StartFailed {
+                message: "out of memory".to_owned(),
+            },
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(whys, [
+            "killed by signal 9",
+            "interrupted, and stopped by signal 2",
+            "incompletely traced: lost a process",
+            "could not start: out of memory",
+        ]);
     }
 
     #[test]
@@ -588,9 +913,9 @@ mod tests {
     #[test]
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
-        // A definite-length array of nine fields, then the specification as a
+        // A definite-length array of twelve fields, then the specification as a
         // definite-length array of twelve.
-        assert_eq!(bytes.get(..2), Some(&[0x89, 0x8C][..]));
+        assert_eq!(bytes.get(..2), Some(&[0x8C, 0x8C][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
