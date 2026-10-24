@@ -27,6 +27,8 @@ allow = [
     # Permissive licenses used across the Rust ecosystem
     "Apache-2.0",
     "BSD-3-Clause",
+    # arrayref (through blake3) and Inflector (through debugserver-types), used by starlark
+    "BSD-2-Clause",
     "MIT",
     "BlueOak-1.0.0",
     "Zlib",

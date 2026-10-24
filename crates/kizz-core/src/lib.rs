@@ -13,16 +13,26 @@
 //! * [`tasks`]: the task blocks of a `kizz.md`.
 //! * [`targets`]: target names, target expressions joined with `+`, and task selection.
 //! * [`project`]: discovery and parsing together, with their configuration errors.
+//! * [`runtime`]: the Starlark runtime of task programs, with module loading and the
+//!   program hash.
+//! * [`step`]: the step specification that `run()` builds, and the step executor the
+//!   runtime hands it to.
 //! * [`warning`]: the warnings of discovery and parsing.
 
 pub mod discovery;
 pub mod project;
+pub mod runtime;
+pub mod step;
 pub mod targets;
 pub mod tasks;
 pub mod warning;
 
 pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
 pub use project::{ConfigError, LoadError, Project, load};
+pub use runtime::{
+    PrintSink, ProgramHash, ProgramLoad, TaskFailure, TaskInfo, TaskProgram, UnexpectedExit,
+};
+pub use step::{StepError, StepExecutor, StepOutcome, StepSpec};
 pub use targets::{Selected, TARGET_NAME_RULE, TargetExpr, TargetExprError, is_valid_target};
 pub use tasks::{ParsedFile, TASK_LANGUAGE, Task, parse_tasks};
 pub use warning::Warning;

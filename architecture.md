@@ -714,7 +714,7 @@ The command line and output use the same libraries as the cbork CLI: `bpaf` with
 | Library error types | `thiserror` | 2.0.21 |
 | Version and banner | `build-info`, `build-info-build` | 0.0.47 |
 | Directory walking | `ignore` | 0.4.33 |
-| Hashing | `blake3` with `rayon` and `mmap` | 1.8.7 |
+| Hashing | `blake3` with `rayon` and `mmap` | 1.8.2, pinned by `starlark` 0.14.2 |
 | Task programs | `starlark` | 0.14.2 |
 | Markdown | `pulldown-cmark` | 0.13.5 |
 | Database | `surrealkv` | 1.0.0 |
