@@ -81,3 +81,61 @@ pub(crate) fn print_error(message: &str) {
         style(message).for_stderr().bold()
     );
 }
+
+/// Print a warning to standard error, loudly: bold and colored.
+pub(crate) fn print_warning(message: &str) {
+    eprintln!(
+        "{}",
+        style(format!("warning: {message}"))
+            .for_stderr()
+            .yellow()
+            .bold()
+    );
+}
+
+/// Repeat every warning in a final summary on standard error; print nothing when
+/// there are none.
+pub(crate) fn print_warning_summary(warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{}",
+        style(format!("{}:", count(warnings.len(), "warning")))
+            .for_stderr()
+            .yellow()
+            .bold()
+    );
+    for warning in warnings {
+        eprintln!("  {}", style(warning).for_stderr().yellow().bold());
+    }
+}
+
+/// Print one task as `path/kizz.md:LINE (Heading) [targets]`.
+pub(crate) fn print_task(
+    location: &str,
+    targets: &[String],
+) {
+    println!(
+        "{} {}",
+        style(location).bold(),
+        style(format!("[{}]", targets.join(", "))).cyan()
+    );
+}
+
+/// Print a dimmed summary line.
+pub(crate) fn print_summary(message: &str) {
+    println!("{}", style(message).dim());
+}
+
+/// `number` followed by `singular`, made plural with `s` unless `number` is 1.
+pub(crate) fn count(
+    number: usize,
+    singular: &str,
+) -> String {
+    if number == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{number} {singular}s")
+    }
+}

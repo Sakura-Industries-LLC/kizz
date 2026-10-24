@@ -5,7 +5,8 @@
 //! Command-line interface for the `kizz` tool.
 //!
 //! This module owns parsing and dispatch only. Every command is parsed with all of
-//! its options; the commands are scaffolds until later phases implement them.
+//! its options; `kizz list` runs in the `list` module, and the other commands are
+//! scaffolds until later phases implement them.
 
 use std::{fmt, path::PathBuf, process::ExitCode, str::FromStr};
 
@@ -81,13 +82,7 @@ impl Cli {
                     path.map(|path| path.display().to_string()),
                 )
             },
-            Command::List { targets } => {
-                stub(
-                    "list",
-                    "List the discovered tasks with their file, line, name and targets.",
-                    targets,
-                )
-            },
+            Command::List { targets } => crate::list::run(targets.as_deref()),
             Command::Cache(CacheCommand::Clean) => {
                 stub(
                     "cache clean",

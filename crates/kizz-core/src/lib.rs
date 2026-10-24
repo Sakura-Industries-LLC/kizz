@@ -9,4 +9,20 @@
 //! runs commands only through the tracer interface of `kizz_trace` and keeps its
 //! records in `kizz_store`, so its tests use a fake tracer.
 //!
-//! Phase 0 of the implementation plan only creates this crate; later phases fill it.
+//! * [`discovery`]: every `kizz.md` under the current directory, in the default order.
+//! * [`tasks`]: the task blocks of a `kizz.md`.
+//! * [`targets`]: target names, target expressions joined with `+`, and task selection.
+//! * [`project`]: discovery and parsing together, with their configuration errors.
+//! * [`warning`]: the warnings of discovery and parsing.
+
+pub mod discovery;
+pub mod project;
+pub mod targets;
+pub mod tasks;
+pub mod warning;
+
+pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
+pub use project::{ConfigError, LoadError, Project, load};
+pub use targets::{Selected, TARGET_NAME_RULE, TargetExpr, TargetExprError, is_valid_target};
+pub use tasks::{ParsedFile, TASK_LANGUAGE, Task, parse_tasks};
+pub use warning::Warning;

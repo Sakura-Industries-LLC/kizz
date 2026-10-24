@@ -10,4 +10,5 @@
 //! to the Linux tracer of `kizz_trace_linux`.
 
 pub mod cli;
+mod list;
 mod ui;

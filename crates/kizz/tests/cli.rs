@@ -47,15 +47,14 @@ fn kizz(args: &[&str]) -> io::Result<Run> {
     })
 }
 
-/// Every command, with the name its scaffold message shows.
-const STUBS: [(&[&str], &str); 13] = [
+/// Every scaffolded command, with the name its scaffold message shows. `kizz list`
+/// is implemented, and `tests/list.rs` covers it.
+const STUBS: [(&[&str], &str); 11] = [
     (&["build"], "build"),
     (&["build", "ci"], "build"),
     (&["build", "--sequential", "--explain", "ci+check"], "build"),
     (&["why"], "why"),
     (&["why", "sub/dir"], "why"),
-    (&["list"], "list"),
-    (&["list", "ci"], "list"),
     (&["cache", "clean"], "cache clean"),
     (&["cache", "reset"], "cache reset"),
     (&["cache", "reset", "--all", "--yes"], "cache reset"),
@@ -148,8 +147,6 @@ fn stub_messages_name_their_target() {
     assert!(build.stdout.contains("target: ci+check"), "{build:?}");
     let why = kizz(&["why", "sub/dir"]).unwrap();
     assert!(why.stdout.contains("target: sub/dir"), "{why:?}");
-    let list = kizz(&["list"]).unwrap();
-    assert!(list.stdout.contains("target: <none>"), "{list:?}");
 }
 
 /// `kizz build --parallel` fails with the not-implemented error and status 2,

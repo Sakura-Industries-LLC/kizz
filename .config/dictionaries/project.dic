@@ -7,6 +7,7 @@ CLOEXEC
 cmark
 creat
 dashmap
+dedup
 dirfd
 DUPFD
 EACCES
@@ -91,6 +92,7 @@ readv
 regs
 renameat
 RESTARTBLOCK
+rgignore
 Riker
 rsplit
 rumdl
@@ -99,6 +101,7 @@ Sakura
 sccache
 seccomp
 SEGV
+setext
 SETMASK
 SETOPTIONS
 sigaction
