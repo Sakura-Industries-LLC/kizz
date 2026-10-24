@@ -46,8 +46,11 @@ fstatat
 ftruncate
 futimesat
 getdents
+geteuid
 GETEVENTMSG
+gethostname
 getpid
+getpwuid
 GETREGS
 GETSIGINFO
 gettid
@@ -130,6 +133,7 @@ TRACEVFORK
 trimpath
 TRUNC
 uncacheable
+uninit
 unlinkat
 untrackable
 uring
@@ -153,3 +157,4 @@ WRONLY
 WSTOPPED
 WSTOPSIG
 WTERMSIG
+xxhash

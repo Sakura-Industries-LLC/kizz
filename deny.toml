@@ -30,6 +30,8 @@ allow = [
     "MIT",
     "BlueOak-1.0.0",
     "Zlib",
+    # Boost Software License (xxhash-rust, used by surrealkv)
+    "BSL-1.0",
     # Unicode data (used by ICU-based crates pulled in transitively)
     "Unicode-3.0",
     # First-party: every kizz crate
