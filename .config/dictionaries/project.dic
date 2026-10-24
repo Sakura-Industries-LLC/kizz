@@ -34,6 +34,7 @@ eventfd
 execv
 execve
 execveat
+execvp
 EXITKILL
 faccessat
 fchdir
@@ -82,9 +83,11 @@ mmap
 newfstatat
 nlink
 nocapture
+nsec
 openat
 pids
 pipefail
+pointee
 prctl
 PRIVS
 ptrace

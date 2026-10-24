@@ -135,6 +135,12 @@ pub trait PrintSink {
 pub struct ProgramHash([u8; 32]);
 
 impl ProgramHash {
+    /// The hash with these bytes, as a stored task record holds it.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// The hash's bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {

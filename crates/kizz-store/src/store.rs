@@ -30,7 +30,10 @@ use crate::records::{Family, Record, RecordKey, SchemaKey, SchemaVersion, databa
 pub const DATABASE_DIR: &str = "db";
 
 /// The version of the record encoding that this build of kizz reads and writes.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 replaced the first step record with the full one: the step
+/// specification, the observations with their path states, and why the step ran.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]

@@ -11,7 +11,7 @@
 //! | Family | Prefix | Rest of the key | Record |
 //! | --- | --- | --- | --- |
 //! | schema version | `meta/` | `schema-version` | [`SchemaVersion`] |
-//! | step records | `step/` | the 32 bytes of the [`StepKey`] | [`StepRecord`] |
+//! | step records | `step/` | the 32 bytes of the [`StepKey`] | [`StepRecord`](crate::step::StepRecord) |
 //! | step positions | `position/` | the [`TaskId`], then the position | [`StepPosition`] |
 //! | task records | `task/` | the [`TaskId`] | [`TaskRecord`] |
 //! | last writers | `writer/` | the absolute path, as a [`PathKey`] | [`LastWriter`] |
@@ -27,9 +27,9 @@
 //! lengths, fields in a fixed order (struct fields are arrays, in index order), and
 //! sets and maps sorted by key, so the same record always has the same bytes.
 //!
-//! This is the first version of every family. Later phases fill in and extend the
-//! record contents, and a change of encoding raises
-//! [`SCHEMA_VERSION`](crate::SCHEMA_VERSION).
+//! Step records hold the full step specification and the observations; their
+//! contents are in [`step`](crate::step). Later phases extend the other record
+//! contents, and a change of encoding raises [`SCHEMA_VERSION`](crate::SCHEMA_VERSION).
 
 use std::{
     collections::BTreeSet,
@@ -332,32 +332,6 @@ impl Record for SchemaVersion {
     const FAMILY: Family = Family::Meta;
 }
 
-/// What is recorded about one run of a step.
-///
-/// The full specification, the observations, and why the step ran are added by the
-/// phases that record them.
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct StepRecord {
-    /// The exit code of the command.
-    #[n(0)]
-    pub exit_code: i32,
-    /// The captured output of the command.
-    #[cbor(n(1), with = "minicbor::bytes")]
-    pub output: Vec<u8>,
-    /// How long the command ran, in nanoseconds.
-    #[n(2)]
-    pub duration_nanos: u64,
-    /// When the command ran, in nanoseconds since the Unix epoch.
-    #[n(3)]
-    pub ran_at_nanos: u64,
-}
-
-impl Record for StepRecord {
-    type Key = StepKey;
-
-    const FAMILY: Family = Family::Step;
-}
-
 /// The step key a task used last time at one step position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub struct StepPosition {
@@ -541,15 +515,6 @@ mod tests {
         let version = encode_stably(&SchemaVersion { version: 1 });
         // A definite-length array of one item, then the unsigned integer 1.
         assert_eq!(version, [0x81, 0x01]);
-
-        let step = encode_stably(&StepRecord {
-            exit_code: -1,
-            output: b"out".to_vec(),
-            duration_nanos: 5,
-            ran_at_nanos: 6,
-        });
-        // A definite-length array of four items, and the output as a byte string.
-        assert_eq!(step, [0x84, 0x20, 0x43, b'o', b'u', b't', 0x05, 0x06]);
 
         let position = encode_stably(&StepPosition {
             step: StepKey([1; 32]),

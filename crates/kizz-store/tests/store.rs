@@ -19,9 +19,10 @@ use std::{
 };
 
 use kizz_store::{
-    DATABASE_DIR, LastWriter, LearnedOrder, PathKey, PositionKey, SCHEMA_VERSION, SchemaKey,
-    SchemaVersion, StepKey, StepPosition, StepRecord, Store, StoreError, TaskId, TaskRecord,
-    path_prefix,
+    AccessBits, Capture, ContentHash, DATABASE_DIR, FileMeta, LastWriter, LearnedOrder,
+    Observation, PathKey, PathState, PositionKey, ProgramPath, RecordedOutput, RunReason,
+    SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey, StepPosition, StepRecord,
+    StepSpecRecord, Store, StoreError, TaskId, TaskRecord, path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -34,10 +35,46 @@ const MARK: &str = "kizz-store-helper\t";
 /// A step record whose fields all derive from `n`.
 fn step_record(n: u8) -> StepRecord {
     StepRecord {
-        exit_code: i32::from(n),
-        output: vec![n; 3],
+        spec: StepSpecRecord {
+            program_hash: ContentHash([n; 32]),
+            cwd: PathBuf::from(format!("/w/{n}")),
+            argv: vec!["tool".to_owned(), n.to_string()],
+            env: [("N".to_owned(), n.to_string())].into(),
+            stdin: None,
+            capture: Capture::Split,
+            stream: false,
+            always: false,
+            ignore: Vec::new(),
+            track: Vec::new(),
+            expect: None,
+            occurrence: u32::from(n),
+        },
+        program: Some(ProgramPath(PathBuf::from("/bin/tool"))),
+        observations: vec![Observation {
+            path: PathBuf::from(format!("/w/{n}/input")),
+            access: AccessBits(AccessBits::READ),
+            tracked: false,
+            state: PathState::File {
+                meta: FileMeta {
+                    size: u64::from(n),
+                    mtime_nanos: i64::from(n),
+                    ctime_nanos: i64::from(n),
+                    inode: u64::from(n),
+                    device: 1,
+                    mode: 0o100_644,
+                },
+                hash: Some(ContentHash([n; 32])),
+            },
+        }],
+        ignored: u64::from(n),
+        exit: StepExit::Exited { code: i32::from(n) },
+        output: RecordedOutput::Split {
+            stdout: vec![n; 3],
+            stderr: Vec::new(),
+        },
         duration_nanos: u64::from(n),
         ran_at_nanos: u64::from(n),
+        reason: RunReason::NeverRun,
     }
 }
 

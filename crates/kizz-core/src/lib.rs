@@ -20,10 +20,21 @@
 //! * [`step`]: the step specification that `run()` builds, and the step executor the
 //!   runtime hands it to.
 //! * [`warning`]: the warnings of discovery and parsing.
+//! * [`key`]: step keys, derived with BLAKE3 from a deterministic CBOR encoding.
+//! * [`lookup`]: program lookup through the task environment's `PATH`.
+//! * [`patterns`]: the path patterns of `ignore` and `track`.
+//! * [`observe`](mod@observe): the recorded state of every path a step touched.
+//! * [`engine`]: the engine side of the step executor, which runs each step through the
+//!   tracer and stores its record.
 
 pub mod discovery;
 pub mod dotenv;
+pub mod engine;
 pub mod files;
+pub mod key;
+pub mod lookup;
+pub mod observe;
+pub mod patterns;
 pub mod project;
 pub mod runtime;
 pub mod step;
@@ -33,7 +44,12 @@ pub mod warning;
 
 pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
 pub use dotenv::DotenvError;
+pub use engine::{Engine, TaskSteps};
 pub use files::{FileError, Files, stable_json};
+pub use key::{KeyError, Occurrences, STEP_KEY_CONTEXT, step_key};
+pub use lookup::{NoPathError, PATH_VARIABLE, ProgramLookup, find_program};
+pub use observe::{HashCounter, Observed, access_bits, is_kernel_path, observe, path_state};
+pub use patterns::{PathPatterns, PatternError, REGEX_PREFIX};
 pub use project::{ConfigError, LoadError, Project, load};
 pub use runtime::{
     PrintSink, ProgramHash, ProgramLoad, TaskFailure, TaskInfo, TaskProgram, TaskRun,
