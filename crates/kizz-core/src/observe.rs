@@ -22,15 +22,23 @@
 //! Paths under `/proc` and `/sys` are recorded as [`PathState::Untracked`] unless a
 //! `track` pattern matches them; a tracked one gets its state, with the content of
 //! a regular file read and hashed again whatever the access, never from the cache.
+//! A path that symbolic links lead into `/proc` or `/sys`, such as `/dev/fd/3` or
+//! `/dev/stdin`, leaves only that final object untracked (see [`kernel_links`]): the
+//! links on the way stay ordinary dependencies, each recorded with its target, so
+//! retargeting, removing, or replacing one of them changes the step. A final link is
+//! recorded as [`PathState::Symlink`] with an untracked pointee, and every other link
+//! on the way is recorded as such a link too, as a probe.
 
 use std::{
+    collections::{BTreeMap, VecDeque},
+    ffi::OsString,
     fs::{self, FileType, Metadata},
     io,
     os::unix::{
         ffi::OsStringExt as _,
         fs::{FileTypeExt as _, MetadataExt as _},
     },
-    path::Path,
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -52,10 +60,114 @@ const KERNEL_ROOTS: [&str; 2] = ["/proc", "/sys"];
 /// Nanoseconds in a second.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
+/// The most symbolic links [`kernel_links`] follows, as many as a Linux path lookup
+/// follows.
+const MAX_LINKS: usize = 40;
+
 /// Whether `path` is under `/proc` or `/sys`, or is one of them.
 #[must_use]
 pub fn is_kernel_path(path: &Path) -> bool {
     KERNEL_ROOTS.iter().any(|root| path.starts_with(root))
+}
+
+/// Whether `path` is under `/proc` or `/sys`, or the symbolic links on the way to it
+/// lead there, as `/dev/fd` leads to `/proc/self/fd` and `/dev/stdin` to
+/// `/proc/self/fd/0` (see [`kernel_links`]).
+#[must_use]
+pub fn reaches_kernel(path: &Path) -> bool {
+    kernel_links(path).is_some()
+}
+
+/// The symbolic links outside `/proc` and `/sys`, each with its target, that lead
+/// `path` into `/proc` or `/sys`, in the order a path lookup follows them; `None`
+/// when `path` does not reach `/proc` or `/sys`, and no links when it is under one
+/// of them already.
+///
+/// A path that reaches `/proc` or `/sys` describes whichever process looks at it:
+/// read when kizz records or checks a step, it would describe kizz, not the
+/// command, so the object it reaches is recorded like any other `/proc` or `/sys`
+/// path. The links that lead there are ordinary files of the project or the
+/// system, so they are not. The lookup resolves each component in turn, follows
+/// at most 40 links, and stops at the first component under `/proc` or `/sys`,
+/// never reading anything there. A path that cannot be resolved, such as a missing
+/// one, is judged by its own form.
+#[must_use]
+pub fn kernel_links(path: &Path) -> Option<Vec<(PathBuf, PathBuf)>> {
+    kernel_route(path).map(|route| route.links)
+}
+
+/// How a path reaches `/proc` or `/sys`.
+#[derive(Debug, Default)]
+struct KernelRoute {
+    /// The symbolic links outside `/proc` and `/sys` on the way, each with its
+    /// target, in lookup order.
+    links: Vec<(PathBuf, PathBuf)>,
+    /// The target of the path's own final component, when that is a symbolic link
+    /// outside `/proc` and `/sys`.
+    own_target: Option<PathBuf>,
+}
+
+/// How `path` reaches `/proc` or `/sys`, or `None` when it does not, as
+/// [`kernel_links`] describes.
+fn kernel_route(path: &Path) -> Option<KernelRoute> {
+    let mut route = KernelRoute::default();
+    if is_kernel_path(path) {
+        return Some(route);
+    }
+    // Each name to look up, marked when it is the path's own final component.
+    let mut pending: VecDeque<(OsString, bool)> = VecDeque::new();
+    push_components(&mut pending, path, true);
+    let mut resolved = PathBuf::from("/");
+    while let Some((name, own)) = pending.pop_front() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        if is_kernel_path(&candidate) {
+            return Some(route);
+        }
+        let metadata = fs::symlink_metadata(&candidate).ok()?;
+        if !metadata.file_type().is_symlink() {
+            resolved = candidate;
+            continue;
+        }
+        if route.links.len() >= MAX_LINKS {
+            return None;
+        }
+        let target = fs::read_link(&candidate).ok()?;
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        let mut rest = VecDeque::new();
+        push_components(&mut rest, &target, false);
+        rest.append(&mut pending);
+        pending = rest;
+        if own {
+            route.own_target = Some(target.clone());
+        }
+        route.links.push((candidate, target));
+    }
+    is_kernel_path(&resolved).then_some(route)
+}
+
+/// Append the names and `..` components of `path` to `pending`, leaving out the
+/// root and `.`, and marking the last one with `own`.
+fn push_components(
+    pending: &mut VecDeque<(OsString, bool)>,
+    path: &Path,
+    own: bool,
+) {
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => pending.push_back((name.to_os_string(), false)),
+            Component::ParentDir => pending.push_back((OsString::from(".."), false)),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {},
+        }
+    }
+    if let Some(last) = pending.back_mut() {
+        last.1 = own;
+    }
 }
 
 /// Counts the files whose content was hashed, so tests can observe hashing.
@@ -122,35 +234,83 @@ pub fn observe(
         .iter()
         .map(|(path, kinds)| (path, *kinds))
         .partition(|(path, _)| !ignore.matches(path));
-    let observations = kept
+    let recorded: Vec<(Observation, Vec<Observation>)> = kept
         .par_iter()
         .map(|&(path, kinds)| observation(path, kinds, track, states))
         .collect();
+    let mut observations = BTreeMap::new();
+    let mut links = Vec::new();
+    for (observation, on_the_way) in recorded {
+        links.extend(on_the_way);
+        observations.insert(observation.path.clone(), observation);
+    }
+    for link in links {
+        let ignored_link = AbsolutePath::new(&link.path).is_ok_and(|path| ignore.matches(&path));
+        if !ignored_link {
+            observations.entry(link.path.clone()).or_insert(link);
+        }
+    }
     Observed {
-        observations,
+        observations: observations.into_values().collect(),
         ignored: u64::try_from(ignored.len()).unwrap_or(u64::MAX),
     }
 }
 
-/// The observation of one path that a step touched with `kinds`.
+/// The observation of one path that a step touched with `kinds`, and the
+/// observations of the symbolic links that lead it into `/proc` or `/sys`.
 fn observation(
     path: &AbsolutePath,
     kinds: AccessKinds,
     track: &PathPatterns,
     states: &FileStates,
-) -> Observation {
-    let kernel = is_kernel_path(path.as_path());
-    let tracked = kernel && track.matches(path);
-    let state = if kernel && !tracked {
-        PathState::Untracked
-    } else {
-        path_state(path.as_path(), kinds, tracked, states)
+) -> (Observation, Vec<Observation>) {
+    let route = kernel_route(path.as_path());
+    let tracked = route.is_some() && track.matches(path);
+    let Some(route) = route else {
+        let observation = Observation {
+            path: path.as_path().to_path_buf(),
+            access: access_bits(kinds),
+            tracked,
+            state: path_state(path.as_path(), kinds, false, states),
+        };
+        return (observation, Vec::new());
     };
-    Observation {
+    let state = if tracked {
+        path_state(path.as_path(), kinds, true, states)
+    } else {
+        // Only the object under `/proc` or `/sys` is untracked: a final link outside
+        // them keeps its target.
+        route
+            .own_target
+            .map_or(PathState::Untracked, untracked_link)
+    };
+    let on_the_way = route
+        .links
+        .into_iter()
+        .map(|(link, target)| {
+            Observation {
+                path: link,
+                access: AccessBits(AccessBits::PROBE),
+                tracked: false,
+                state: untracked_link(target),
+            }
+        })
+        .collect();
+    let observation = Observation {
         path: path.as_path().to_path_buf(),
         access: access_bits(kinds),
         tracked,
         state,
+    };
+    (observation, on_the_way)
+}
+
+/// The state of a symbolic link to `target`, which leads into `/proc` or `/sys`:
+/// the target, with an untracked pointee.
+fn untracked_link(target: PathBuf) -> PathState {
+    PathState::Symlink {
+        target,
+        pointee: Box::new(PathState::Untracked),
     }
 }
 
@@ -320,4 +480,122 @@ pub(crate) fn list(path: &Path) -> io::Result<Listing> {
         hash: ContentHash(*hasher.finalize().as_bytes()),
         entries: (entries.len() <= MAX_LISTED_NAMES).then_some(entries),
     })
+}
+
+/// Unit tests for recognizing paths that lead into `/proc` and `/sys`.
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    /// Paths under `/proc` and `/sys`, and the standard links into them, reach a
+    /// kernel interface.
+    #[test]
+    fn kernel_paths_and_the_standard_links_into_them_reach_the_kernel() {
+        for path in ["/proc/version", "/sys/kernel", "/dev/fd/0", "/dev/stdin"] {
+            assert!(reaches_kernel(Path::new(path)), "{path}");
+        }
+    }
+
+    /// A directory link, a final link, a chain of links, and a relative link that
+    /// lead into `/proc` or `/sys` reach a kernel interface.
+    #[test]
+    fn links_that_lead_into_proc_or_sys_reach_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        symlink("/proc/self/fd", root.join("fd")).unwrap();
+        symlink("/proc/self/fd/0", root.join("stdin")).unwrap();
+        symlink("stdin", root.join("chain")).unwrap();
+        let up = "../".repeat(root.components().count().saturating_sub(1));
+        symlink(format!("{up}sys/kernel"), root.join("relative")).unwrap();
+        for name in ["fd/0", "fd/1", "stdin", "chain", "relative"] {
+            assert!(reaches_kernel(&root.join(name)), "{name}");
+        }
+    }
+
+    /// Files, links to files, missing paths, dangling links, and link loops do not
+    /// reach a kernel interface, and the loop ends.
+    #[test]
+    fn other_paths_do_not_reach_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("file"), "content").unwrap();
+        symlink("file", root.join("to-file")).unwrap();
+        symlink("missing", root.join("dangling")).unwrap();
+        symlink("loop-b", root.join("loop-a")).unwrap();
+        symlink("loop-a", root.join("loop-b")).unwrap();
+        for name in [
+            "file",
+            "to-file",
+            "missing",
+            "missing/below",
+            "dangling",
+            "loop-a",
+        ] {
+            assert!(!reaches_kernel(&root.join(name)), "{name}");
+        }
+        assert!(!reaches_kernel(Path::new("/")));
+    }
+
+    /// The links that lead a path into `/proc` or `/sys` are listed with their
+    /// targets, in lookup order, at the places a lookup finds them, and no link
+    /// under `/proc` or `/sys` is among them.
+    #[test]
+    fn the_links_that_lead_into_proc_or_sys_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        symlink("/proc/self/fd", root.join("real/fd")).unwrap();
+        symlink("real", root.join("alias")).unwrap();
+        symlink("/proc/self/fd/0", root.join("stdin")).unwrap();
+        symlink("stdin", root.join("chain")).unwrap();
+        let link = |path: &Path, target: &str| (path.to_path_buf(), PathBuf::from(target));
+        assert_eq!(kernel_links(Path::new("/proc/self/fd/0")), Some(Vec::new()));
+        assert_eq!(
+            kernel_links(&root.join("real/fd/1")),
+            Some(vec![link(&root.join("real/fd"), "/proc/self/fd")])
+        );
+        assert_eq!(
+            kernel_links(&root.join("alias/fd/1")),
+            Some(vec![
+                link(&root.join("alias"), "real"),
+                link(&root.join("real/fd"), "/proc/self/fd"),
+            ])
+        );
+        assert_eq!(
+            kernel_links(&root.join("chain")),
+            Some(vec![
+                link(&root.join("chain"), "stdin"),
+                link(&root.join("stdin"), "/proc/self/fd/0"),
+            ])
+        );
+        assert_eq!(kernel_links(&root.join("real")), None);
+    }
+
+    /// Only a path whose own final component is a link outside `/proc` and `/sys`
+    /// keeps a link target: a path reached through a directory link into them, such
+    /// as `/dev/fd/0`, is the `/proc` object itself, even though that is a link too.
+    #[test]
+    fn only_a_final_link_outside_proc_and_sys_keeps_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        symlink("/proc/self/fd", root.join("real/fd")).unwrap();
+        symlink("real", root.join("alias")).unwrap();
+        symlink("/proc/self/fd/0", root.join("real/stdin")).unwrap();
+        let own = |path: &Path| kernel_route(path).map(|route| route.own_target);
+        assert_eq!(own(Path::new("/proc/self/fd/0")), Some(None));
+        assert_eq!(own(&root.join("real/fd/0")), Some(None));
+        assert_eq!(own(&root.join("alias/fd/0")), Some(None));
+        assert_eq!(
+            own(&root.join("real/fd")),
+            Some(Some(PathBuf::from("/proc/self/fd")))
+        );
+        assert_eq!(
+            own(&root.join("alias/stdin")),
+            Some(Some(PathBuf::from("/proc/self/fd/0")))
+        );
+        assert_eq!(own(&root.join("alias")), None);
+    }
 }

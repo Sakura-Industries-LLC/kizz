@@ -17,12 +17,15 @@ use std::{
     error::Error,
     fs,
     io::{self, BufRead as _, BufReader, Lines},
-    os::unix::{fs::PermissionsExt as _, process::CommandExt as _},
-    path::PathBuf,
+    os::unix::{
+        fs::{PermissionsExt as _, symlink},
+        process::CommandExt as _,
+    },
+    path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
 };
 
-use kizz_store::{LOCK_FILE_NAME, NotCachedReason, StepRecord, Store};
+use kizz_store::{LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store};
 use tempfile::TempDir;
 
 /// The result of a test or a test helper.
@@ -926,6 +929,173 @@ fn a_build_that_does_not_settle_names_the_changing_inputs() -> TestResult {
              (Pong) in this build",
         ])
     );
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// A command that reads `/dev/stdin` and `/dev/fd/3`, which lead into `/proc/self`,
+/// is cached on the next build: only the `/proc` objects they reach are untracked,
+/// not the state of whatever `kizz` itself has open under those numbers, and the
+/// links `/dev/stdin` and `/dev/fd` are recorded with their targets.
+#[test]
+fn a_command_that_reads_dev_fd_paths_is_cached_on_the_next_build() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[(
+        "Descriptors",
+        "run(\"sh\", \"-c\", \"cat /dev/stdin; exec 3</dev/null; cat /dev/fd/3\", expect = [0])",
+    )])?;
+    let command = "sh -c cat /dev/stdin; exec 3</dev/null; cat /dev/fd/3";
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        text(&[
+            &ran(command, "kizz.md:3 (Descriptors)", NEVER_RUN),
+            &pass(2),
+            "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    let records = project.step_records()?;
+    let [record] = records.as_slice() else {
+        return Err(format!("expected one step record: {records:?}").into());
+    };
+    let state = |path: &str| {
+        record
+            .observations
+            .iter()
+            .find(|observation| observation.path == Path::new(path))
+            .map(|observation| observation.state.clone())
+            .ok_or_else(|| format!("no observation of {path}: {record:?}"))
+    };
+    let link_into_proc = |link: &str| -> TestResult<PathState> {
+        Ok(PathState::Symlink {
+            target: fs::read_link(link)?,
+            pointee: Box::new(PathState::Untracked),
+        })
+    };
+    assert_eq!(state("/dev/fd/3")?, PathState::Untracked);
+    assert_eq!(state("/dev/fd")?, link_into_proc("/dev/fd")?);
+    assert_eq!(state("/dev/stdin")?, link_into_proc("/dev/stdin")?);
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(
+        second.stdout,
+        text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"])
+    );
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// Run `kizz build ci` twice in `project`, whose one task runs `command`: the first
+/// build must run it again for `reason`, and the second must be a cache hit.
+fn reruns_then_hits(
+    project: &Project,
+    command: &str,
+    reason: &str,
+) -> TestResult {
+    let rerun = project.run("", &["build", "ci"])?;
+    assert_eq!(rerun.status, Some(0), "{rerun:?}");
+    assert_eq!(
+        rerun.stdout,
+        text(&[
+            &ran(command, "kizz.md:3 (Links)", reason),
+            &pass(2),
+            "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    let hit = project.run("", &["build", "ci"])?;
+    assert_eq!(hit.status, Some(0), "{hit:?}");
+    assert_eq!(
+        hit.stdout,
+        text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"])
+    );
+    Ok(())
+}
+
+/// Replace the symbolic link `link` with one to `target`.
+fn relink(
+    target: &str,
+    link: &Path,
+) -> TestResult {
+    fs::remove_file(link)?;
+    symlink(target, link)?;
+    Ok(())
+}
+
+/// Links that lead into `/proc` stay ordinary dependencies with the real tracer: a
+/// command that reads through a final link and a directory link into `/proc` is a
+/// cache hit while they are unchanged, and it runs again when the final link is
+/// retargeted to a regular file, retargeted back, or replaced by a regular file, and
+/// when the directory link is retargeted to a regular directory. The links live
+/// outside the project, because discovery follows directory links and would walk
+/// all of `/proc`.
+#[test]
+fn retargeting_or_replacing_a_link_into_proc_runs_the_command_again() -> TestResult {
+    let project = Project::new()?;
+    let links_dir = tempfile::tempdir()?;
+    let links = links_dir.path().canonicalize()?;
+    let file_link = links.join("version-link");
+    let dir_link = links.join("proc-link");
+    fs::write(links.join("input.txt"), "regular input\n")?;
+    fs::create_dir(links.join("inputs"))?;
+    fs::write(links.join("inputs/version"), "regular version\n")?;
+    symlink("/proc/version", &file_link)?;
+    symlink("/proc", &dir_link)?;
+    let read_file = file_link.display().to_string();
+    let read_dir = dir_link.join("version").display().to_string();
+    project.kizz_md("", &[(
+        "Links",
+        &format!("run(\"cat\", \"{read_file}\", \"{read_dir}\")"),
+    )])?;
+    let command = format!("cat {read_file} {read_dir}");
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        text(&[
+            &ran(&command, "kizz.md:3 (Links)", NEVER_RUN),
+            &pass(2),
+            "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    let unchanged = project.run("", &["build", "ci"])?;
+    assert_eq!(unchanged.status, Some(0), "{unchanged:?}");
+    assert_eq!(
+        unchanged.stdout,
+        text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"])
+    );
+
+    relink("input.txt", &file_link)?;
+    reruns_then_hits(
+        &project,
+        &command,
+        &format!("`{read_file}` changed (link target changed from /proc/version to input.txt)"),
+    )?;
+    relink("/proc/version", &file_link)?;
+    reruns_then_hits(
+        &project,
+        &command,
+        &format!("`{read_file}` changed (link target changed from input.txt to /proc/version)"),
+    )?;
+    fs::remove_file(&file_link)?;
+    fs::write(file_link, "replaced\n")?;
+    reruns_then_hits(
+        &project,
+        &command,
+        &format!("`{read_file}` changed (type changed)"),
+    )?;
+    relink("inputs", &dir_link)?;
+    reruns_then_hits(
+        &project,
+        &command,
+        &format!(
+            "`{}` changed (link target changed from /proc to inputs)",
+            dir_link.display()
+        ),
+    )?;
     assert!(!project.has_lock_file());
     Ok(())
 }

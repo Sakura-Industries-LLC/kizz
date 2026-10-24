@@ -24,7 +24,8 @@
 //! * Devices, FIFOs, and sockets are compared by type.
 //! * Untracked paths under `/proc` and `/sys` are never compared. Tracked ones are read
 //!   and hashed again, without the cache of file states, because their metadata says
-//!   nothing about their content.
+//!   nothing about their content. A symbolic link that leads into `/proc` or `/sys` is
+//!   compared by its target, and its untracked pointee is not compared.
 //!
 //! Hashes of files that were not tracked go through the build's [`FileStates`], so a
 //! file is hashed once per build.

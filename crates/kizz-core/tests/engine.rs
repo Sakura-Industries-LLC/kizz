@@ -957,6 +957,93 @@ fn proc_and_sys_accesses_are_recorded_and_tracked_ones_hashed() -> TestResult {
     Ok(())
 }
 
+/// A path that symbolic links lead into `/proc` or `/sys`, such as `/dev/fd/0`,
+/// `/dev/stdin`, or a project link to `/proc/self/fd`, leaves only the `/proc` object
+/// untracked, with no state read through kizz's own descriptors and nothing hashed:
+/// a final link keeps its target with an untracked pointee, and each directory link
+/// on the way is recorded as a probed link with its target. A regular file beside
+/// them keeps its state.
+#[test]
+fn paths_that_links_lead_into_proc_or_sys_keep_only_their_links() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("plain.txt", "plain")?;
+    symlink("/proc/self/fd", fixture.path("fd"))?;
+    symlink("/proc/self/fd/0", fixture.path("stdin"))?;
+    let linked = [
+        PathBuf::from("/dev/fd/0"),
+        PathBuf::from("/dev/stdin"),
+        fixture.path("fd/0"),
+        fixture.path("stdin"),
+    ];
+    let mut accesses: Vec<(PathBuf, AccessKind)> = linked
+        .iter()
+        .map(|path| (path.clone(), AccessKind::Read))
+        .collect();
+    accesses.push((fixture.path("plain.txt"), AccessKind::Read));
+    let tracer =
+        FakeTracer::new(move |request| finished(request, &accesses, Termination::Exited(0)));
+    let store = fixture.store()?;
+    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let steps = engine.task(PROGRAM, fixture.dir());
+    steps.execute(&fixture.step(&["tool"]))?;
+    let stored = record(&store, &steps.keys()[0])?;
+
+    let link_into_proc = |link: &Path| -> TestResult<PathState> {
+        Ok(PathState::Symlink {
+            target: fs::read_link(link)?,
+            pointee: Box::new(PathState::Untracked),
+        })
+    };
+    let read = AccessBits(AccessBits::READ);
+    let probe = AccessBits(AccessBits::PROBE);
+    let expected = [
+        (PathBuf::from("/dev/fd/0"), read, PathState::Untracked),
+        (fixture.path("fd/0"), read, PathState::Untracked),
+        (
+            PathBuf::from("/dev/stdin"),
+            read,
+            link_into_proc(Path::new("/dev/stdin"))?,
+        ),
+        (
+            fixture.path("stdin"),
+            read,
+            link_into_proc(&fixture.path("stdin"))?,
+        ),
+        (
+            PathBuf::from("/dev/fd"),
+            probe,
+            link_into_proc(Path::new("/dev/fd"))?,
+        ),
+        (
+            fixture.path("fd"),
+            probe,
+            link_into_proc(&fixture.path("fd"))?,
+        ),
+    ];
+    for (path, access, state) in expected {
+        let observed = observation(&stored, &path)?;
+        assert!(!observed.tracked, "{}", path.display());
+        assert_eq!(observed.access, access, "{}", path.display());
+        assert_eq!(observed.state, state, "{}", path.display());
+    }
+    let plain = observation(&stored, &fixture.path("plain.txt"))?;
+    assert!(
+        matches!(plain.state, PathState::File { hash: Some(_), .. }),
+        "{plain:?}"
+    );
+    assert!(
+        stored
+            .observations
+            .windows(2)
+            .all(|pair| pair[0].path < pair[1].path),
+        "the observations are not sorted by path: {:?}",
+        stored.observations
+    );
+    // The program and the plain file.
+    assert_eq!(engine.files_hashed(), 2);
+    Ok(())
+}
+
 /// Each ignore pattern form leaves its matches out of the record and counts them:
 /// a relative path, a relative glob, a `~/` glob, an absolute path, and a regular
 /// expression.

@@ -20,7 +20,7 @@ use std::{
     error::Error,
     fs::{self, File, FileTimes},
     io,
-    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
     thread,
@@ -32,8 +32,8 @@ use kizz_core::{
     parse_tasks, step_key,
 };
 use kizz_store::{
-    Change, ContentHash, Difference, FileMeta, NotCachedReason, Observation, PathState, RunReason,
-    StepExit, StepKey, StepRecord, Store,
+    AccessBits, Change, ContentHash, Difference, FileMeta, NotCachedReason, Observation, PathState,
+    RunReason, StepExit, StepKey, StepRecord, Store,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -828,6 +828,185 @@ fn kernel_paths_rerun_a_step_only_when_tracked() -> TestResult {
     assert!(!second.cached(1)?);
     let record = fixture.record(&tracked)?.ok_or("no record")?;
     assert_eq!(differences(&record), [difference(uptime, Change::Content)]);
+    Ok(())
+}
+
+/// Build `step` with `tracer` twice: the first build must run it again, with
+/// `expected` as its differences when given, and the second must be a cache hit.
+fn reruns_then_hits(
+    fixture: &Fixture,
+    tracer: &FakeTracer,
+    step: &StepSpec,
+    expected: Option<&[Difference]>,
+) -> TestResult {
+    let rerun = fixture.build(tracer, &[step])?;
+    assert!(!rerun.cached(0)?, "the step was a hit");
+    if let Some(expected) = expected {
+        let record = fixture.record(step)?.ok_or("no record")?;
+        assert_eq!(differences(&record), expected);
+    }
+    assert!(fixture.build(tracer, &[step])?.cached(0)?, "the step ran");
+    Ok(())
+}
+
+/// Remove `path`, a link, a file, or a directory with what it holds.
+fn remove(path: &Path) -> TestResult {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Replace whatever is at `link` with a symbolic link to `target`.
+fn relink(
+    target: &Path,
+    link: &Path,
+) -> TestResult {
+    if fs::symlink_metadata(link).is_ok() {
+        remove(link)?;
+    }
+    symlink(target, link)?;
+    Ok(())
+}
+
+/// The difference of a link at `link` retargeted from `old` to `new`.
+fn link_target(
+    link: &Path,
+    old: &Path,
+    new: &Path,
+) -> [Difference; 1] {
+    [difference(link.to_path_buf(), Change::LinkTarget {
+        old: old.to_path_buf(),
+        new: new.to_path_buf(),
+    })]
+}
+
+/// A step that reads a final link to `/proc/version` and a file through a directory
+/// link to `/proc`, built once and then found a hit while the links are unchanged.
+struct LinksIntoProc {
+    /// The project and cache.
+    fixture: Fixture,
+    /// The tracer, which reports reading `file_link` and `through_dir`.
+    tracer: FakeTracer,
+    /// The step.
+    step: StepSpec,
+    /// A regular directory of the project, holding `regular`.
+    inputs: PathBuf,
+    /// A regular input file, `inputs/version`.
+    regular: PathBuf,
+    /// The final link, at first to `/proc/version`.
+    file_link: PathBuf,
+    /// The directory link, at first to `/proc`.
+    dir_link: PathBuf,
+    /// The path read through `dir_link`.
+    through_dir: PathBuf,
+}
+
+impl LinksIntoProc {
+    /// Build the step, prove that only the `/proc` objects are untracked and the
+    /// links keep their targets, and prove the next build a hit.
+    fn new() -> TestResult<Self> {
+        let fixture = Fixture::new()?;
+        let root = fs::canonicalize(fixture.dir()?.as_path())?;
+        fixture.write_old("inputs/version", "regular version")?;
+        let file_link = root.join("version-link");
+        let dir_link = root.join("proc-link");
+        let through_dir = dir_link.join("version");
+        symlink("/proc/version", &file_link)?;
+        symlink("/proc", &dir_link)?;
+        let links = Self {
+            tracer: FakeTracer::reading(vec![file_link.clone(), through_dir.clone()]),
+            step: fixture.step(&["tool"])?,
+            fixture,
+            inputs: root.join("inputs"),
+            regular: root.join("inputs/version"),
+            file_link,
+            dir_link,
+            through_dir,
+        };
+        links.fixture.build(&links.tracer, &[&links.step])?;
+        let record = links.fixture.record(&links.step)?.ok_or("no record")?;
+        let into_proc = |target: &str| {
+            PathState::Symlink {
+                target: PathBuf::from(target),
+                pointee: Box::new(PathState::Untracked),
+            }
+        };
+        assert_eq!(
+            observation(&record, &links.file_link)?.state,
+            into_proc("/proc/version")
+        );
+        assert_eq!(
+            observation(&record, &links.through_dir)?.state,
+            PathState::Untracked
+        );
+        let probed = observation(&record, &links.dir_link)?;
+        assert_eq!(probed.state, into_proc("/proc"));
+        assert_eq!(probed.access, AccessBits(AccessBits::PROBE));
+        let unchanged = links.fixture.build(&links.tracer, &[&links.step])?;
+        assert!(unchanged.cached(0)?);
+        assert_eq!(unchanged.hashed, 0);
+        Ok(links)
+    }
+
+    /// Build the step twice: the first build must run it again, with `expected` as
+    /// its differences when given, and the second must be a hit.
+    fn reruns_then_hits(
+        &self,
+        expected: Option<&[Difference]>,
+    ) -> TestResult {
+        reruns_then_hits(&self.fixture, &self.tracer, &self.step, expected)
+    }
+}
+
+/// A final project link to `/proc/version` stays an ordinary dependency, and only
+/// `/proc/version` is untracked: retargeting it to a regular input and back,
+/// removing it, restoring it, and replacing it with a regular file each run the step
+/// again.
+#[test]
+fn a_final_link_into_proc_stays_a_dependency() -> TestResult {
+    let links = LinksIntoProc::new()?;
+    let proc_version = Path::new("/proc/version");
+    let file_link = &links.file_link;
+    relink(&links.regular, file_link)?;
+    links.reruns_then_hits(Some(&link_target(file_link, proc_version, &links.regular)))?;
+    relink(proc_version, file_link)?;
+    links.reruns_then_hits(Some(&link_target(file_link, &links.regular, proc_version)))?;
+    remove(file_link)?;
+    links.reruns_then_hits(Some(&[difference(file_link.clone(), Change::Disappeared)]))?;
+    relink(proc_version, file_link)?;
+    links.reruns_then_hits(Some(&[difference(file_link.clone(), Change::Appeared)]))?;
+    let replacement = file_link.with_extension("new");
+    fs::write(&replacement, "replaced")?;
+    fs::rename(replacement, file_link)?;
+    links.reruns_then_hits(Some(&[difference(file_link.clone(), Change::Type)]))?;
+    Ok(())
+}
+
+/// A project directory link to `/proc` stays an ordinary dependency, and only the
+/// `/proc` object read through it is untracked: retargeting it to a regular
+/// directory and back, removing it, restoring it, and replacing it with a regular
+/// directory each run the step again.
+#[test]
+fn a_directory_link_into_proc_stays_a_dependency() -> TestResult {
+    let links = LinksIntoProc::new()?;
+    let proc = Path::new("/proc");
+    let dir_link = &links.dir_link;
+    relink(&links.inputs, dir_link)?;
+    links.reruns_then_hits(Some(&link_target(dir_link, proc, &links.inputs)))?;
+    // The recorded state of the file read through the link changes too.
+    relink(proc, dir_link)?;
+    links.reruns_then_hits(None)?;
+    remove(dir_link)?;
+    links.reruns_then_hits(Some(&[difference(dir_link.clone(), Change::Disappeared)]))?;
+    relink(proc, dir_link)?;
+    links.reruns_then_hits(None)?;
+    remove(dir_link)?;
+    fs::create_dir(dir_link)?;
+    fs::write(&links.through_dir, "regular version")?;
+    links.reruns_then_hits(Some(&[difference(dir_link.clone(), Change::Type)]))?;
     Ok(())
 }
 
