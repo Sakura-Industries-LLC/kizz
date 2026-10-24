@@ -20,7 +20,7 @@ use minicbor::{Decode, Decoder, Encode, Encoder, bytes::ByteArray, decode, encod
 use crate::records::{Family, Record, StepKey};
 
 /// Encodes and decodes a path as a CBOR byte string of its bytes.
-mod path_bytes {
+pub(crate) mod path_bytes {
     use std::{
         ffi::OsStr,
         os::unix::ffi::OsStrExt as _,
@@ -44,6 +44,43 @@ mod path_bytes {
         _ctx: &mut C,
     ) -> Result<PathBuf, DecodeError> {
         Ok(PathBuf::from(OsStr::from_bytes(d.bytes()?)))
+    }
+}
+
+/// Encodes and decodes a list of paths as a definite-length CBOR array of byte
+/// strings, one per path.
+pub(crate) mod path_list {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _, path::PathBuf};
+
+    use minicbor::{Decoder, Encoder, decode::Error as DecodeError, encode::Error as EncodeError};
+
+    /// Encodes `paths` as an array of byte strings.
+    pub fn encode<C, W: minicbor::encode::Write, P: AsRef<[PathBuf]>>(
+        paths: &P,
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), EncodeError<W::Error>> {
+        let paths = paths.as_ref();
+        e.array(u64::try_from(paths.len()).unwrap_or(u64::MAX))?;
+        for path in paths {
+            e.bytes(path.as_os_str().as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Decodes a list of paths from an array of byte strings.
+    pub fn decode<C>(
+        d: &mut Decoder<'_>,
+        _ctx: &mut C,
+    ) -> Result<Vec<PathBuf>, DecodeError> {
+        let Some(len) = d.array()? else {
+            return Err(DecodeError::message("a path list has a definite length"));
+        };
+        let mut paths = Vec::new();
+        for _ in 0..len {
+            paths.push(PathBuf::from(OsStr::from_bytes(d.bytes()?)));
+        }
+        Ok(paths)
     }
 }
 

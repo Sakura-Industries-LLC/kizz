@@ -19,10 +19,10 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, Capture, ContentHash, DATABASE_DIR, FileMeta, LastWriter, LearnedOrder,
+    AccessBits, BuildId, Capture, ContentHash, DATABASE_DIR, FileMeta, LastWriter, LearnedOrder,
     Observation, PathKey, PathState, PositionKey, ProgramPath, RecordedOutput, RunReason,
     SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey, StepPosition, StepRecord,
-    StepSpecRecord, Store, StoreError, TaskId, TaskRecord, path_prefix,
+    StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Verdict, path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -97,6 +97,23 @@ fn task_record(n: u8) -> TaskRecord {
     TaskRecord {
         program_hash: [n; 32],
         succeeded: n.is_multiple_of(2),
+        build: BuildId(u64::from(n)),
+        steps: 1,
+        line: u32::from(n),
+        heading: None,
+        targets: vec!["ci".to_owned()],
+        block: ContentHash([n; 32]),
+        modules: Vec::new(),
+    }
+}
+
+/// The step position of the step whose key derives from `n`, found cached.
+fn step_position(n: u8) -> StepPosition {
+    StepPosition {
+        step: StepKey([n; 32]),
+        build: BuildId(u64::from(n)),
+        verdict: Verdict::Cached,
+        carried: Vec::new(),
     }
 }
 
@@ -138,6 +155,9 @@ fn records_survive_closing_and_reopening_the_store() {
     txn.put(&PathKey(PathBuf::from("/w/a/out")), &LastWriter {
         task: task("/w/a", 0),
         step: StepKey([1; 32]),
+        position: 0,
+        build: BuildId(1),
+        written_at_nanos: 1,
     })
     .unwrap();
     txn.put(&task("/w/b", 0), &LearnedOrder {
@@ -149,9 +169,7 @@ fn records_survive_closing_and_reopening_the_store() {
             task: task("/w/a", 0),
             position: 0,
         },
-        &StepPosition {
-            step: StepKey([1; 32]),
-        },
+        &step_position(1),
     )
     .unwrap();
     txn.commit().unwrap();
@@ -179,9 +197,7 @@ fn records_survive_closing_and_reopening_the_store() {
             position: 0,
         })
         .unwrap(),
-        Some(StepPosition {
-            step: StepKey([1; 32]),
-        })
+        Some(step_position(1))
     );
     assert_eq!(
         txn.get::<SchemaVersion>(&SchemaKey).unwrap(),
@@ -356,9 +372,7 @@ fn a_prefix_scan_returns_exactly_the_records_under_the_prefix_in_key_order() {
                     task: task("/w/a", 0),
                     position,
                 },
-                &StepPosition {
-                    step: StepKey([step; 32]),
-                },
+                &step_position(step),
             )
             .unwrap();
     }
@@ -368,9 +382,7 @@ fn a_prefix_scan_returns_exactly_the_records_under_the_prefix_in_key_order() {
                 task: task("/w/a", 1),
                 position: 0,
             },
-            &StepPosition {
-                step: StepKey([9; 32]),
-            },
+            &step_position(9),
         )
         .unwrap();
     write.commit().unwrap();

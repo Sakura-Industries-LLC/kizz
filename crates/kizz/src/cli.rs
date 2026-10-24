@@ -5,8 +5,8 @@
 //! Command-line interface for the `kizz` tool.
 //!
 //! This module owns parsing and dispatch only. Every command is parsed with all of
-//! its options; `kizz list` runs in the `list` module, and the other commands are
-//! scaffolds until later phases implement them.
+//! its options; `kizz list` runs in the `list` module and `kizz why` in the `why`
+//! module, and the other commands are scaffolds until later phases implement them.
 
 use std::{fmt, path::PathBuf, process::ExitCode, str::FromStr};
 
@@ -75,13 +75,7 @@ impl Cli {
                     targets,
                 )
             },
-            Command::Why { path } => {
-                stub(
-                    "why",
-                    "Print why each command ran or was cached in the most recent build.",
-                    path.map(|path| path.display().to_string()),
-                )
-            },
+            Command::Why { path } => crate::why::run(path.as_deref(), self.verbose),
             Command::List { targets } => crate::list::run(targets.as_deref()),
             Command::Cache(CacheCommand::Clean) => {
                 stub(

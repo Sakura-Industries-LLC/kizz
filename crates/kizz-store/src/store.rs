@@ -37,8 +37,11 @@ pub const DATABASE_DIR: &str = "db";
 /// each record's observations were written, and the failure message of a missing
 /// or non-executable program. Version 4 added the reason a run's result was not
 /// cached, which marks a record that is never a cache hit, and the exit of a
-/// command that could not start.
-pub const SCHEMA_VERSION: u32 = 4;
+/// command that could not start. Version 5 added explanations: the verdict of the
+/// most recent build in step positions, the parts of the task program and how
+/// output names the task in task records, and the position, build, and time of
+/// each last writer.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]

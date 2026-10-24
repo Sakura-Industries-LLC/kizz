@@ -77,6 +77,8 @@ pub struct TaskInfo {
     pub relative_file: PathBuf,
     /// The line of the block's opening fence, counting from 1.
     pub line: usize,
+    /// The index of the task block in its `kizz.md`, counting from zero.
+    pub index: u32,
     /// The nearest heading above the block, which names the task, if there is one.
     pub name: Option<String>,
     /// The targets on the block, in the order written.
@@ -104,6 +106,7 @@ impl TaskInfo {
             file,
             relative_file: task.relative_file.clone(),
             line: task.line,
+            index: task.id.index,
             name: task.heading.clone(),
             targets: task.targets.clone(),
             selected: selected.to_vec(),
@@ -1124,6 +1127,17 @@ fn hash_field(
     hasher.update(bytes);
 }
 
+/// The parts of a task program and the hash of each, so explanations can say
+/// whether the block or a named loaded module changed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProgramParts {
+    /// The BLAKE3 hash of the block's source.
+    pub block: [u8; 32],
+    /// The absolute path of every module the block loads, directly or indirectly,
+    /// with the BLAKE3 hash of its source, sorted by path.
+    pub modules: Vec<(PathBuf, [u8; 32])>,
+}
+
 /// The result of [`TaskProgram::load`].
 #[derive(Debug)]
 pub struct ProgramLoad {
@@ -1144,6 +1158,8 @@ pub struct TaskProgram {
     imports: ModuleMap,
     /// The hash of the block and every module it loads.
     hash: ProgramHash,
+    /// The hashes of the block and of each module.
+    parts: ProgramParts,
 }
 
 impl fmt::Debug for TaskProgram {
@@ -1154,6 +1170,7 @@ impl fmt::Debug for TaskProgram {
         f.debug_struct("TaskProgram")
             .field("task", &self.task)
             .field("hash", &self.hash)
+            .field("parts", &self.parts)
             .finish_non_exhaustive()
     }
 }
@@ -1205,11 +1222,26 @@ impl TaskProgram {
                 hash_field(&mut hasher, source.as_bytes());
             }
             let hash = ProgramHash(*hasher.finalize().as_bytes());
+            let mut modules: Vec<(PathBuf, [u8; 32])> = sources
+                .iter()
+                .map(|(path, source)| {
+                    (
+                        path.as_path().to_path_buf(),
+                        *blake3::hash(source.as_bytes()).as_bytes(),
+                    )
+                })
+                .collect();
+            modules.sort();
+            let parts = ProgramParts {
+                block: *blake3::hash(task.source.as_bytes()).as_bytes(),
+                modules,
+            };
             Self {
                 task,
                 ast,
                 imports,
                 hash,
+                parts,
             }
         });
         ProgramLoad { accesses, program }
@@ -1219,6 +1251,13 @@ impl TaskProgram {
     #[must_use]
     pub const fn hash(&self) -> ProgramHash {
         self.hash
+    }
+
+    /// The hashes of the block and of each module it loads, so explanations can
+    /// name the part that changed.
+    #[must_use]
+    pub const fn parts(&self) -> &ProgramParts {
+        &self.parts
     }
 
     /// The task.
@@ -1343,6 +1382,7 @@ mod tests {
             file: AbsolutePath::new("/work/kizz.md").unwrap(),
             relative_file: PathBuf::from("kizz.md"),
             line: 1,
+            index: 0,
             name: None,
             targets: vec!["ci".to_owned()],
             selected: vec!["ci".to_owned()],

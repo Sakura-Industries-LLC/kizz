@@ -93,6 +93,18 @@ pub(crate) fn print_warning(message: &str) {
     );
 }
 
+/// Print to standard error that the command waits for the cache lock, and who
+/// holds it.
+pub(crate) fn print_waiting(holder: &str) {
+    eprintln!(
+        "{} {}",
+        style("waiting for the kizz cache, which is in use by")
+            .for_stderr()
+            .yellow(),
+        style(holder).for_stderr().bold()
+    );
+}
+
 /// Repeat every warning in a final summary on standard error; print nothing when
 /// there are none.
 pub(crate) fn print_warning_summary(warnings: &[String]) {

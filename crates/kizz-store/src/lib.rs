@@ -13,18 +13,25 @@
 //! * [`records`]: the record families, their key layout, and their typed records.
 //! * [`step`]: the contents of step records: the step specification, the observations
 //!   with their path states, and how the step ended.
+//! * [`explanation`]: the contents of explanations: why a step ran, or that it was
+//!   cached, as the step-position records keep them for `kizz why`.
 
+pub mod explanation;
 pub mod location;
 pub mod lock;
 pub mod records;
 pub mod step;
 pub mod store;
 
+pub use explanation::{
+    BuildId, ChangedInput, EnvChange, Explanation, ModuleChange, ModuleChangeKind, Reason,
+    SelfInflicted, TaskLabel, Verdict, Writer,
+};
 pub use location::{LocationError, cache_dir, cache_dir_from_env};
 pub use lock::{CacheLock, LOCK_FILE_NAME, LockDetails, LockError, LockOptions};
 pub use records::{
-    Family, LastWriter, LearnedOrder, PathKey, PositionKey, Record, RecordKey, SchemaKey,
-    SchemaVersion, StepKey, StepPosition, TaskId, TaskRecord, database_key, path_prefix,
+    Family, LastWriter, LearnedOrder, ModuleHash, PathKey, PositionKey, Record, RecordKey,
+    SchemaKey, SchemaVersion, StepKey, StepPosition, TaskId, TaskRecord, database_key, path_prefix,
 };
 pub use step::{
     AccessBits, Capture, Change, ContentHash, Difference, DirEntry, EntryKind, FileMeta, Listing,

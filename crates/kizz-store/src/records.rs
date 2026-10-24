@@ -41,6 +41,11 @@ use std::{
 
 use minicbor::{Decode, Decoder, Encode, Encoder, bytes::ByteArray, decode, encode};
 
+use crate::{
+    explanation::{BuildId, Verdict},
+    step::{ContentHash, path_bytes, path_list},
+};
+
 /// The record families of the cache database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Family {
@@ -332,12 +337,26 @@ impl Record for SchemaVersion {
     const FAMILY: Family = Family::Meta;
 }
 
-/// The step key a task used last time at one step position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+/// The step key a task used last time at one step position, with what that build
+/// decided about the step, so a changed key is explained by comparing the step
+/// specifications and `kizz why` prints the reasons the most recent build stored.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct StepPosition {
     /// The step key.
     #[n(0)]
     pub step: StepKey,
+    /// The build that last decided about the step at this position.
+    #[n(1)]
+    pub build: BuildId,
+    /// What that build decided. Within one build, a step that ran keeps its reasons
+    /// when a later pass finds it cached.
+    #[n(2)]
+    pub verdict: Verdict,
+    /// The self-inflicted inputs that made the step run in its task's previous
+    /// build, sorted, so a run in this build for the same reason gets the warning
+    /// for consecutive builds.
+    #[cbor(n(3), with = "path_list")]
+    pub carried: Vec<PathBuf>,
 }
 
 impl Record for StepPosition {
@@ -346,7 +365,19 @@ impl Record for StepPosition {
     const FAMILY: Family = Family::Position;
 }
 
-/// What is recorded about a task: its program hash and a summary of its last run.
+/// The hash of one module a task program loads.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct ModuleHash {
+    /// The absolute path of the module.
+    #[cbor(n(0), with = "path_bytes")]
+    pub path: PathBuf,
+    /// The BLAKE3 hash of its source.
+    #[n(1)]
+    pub hash: ContentHash,
+}
+
+/// What is recorded about a task: its program hash, the hashes of the program's
+/// parts, how output names the task, and a summary of its last run.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct TaskRecord {
     /// The hash of the task program: its block and every module it loads.
@@ -355,6 +386,27 @@ pub struct TaskRecord {
     /// Whether the last run of the task succeeded.
     #[n(1)]
     pub succeeded: bool,
+    /// The build of the last run.
+    #[n(2)]
+    pub build: BuildId,
+    /// The number of steps of the last run; its step positions are those below it.
+    #[n(3)]
+    pub steps: u32,
+    /// The line of the block's opening fence, counting from 1.
+    #[n(4)]
+    pub line: u32,
+    /// The nearest heading above the block, if there is one.
+    #[n(5)]
+    pub heading: Option<String>,
+    /// The targets on the block, in the order written.
+    #[n(6)]
+    pub targets: Vec<String>,
+    /// The BLAKE3 hash of the block's source.
+    #[n(7)]
+    pub block: ContentHash,
+    /// The hash of every module the program loads, sorted by path.
+    #[n(8)]
+    pub modules: Vec<ModuleHash>,
 }
 
 impl Record for TaskRecord {
@@ -372,6 +424,16 @@ pub struct LastWriter {
     /// The step key.
     #[n(1)]
     pub step: StepKey,
+    /// The position of the step in its task's run, counting from zero.
+    #[n(2)]
+    pub position: u32,
+    /// The build in which the step wrote the path.
+    #[n(3)]
+    pub build: BuildId,
+    /// When kizz recorded the state the step left, after the write, in nanoseconds
+    /// since the Unix epoch: the `recorded_at_nanos` of the step's record.
+    #[n(4)]
+    pub written_at_nanos: u64,
 }
 
 impl Record for LastWriter {
@@ -518,16 +580,33 @@ mod tests {
 
         let position = encode_stably(&StepPosition {
             step: StepKey([1; 32]),
+            build: BuildId(5),
+            verdict: Verdict::Cached,
+            carried: vec![PathBuf::from("/work/a/out")],
         });
-        assert_eq!(position.get(..3), Some(&[0x81, 0x58, 0x20][..]));
+        // A definite-length array of four items, then the 32 bytes of the key.
+        assert_eq!(position.get(..3), Some(&[0x84, 0x58, 0x20][..]));
 
         encode_stably(&TaskRecord {
             program_hash: [2; 32],
             succeeded: true,
+            build: BuildId(5),
+            steps: 2,
+            line: 3,
+            heading: Some("Build".to_owned()),
+            targets: vec!["ci".to_owned()],
+            block: ContentHash([4; 32]),
+            modules: vec![ModuleHash {
+                path: PathBuf::from("/work/lib.star"),
+                hash: ContentHash([5; 32]),
+            }],
         });
         encode_stably(&LastWriter {
             task: task("a", 0),
             step: StepKey([3; 32]),
+            position: 1,
+            build: BuildId(5),
+            written_at_nanos: 6,
         });
     }
 

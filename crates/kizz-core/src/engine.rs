@@ -48,19 +48,34 @@
 //! other failure, with every path checked and the failure message, which a cache hit
 //! fails with again. A bare program name without `PATH` in the step's environment,
 //! a malformed pattern, and a tracer failure fail the task without a record.
+//!
+//! Explanations ("Explaining decisions"): before a step runs, the engine turns the
+//! cache check's reason into an [`Explanation`] (see [`explain`](crate::explain)), and
+//! each step's [`StepDecision`] is kept for the line `kizz build` prints. For a task
+//! run made with [`Engine::task_for`], which knows its [`TaskIdentity`], the engine
+//! also stores, with each step record it writes, a last-writer record for every path
+//! the step wrote and the step-position record with the explanation; a cached step's
+//! position is stored when [`TaskSteps::finish`] stores the task record, which also
+//! removes the positions the run no longer reached. A step that re-runs in
+//! consecutive builds for the same self-inflicted reason adds a [`RepeatedWarning`].
 
 use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::OsString,
     fmt,
-    sync::{Mutex, MutexGuard, PoisonError},
+    path::PathBuf,
+    sync::{
+        Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
 use kizz_store::{
-    Capture, ContentHash, NotCachedReason, Observation, ProgramPath, RecordedOutput, RunReason,
-    StepExit, StepKey, StepRecord, StepSpecRecord, Store, StoreError,
+    AccessBits, BuildId, Capture, ContentHash, Explanation, LastWriter, NotCachedReason,
+    Observation, PathKey, PositionKey, ProgramPath, Reason, RecordedOutput, RunReason, StepExit,
+    StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskRecord, Txn, Verdict,
 };
 use kizz_trace::{
     AbsolutePath, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink, RunRequest,
@@ -69,6 +84,10 @@ use kizz_trace::{
 
 use crate::{
     check::{Checked, check},
+    explain::{
+        Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
+        changed_inputs, spec_reasons,
+    },
     key::Occurrences,
     lookup::{ProgramLookup, find_program},
     observe::observe,
@@ -77,6 +96,24 @@ use crate::{
     states::FileStates,
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
 };
+
+/// The identity of the most recent build this process started, so every build
+/// gets a larger one than the last.
+static LAST_BUILD: AtomicU64 = AtomicU64::new(0);
+
+/// A new build identity: now, in nanoseconds since the Unix epoch, or one more
+/// than the last build of this process when that is larger.
+fn next_build() -> BuildId {
+    let now = now_nanos();
+    let mut last = LAST_BUILD.load(Ordering::SeqCst);
+    loop {
+        let id = now.max(last.saturating_add(1));
+        match LAST_BUILD.compare_exchange_weak(last, id, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return BuildId(id),
+            Err(current) => last = current,
+        }
+    }
+}
 
 /// A result that was not cached, kept in memory for the rest of the build.
 #[derive(Debug, Clone)]
@@ -111,6 +148,11 @@ pub struct Engine<'a> {
     always_ran: Mutex<HashMap<StepKey, Option<Result<StepOutcome, StepError>>>>,
     /// The results of the build that were not cached, by step key.
     not_cached: Mutex<HashMap<StepKey, NotCachedRun>>,
+    /// The identity of the build.
+    build: BuildId,
+    /// The warnings for steps that re-ran in consecutive builds for the same
+    /// self-inflicted reason, in the order they ran.
+    warnings: Mutex<Vec<RepeatedWarning>>,
 }
 
 impl fmt::Debug for Engine<'_> {
@@ -124,6 +166,8 @@ impl fmt::Debug for Engine<'_> {
             .field("states", &self.states)
             .field("always_ran", &self.always_ran)
             .field("not_cached", &self.not_cached)
+            .field("build", &self.build)
+            .field("warnings", &self.warnings)
             .finish_non_exhaustive()
     }
 }
@@ -154,6 +198,38 @@ impl<'a> Engine<'a> {
             states: FileStates::new(),
             always_ran: Mutex::new(HashMap::new()),
             not_cached: Mutex::new(HashMap::new()),
+            build: next_build(),
+            warnings: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The identity of the build.
+    #[must_use]
+    pub const fn build(&self) -> BuildId {
+        self.build
+    }
+
+    /// The warnings for steps that re-ran in consecutive builds for the same
+    /// self-inflicted reason, in the order they ran, one per step.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<RepeatedWarning> {
+        lock(&self.warnings).clone()
+    }
+
+    /// Keep `warning`, unless the same step already has one in this build.
+    fn warn(
+        &self,
+        warning: RepeatedWarning,
+    ) {
+        let mut warnings = lock(&self.warnings);
+        let known = warnings.iter().any(|known| {
+            known.task.as_ref().map(|task| &task.task)
+                == warning.task.as_ref().map(|task| &task.task)
+                && known.position == warning.position
+                && known.command == warning.command
+        });
+        if !known {
+            warnings.push(warning);
         }
     }
 
@@ -183,7 +259,9 @@ impl<'a> Engine<'a> {
     }
 
     /// The step executor of one run of a task program whose hash is `program` and
-    /// whose directory is `task_dir`.
+    /// whose directory is `task_dir`, without a task identity: its steps are checked,
+    /// run, recorded, and explained, but no step position, last writer, or task
+    /// record is stored for them. Builds use [`Engine::task_for`].
     #[must_use]
     pub fn task(
         &self,
@@ -194,8 +272,31 @@ impl<'a> Engine<'a> {
             engine: self,
             program,
             task_dir,
+            identity: None,
             occurrences: RefCell::new(Occurrences::new()),
             keys: RefCell::new(Vec::new()),
+            decisions: RefCell::new(Vec::new()),
+            cached_positions: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The step executor of one run of the task `identity`, which stores the step
+    /// positions and last writers of its steps, and its task record when the run
+    /// ends with [`TaskSteps::finish`].
+    #[must_use]
+    pub fn task_for(
+        &self,
+        identity: TaskIdentity,
+    ) -> TaskSteps<'_> {
+        TaskSteps {
+            engine: self,
+            program: identity.program,
+            task_dir: identity.dir.clone(),
+            identity: Some(identity),
+            occurrences: RefCell::new(Occurrences::new()),
+            keys: RefCell::new(Vec::new()),
+            decisions: RefCell::new(Vec::new()),
+            cached_positions: RefCell::new(Vec::new()),
         }
     }
 
@@ -246,10 +347,17 @@ pub struct TaskSteps<'a> {
     program: ProgramHash,
     /// The task directory, at which relative patterns are anchored.
     task_dir: AbsolutePath,
+    /// The task's identity, when the run stores step positions, last writers, and a
+    /// task record.
+    identity: Option<TaskIdentity>,
     /// Counts identical commands in the run.
     occurrences: RefCell<Occurrences>,
     /// The key of each step of the run, in order.
     keys: RefCell<Vec<StepKey>>,
+    /// What the build decided about each step of the run, in order.
+    decisions: RefCell<Vec<StepDecision>>,
+    /// The step positions of the cached steps, stored by [`TaskSteps::finish`].
+    cached_positions: RefCell<Vec<(PositionKey, StepPosition)>>,
 }
 
 /// What is known about a step before it runs.
@@ -264,12 +372,20 @@ struct Pending {
     ignore: PathPatterns,
     /// The step's `track` patterns.
     track: PathPatterns,
+    /// The position of the step in the task's run.
+    position: u32,
+    /// Why the step runs, explained.
+    explanation: Explanation,
+    /// The self-inflicted inputs that made the step run in its task's previous
+    /// build, for its step position.
+    carried: Vec<PathBuf>,
 }
 
 /// Whether a step runs, as the cache check decided.
 enum Decision {
-    /// The step runs, for this reason.
-    Run(RunReason),
+    /// The step runs, for this reason; with the recorded state the cache check
+    /// compared, when it compared one.
+    Run(RunReason, Option<Baseline>),
     /// The record is a cache hit.
     Hit {
         /// The record.
@@ -414,6 +530,45 @@ impl TaskSteps<'_> {
         self.keys.borrow().clone()
     }
 
+    /// What the build decided about each step so far, in order: why each one ran,
+    /// or that it was cached.
+    #[must_use]
+    pub fn decisions(&self) -> Vec<StepDecision> {
+        self.decisions.borrow().clone()
+    }
+
+    /// End the run of the task: store the step positions of its cached steps, remove
+    /// the positions beyond its last step, and store its task record, with
+    /// `succeeded` saying whether the run succeeded. Without a task identity this
+    /// stores nothing.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when the records cannot be written.
+    pub fn finish(
+        &self,
+        succeeded: bool,
+    ) -> Result<(), StoreError> {
+        let Some(identity) = &self.identity else {
+            return Ok(());
+        };
+        let steps = u32::try_from(self.keys.borrow().len()).unwrap_or(u32::MAX);
+        let mut txn = self.engine.store.write()?;
+        for (key, position) in self.cached_positions.take() {
+            txn.put(&key, &position)?;
+        }
+        for (key, _) in txn.scan::<StepPosition>(&identity.id.key_prefix())? {
+            if key.task == identity.id && key.position >= steps {
+                txn.delete::<StepPosition>(&key)?;
+            }
+        }
+        txn.put(
+            &identity.id,
+            &identity.task_record(succeeded, self.engine.build, steps),
+        )?;
+        txn.commit()
+    }
+
     /// The patterns `patterns` of a step, anchored at the task directory.
     fn patterns(
         &self,
@@ -453,6 +608,50 @@ impl TaskSteps<'_> {
         Ok(())
     }
 
+    /// Store `record`, the record of a run of the step `pending`, and, with a task
+    /// identity, a last-writer record for every path the step wrote and the step's
+    /// position with its explanation, all in one transaction; then forget any
+    /// result of the build under its key that was not cached.
+    fn put_run(
+        &self,
+        pending: &Pending,
+        record: &StepRecord,
+    ) -> Result<(), StepError> {
+        let write = || -> Result<(), StoreError> {
+            let mut txn = self.engine.store.write()?;
+            txn.put(&pending.key, record)?;
+            if let Some(identity) = &self.identity {
+                for observation in &record.observations {
+                    if observation.access.contains(AccessBits::WRITE) {
+                        txn.put(&PathKey(observation.path.clone()), &LastWriter {
+                            task: identity.id.clone(),
+                            step: pending.key,
+                            position: pending.position,
+                            build: self.engine.build,
+                            written_at_nanos: record.recorded_at_nanos,
+                        })?;
+                    }
+                }
+                txn.put(
+                    &PositionKey {
+                        task: identity.id.clone(),
+                        position: pending.position,
+                    },
+                    &StepPosition {
+                        step: pending.key,
+                        build: self.engine.build,
+                        verdict: Verdict::Ran(pending.explanation.clone()),
+                        carried: pending.carried.clone(),
+                    },
+                )?;
+            }
+            txn.commit()
+        };
+        write().map_err(|error| store_error(&error))?;
+        lock(&self.engine.not_cached).remove(&pending.key);
+        Ok(())
+    }
+
     /// Decide whether the step `step`, whose key is `key`, runs.
     fn decide(
         &self,
@@ -465,11 +664,12 @@ impl TaskSteps<'_> {
             if let Some(first) = self.engine.first_always_result(key) {
                 return Ok(Decision::Replay(first));
             }
-            return Ok(Decision::Run(if known {
+            let reason = if known {
                 RunReason::Always
             } else {
                 RunReason::NeverRun
-            }));
+            };
+            return Ok(Decision::Run(reason, None));
         }
         if let Some(run) = remembered {
             let checked = check(
@@ -480,14 +680,17 @@ impl TaskSteps<'_> {
             return Ok(if checked.is_hit() {
                 Decision::Replay(run.result)
             } else {
-                Decision::Run(RunReason::NotCached {
-                    why: run.why,
-                    differences: checked.differences,
-                })
+                Decision::Run(
+                    RunReason::NotCached {
+                        why: run.why,
+                        differences: checked.differences,
+                    },
+                    Some(Baseline::new(&run.observations, run.recorded_at_nanos)),
+                )
             });
         }
         let Some(record) = self.record(&key)? else {
-            return Ok(Decision::Run(RunReason::NeverRun));
+            return Ok(Decision::Run(RunReason::NeverRun, None));
         };
         let checked_at_nanos = now_nanos();
         let checked = check(
@@ -498,10 +701,16 @@ impl TaskSteps<'_> {
         if let Some(why) = record.not_cached {
             // The record of a run of an earlier build whose result was not cached:
             // never a hit, so the step runs again, with that as the reason.
-            return Ok(Decision::Run(RunReason::NotCached {
-                why,
-                differences: checked.differences,
-            }));
+            return Ok(Decision::Run(
+                RunReason::NotCached {
+                    why,
+                    differences: checked.differences,
+                },
+                Some(Baseline::new(
+                    &record.observations,
+                    record.recorded_at_nanos,
+                )),
+            ));
         }
         Ok(if checked.is_hit() {
             Decision::Hit {
@@ -510,10 +719,184 @@ impl TaskSteps<'_> {
                 checked_at_nanos,
             }
         } else {
-            Decision::Run(RunReason::InputsChanged {
-                differences: checked.differences,
-            })
+            Decision::Run(
+                RunReason::InputsChanged {
+                    differences: checked.differences,
+                },
+                Some(Baseline::new(
+                    &record.observations,
+                    record.recorded_at_nanos,
+                )),
+            )
         })
+    }
+
+    /// The step-position record of the step at `position`, before this decision.
+    fn stored_position(
+        &self,
+        txn: &Txn<'_>,
+        position: u32,
+    ) -> Result<Option<StepPosition>, StoreError> {
+        match &self.identity {
+            Some(identity) => {
+                txn.get::<StepPosition>(&PositionKey {
+                    task: identity.id.clone(),
+                    position,
+                })
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Explain why the step at `position`, whose key is `key` and whose
+    /// specification is `spec`, runs for `reason`, with `baseline`, the recorded
+    /// state the cache check compared; and return the self-inflicted inputs its
+    /// position carries from the task's previous build.
+    fn explain(
+        &self,
+        position: u32,
+        key: StepKey,
+        spec: &StepSpecRecord,
+        reason: &RunReason,
+        baseline: Option<&Baseline>,
+    ) -> Result<(Explanation, Vec<PathBuf>), StoreError> {
+        let txn = self.engine.store.read()?;
+        let previous = self.stored_position(&txn, position)?;
+        let context = InputContext {
+            identity: self.identity.as_ref(),
+            position,
+            key,
+            build: self.engine.build,
+            baseline,
+        };
+        let reasons = match reason {
+            RunReason::NeverRun => self.never_run(&txn, previous.as_ref(), key, spec)?,
+            RunReason::Always => vec![Reason::Always],
+            RunReason::InputsChanged { differences } => {
+                vec![Reason::InputsChanged {
+                    inputs: changed_inputs(&txn, &context, differences)?,
+                }]
+            },
+            RunReason::NotCached { why, differences } => {
+                vec![Reason::NotCached {
+                    why: why.clone(),
+                    inputs: changed_inputs(&txn, &context, differences)?,
+                }]
+            },
+        };
+        let carried = carried_from(previous.as_ref(), self.engine.build);
+        let mut explanation = Explanation {
+            reasons,
+            repeated: Vec::new(),
+        };
+        explanation.repeated = explanation
+            .self_inflicted()
+            .into_iter()
+            .filter(|path| carried.binary_search(path).is_ok())
+            .collect();
+        Ok((explanation, carried))
+    }
+
+    /// The reasons of a step key with no record: what changed since the
+    /// specification the task used at the same position last time, `previous`, or
+    /// that the step never ran.
+    fn never_run(
+        &self,
+        txn: &Txn<'_>,
+        previous: Option<&StepPosition>,
+        key: StepKey,
+        spec: &StepSpecRecord,
+    ) -> Result<Vec<Reason>, StoreError> {
+        let Some(previous) = previous.filter(|previous| previous.step != key) else {
+            return Ok(vec![Reason::NeverRun]);
+        };
+        let Some(old) = txn.get::<StepRecord>(&previous.step)? else {
+            return Ok(vec![Reason::NeverRun]);
+        };
+        let old_task = match &self.identity {
+            Some(identity) => txn.get::<TaskRecord>(&identity.id)?,
+            None => None,
+        };
+        let reasons = spec_reasons(
+            &old.spec,
+            spec,
+            old_task.as_ref(),
+            self.identity.as_ref().map(|identity| &identity.parts),
+        );
+        Ok(if reasons.is_empty() {
+            vec![Reason::NeverRun]
+        } else {
+            reasons
+        })
+    }
+
+    /// Note that the step `step` at `position`, whose key is `key`, was cached; its
+    /// position is stored when the run finishes, unless it already ran in this
+    /// build with the same key, whose reasons it keeps.
+    fn note_cached(
+        &self,
+        position: u32,
+        key: StepKey,
+        step: &StepSpec,
+    ) -> Result<(), StepError> {
+        self.decisions.borrow_mut().push(StepDecision {
+            position,
+            command: step.command(),
+            verdict: Verdict::Cached,
+        });
+        let Some(identity) = &self.identity else {
+            return Ok(());
+        };
+        let previous = self
+            .engine
+            .store
+            .read()
+            .and_then(|txn| self.stored_position(&txn, position))
+            .map_err(|error| store_error(&error))?;
+        if let Some(previous) = &previous
+            && previous.build == self.engine.build
+            && previous.step == key
+            && matches!(previous.verdict, Verdict::Ran(_))
+        {
+            return Ok(());
+        }
+        let stored = StepPosition {
+            step: key,
+            build: self.engine.build,
+            verdict: Verdict::Cached,
+            carried: carried_from(previous.as_ref(), self.engine.build),
+        };
+        self.cached_positions.borrow_mut().push((
+            PositionKey {
+                task: identity.id.clone(),
+                position,
+            },
+            stored,
+        ));
+        Ok(())
+    }
+
+    /// Note that the step `step` of `pending` ran, and warn when it re-ran in
+    /// consecutive builds for the same self-inflicted reason.
+    fn note_ran(
+        &self,
+        step: &StepSpec,
+        pending: &Pending,
+    ) {
+        let command = step.command();
+        if !pending.explanation.repeated.is_empty() {
+            self.engine.warn(RepeatedWarning {
+                task: self.identity.as_ref().map(TaskIdentity::label),
+                position: pending.position,
+                command: command.clone(),
+                paths: pending.explanation.repeated.clone(),
+            });
+        }
+        self.decisions.borrow_mut().push(StepDecision {
+            position: pending.position,
+            command,
+            verdict: Verdict::Ran(pending.explanation.clone()),
+        });
     }
 
     /// Return the result of the cache hit on `record`, stored under `key`, after
@@ -671,7 +1054,7 @@ impl TaskSteps<'_> {
         result: Result<StepOutcome, StepError>,
     ) -> Result<(), StepError> {
         let record = self.record_of(step, pending, finished, Some(why.clone()));
-        self.put(&pending.key, &record)?;
+        self.put_run(pending, &record)?;
         let result = result.map(|outcome| {
             StepOutcome {
                 cached: true,
@@ -696,7 +1079,30 @@ impl TaskSteps<'_> {
         finished: Finished,
     ) -> Result<(), StepError> {
         let record = self.record_of(step, pending, finished, None);
-        self.put(&pending.key, &record)
+        self.put_run(pending, &record)
+    }
+
+    /// The specification of `step`, whose occurrence number is `occurrence`, as its
+    /// record holds it.
+    fn spec_record(
+        &self,
+        step: &StepSpec,
+        occurrence: u32,
+    ) -> StepSpecRecord {
+        StepSpecRecord {
+            program_hash: ContentHash(*self.program.as_bytes()),
+            cwd: step.cwd.as_path().to_path_buf(),
+            argv: step.argv.clone(),
+            env: step.env.clone(),
+            stdin: step.stdin.clone(),
+            capture: capture(step.capture),
+            stream: step.stream,
+            always: step.always,
+            ignore: step.ignore.clone(),
+            track: step.track.clone(),
+            expect: step.expect.clone(),
+            occurrence,
+        }
     }
 
     /// The record of `step`, which ended as `finished`, with the state of every path
@@ -716,20 +1122,7 @@ impl TaskSteps<'_> {
             &self.engine.states,
         );
         StepRecord {
-            spec: StepSpecRecord {
-                program_hash: ContentHash(*self.program.as_bytes()),
-                cwd: step.cwd.as_path().to_path_buf(),
-                argv: step.argv.clone(),
-                env: step.env.clone(),
-                stdin: step.stdin.clone(),
-                capture: capture(step.capture),
-                stream: step.stream,
-                always: step.always,
-                ignore: step.ignore.clone(),
-                track: step.track.clone(),
-                expect: step.expect.clone(),
-                occurrence: pending.occurrence,
-            },
+            spec: self.spec_record(step, pending.occurrence),
             program: finished
                 .program
                 .map(|program| ProgramPath(program.into_path_buf())),
@@ -784,6 +1177,7 @@ impl StepExecutor for TaskSteps<'_> {
         let Some(name) = step.argv.first() else {
             return Err(StepError::new("run() needs a program"));
         };
+        let position = u32::try_from(self.keys.borrow().len()).unwrap_or(u32::MAX);
         let (key, occurrence) = self
             .occurrences
             .borrow_mut()
@@ -792,22 +1186,37 @@ impl StepExecutor for TaskSteps<'_> {
         self.keys.borrow_mut().push(key);
         let ignore = self.patterns(&step.ignore)?;
         let track = self.patterns(&step.track)?;
-        let reason = match self.decide(key, step)? {
-            Decision::Run(reason) => reason,
+        let (reason, baseline) = match self.decide(key, step)? {
+            Decision::Run(reason, baseline) => (reason, baseline),
             Decision::Hit {
                 record,
                 checked,
                 checked_at_nanos,
-            } => return self.hit(&key, *record, checked, checked_at_nanos),
-            Decision::Replay(result) => return result,
+            } => {
+                let result = self.hit(&key, *record, checked, checked_at_nanos);
+                self.note_cached(position, key, step)?;
+                return result;
+            },
+            Decision::Replay(result) => {
+                self.note_cached(position, key, step)?;
+                return result;
+            },
         };
+        let spec = self.spec_record(step, occurrence);
+        let (explanation, carried) = self
+            .explain(position, key, &spec, &reason, baseline.as_ref())
+            .map_err(|error| store_error(&error))?;
         let pending = Pending {
             key,
             occurrence,
             reason,
             ignore,
             track,
+            position,
+            explanation,
+            carried,
         };
+        self.note_ran(step, &pending);
         let result = self.look_up_and_run(step, name, &pending);
         if step.always {
             self.engine.finish_always(key, &result);
