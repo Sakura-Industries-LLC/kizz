@@ -39,17 +39,35 @@
 //! The loop itself signals a thread by its own ID only when the thread cannot run
 //! `exec`: it is in a `ptrace` stop that the loop collected and has not resumed, or
 //! it was just created and has not run yet.
+//!
+//! # System calls
+//!
+//! A tracked system call stops its thread twice. At the seccomp stop before the
+//! call runs, the loop decodes the call's paths from the thread, and resumes it
+//! with `PTRACE_SYSCALL`, so the thread stops again when the call returns. At that
+//! stop the loop reads the result and records the paths in the outcome's accesses.
+//! A call that a signal interrupts reaches that stop too, with `EINTR` or one of the
+//! kernel's internal restart errors, and is recorded like a failed call, so a call
+//! that returns `EINTR` without restarting keeps its lookup; a call that restarts
+//! stops at its entry again and is decoded again.
+//! A thread that runs `exec` from a thread that does not lead its process keeps its
+//! call under the ID it takes over, and a thread that exits inside a call records
+//! the call with its result unknown.
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map},
-    io,
+    io, mem,
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-use kizz_trace::{Cancellation, IncompleteReason, Termination};
-use libc::{c_int, c_ulong, pid_t};
+use kizz_trace::{Accesses, Cancellation, IncompleteReason, Termination};
+use libc::{c_int, c_long, c_ulong, pid_t};
 
-use crate::{filter, sys};
+use crate::{decode, filter, sys};
+
+/// The signal of a stop at the exit of a system call, with
+/// `PTRACE_O_TRACESYSGOOD`: `SIGTRAP` with the high bit set.
+const SYSTEM_CALL_STOP: c_int = libc::SIGTRAP | 0x80;
 
 /// The process IDs of the live processes of a traced tree, shared with the
 /// cancellation watchdog. It never holds the ID of a thread that does not lead its
@@ -88,12 +106,14 @@ fn leads_its_process(tid: pid_t) -> bool {
 pub(crate) struct Outcome {
     /// How the first process ended, if the loop saw it end.
     pub termination: Option<Termination>,
+    /// Every path the tree touched, with its combined access kinds.
+    pub accesses: Accesses,
     /// Why the trace is incomplete, if it is.
     pub incomplete: Option<IncompleteReason>,
 }
 
 /// What the loop knows about one traced thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct Tracee {
     /// Whether the thread still has to report the `SIGSTOP` with which every
     /// automatically traced thread starts.
@@ -102,6 +122,23 @@ struct Tracee {
     /// A new thread can report its first stop, and even its exit, before that
     /// event.
     announced: bool,
+    /// The tracked system call the thread is in, decoded at its entry, until the
+    /// loop reads its result.
+    pending: Option<decode::Call>,
+}
+
+impl Tracee {
+    /// A thread that is in no tracked system call.
+    const fn new(
+        awaiting_initial_stop: bool,
+        announced: bool,
+    ) -> Self {
+        Self {
+            awaiting_initial_stop,
+            announced,
+            pending: None,
+        }
+    }
 }
 
 /// The state of the loop.
@@ -183,16 +220,14 @@ impl<'a> Tree<'a> {
         lock(live).insert(root);
         Self {
             root,
-            tracees: BTreeMap::from([(root, Tracee {
-                awaiting_initial_stop: false,
-                announced: true,
-            })]),
+            tracees: BTreeMap::from([(root, Tracee::new(false, true))]),
             exited_unannounced: BTreeSet::new(),
             live,
             cancel,
             killed: false,
             outcome: Outcome {
                 termination: None,
+                accesses: Accesses::new(),
                 incomplete: None,
             },
         }
@@ -214,15 +249,56 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Stop following a thread that no longer exists.
+    /// Stop following a thread that no longer exists, and return the tracked call
+    /// it was in.
     ///
     /// Only the former ID of a thread that ran `exec` disappears this way, and
     /// that thread did not lead its process, so its ID was never in the live set.
     fn forget(
         &mut self,
         pid: pid_t,
+    ) -> Option<decode::Call> {
+        self.tracees.remove(&pid).and_then(|tracee| tracee.pending)
+    }
+
+    /// Note why the trace is incomplete, unless an earlier reason was noted.
+    fn incomplete(
+        &mut self,
+        reason: IncompleteReason,
     ) {
-        self.tracees.remove(&pid);
+        if self.outcome.incomplete.is_none() {
+            self.outcome.incomplete = Some(reason);
+        }
+    }
+
+    /// Record the paths of a tracked call that returned `result`, or whose result
+    /// was never seen.
+    fn finish(
+        &mut self,
+        call: decode::Call,
+        result: Option<i64>,
+    ) {
+        if let Some(detail) = call.finish(result, &mut self.outcome.accesses) {
+            self.incomplete(IncompleteReason::Other { detail });
+        }
+    }
+
+    /// Resume a stopped thread, delivering `signal` unless it is zero. A thread in
+    /// a tracked call is resumed to the exit of the call.
+    fn resume(
+        &self,
+        pid: pid_t,
+        signal: c_int,
+    ) -> io::Result<()> {
+        let in_call = self
+            .tracees
+            .get(&pid)
+            .is_some_and(|tracee| tracee.pending.is_some());
+        unless_vanished(if in_call {
+            sys::resume_to_exit(pid, signal)
+        } else {
+            sys::resume(pid, signal)
+        })
     }
 
     /// Follow the tree until every thread in it has exited and been collected.
@@ -264,12 +340,14 @@ impl<'a> Tree<'a> {
         pid: pid_t,
         status: c_int,
     ) {
-        let announced = self
-            .tracees
-            .remove(&pid)
-            .is_some_and(|tracee| tracee.announced);
+        let tracee = self.tracees.remove(&pid);
+        let announced = tracee.as_ref().is_some_and(|tracee| tracee.announced);
         if !announced {
             self.exited_unannounced.insert(pid);
+        }
+        if let Some(call) = tracee.and_then(|tracee| tracee.pending) {
+            // The thread ended inside the call, which may have taken effect.
+            self.finish(call, None);
         }
         if pid == self.root {
             self.outcome.termination = Some(if libc::WIFEXITED(status) {
@@ -308,20 +386,16 @@ impl<'a> Tree<'a> {
         // the thread that created it. It is stopped, so its ID still names it.
         if !self.tracees.contains_key(&pid) {
             let leader = leads_its_process(pid);
-            self.adopt(
-                pid,
-                Tracee {
-                    awaiting_initial_stop: true,
-                    announced: false,
-                },
-                leader,
-            );
+            self.adopt(pid, Tracee::new(true, false), leader);
         }
         if signal == libc::SIGTRAP && event != 0 {
             return self.event_stop(pid, event);
         }
         if self.cancel.is_cancelled() {
             return self.kill(pid);
+        }
+        if signal == SYSTEM_CALL_STOP && event == 0 {
+            return self.system_call_exit(pid);
         }
         if let Some(tracee) = self.tracees.get_mut(&pid)
             && tracee.awaiting_initial_stop
@@ -333,10 +407,77 @@ impl<'a> Tree<'a> {
         }
         match sys::has_signal_info(pid) {
             // A signal-delivery stop: deliver the signal.
-            Ok(true) => unless_vanished(sys::resume(pid, signal)),
+            Ok(true) => self.resume(pid, signal),
             // A group stop: let the thread continue.
-            Ok(false) => unless_vanished(sys::resume(pid, 0)),
+            Ok(false) => self.resume(pid, 0),
             Err(error) => unless_vanished(Err(error)),
+        }
+    }
+
+    /// Handle the stop at the exit of a tracked system call: read the result,
+    /// record the call's paths, and let the thread continue.
+    fn system_call_exit(
+        &mut self,
+        pid: pid_t,
+    ) -> io::Result<()> {
+        let call = self
+            .tracees
+            .get_mut(&pid)
+            .and_then(|tracee| tracee.pending.take());
+        if let Some(mut call) = call {
+            // Without the registers the result is unknown, so the call is recorded
+            // as one that may or may not have taken effect.
+            let result = sys::registers(pid)
+                .ok()
+                .map(|registers| i64::from_ne_bytes(registers.rax.to_ne_bytes()));
+            // A descriptor the call returned names the object it actually opened.
+            call.opened(result, &sys::Thread(pid));
+            self.finish(call, result);
+        }
+        unless_vanished(sys::resume(pid, 0))
+    }
+
+    /// Decode the tracked system call a thread is entering at a seccomp stop, and
+    /// keep it until the call returns.
+    fn system_call_entry(
+        &mut self,
+        pid: pid_t,
+    ) {
+        let registers = match sys::registers(pid) {
+            Ok(registers) => registers,
+            // A thread that vanished makes no call.
+            Err(error) if vanished(&error) => return,
+            Err(error) => {
+                self.incomplete(IncompleteReason::Other {
+                    detail: format!(
+                        "could not read the registers of thread {pid} at a system call: {error}"
+                    ),
+                });
+                return;
+            },
+        };
+        let arguments = [
+            registers.rdi,
+            registers.rsi,
+            registers.rdx,
+            registers.r10,
+            registers.r8,
+            registers.r9,
+        ];
+        let Some(call) = c_long::try_from(registers.orig_rax)
+            .ok()
+            .and_then(|number| decode::enter(number, arguments, &sys::Thread(pid)))
+        else {
+            return;
+        };
+        let earlier = self
+            .tracees
+            .get_mut(&pid)
+            .and_then(|tracee| tracee.pending.replace(call));
+        if let Some(earlier) = earlier {
+            // A call whose exit was never seen; it cannot happen when every stop
+            // is handled, and is recorded as one whose result is unknown.
+            self.finish(earlier, None);
         }
     }
 
@@ -363,14 +504,7 @@ impl<'a> Tree<'a> {
         // A fork or vfork always starts a process; a clone starts a thread unless
         // it was asked for a process.
         let leader = event != libc::PTRACE_EVENT_CLONE || leads_its_process(child);
-        self.adopt(
-            child,
-            Tracee {
-                awaiting_initial_stop: true,
-                announced: true,
-            },
-            leader,
-        );
+        self.adopt(child, Tracee::new(true, true), leader);
         if self.cancel.is_cancelled() {
             // The new thread has not run since it was created, so it cannot have
             // run `exec`, and its ID still names it.
@@ -403,10 +537,19 @@ impl<'a> Tree<'a> {
             libc::PTRACE_EVENT_EXEC => {
                 // A thread other than the leader that runs `exec` takes over the
                 // leader's ID, and its former ID disappears without an exit. The
-                // live set never held that ID, so nothing has signaled it.
+                // live set never held that ID, so nothing has signaled it. The
+                // `exec` call it is in continues under the leader's ID, and a call
+                // the former leader was in ended with it.
                 let former = message_pid(message)?;
                 if former != pid {
-                    self.forget(former);
+                    let call = self.forget(former);
+                    let ended = match self.tracees.get_mut(&pid) {
+                        Some(tracee) => mem::replace(&mut tracee.pending, call),
+                        None => call,
+                    };
+                    if let Some(ended) = ended {
+                        self.finish(ended, None);
+                    }
                 }
             },
             libc::PTRACE_EVENT_SECCOMP if !cancelled => self.seccomp_stop(pid, message),
@@ -415,18 +558,22 @@ impl<'a> Tree<'a> {
         if cancelled {
             return self.kill(pid);
         }
-        unless_vanished(sys::resume(pid, 0))
+        self.resume(pid, 0)
     }
 
-    /// Handle a seccomp stop with the filter's return data. A tracked call only
-    /// continues until the decoding of the second part of phase 1 is added. A
-    /// non-native call marks the run as incompletely traced.
+    /// Handle a seccomp stop with the filter's return data. A tracked call is
+    /// decoded, and the thread is resumed to its exit. A non-native call marks the
+    /// run as incompletely traced.
     fn seccomp_stop(
         &mut self,
         pid: pid_t,
         data: c_ulong,
     ) {
         let interface = match u16::try_from(data) {
+            Ok(filter::DATA_TRACKED) => {
+                self.system_call_entry(pid);
+                return;
+            },
             Ok(filter::DATA_FOREIGN_ARCH) => "the 32-bit `int 0x80` interface",
             Ok(filter::DATA_X32) => "the x32 interface",
             Ok(_) | Err(_) => return,

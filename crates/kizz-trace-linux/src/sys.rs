@@ -11,11 +11,17 @@
 
 use std::{
     fs, io, mem,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::{ffi::OsStringExt as _, fs::MetadataExt as _},
+    },
+    path::Path,
     ptr,
 };
 
 use libc::{c_int, c_long, c_uint, c_ulong, c_void, pid_t};
+
+use crate::decode;
 
 /// The flags of every wait: report every traced thread, and only the children and
 /// tracees of the calling thread, so tracers on other threads of the process never
@@ -82,6 +88,111 @@ pub(crate) fn resume(
     signal: c_int,
 ) -> io::Result<()> {
     ptrace_value(libc::PTRACE_CONT, pid, c_long::from(signal))
+}
+
+/// Resume a tracee in a `ptrace` stop until its current system call returns,
+/// delivering `signal` unless it is zero: the tracee stops again at the exit of
+/// the call, where the tracer reads the result.
+pub(crate) fn resume_to_exit(
+    pid: pid_t,
+    signal: c_int,
+) -> io::Result<()> {
+    ptrace_value(libc::PTRACE_SYSCALL, pid, c_long::from(signal))
+}
+
+/// A traced thread in a `ptrace` stop, whose memory, working directory and
+/// descriptors the decoding of a system call reads. Nothing in it is changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Thread(pub pid_t);
+
+impl Thread {
+    /// The link in `/proc` of the thread's descriptor `fd`, or of its working
+    /// directory for `AT_FDCWD`.
+    fn link(
+        self,
+        fd: c_int,
+    ) -> String {
+        if fd == libc::AT_FDCWD {
+            format!("/proc/{}/cwd", self.0)
+        } else {
+            format!("/proc/{}/fd/{fd}", self.0)
+        }
+    }
+}
+
+/// The target of a symbolic link, as bytes.
+fn read_link(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    Ok(fs::read_link(path)?.into_os_string().into_vec())
+}
+
+/// The identity of the object that `metadata` describes.
+fn object(metadata: &fs::Metadata) -> decode::Object {
+    decode::Object {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
+        symbolic_link: metadata.file_type().is_symlink(),
+        directory: metadata.is_dir(),
+    }
+}
+
+impl decode::Inspect for Thread {
+    fn memory(
+        &self,
+        address: u64,
+        buffer: &mut [u8],
+    ) -> io::Result<usize> {
+        let address = usize::try_from(address)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let local = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast::<c_void>(),
+            iov_len: buffer.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: ptr::without_provenance_mut::<c_void>(address),
+            iov_len: buffer.len(),
+        };
+        // SAFETY: `local` describes `buffer`, which is writable for its whole
+        // length; `remote` is only an address in the traced thread, which the
+        // kernel checks.
+        let read =
+            unsafe { libc::process_vm_readv(self.0, &raw const local, 1, &raw const remote, 1, 0) };
+        usize::try_from(read).map_err(|_| io::Error::last_os_error())
+    }
+
+    fn working_directory(&self) -> io::Result<Vec<u8>> {
+        read_link(self.link(libc::AT_FDCWD))
+    }
+
+    fn descriptor(
+        &self,
+        fd: c_int,
+    ) -> io::Result<Vec<u8>> {
+        read_link(self.link(fd))
+    }
+
+    fn link_object(
+        &self,
+        fd: c_int,
+    ) -> io::Result<decode::Object> {
+        // `stat` follows the link in `/proc` to the object itself, even when it
+        // was removed.
+        Ok(object(&fs::metadata(self.link(fd))?))
+    }
+
+    fn path_object(
+        &self,
+        path: &Path,
+    ) -> io::Result<decode::Object> {
+        Ok(object(&fs::symlink_metadata(path)?))
+    }
+
+    fn link_target(
+        &self,
+        path: &Path,
+    ) -> io::Result<Vec<u8>> {
+        read_link(path)
+    }
 }
 
 /// The message of the `ptrace` event stop a tracee is in: the new thread or process

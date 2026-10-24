@@ -34,9 +34,11 @@ use libc::{c_char, c_int, pid_t, sock_filter, sock_fprog};
 use crate::sys;
 
 /// The options set on the first traced process, which every process and thread it
-/// starts inherits: stop at seccomp `SECCOMP_RET_TRACE` actions, follow forks,
+/// starts inherits: stop at seccomp `SECCOMP_RET_TRACE` actions, mark the stop at
+/// the exit of a system call so it is told apart from a signal, follow forks,
 /// vforks, clones and `exec`, and kill every traced process if the tracer exits.
 pub(crate) const TRACE_OPTIONS: c_int = libc::PTRACE_O_TRACESECCOMP
+    | libc::PTRACE_O_TRACESYSGOOD
     | libc::PTRACE_O_TRACEFORK
     | libc::PTRACE_O_TRACEVFORK
     | libc::PTRACE_O_TRACECLONE
@@ -124,14 +126,15 @@ pub(crate) struct ChildFailure {
 }
 
 impl ChildFailure {
-    /// The error for a request whose child failed this way.
+    /// The error for a request whose child failed this way, with the paths it
+    /// touched while it tried to start the program.
     pub(crate) fn into_error(
         self,
         request: &RunRequest,
+        accesses: Accesses,
     ) -> TraceError {
         let source = io::Error::from_raw_os_error(self.errno);
         let program = request.program.clone();
-        let accesses = Accesses::new();
         match self.step {
             Step::Exec if matches!(self.errno, libc::ENOENT | libc::ENOTDIR) => {
                 TraceError::ProgramNotFound { program, accesses }
@@ -480,7 +483,7 @@ pub(crate) fn start(
 mod tests {
     use std::{collections::BTreeMap, ffi::OsString};
 
-    use kizz_trace::{AbsolutePath, CaptureMode};
+    use kizz_trace::{AbsolutePath, AccessKind, CaptureMode};
 
     use super::*;
 
@@ -508,7 +511,8 @@ mod tests {
     #[test]
     fn failures_map_to_the_interface_errors() {
         let request = request("/missing");
-        let failure = |step, errno| ChildFailure { step, errno }.into_error(&request);
+        let failure =
+            |step, errno| ChildFailure { step, errno }.into_error(&request, Accesses::new());
         assert!(matches!(
             failure(Step::Exec, libc::ENOENT),
             TraceError::ProgramNotFound { .. }
@@ -527,6 +531,21 @@ mod tests {
         ));
         assert!(failure(Step::TraceMe, libc::EPERM).is_tracer_failure());
         assert!(failure(Step::Filter, libc::EACCES).is_tracer_failure());
+    }
+
+    #[test]
+    fn failures_keep_the_paths_touched_while_starting() {
+        let request = request("/missing");
+        let mut accesses = Accesses::new();
+        accesses.record(request.program.clone(), AccessKind::Probe);
+        for (step, errno) in [
+            (Step::Exec, libc::ENOENT),
+            (Step::Exec, libc::EACCES),
+            (Step::Exec, libc::E2BIG),
+        ] {
+            let error = ChildFailure { step, errno }.into_error(&request, accesses.clone());
+            assert_eq!(error.accesses(), Some(&accesses), "{error}");
+        }
     }
 
     #[test]

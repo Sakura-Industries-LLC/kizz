@@ -15,14 +15,17 @@
 //! all of them if the tracer exits. Nothing in the traced program changes, except
 //! that `io_uring_setup` fails with `ENOSYS`, so its file accesses stay observable.
 //!
-//! This part of phase 1 starts, follows and stops the process tree and handles its
-//! input and output; the system calls that stop for the tracer only continue, and
-//! the reported accesses are empty until their decoding is added.
+//! At each tracked call the tracer reads the call's path arguments, directory
+//! descriptors and flags from the stopped thread before the call runs, and its
+//! result after it returns, and reports every path the tree touched as an absolute
+//! path with its combined access kinds. Successful and failed calls are recorded
+//! alike: a failed call, including a lookup that found nothing, is a probe.
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("the kizz tracer supports only Linux on x86_64");
 
 mod capture;
+mod decode;
 mod filter;
 mod follow;
 mod spawn;
@@ -248,16 +251,16 @@ impl Tracer for LinuxTracer {
             .map_err(|error| tracer_error("could not follow the traced processes", error))?;
         let streams = supervised.streams?;
         supervised.fed?;
+        let (termination, accesses, incomplete) = outcome.map_or_else(
+            || (None, Accesses::new(), None),
+            |outcome| (outcome.termination, outcome.accesses, outcome.incomplete),
+        );
         if let Some(failure) = spawn::read_failure(report_read)
             .map_err(|error| tracer_error("could not read the failure pipe", error))?
         {
-            return Err(failure.into_error(request));
+            return Err(failure.into_error(request, accesses));
         }
-        let Some((termination, incomplete)) = outcome.and_then(|outcome| {
-            outcome
-                .termination
-                .map(|termination| (termination, outcome.incomplete))
-        }) else {
+        let Some(termination) = termination else {
             return Err(TraceError::Tracer {
                 message: "the traced program ended without an exit status".to_owned(),
                 source: None,
@@ -266,7 +269,7 @@ impl Tracer for LinuxTracer {
         Ok(RunResult {
             termination,
             output: capture::assemble(request.capture, streams),
-            accesses: Accesses::new(),
+            accesses,
             incomplete,
         })
     }
