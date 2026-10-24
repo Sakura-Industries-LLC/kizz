@@ -28,10 +28,11 @@
 //! hit only when nothing changed, and otherwise it runs, with every difference as
 //! the reason.
 //!
-//! A step marked `always` runs once per build, in the first pass: the first time
-//! its key comes up in the build, and it is recorded like any other step. Every
-//! later time in the same build, whatever changed, its first result is returned
-//! again without running ("Commands that always run").
+//! A step marked `always` runs at most once per build, when a pass first reaches it:
+//! the first time its key comes up in the build, normally in the first pass, and it
+//! is recorded like any other step. Every later time in the same build, whatever
+//! changed, its first result is returned again without running ("Commands that
+//! always run"). A key first reached in a later pass runs once then.
 //!
 //! Results that are not cached ("Results that are not cached"): a command killed by
 //! a signal, interrupted ones included, a run that the tracer reports as
@@ -207,6 +208,18 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub const fn build(&self) -> BuildId {
         self.build
+    }
+
+    /// Whether cancellation was requested, so the build starts nothing new.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// The store that holds the build's records.
+    #[must_use]
+    pub(crate) const fn store(&self) -> &'a Store {
+        self.store
     }
 
     /// The warnings for steps that re-ran in consecutive builds for the same

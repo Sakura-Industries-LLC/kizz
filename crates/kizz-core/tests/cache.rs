@@ -1127,10 +1127,10 @@ fn an_older_record_is_never_replayed_after_a_result_that_is_not_cached() -> Test
     Ok(())
 }
 
-/// An `always` step runs once per build, in the first pass: every later pass of the
-/// same build returns its first result without running it, even after a path it
-/// touched changed, whether that result was cached or not; the next build runs it
-/// again.
+/// An `always` step runs at most once per build, when a pass first reaches it: every
+/// later pass of the same build reuses its result without running it, even after a
+/// path it touched changed, whether that result was cached or not; the next build
+/// runs it again.
 #[test]
 fn an_always_step_runs_once_per_build_whatever_changes() -> TestResult {
     for kind in ["ok", "signal"] {

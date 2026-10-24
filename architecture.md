@@ -582,7 +582,9 @@ It runs again once the program appears, for example after another task builds it
 
 ### Commands that always run
 
-An `always` command runs once per build, in the first pass, and is recorded like any other step.
+An `always` command runs at most once per build, when a pass first reaches it, and is recorded like any other step.
+That is normally the first pass; later passes of the same build reuse its result without running the command again.
+A command first reached in a later pass, or with a new step key, therefore runs once in that pass.
 If it rewrites files with identical content, dependent steps see unchanged hashes and stay cached.
 If it changes content, dependent steps run again, as they should.
 
@@ -654,8 +656,10 @@ and the user can decide whether to add an ignore pattern.
   or one that failed and whose looked-for dependencies have since appeared.
   A task whose inputs did not change is a cache hit, and a failed one fails again from the cache without running.
   The build ends when a pass runs nothing; it succeeds if no task failed in that pass, and fails otherwise.
-  A first build may take extra passes; later builds usually take one, because the order has been learned.
-  Commands marked `always` run in the first pass only.
+  A build settles in the passes up to and including the last one that ran a command, or in one pass if no command ran.
+  After a pass that ran a command, the final pass, which runs nothing, only confirms the build and is not counted.
+  A first build may take extra passes to settle; later builds usually settle in one, because the order has been learned.
+  A command marked `always` runs at most once per build, when a pass first reaches it; later passes reuse its result.
 * If the build has not settled after a fixed number of passes (one more than the number of tasks),
   kizz stops and names the paths that keep changing and who writes them.
 * A missing file is a dependency, never a scheduling signal: kizz never pauses a process to wait for a file to appear.
