@@ -54,6 +54,7 @@ getdents
 geteuid
 GETEVENTMSG
 gethostname
+getpgrp
 getpid
 getpwuid
 GETREGS
@@ -64,6 +65,7 @@ GOFLAGS
 hasattr
 hermeticity
 idents
+idtype
 IFIFO
 iovec
 JSET
@@ -90,6 +92,7 @@ pipefail
 pointee
 prctl
 PRIVS
+pthread
 ptrace
 RDONLY
 RDWR
@@ -111,11 +114,15 @@ SEGV
 setext
 SETMASK
 SETOPTIONS
+setpgid
+SETSIGMASK
 sigaction
+sigaddset
 SIGCHLD
 sigemptyset
 sighandler
 siginfo
+sigmask
 SIGPIPE
 sigprocmask
 SIGSEGV

@@ -572,6 +572,14 @@ pub enum NotCachedReason {
         #[n(0)]
         message: String,
     },
+    /// The build was interrupted, and the command exited with a code that it chose,
+    /// for example after it handled the interrupt.
+    #[n(4)]
+    InterruptedExited {
+        /// The exit code.
+        #[n(0)]
+        code: i32,
+    },
 }
 
 impl fmt::Display for NotCachedReason {
@@ -583,6 +591,9 @@ impl fmt::Display for NotCachedReason {
             Self::Signaled { signal } => write!(f, "killed by signal {signal}"),
             Self::Interrupted { signal } => {
                 write!(f, "interrupted, and stopped by signal {signal}")
+            },
+            Self::InterruptedExited { code } => {
+                write!(f, "interrupted, and exited with code {code}")
             },
             Self::Incomplete { detail } => write!(f, "incompletely traced: {detail}"),
             Self::StartFailed { message } => write!(f, "could not start: {message}"),
@@ -821,6 +832,7 @@ mod tests {
         let whys = [
             NotCachedReason::Signaled { signal: 9 },
             NotCachedReason::Interrupted { signal: 2 },
+            NotCachedReason::InterruptedExited { code: 130 },
             NotCachedReason::Incomplete {
                 detail: "int 0x80".to_owned(),
             },
@@ -866,6 +878,7 @@ mod tests {
         let markers = [
             None,
             Some(NotCachedReason::Interrupted { signal: 2 }),
+            Some(NotCachedReason::InterruptedExited { code: 130 }),
             Some(NotCachedReason::Incomplete {
                 detail: "int 0x80".to_owned(),
             }),
@@ -920,6 +933,7 @@ mod tests {
         let whys: Vec<String> = [
             NotCachedReason::Signaled { signal: 9 },
             NotCachedReason::Interrupted { signal: 2 },
+            NotCachedReason::InterruptedExited { code: 130 },
             NotCachedReason::Incomplete {
                 detail: "lost a process".to_owned(),
             },
@@ -933,6 +947,7 @@ mod tests {
         assert_eq!(whys, [
             "killed by signal 9",
             "interrupted, and stopped by signal 2",
+            "interrupted, and exited with code 130",
             "incompletely traced: lost a process",
             "could not start: out of memory",
         ]);

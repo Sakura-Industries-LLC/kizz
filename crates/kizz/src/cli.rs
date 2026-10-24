@@ -5,8 +5,9 @@
 //! Command-line interface for the `kizz` tool.
 //!
 //! This module owns parsing and dispatch only. Every command is parsed with all of
-//! its options; `kizz list` runs in the `list` module and `kizz why` in the `why`
-//! module, and the other commands are scaffolds until later phases implement them.
+//! its options; `kizz build` runs in the `build` module, `kizz list` in the `list`
+//! module, and `kizz why` in the `why` module, and the other commands are scaffolds
+//! until later phases implement them.
 
 use std::{fmt, path::PathBuf, process::ExitCode, str::FromStr};
 
@@ -17,6 +18,12 @@ use crate::ui;
 /// The exit status for usage and configuration errors, and for scaffolded
 /// commands.
 pub const USAGE_ERROR: u8 = 2;
+
+/// The exit status when a task fails, or the build does not settle.
+pub const TASK_FAILED: u8 = 1;
+
+/// The exit status of a build interrupted with Ctrl-C.
+pub const INTERRUPTED: u8 = 130;
 
 /// The width that parse errors and help are wrapped to.
 const MESSAGE_WIDTH: usize = 100;
@@ -68,12 +75,13 @@ impl Cli {
                 ui::print_error(PARALLEL_NOT_IMPLEMENTED);
                 ExitCode::from(USAGE_ERROR)
             },
-            Command::Build { targets, .. } => {
-                stub(
-                    "build",
-                    "Run the tasks for the targets in the current directory and below.",
-                    targets,
-                )
+            Command::Build {
+                targets, explain, ..
+            } => {
+                crate::build::run(targets.as_deref(), crate::build::Options {
+                    explain,
+                    verbose: self.verbose,
+                })
             },
             Command::Why { path } => crate::why::run(path.as_deref(), self.verbose),
             Command::List { targets } => crate::list::run(targets.as_deref()),

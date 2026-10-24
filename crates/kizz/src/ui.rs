@@ -140,6 +140,81 @@ pub(crate) fn print_summary(message: &str) {
     println!("{}", style(message).dim());
 }
 
+/// Print a command that ran: `text` names it and gives its one-line reason.
+pub(crate) fn print_ran(text: &str) {
+    println!("{} {text}", style("ran").green().bold());
+}
+
+/// Print a command that came from the cache: `text` names it.
+pub(crate) fn print_cached(text: &str) {
+    println!("{} {}", style("cached").dim(), style(text).dim());
+}
+
+/// Print one line of detail under a command, indented.
+pub(crate) fn print_detail(line: &str) {
+    println!("  {line}");
+}
+
+/// Print one line that a task program printed, already prefixed with its task.
+pub(crate) fn print_line(line: &str) {
+    println!("{line}");
+}
+
+/// Print one indented line of detail under an error, to standard error.
+pub(crate) fn print_error_detail(line: &str) {
+    eprintln!("  {}", style(line).for_stderr().bold());
+}
+
+/// Print to standard error that `task` failed, with `message`, which holds the
+/// error, the Starlark stack, and the failing command's captured output, indented.
+pub(crate) fn print_task_failure(
+    task: &str,
+    message: &str,
+) {
+    eprintln!(
+        "{} {}",
+        style("error:").for_stderr().red().bold(),
+        style(format!("{task} failed:")).for_stderr().bold()
+    );
+    for line in message.lines() {
+        eprintln!("  {line}");
+    }
+}
+
+/// Print to standard error a task that failed in the pass that ended the build,
+/// with the paths it looked for and did not find.
+pub(crate) fn print_failed_task(
+    task: &str,
+    missing: &[String],
+) {
+    eprintln!(
+        "{} {}",
+        style("failed:").for_stderr().red().bold(),
+        style(task).for_stderr().bold()
+    );
+    if missing.is_empty() {
+        eprintln!("  it looked for no path that is missing");
+    } else {
+        eprintln!("  it looked for these paths and did not find them:");
+        for path in missing {
+            eprintln!("    {path}");
+        }
+    }
+}
+
+/// `number` followed by `singular` when `number` is 1, and by `plural` otherwise.
+pub(crate) fn count_as(
+    number: usize,
+    singular: &str,
+    plural: &str,
+) -> String {
+    if number == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{number} {plural}")
+    }
+}
+
 /// `number` followed by `singular`, made plural with `s` unless `number` is 1.
 pub(crate) fn count(
     number: usize,

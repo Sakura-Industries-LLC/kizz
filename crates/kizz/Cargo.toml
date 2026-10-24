@@ -20,9 +20,11 @@ kizz-trace-linux = { path = "../kizz-trace-linux", version = "0.0.1" }
 bpaf = { version = "0.9.28", features = ["derive"] }
 build-info = "0.0.47"
 console = "0.16.6"
+signal-hook = "0.4.5"
 
 [build-dependencies]
 build-info-build = "0.0.47"
 
 [dev-dependencies]
+libc = "0.2.191"
 tempfile = "3.27.0"

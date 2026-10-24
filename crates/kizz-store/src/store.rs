@@ -40,8 +40,10 @@ pub const DATABASE_DIR: &str = "db";
 /// command that could not start. Version 5 added explanations: the verdict of the
 /// most recent build in step positions, the parts of the task program and how
 /// output names the task in task records, and the position, build, and time of
-/// each last writer.
-pub const SCHEMA_VERSION: u32 = 5;
+/// each last writer. Version 6 added the reason for the result of a command that
+/// exited with a code of its own after the build was interrupted, which, like a
+/// command that a signal stopped then, is never a cache hit.
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]

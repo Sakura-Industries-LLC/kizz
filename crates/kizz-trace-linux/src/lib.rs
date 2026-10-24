@@ -20,6 +20,15 @@
 //! result after it returns, and reports every path the tree touched as an absolute
 //! path with its combined access kinds. Successful and failed calls are recorded
 //! alike: a failed call, including a lookup that found nothing, is a probe.
+//!
+//! When a request is cancelled, the tracer interrupts the tree: it sends `SIGINT`
+//! once to every live process. It follows the tree as before for
+//! [`CANCEL_GRACE_PERIOD`], and returns as soon as the whole tree has exited; when
+//! the grace period ends first, it kills whatever remains with `SIGKILL`. A
+//! cancelled run may therefore end with an exit code that the program chose after
+//! it handled the interrupt. The program runs in a process group of its own, so an
+//! interrupt that a terminal sends to the tracer's process group never reaches it
+//! directly: it receives the interrupt exactly once, from the tracer.
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("the kizz tracer supports only Linux on x86_64");
@@ -46,12 +55,16 @@ use kizz_trace::{
 
 use crate::{
     capture::TracerStdio,
-    follow::LiveProcesses,
+    follow::{Escalation, LiveProcesses},
     spawn::{Program, Started},
 };
 
 /// How often the cancellation watchdog checks the cancellation flag.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How long a cancelled tree may run after its interrupt, the `SIGINT` that every
+/// live process receives once, before the tracer kills whatever remains of it.
+pub const CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Runs commands under `ptrace` with a seccomp-bpf filter in front.
 ///
@@ -96,27 +109,37 @@ fn join<T>(
     }
 }
 
-/// Kill the tree when the request is cancelled, until `done` is dropped.
+/// Interrupt the tree when the request is cancelled, and kill whatever remains of
+/// it when the grace period ends, until `done` is dropped.
 ///
-/// The event loop also kills every thread it sees after cancellation; the watchdog
-/// covers a tree whose threads are all blocked and report nothing. It signals only
-/// the process IDs in the live set, never the ID of a thread that does not lead its
-/// process, which that thread releases when it runs `exec`.
+/// On cancellation the watchdog sends `SIGINT` once to every live process. During
+/// [`CANCEL_GRACE_PERIOD`] the event loop follows the tree as it does without
+/// cancellation, and a tree that exits in that time drops `done`, which ends the
+/// watchdog at once. When the grace period ends first, the watchdog sets
+/// `escalation`, so the event loop kills every thread it sees from then on, and
+/// then sends `SIGKILL` to every live process; it also covers a tree whose threads
+/// are all blocked and report nothing. It signals only the process IDs in the live
+/// set, never the ID of a thread that does not lead its process, which that thread
+/// releases when it runs `exec`.
 fn watch(
     live: &LiveProcesses,
     cancel: &Cancellation,
+    escalation: &Escalation,
     done: &mpsc::Receiver<()>,
 ) {
-    loop {
-        if cancel.is_cancelled() {
-            follow::kill_all(live);
-            return;
-        }
+    while !cancel.is_cancelled() {
         match done.recv_timeout(CANCEL_POLL_INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {},
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+    follow::interrupt_all(live);
+    match done.recv_timeout(CANCEL_GRACE_PERIOD) {
+        Err(RecvTimeoutError::Timeout) => {},
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+    }
+    escalation.escalate();
+    follow::kill_all(live);
 }
 
 /// What the event loop and the helper threads of one run produced.
@@ -142,6 +165,7 @@ fn supervise(
     cancel: &Cancellation,
 ) -> Supervised {
     let live = LiveProcesses::new(BTreeSet::new());
+    let escalation = Escalation::new();
     thread::scope(|scope| {
         let feeder = tracer_stdio.stdin.map(|stdin| {
             let content = request.stdin.as_deref().unwrap_or_default();
@@ -161,8 +185,12 @@ fn supervise(
             Started::Running(root) => {
                 let (done_sender, done) = mpsc::channel::<()>();
                 let live = &live;
-                let watchdog = scope.spawn(move || watch(live, cancel, &done));
-                let followed = follow::follow(root, live, cancel);
+                let escalation = &escalation;
+                // The first process is live before the watchdog starts, so an
+                // interrupt for a request that is already cancelled reaches it.
+                follow::lock(live).insert(root);
+                let watchdog = scope.spawn(move || watch(live, cancel, escalation, &done));
+                let followed = follow::follow(root, live, escalation);
                 if followed.is_err() {
                     follow::abandon(live);
                 }

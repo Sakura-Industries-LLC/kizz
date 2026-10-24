@@ -4,12 +4,20 @@
 
 //! Starting a traced program.
 //!
-//! The tracer forks, and before the program runs the child connects its standard
-//! input, output and error, enters the working directory, sets
-//! `PR_SET_NO_NEW_PRIVS`, comes under `ptrace` with `PTRACE_TRACEME`, and stops
-//! itself. The tracer then sets the options that follow forks, clones and `exec` and
-//! kill the traced processes if the tracer dies, and resumes the child, which
-//! installs the seccomp-bpf filter and runs the program with `execve`.
+//! The tracer forks, and before the program runs the child moves into a process
+//! group of its own, connects its standard input, output and error, enters the
+//! working directory, sets `PR_SET_NO_NEW_PRIVS`, comes under `ptrace` with
+//! `PTRACE_TRACEME`, and stops itself. The tracer then sets the options that follow
+//! forks, clones and `exec` and kill the traced processes if the tracer dies, and
+//! resumes the child, which installs the seccomp-bpf filter and runs the program
+//! with `execve`.
+//!
+//! The own process group keeps a terminal's Ctrl-C, which the terminal sends to its
+//! foreground process group, away from the traced tree: it reaches only the
+//! tracer's process, which interrupts the tree on cancellation, so the program
+//! receives the interrupt exactly once. The child's standard streams are pipes or
+//! `/dev/null`, never the terminal, so leaving the terminal's process group changes
+//! nothing else.
 //!
 //! Between `fork` and `execve` the child runs only async-signal-safe `libc` calls on
 //! data prepared before the fork, because other threads of the tracer's process may
@@ -67,11 +75,13 @@ pub(crate) enum Step {
     Filter,
     /// Running the program with `execve`.
     Exec,
+    /// Moving into a process group of its own.
+    ProcessGroup,
 }
 
 impl Step {
     /// Every step, in the order of their codes.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Stdio,
         Self::Signals,
         Self::WorkingDirectory,
@@ -80,6 +90,7 @@ impl Step {
         Self::Stop,
         Self::Filter,
         Self::Exec,
+        Self::ProcessGroup,
     ];
 
     /// The code the child writes for this step.
@@ -93,6 +104,7 @@ impl Step {
             Self::Stop => 6,
             Self::Filter => 7,
             Self::Exec => 8,
+            Self::ProcessGroup => 9,
         }
     }
 
@@ -112,6 +124,7 @@ impl Step {
             Self::Stop => "stopping for the tracer",
             Self::Filter => "installing the seccomp-bpf filter",
             Self::Exec => "running the program",
+            Self::ProcessGroup => "moving into a process group of its own",
         }
     }
 }
@@ -153,7 +166,11 @@ impl ChildFailure {
                     accesses,
                 }
             },
-            Step::NoNewPrivileges | Step::TraceMe | Step::Stop | Step::Filter => {
+            Step::NoNewPrivileges
+            | Step::TraceMe
+            | Step::Stop
+            | Step::Filter
+            | Step::ProcessGroup => {
                 TraceError::Tracer {
                     message: format!(
                         "the child of {program} failed while {}",
@@ -279,6 +296,11 @@ unsafe fn child(plan: &ChildPlan) -> ! {
     // SAFETY: every call below is async-signal-safe and gets valid arguments from
     // `plan`.
     unsafe {
+        // First, so that a terminal's Ctrl-C reaches the child, which still runs
+        // the tracer's signal handlers, for as short a time as possible.
+        if libc::setpgid(0, 0) == -1 {
+            fail(plan.report, Step::ProcessGroup);
+        }
         if libc::dup2(plan.stdin, libc::STDIN_FILENO) == -1
             || libc::dup2(plan.stdout, libc::STDOUT_FILENO) == -1
             || libc::dup2(plan.stderr, libc::STDERR_FILENO) == -1
@@ -531,6 +553,7 @@ mod tests {
         ));
         assert!(failure(Step::TraceMe, libc::EPERM).is_tracer_failure());
         assert!(failure(Step::Filter, libc::EACCES).is_tracer_failure());
+        assert!(failure(Step::ProcessGroup, libc::EPERM).is_tracer_failure());
     }
 
     #[test]

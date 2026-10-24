@@ -512,8 +512,11 @@ impl EchoSink for StdioEcho {
 /// A shared flag that cancels a running request.
 ///
 /// Clones share the flag, so the engine keeps one clone and hands another to the
-/// tracer. When the flag is set, the tracer stops the request's whole process tree
-/// and returns its result, which reports the terminating signal.
+/// tracer. When the flag is set, the tracer interrupts the request's process tree,
+/// kills whatever remains of it after a grace period, and returns its result once
+/// the whole tree has exited. The result reports how the command ended: by a
+/// signal, or with an exit code that the command chose after it handled the
+/// interrupt.
 #[derive(Debug, Clone, Default)]
 pub struct Cancellation {
     /// Whether cancellation was requested.
@@ -762,8 +765,10 @@ pub trait Tracer: Send + Sync {
     /// it did.
     ///
     /// When [`RunRequest::echo`] is set, output also goes to `echo` live. When
-    /// `cancel` is set while the command runs, the tracer stops the whole process
-    /// tree and returns the result.
+    /// `cancel` is set while the command runs, the tracer interrupts the whole
+    /// process tree, kills whatever remains of it after a grace period, and returns
+    /// the result once the tree has exited; the command may then have ended by a
+    /// signal or with an exit code.
     ///
     /// # Errors
     ///

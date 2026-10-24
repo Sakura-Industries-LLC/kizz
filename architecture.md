@@ -686,6 +686,7 @@ This is the first version of the rule, to be refined later.
   since any of them may be the cause.
 * Steps that finished before a failure keep their cache entries.
 * On Ctrl-C, kizz starts nothing new, the running command receives the interrupt, and its result is not cached.
+  Kizz kills every process of the command that is still running 2 seconds after the interrupt.
   Kizz then releases and deletes the lock file, closes the database, and exits with status 130.
 
 ## Crates and module boundaries

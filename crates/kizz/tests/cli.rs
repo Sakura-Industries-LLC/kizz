@@ -47,12 +47,10 @@ fn kizz(args: &[&str]) -> io::Result<Run> {
     })
 }
 
-/// Every scaffolded command, with the name its scaffold message shows. `kizz list`
-/// and `kizz why` are implemented, and `tests/list.rs` and `tests/why.rs` cover them.
-const STUBS: [(&[&str], &str); 9] = [
-    (&["build"], "build"),
-    (&["build", "ci"], "build"),
-    (&["build", "--sequential", "--explain", "ci+check"], "build"),
+/// Every scaffolded command, with the name its scaffold message shows. `kizz build`,
+/// `kizz list`, and `kizz why` are implemented, and `tests/build.rs`, `tests/list.rs`,
+/// and `tests/why.rs` cover them.
+const STUBS: [(&[&str], &str); 6] = [
     (&["cache", "clean"], "cache clean"),
     (&["cache", "reset"], "cache reset"),
     (&["cache", "reset", "--all", "--yes"], "cache reset"),
@@ -141,8 +139,6 @@ fn each_subcommand_prints_its_stub_message() {
 /// A scaffold message names the target or path it was given.
 #[test]
 fn stub_messages_name_their_target() {
-    let build = kizz(&["build", "ci+check"]).unwrap();
-    assert!(build.stdout.contains("target: ci+check"), "{build:?}");
     let reset = kizz(&["cache", "reset", "sub/dir"]).unwrap();
     assert!(reset.stdout.contains("target: sub/dir"), "{reset:?}");
 }

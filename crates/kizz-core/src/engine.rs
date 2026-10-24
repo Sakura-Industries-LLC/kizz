@@ -35,15 +35,17 @@
 //! always run"). A key first reached in a later pass runs once then.
 //!
 //! Results that are not cached ("Results that are not cached"): a command killed by
-//! a signal, interrupted ones included, a run that the tracer reports as
-//! incompletely traced, and a command that could not start for a reason other than a
-//! missing or non-executable program. Their record is marked with why, which makes
-//! it a record that is never a cache hit and replaces any older record of the step
-//! key, so no older result is replayed. The engine also keeps the paths such a
-//! command touched, with their states, in memory for the rest of the build: when
-//! the step comes up again, it runs again only if one of them changed, and otherwise
-//! its result is returned again without running. In a later build, the marked
-//! record makes the step run again, with that stated as the reason.
+//! a signal, every run that returns once cancellation has been requested, whether a
+//! signal ended it or it exited with a code after it handled the interrupt, a run
+//! that the tracer reports as incompletely traced, and a command that could not
+//! start for a reason other than a missing or non-executable program. Their record
+//! is marked with why, which makes it a record that is never a cache hit and
+//! replaces any older record of the step key, so no older result is replayed. The
+//! engine also keeps the paths such a command touched, with their states, in memory
+//! for the rest of the build: when the step comes up again, it runs again only if
+//! one of them changed, and otherwise its result is returned again without running.
+//! In a later build, the marked record makes the step run again, with that stated
+//! as the reason.
 //!
 //! A missing or non-executable program fails the task and is recorded like any
 //! other failure, with every path checked and the failure message, which a cache hit
@@ -1036,16 +1038,22 @@ impl TaskSteps<'_> {
     }
 
     /// Why the result `result` of a run is not cached, or `None` when it is.
+    ///
+    /// Every run that returns once cancellation has been requested is interrupted,
+    /// however it ended: by a signal, or with an exit code that the command chose
+    /// after it handled the interrupt.
     fn not_cached_reason(
         &self,
         result: &RunResult,
     ) -> Option<NotCachedReason> {
-        if let Termination::Signaled(signal) = result.termination {
-            return Some(if self.engine.cancel.is_cancelled() {
-                NotCachedReason::Interrupted { signal }
-            } else {
-                NotCachedReason::Signaled { signal }
+        if self.engine.cancel.is_cancelled() {
+            return Some(match result.termination {
+                Termination::Signaled(signal) => NotCachedReason::Interrupted { signal },
+                Termination::Exited(code) => NotCachedReason::InterruptedExited { code },
             });
+        }
+        if let Termination::Signaled(signal) = result.termination {
+            return Some(NotCachedReason::Signaled { signal });
         }
         result.incomplete.as_ref().map(|reason| {
             NotCachedReason::Incomplete {

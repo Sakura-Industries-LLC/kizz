@@ -936,7 +936,9 @@ fn show(
 }
 
 /// A tracer whose runs read `outcome` in the project and end as it says: `signal`,
-/// `interrupt`, `incomplete`, `start`, or anything else for exit status 0.
+/// `interrupt` (a signal stops the command), `handled` (the command handles the
+/// interrupt and exits with code 130), `incomplete`, `start`, or anything else for
+/// exit status 0.
 fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
     FakeTracer::new(move |request| {
         let text = fs::read_to_string(&outcome).map_err(|error| tracer_failure(&error))?;
@@ -944,6 +946,7 @@ fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
         let termination = match text.as_str() {
             "signal" => Termination::Signaled(9),
             "interrupt" => Termination::Signaled(2),
+            "handled" => Termination::Exited(130),
             _ => Termination::Exited(0),
         };
         if text == "start" {
@@ -963,6 +966,12 @@ fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
     })
 }
 
+/// Whether a run that ends as `kind` says, for the outcome tracer, runs after
+/// cancellation was requested, as an interrupted command does.
+fn cancelled(kind: &str) -> bool {
+    matches!(kind, "interrupt" | "handled")
+}
+
 /// Why a run that ends as `kind` says, for the outcome tracer, is not cached, for
 /// the program `program`.
 fn not_cached_reason(
@@ -972,6 +981,7 @@ fn not_cached_reason(
     match kind {
         "signal" => NotCachedReason::Signaled { signal: 9 },
         "interrupt" => NotCachedReason::Interrupted { signal: 2 },
+        "handled" => NotCachedReason::InterruptedExited { code: 130 },
         "incomplete" => {
             NotCachedReason::Incomplete {
                 detail: "a system call used a non-native interface: int 0x80".to_owned(),
@@ -992,17 +1002,19 @@ fn not_cached_reason(
 /// Each kind of result that is not cached leaves only a record marked with why,
 /// which is never a cache hit. Within the build, the step is not run again while
 /// nothing it touched changed, and runs again when something did; each new build
-/// runs it again, with that stated as the reason.
+/// runs it again, with that stated as the reason. With cancellation requested, a
+/// run that exits with a code after it handled the interrupt is such a result, like
+/// one that a signal stopped.
 #[test]
 fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
-    for kind in ["signal", "interrupt", "incomplete", "start"] {
+    for kind in ["signal", "interrupt", "handled", "incomplete", "start"] {
         let fixture = Fixture::new()?;
         let why = not_cached_reason(kind, &fixture.path("bin/tool"));
         let outcome = fixture.write_old("outcome", kind)?;
         let tracer = outcome_tracer(outcome.clone());
         let step = fixture.step(&["tool"])?;
         let cancel = Cancellation::new();
-        if kind == "interrupt" {
+        if cancelled(kind) {
             cancel.cancel();
         }
         let store = fixture.store()?;
@@ -1031,15 +1043,19 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
             other => return Err(format!("{kind}: {other:?}").into()),
         }
 
+        // With cancellation still requested, the rerun returns once cancellation has
+        // been requested, so it is interrupted too, even though it exits with 0.
+        let rerun_why = cancelled(kind).then_some(NotCachedReason::InterruptedExited { code: 0 });
         fs::write(&outcome, "ok")?;
         let rerun = engine.task(PROGRAM, fixture.dir()?).execute(&step)?;
         assert!(!rerun.cached, "{kind}");
         assert_eq!(tracer.runs(), 2, "{kind}");
-        assert_eq!(engine.not_cached(), Vec::new(), "{kind}");
+        let rerun_not_cached: Vec<_> = rerun_why.iter().map(|why| (key, why.clone())).collect();
+        assert_eq!(engine.not_cached(), rerun_not_cached, "{kind}");
         drop(engine);
         store.close()?;
         let record = fixture.record(&step)?.ok_or("no record")?;
-        assert_eq!(record.not_cached, None, "{kind}");
+        assert_eq!(record.not_cached, rerun_why, "{kind}");
         assert_eq!(record.reason, RunReason::NotCached {
             why: why.clone(),
             differences: vec![difference(outcome.clone(), Change::Size {
@@ -1054,7 +1070,7 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
         fs::write(&outcome, kind)?;
         for _ in 0..2 {
             let cancel = Cancellation::new();
-            if kind == "interrupt" {
+            if cancelled(kind) {
                 cancel.cancel();
             }
             let built = fixture.build_with(&tracer, cancel, &[&step])?;
@@ -1079,7 +1095,7 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
 /// and only the build after that is a cache hit.
 #[test]
 fn an_older_record_is_never_replayed_after_a_result_that_is_not_cached() -> TestResult {
-    for kind in ["signal", "interrupt", "incomplete", "start"] {
+    for kind in ["signal", "interrupt", "handled", "incomplete", "start"] {
         let fixture = Fixture::new()?;
         let why = not_cached_reason(kind, &fixture.path("bin/tool"));
         let outcome = fixture.write_old("outcome", "ok")?;
@@ -1093,7 +1109,7 @@ fn an_older_record_is_never_replayed_after_a_result_that_is_not_cached() -> Test
 
         fs::write(&outcome, kind)?;
         let cancel = Cancellation::new();
-        if kind == "interrupt" {
+        if cancelled(kind) {
             cancel.cancel();
         }
         let failed = fixture.build_with(&tracer, cancel, &[&step])?;

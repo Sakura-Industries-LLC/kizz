@@ -274,13 +274,31 @@ pub(crate) fn thread_group(tid: pid_t) -> io::Result<pid_t> {
         })
 }
 
-/// Wait until a child or tracee of the calling thread changes state, without
-/// collecting the change, and return its thread ID, or `None` when the calling
-/// thread has no child or tracee left to wait for.
-///
-/// The wait covers every child of the calling thread, so the caller must be a
-/// thread whose only children are the traced program's first process.
-pub(crate) fn wait_pending() -> io::Result<Option<pid_t>> {
+/// A state change of a child or tracee that a wait reported without collecting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pending {
+    /// The thread is in a stop, which this wait status describes. The stop stays
+    /// in place until the tracer either collects it with [`collect`] or resumes
+    /// or kills the thread.
+    ///
+    /// While a signal-delivery stop is in place, the thread keeps the signal it is
+    /// about to receive; collecting the stop clears it, and the signal is then
+    /// delivered only if the tracer resumes the thread with it. A thread that is
+    /// killed in a stop that is still in place, for example when another thread of
+    /// its process runs `exec`, queues its signal again for its process.
+    Stopped(c_int),
+    /// The thread has exited; [`collect`] collects its exit.
+    Ended,
+}
+
+/// Wait for a state change of a child or tracee of the calling thread, with the
+/// `waitid` target `id_type` and `id` and the extra `flags`, without collecting it,
+/// and return the thread and the change, or `None` when there is nothing to report.
+fn peek(
+    id_type: libc::idtype_t,
+    id: libc::id_t,
+    flags: c_int,
+) -> io::Result<Option<(pid_t, Pending)>> {
     loop {
         // SAFETY: `siginfo_t` is plain data, for which all zero bytes are a valid
         // value.
@@ -288,23 +306,56 @@ pub(crate) fn wait_pending() -> io::Result<Option<pid_t>> {
         // SAFETY: `info` is a valid `siginfo_t` for `waitid` to fill.
         let ret = unsafe {
             libc::waitid(
-                libc::P_ALL,
-                0,
+                id_type,
+                id,
                 &raw mut info,
-                libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT | WAIT_FLAGS,
+                libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT | WAIT_FLAGS | flags,
             )
         };
         match check(ret) {
             Ok(_) => {
-                // SAFETY: a successful `waitid` for a child filled in the child
-                // fields of `info`.
-                return Ok(Some(unsafe { info.si_pid() }));
+                // SAFETY: a successful `waitid` filled in the child fields of
+                // `info`, or left them zero when `WNOHANG` found no change.
+                let pid = unsafe { info.si_pid() };
+                if pid == 0 {
+                    return Ok(None);
+                }
+                let pending = if matches!(info.si_code, libc::CLD_TRAPPED | libc::CLD_STOPPED) {
+                    // SAFETY: as above. For a stop, the status holds the signal and,
+                    // for a `ptrace` event stop, the event in the bits above it, as
+                    // a wait status does from its second byte on.
+                    let code = unsafe { info.si_status() };
+                    Pending::Stopped(code.checked_shl(8).unwrap_or(0) | 0x7F)
+                } else {
+                    Pending::Ended
+                };
+                return Ok(Some((pid, pending)));
             },
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
             Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(None),
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Wait until a child or tracee of the calling thread changes state, without
+/// collecting the change, and return its thread ID and the change, or `None` when
+/// the calling thread has no child or tracee left to wait for.
+///
+/// The wait covers every child of the calling thread, so the caller must be a
+/// thread whose only children are the traced program's first process.
+pub(crate) fn wait_pending() -> io::Result<Option<(pid_t, Pending)>> {
+    peek(libc::P_ALL, 0, 0)
+}
+
+/// The state change of the thread `pid` that a wait would report now, without
+/// collecting it, or `None` when there is none or `pid` is not a child or tracee
+/// of the calling thread.
+#[cfg(test)]
+pub(crate) fn pending(pid: pid_t) -> io::Result<Option<Pending>> {
+    let id = libc::id_t::try_from(pid)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    Ok(peek(libc::P_PID, id, libc::WNOHANG)?.map(|(_, pending)| pending))
 }
 
 /// Collect the waiting state change of `pid`, if it has one, and return its wait

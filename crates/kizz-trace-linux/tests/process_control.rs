@@ -28,10 +28,10 @@ use std::{
 };
 
 use kizz_trace::{
-    AbsolutePath, Cancellation, CaptureMode, CapturedOutput, EchoSink, IncompleteReason,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Cancellation, CaptureMode, CapturedOutput, EchoSink,
+    IncompleteReason, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
-use kizz_trace_linux::LinuxTracer;
+use kizz_trace_linux::{CANCEL_GRACE_PERIOD, LinuxTracer};
 
 /// The variable that selects the helper mode of this test executable.
 const HELPER_VARIABLE: &str = "KIZZ_TRACE_TEST_HELPER";
@@ -460,6 +460,9 @@ fn a_handled_signal_is_delivered_to_the_program() {
     assert_eq!(split(&result.output).unwrap().0, "caught\n");
 }
 
+/// Cancellation interrupts every process of the tree once and kills, at the end of
+/// the grace period, the background processes, which the shell starts with `SIGINT`
+/// ignored.
 #[test]
 fn cancellation_stops_the_whole_process_tree() {
     let dir = tempfile::tempdir().unwrap();
@@ -478,7 +481,8 @@ fn cancellation_stops_the_whole_process_tree() {
         (tracer.join().unwrap(), pids)
     });
     let result = result.unwrap();
-    assert_eq!(result.termination, Termination::Signaled(libc::SIGKILL));
+    // The shell ends at the interrupt; the run ends after the escalation.
+    assert_eq!(result.termination, Termination::Signaled(libc::SIGINT));
     for pid in pids {
         assert!(
             exits_in_time(pid).unwrap(),
@@ -488,10 +492,12 @@ fn cancellation_stops_the_whole_process_tree() {
 }
 
 /// Cancel the helper `mode` at ten different moments after it has written its
-/// process ID, and fail unless each run ends killed and its first process is gone.
+/// process ID, and fail unless each run ends at the interrupt, which the helper
+/// does not handle, and its first process is gone.
 ///
 /// Every process and thread of the tree holds the output pipes, so a run ends only
-/// once all of them have exited.
+/// once all of them have exited, the processes created after the interrupt at the
+/// escalation.
 fn cancel_helper_at_different_moments(mode: &str) -> Outcome<()> {
     for delay in 0..10_u64 {
         let dir = tempfile::tempdir()?;
@@ -514,7 +520,7 @@ fn cancel_helper_at_different_moments(mode: &str) -> Outcome<()> {
         let result = receiver
             .recv_timeout(PATIENCE)
             .map_err(|_| format!("the run cancelled after {delay} ms did not end"))??;
-        if result.termination != Termination::Signaled(libc::SIGKILL) {
+        if result.termination != Termination::Signaled(libc::SIGINT) {
             return Err(format!("the run ended with {:?}", result.termination).into());
         }
         if !exits_in_time(root)? {
@@ -535,6 +541,110 @@ fn cancellation_while_threads_run_exec_stops_the_whole_tree() {
     // Cancellation meets threads that do not lead their process while they run
     // `exec` and release their former IDs.
     cancel_helper_at_different_moments("thread_exec").unwrap();
+}
+
+/// Run `request`, cancel it once the file `ready` holds a process ID, and return the
+/// result and how long the run went on after cancellation.
+fn run_cancelled_when_ready(
+    request: &RunRequest,
+    ready: &Path,
+) -> Outcome<(RunResult, Duration)> {
+    let cancel = Cancellation::new();
+    thread::scope(|scope| {
+        let tracer = scope.spawn(|| LinuxTracer::new().run(request, &Recorder::default(), &cancel));
+        let waited = read_pid(ready);
+        // Cancelled even when `ready` never appeared, so the run ends.
+        cancel.cancel();
+        let cancelled = Instant::now();
+        let result = tracer.join().map_err(|_| "the tracing thread panicked")?;
+        let after = cancelled.elapsed();
+        waited?;
+        Ok((result?, after))
+    })
+}
+
+/// A command that handles `SIGINT` receives exactly one, and its handler runs to the
+/// end during the grace period: a process that it starts runs, the file that process
+/// writes is among the run's accesses, and the run reports the exit code the
+/// command chose, with its output captured.
+#[test]
+fn a_command_that_handles_the_interrupt_receives_it_once_and_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().canonicalize().unwrap();
+    let dir_arg = dir_path.to_str().unwrap();
+    let request = shell(
+        r#"trap 'echo interrupt >> "$1/interrupts"; sleep 0.3; cp "$1/interrupts" "$1/handled"; echo handled; exit 42' INT; echo $$ > "$1/ready"; while :; do sleep 0.05; done"#,
+        &[dir_arg],
+    )
+    .unwrap();
+    let (result, after) = run_cancelled_when_ready(&request, &dir_path.join("ready")).unwrap();
+    assert_eq!(result.termination, Termination::Exited(42));
+    assert_eq!(
+        split(&result.output).unwrap(),
+        ("handled\n".to_owned(), String::new())
+    );
+    assert_eq!(
+        fs::read_to_string(dir_path.join("interrupts")).unwrap(),
+        "interrupt\n"
+    );
+    let handled = dir_path.join("handled");
+    assert_eq!(fs::read_to_string(&handled).unwrap(), "interrupt\n");
+    let kinds = result.accesses.get(&AbsolutePath::new(&handled).unwrap());
+    assert!(
+        kinds.is_some_and(|kinds| kinds.contains(AccessKind::Write)),
+        "{kinds:?}"
+    );
+    assert!(after < CANCEL_GRACE_PERIOD, "the run took {after:?}");
+}
+
+/// A command that does not handle `SIGINT` ends at the interrupt, and the run
+/// returns as soon as the tree has exited, well before the grace period ends.
+#[test]
+fn a_command_that_does_not_handle_the_interrupt_ends_at_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_arg = dir.path().to_str().unwrap();
+    let request = shell(r#"echo $$ > "$1/ready"; exec sleep 1000"#, &[dir_arg]).unwrap();
+    let (result, after) = run_cancelled_when_ready(&request, &dir.path().join("ready")).unwrap();
+    assert_eq!(result.termination, Termination::Signaled(libc::SIGINT));
+    assert!(after < CANCEL_GRACE_PERIOD, "the run took {after:?}");
+}
+
+/// A command that ignores `SIGINT`, and a process it started, are killed when the
+/// grace period ends, and nothing of the tree survives.
+#[test]
+fn a_command_that_ignores_the_interrupt_is_killed_after_the_grace_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_arg = dir.path().to_str().unwrap();
+    let request = shell(
+        r#"trap '' INT; sleep 1000 & echo $! > "$1/child"; echo $$ > "$1/ready"; wait"#,
+        &[dir_arg],
+    )
+    .unwrap();
+    let (result, after) = run_cancelled_when_ready(&request, &dir.path().join("ready")).unwrap();
+    assert_eq!(result.termination, Termination::Signaled(libc::SIGKILL));
+    assert!(after >= CANCEL_GRACE_PERIOD, "the run took {after:?}");
+    for name in ["child", "ready"] {
+        let pid = read_pid(&dir.path().join(name)).unwrap();
+        assert!(
+            exits_in_time(pid).unwrap(),
+            "process {pid} survived cancellation"
+        );
+    }
+}
+
+/// The program runs in a process group of its own, which its first process leads,
+/// so a Ctrl-C that a terminal sends to the tracer's process group never reaches it.
+#[test]
+fn the_program_runs_in_a_process_group_of_its_own() {
+    let result = run(&shell(r"cut -d ' ' -f 5 /proc/$$/stat; echo $$", &[]).unwrap()).unwrap();
+    assert_eq!(result.termination, Termination::Exited(0));
+    let (stdout, _) = split(&result.output).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    assert_eq!(lines.first(), lines.get(1), "{stdout}");
+    // SAFETY: `getpgrp` has no requirements.
+    let own = unsafe { libc::getpgrp() };
+    assert_ne!(lines.first().copied(), Some(own.to_string().as_str()));
 }
 
 #[test]

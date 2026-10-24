@@ -14,8 +14,34 @@
 //!
 //! The tree has ended when the thread has nothing left to wait for. A process or
 //! thread whose creation the loop has not seen yet is still a tracee of the thread,
-//! so the loop keeps waiting for it, and kills it after cancellation, before it
+//! so the loop keeps waiting for it, and kills it after the escalation, before it
 //! ends.
+//!
+//! # Cancellation
+//!
+//! When the request is cancelled, the cancellation watchdog interrupts the tree: it
+//! sends `SIGINT` once to every live process. For a grace period the loop then
+//! follows the tree as it does without cancellation: it delivers every signal,
+//! `SIGINT` included, records every access, and follows the processes and threads
+//! the tree creates, for example from a handler. When the grace period ends with
+//! some of the tree still running, the watchdog escalates: it sets the
+//! [`Escalation`] flag and sends `SIGKILL` to every live process, and from then on
+//! the loop kills each thread at its next stop and each new thread at once.
+//!
+//! # Signals
+//!
+//! A thread that is about to receive a signal stops first, and the loop resumes it
+//! with the signal. The loop handles such a stop while it is still in place,
+//! without collecting it: a collected stop no longer holds the signal, so a thread
+//! killed before the loop resumed it would lose the signal, and its process would
+//! go on without it. That happens to every other thread of a process when one of
+//! them runs `exec`, which kills them, and the process lives on in the new program.
+//! A thread killed in a stop that is still in place queues its signal again for its
+//! process, so the interrupt that cancellation sends reaches the process even when
+//! the thread that took it dies in another thread's `exec`. Event stops and stops
+//! at the exit of a system call hold no signal and are collected before the loop
+//! handles them: Linux refuses every request for a thread that stopped at an
+//! `exec` under an ID it took over until that stop is collected.
 //!
 //! # Which IDs are signaled
 //!
@@ -33,11 +59,11 @@
 //! other thread of its process has exited, and an `exec` by another thread hands
 //! that thread the same ID. The loop collects a leader's exit only while it holds
 //! the mutex, and removes the ID at the same time, so every ID in the set names a
-//! process of the tree, and the watchdog's `SIGKILL`, which kills every thread of
-//! a process, never reaches another process.
+//! process of the tree, and the watchdog's `SIGINT` and `SIGKILL`, which are sent
+//! to a whole process, never reach another process.
 //!
 //! The loop itself signals a thread by its own ID only when the thread cannot run
-//! `exec`: it is in a `ptrace` stop that the loop collected and has not resumed, or
+//! `exec`: it is in a `ptrace` stop that the loop has seen and not resumed, or
 //! it was just created and has not run yet.
 //!
 //! # System calls
@@ -57,10 +83,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map},
     io, mem,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{
+        Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use kizz_trace::{Accesses, Cancellation, IncompleteReason, Termination};
+use kizz_trace::{Accesses, IncompleteReason, Termination};
 use libc::{c_int, c_long, c_ulong, pid_t};
 
 use crate::{decode, filter, sys};
@@ -80,15 +109,55 @@ pub(crate) fn lock(live: &LiveProcesses) -> MutexGuard<'_, BTreeSet<pid_t>> {
     live.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Send `SIGKILL` to every live process, which kills all of its threads.
+/// Whether the grace period after cancellation has ended with some of the tree
+/// still running, so the tracer kills the tree. Shared by the event loop and the
+/// cancellation watchdog, which sets it.
+#[derive(Debug)]
+pub(crate) struct Escalation(AtomicBool);
+
+impl Escalation {
+    /// A flag that is not set: the tree is not being killed.
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Note that the tree is being killed. Set it before the live processes are
+    /// killed, so a process that the loop adds to the live set after they were
+    /// killed is killed by the loop.
+    pub(crate) fn escalate(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the tree is being killed.
+    pub(crate) fn is_escalated(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Send `signal` to every live process.
 ///
 /// The set stays locked while the signals are sent, so the loop cannot collect the
 /// exit of a process in between, and every ID still names a process of the tree.
-pub(crate) fn kill_all(live: &LiveProcesses) {
+fn signal_all(
+    live: &LiveProcesses,
+    signal: c_int,
+) {
     for &pid in lock(live).iter() {
         // A process that already exited needs no signal.
-        drop(sys::kill(pid, libc::SIGKILL));
+        drop(sys::kill(pid, signal));
     }
+}
+
+/// Interrupt the tree after cancellation: send `SIGINT` once to every live process,
+/// under the rules of [`signal_all`].
+pub(crate) fn interrupt_all(live: &LiveProcesses) {
+    signal_all(live, libc::SIGINT);
+}
+
+/// Send `SIGKILL` to every live process, which kills all of its threads, under the
+/// rules of [`signal_all`].
+pub(crate) fn kill_all(live: &LiveProcesses) {
+    signal_all(live, libc::SIGKILL);
 }
 
 /// Whether a traced thread leads its process, so its ID is the process ID.
@@ -96,7 +165,7 @@ pub(crate) fn kill_all(live: &LiveProcesses) {
 /// The thread must be one the loop has not resumed since it was created, or one in
 /// a `ptrace` stop, so its ID cannot have been released. When the answer cannot be
 /// read, the thread is taken not to lead, so the watchdog never signals its ID; the
-/// loop still kills it at its next stop after cancellation.
+/// loop still kills it at its next stop after the escalation.
 fn leads_its_process(tid: pid_t) -> bool {
     sys::thread_group(tid).is_ok_and(|process| process == tid)
 }
@@ -153,9 +222,11 @@ struct Tree<'a> {
     /// The processes of the threads in `tracees`, by the IDs of the threads that
     /// lead them, shared with the cancellation watchdog.
     live: &'a LiveProcesses,
-    /// The request's cancellation flag.
-    cancel: &'a Cancellation,
-    /// Whether the loop has already killed every live process after cancellation.
+    /// Whether the grace period after cancellation has ended, so the tree is
+    /// being killed.
+    escalation: &'a Escalation,
+    /// Whether the loop has already killed every live process after the
+    /// escalation.
     killed: bool,
     /// What the loop has observed so far.
     outcome: Outcome,
@@ -185,21 +256,34 @@ fn ended(status: c_int) -> bool {
     libc::WIFEXITED(status) || libc::WIFSIGNALED(status)
 }
 
-/// A collected state change: the thread, and its wait status, or `None` when the
-/// change was gone by the time it was collected.
+/// A state change that the loop takes: the thread, and its wait status, or `None`
+/// when the change was gone by the time it was collected.
 type Change = (pid_t, Option<c_int>);
 
-/// Collect the next state change of a thread of the tree, or return `None` when the
-/// calling thread has nothing left to wait for, which means that every process and
-/// thread of the tree has exited and been collected.
+/// Whether a stop stays in place while the loop handles it: a stop for a signal,
+/// either a signal-delivery stop or a group stop, which holds the signal until the
+/// loop resumes the thread. A `ptrace` event stop and a stop at the exit of a system
+/// call hold none and are collected.
+fn stays_in_place(status: c_int) -> bool {
+    sys::stop_event(status) == 0 && libc::WSTOPSIG(status) != SYSTEM_CALL_STOP
+}
+
+/// Take a change of the thread `pid` that a wait reported: leave a stop for a
+/// signal in place, and collect any other change, and return the wait status.
 ///
 /// An exit is collected while the live set is locked. When the thread leads its
 /// process, the process has ended and leaves the set at the same time; any other
 /// thread's ID was never in the set.
-fn next_change(live: &LiveProcesses) -> io::Result<Option<Change>> {
-    let Some(pid) = sys::wait_pending()? else {
-        return Ok(None);
-    };
+fn take(
+    live: &LiveProcesses,
+    pid: pid_t,
+    pending: sys::Pending,
+) -> io::Result<Option<c_int>> {
+    if let sys::Pending::Stopped(status) = pending
+        && stays_in_place(status)
+    {
+        return Ok(Some(status));
+    }
     let mut live = lock(live);
     let status = sys::collect(pid)?;
     if let Some(status) = status
@@ -207,7 +291,17 @@ fn next_change(live: &LiveProcesses) -> io::Result<Option<Change>> {
     {
         live.remove(&pid);
     }
-    Ok(Some((pid, status)))
+    Ok(status)
+}
+
+/// Take the next state change of a thread of the tree, or return `None` when the
+/// calling thread has nothing left to wait for, which means that every process and
+/// thread of the tree has exited and been collected.
+fn next_change(live: &LiveProcesses) -> io::Result<Option<Change>> {
+    let Some((pid, pending)) = sys::wait_pending()? else {
+        return Ok(None);
+    };
+    Ok(Some((pid, take(live, pid, pending)?)))
 }
 
 impl<'a> Tree<'a> {
@@ -215,7 +309,7 @@ impl<'a> Tree<'a> {
     fn new(
         root: pid_t,
         live: &'a LiveProcesses,
-        cancel: &'a Cancellation,
+        escalation: &'a Escalation,
     ) -> Self {
         lock(live).insert(root);
         Self {
@@ -223,7 +317,7 @@ impl<'a> Tree<'a> {
             tracees: BTreeMap::from([(root, Tracee::new(false, true))]),
             exited_unannounced: BTreeSet::new(),
             live,
-            cancel,
+            escalation,
             killed: false,
             outcome: Outcome {
                 termination: None,
@@ -318,7 +412,7 @@ impl<'a> Tree<'a> {
         Ok(())
     }
 
-    /// Handle one collected wait status of a thread.
+    /// Handle one wait status of a thread that the loop took.
     fn handle(
         &mut self,
         pid: pid_t,
@@ -358,10 +452,10 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Kill the process of a stopped thread after cancellation; the first time,
+    /// Kill the process of a stopped thread after the escalation; the first time,
     /// kill every live process as well.
     ///
-    /// The thread is in a stop that the loop collected and has not resumed, so it
+    /// The thread is in a stop that the loop has seen and not resumed, so it
     /// cannot have run `exec`, and its ID still names it.
     fn kill(
         &mut self,
@@ -391,7 +485,7 @@ impl<'a> Tree<'a> {
         if signal == libc::SIGTRAP && event != 0 {
             return self.event_stop(pid, event);
         }
-        if self.cancel.is_cancelled() {
+        if self.escalation.is_escalated() {
             return self.kill(pid);
         }
         if signal == SYSTEM_CALL_STOP && event == 0 {
@@ -405,6 +499,11 @@ impl<'a> Tree<'a> {
             tracee.awaiting_initial_stop = false;
             return unless_vanished(sys::resume(pid, 0));
         }
+        // The stop is still in place, so a thread that vanished since it stopped,
+        // killed by another thread's `exec` for example, queued the signal again
+        // for its process, and the request fails without losing it. A thread that
+        // took over the ID in its `exec` refuses the request too, until the loop
+        // collects its `exec` stop.
         match sys::has_signal_info(pid) {
             // A signal-delivery stop: deliver the signal.
             Ok(true) => self.resume(pid, signal),
@@ -483,8 +582,9 @@ impl<'a> Tree<'a> {
 
     /// Follow a thread or process that a thread just created at an `event`.
     ///
-    /// After cancellation a new thread is killed at once: its first stop may still
-    /// be pending, and nothing else would signal it before then.
+    /// After the escalation a new thread is killed at once: its first stop may
+    /// still be pending, and nothing else would signal it before then. During the
+    /// grace period after cancellation it runs, as it does without cancellation.
     fn created(
         &mut self,
         child: pid_t,
@@ -495,9 +595,9 @@ impl<'a> Tree<'a> {
             return Ok(());
         }
         if let Some(tracee) = self.tracees.get_mut(&child) {
-            // Its first stop came first and was handled: after cancellation it was
-            // killed then; otherwise it may be running now, and only the live set
-            // and its next stop may signal it.
+            // Its first stop came first and was handled: after the escalation it
+            // was killed then; otherwise it may be running now, and only the live
+            // set and its next stop may signal it.
             tracee.announced = true;
             return Ok(());
         }
@@ -505,7 +605,7 @@ impl<'a> Tree<'a> {
         // it was asked for a process.
         let leader = event != libc::PTRACE_EVENT_CLONE || leads_its_process(child);
         self.adopt(child, Tracee::new(true, true), leader);
-        if self.cancel.is_cancelled() {
+        if self.escalation.is_escalated() {
             // The new thread has not run since it was created, so it cannot have
             // run `exec`, and its ID still names it.
             return unless_vanished(sys::kill(child, libc::SIGKILL));
@@ -513,10 +613,10 @@ impl<'a> Tree<'a> {
         Ok(())
     }
 
-    /// Handle a `ptrace` event stop, then resume the thread, or kill it after
-    /// cancellation.
+    /// Handle a `ptrace` event stop, then resume the thread, or kill it after the
+    /// escalation.
     ///
-    /// The event is handled even after cancellation, so a thread or process
+    /// The event is handled even after the escalation, so a thread or process
     /// created at this stop is followed and killed before the loop can end.
     fn event_stop(
         &mut self,
@@ -529,7 +629,7 @@ impl<'a> Tree<'a> {
             // still reports its first stop, and the loop waits for it.
             Err(error) => return unless_vanished(Err(error)),
         };
-        let cancelled = self.cancel.is_cancelled();
+        let escalated = self.escalation.is_escalated();
         match event {
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                 self.created(message_pid(message)?, event)?;
@@ -552,10 +652,10 @@ impl<'a> Tree<'a> {
                     }
                 }
             },
-            libc::PTRACE_EVENT_SECCOMP if !cancelled => self.seccomp_stop(pid, message),
+            libc::PTRACE_EVENT_SECCOMP if !escalated => self.seccomp_stop(pid, message),
             _ => {},
         }
-        if cancelled {
+        if escalated {
             return self.kill(pid);
         }
         self.resume(pid, 0)
@@ -599,7 +699,9 @@ impl<'a> Tree<'a> {
 /// Follow the tree whose first process is `root` until all of it has exited.
 ///
 /// `root` must be a resumed tracee, and the only child, of the calling thread.
-/// When `cancel` is set, every thread the loop sees is killed.
+/// Until `escalation` is set, the loop follows the tree in full, also during the
+/// grace period after cancellation; once it is set, every thread the loop sees is
+/// killed.
 ///
 /// # Errors
 ///
@@ -608,9 +710,9 @@ impl<'a> Tree<'a> {
 pub(crate) fn follow(
     root: pid_t,
     live: &LiveProcesses,
-    cancel: &Cancellation,
+    escalation: &Escalation,
 ) -> io::Result<Outcome> {
-    let mut tree = Tree::new(root, live, cancel);
+    let mut tree = Tree::new(root, live, escalation);
     tree.run()?;
     Ok(tree.outcome)
 }
@@ -623,7 +725,7 @@ pub(crate) fn abandon(live: &LiveProcesses) {
     // and the waits go on until nothing is left or waiting fails.
     while let Ok(Some((pid, status))) = next_change(live) {
         if status.is_some_and(|status| libc::WIFSTOPPED(status)) {
-            // The thread is in a stop that was just collected and not resumed, so
+            // The thread is in a stop that was just reported and not resumed, so
             // it cannot have run `exec`, and its ID still names it.
             drop(sys::kill(pid, libc::SIGKILL));
         }
@@ -639,6 +741,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         ffi::OsString,
         fs,
+        io::{Read as _, Write as _},
         os::fd::OwnedFd,
         path::Path,
         ptr,
@@ -720,6 +823,28 @@ mod tests {
                 }));
                 pause_forever();
             },
+            Some(mode @ ("interrupt-leader-exec" | "interrupt-thread-exec")) => {
+                // The thread that runs `exec` starts with `SIGINT` blocked, so it
+                // never takes the interrupt.
+                set_interrupt_mask(libc::SIG_BLOCK);
+                drop(thread::spawn(exec_when_released));
+                if mode == "interrupt-thread-exec" {
+                    // The test blocks `SIGINT` in the leader from its first stop on,
+                    // and every thread inherits that, so only this new thread, which
+                    // does not lead the process, takes the interrupt.
+                    drop(thread::spawn(|| {
+                        set_interrupt_mask(libc::SIG_UNBLOCK);
+                        mark_ready();
+                        pause_forever();
+                    }));
+                } else {
+                    // The leader, which no thread here can block, takes the
+                    // interrupt: Linux offers a process its signals first.
+                    set_interrupt_mask(libc::SIG_UNBLOCK);
+                    mark_ready();
+                }
+                pause_forever();
+            },
             other => panic!("unknown helper mode {other:?}"),
         }
     }
@@ -746,6 +871,58 @@ mod tests {
         }
     }
 
+    /// The signal set that holds only `SIGINT`.
+    fn interrupt_set() -> libc::sigset_t {
+        // SAFETY: `sigset_t` is plain data, for which all zero bytes are a valid
+        // value.
+        let mut set: libc::sigset_t = unsafe { mem::zeroed() };
+        // SAFETY: `set` is a valid signal set, and `SIGINT` a valid signal.
+        unsafe {
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, libc::SIGINT);
+        }
+        set
+    }
+
+    /// Block or unblock `SIGINT` in the calling thread, as `how` says.
+    fn set_interrupt_mask(how: c_int) {
+        let set = interrupt_set();
+        // SAFETY: `set` is a valid signal set, and the old mask is not asked for.
+        let ret = unsafe { libc::pthread_sigmask(how, &raw const set, ptr::null_mut()) };
+        assert_eq!(ret, 0, "could not change the signal mask");
+    }
+
+    /// Tell the test that the helper is ready, with a tracked system call that
+    /// nothing else in the helper makes and that changes nothing: `chdir` to `/`,
+    /// the working directory of every helper.
+    fn mark_ready() {
+        // SAFETY: the path is a NUL-terminated string.
+        let ret = unsafe { libc::chdir(c"/".as_ptr()) };
+        assert_eq!(
+            ret,
+            0,
+            "could not change to /: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    /// Wait until the test writes to standard input, then run `sleep` from this
+    /// thread, which does not lead its process; the `exec` kills every other thread
+    /// of the process. The program sleeps for as long as the test's patience, so a
+    /// run that lost the interrupt would end late, with an exit code.
+    fn exec_when_released() {
+        let mut byte = [0_u8];
+        io::stdin().read_exact(&mut byte).unwrap();
+        // Another thread has already taken the interrupt, so none is pending for
+        // this one, and the program must not start with `SIGINT` blocked.
+        set_interrupt_mask(libc::SIG_UNBLOCK);
+        let argv = [c"sleep".as_ptr(), c"30".as_ptr(), ptr::null()];
+        // SAFETY: the program and the arguments are NUL-terminated strings, and
+        // `argv` is a null-terminated array.
+        unsafe { libc::execv(c"/bin/sleep".as_ptr(), argv.as_ptr()) };
+        panic!("could not run sleep: {}", io::Error::last_os_error());
+    }
+
     /// Whether a process or thread has exited: it no longer exists, or it is a
     /// zombie that only waits to be collected.
     fn has_exited(pid: pid_t) -> bool {
@@ -758,36 +935,34 @@ mod tests {
         matches!(state, Some('Z' | 'X'))
     }
 
-    /// Collect the waiting state change of a known thread, if it has one, keeping
-    /// the live set as [`next_change`] does. A thread whose ID was released by an
-    /// `exec` that the loop has not handled yet has nothing to collect.
-    fn collect_known(
+    /// Take the waiting state change of a known thread, if it has one, as
+    /// [`next_change`] does. A thread whose ID was released by an `exec` that the
+    /// loop has not handled yet has nothing to take.
+    fn pending_known(
         live: &LiveProcesses,
         pid: pid_t,
     ) -> Option<c_int> {
-        let mut live = lock(live);
-        let status = match sys::collect(pid) {
-            Ok(status) => status,
-            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => None,
-            Err(error) => panic!("could not collect thread {pid}: {error}"),
-        };
-        if let Some(status) = status
-            && ended(status)
-        {
-            live.remove(&pid);
-        }
-        status
+        let pending = sys::pending(pid)
+            .unwrap_or_else(|error| panic!("could not wait for thread {pid}: {error}"))?;
+        take(live, pid, pending)
+            .unwrap_or_else(|error| panic!("could not collect thread {pid}: {error}"))
     }
 
     /// How the test hands an event to the loop after cancellation.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Handover {
-        /// The loop handles the event after cancellation.
+        /// The grace period has ended, and the loop handles the event after the
+        /// escalation.
         Event,
-        /// The watchdog kills the live processes before the loop handles the event,
-        /// as when it acts while the event happens. For a creation event, the
-        /// creator is killed, so the loop never learns of the new thread from it.
+        /// The grace period has ended, and the watchdog kills the live processes
+        /// before the loop handles the event, as when it escalates while the event
+        /// happens. For a creation event, the creator is killed, so the loop never
+        /// learns of the new thread from it.
         Watchdog,
+        /// The watchdog interrupts the live processes before the loop handles the
+        /// event, as when cancellation is requested while the event happens, and
+        /// the loop then handles it during the grace period.
+        Interrupt,
     }
 
     /// A helper that a test traces and follows by hand.
@@ -796,18 +971,32 @@ mod tests {
         root: pid_t,
         /// One report per output pipe: whether its reader reached end of file.
         finished: mpsc::Receiver<bool>,
+        /// The write end of the helper's standard input, when the test holds it.
+        gate: Option<fs::File>,
         /// The read end of the start-failure pipe, kept open while the test runs.
         _report: OwnedFd,
     }
 
     /// Start the helper `mode` under `ptrace`, with a reader on each output pipe.
     fn trace_helper(mode: &str) -> Traced {
-        let request = helper(mode);
-        let program = Program::prepare(&request).unwrap();
+        trace(&helper(mode))
+    }
+
+    /// Start the helper `mode` like [`trace_helper`], with its standard input a pipe
+    /// whose write end the test holds as [`Traced::gate`].
+    fn trace_gated_helper(mode: &str) -> Traced {
+        let mut request = helper(mode);
+        request.stdin = Some(Vec::new());
+        trace(&request)
+    }
+
+    /// Start `request` under `ptrace`, with a reader on each output pipe.
+    fn trace(request: &RunRequest) -> Traced {
+        let program = Program::prepare(request).unwrap();
         let filter = filter::program().unwrap();
-        let (child_stdio, tracer_stdio) = capture::pipes(&request).unwrap();
+        let (child_stdio, tracer_stdio) = capture::pipes(request).unwrap();
         let (report, report_write) = sys::pipe().unwrap();
-        let started = spawn::start(&request, &program, &filter, &child_stdio, report_write);
+        let started = spawn::start(request, &program, &filter, &child_stdio, report_write);
         drop(child_stdio);
         let Ok(Started::Running(root)) = started else {
             panic!("the helper did not start: {started:?}");
@@ -823,6 +1012,7 @@ mod tests {
         Traced {
             root,
             finished,
+            gate: tracer_stdio.stdin,
             _report: report,
         }
     }
@@ -848,8 +1038,8 @@ mod tests {
 
     /// Follow the tree by hand, waiting only for threads the loop already knows, so
     /// a new thread's first stop stays pending, until `wanted` picks a stop, and
-    /// return that thread and its wait status, not yet handled. The live-set
-    /// invariant is checked before every round of waits.
+    /// return that thread and its wait status, taken as the loop takes it and not
+    /// yet handled. The live-set invariant is checked before every round of waits.
     fn drive_until(
         tree: &mut Tree<'_>,
         live: &LiveProcesses,
@@ -863,7 +1053,7 @@ mod tests {
             let mut idle = true;
             let known: Vec<pid_t> = tree.tracees.keys().copied().collect();
             for pid in known {
-                let Some(status) = collect_known(live, pid) else {
+                let Some(status) = pending_known(live, pid) else {
                     continue;
                 };
                 idle = false;
@@ -878,6 +1068,78 @@ mod tests {
         }
     }
 
+    /// Follow the tree by hand like [`drive_until`] while the loop holds the stop
+    /// `held`, which it has taken and not handled yet: no change of that thread is
+    /// taken or handled. Return the first change, other than the held stop, that
+    /// `wanted` picks, as a wait reports it, not yet taken.
+    fn drive_holding(
+        tree: &mut Tree<'_>,
+        live: &LiveProcesses,
+        held: (pid_t, c_int),
+        what: &str,
+        wanted: impl Fn(pid_t, sys::Pending) -> bool,
+    ) -> (pid_t, sys::Pending) {
+        let deadline = Instant::now().checked_add(PATIENCE).unwrap();
+        loop {
+            assert!(Instant::now() < deadline, "the helper made no {what}");
+            let mut idle = true;
+            let known: Vec<pid_t> = tree.tracees.keys().copied().collect();
+            for pid in known {
+                let Some(pending) = sys::pending(pid)
+                    .unwrap_or_else(|error| panic!("could not wait for thread {pid}: {error}"))
+                else {
+                    continue;
+                };
+                if (pid, pending) != (held.0, sys::Pending::Stopped(held.1)) && wanted(pid, pending)
+                {
+                    return (pid, pending);
+                }
+                if pid == held.0 {
+                    continue;
+                }
+                idle = false;
+                if let Some(status) = take(live, pid, pending).unwrap() {
+                    tree.handle(pid, status).unwrap();
+                }
+            }
+            if idle {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Block `SIGINT` in the traced thread `pid`, which is in a `ptrace` stop.
+    fn block_interrupt(pid: pid_t) {
+        let set = interrupt_set();
+        // SAFETY: `PTRACE_SETSIGMASK` reads one kernel signal set, whose size is
+        // the address argument, from the start of `set`, which is larger.
+        let ret = unsafe {
+            libc::ptrace(
+                libc::PTRACE_SETSIGMASK,
+                pid,
+                ptr::without_provenance_mut::<libc::c_void>(mem::size_of::<u64>()),
+                (&raw const set).cast::<libc::c_void>(),
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "could not block SIGINT in {pid}: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    /// The signals pending for the whole process `pid`, as a bit set in which
+    /// signal N is the bit N - 1.
+    fn shared_pending(pid: pid_t) -> u64 {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let set = status
+            .lines()
+            .find_map(|line| line.strip_prefix("ShdPnd:"))
+            .unwrap();
+        u64::from_str_radix(set.trim(), 16).unwrap()
+    }
+
     /// Whether a wait status is a `ptrace` stop at `event`.
     fn is_event_stop(
         status: c_int,
@@ -889,20 +1151,21 @@ mod tests {
     }
 
     /// Let the loop finish after cancellation, and assert that it ended with every
-    /// thread collected, the first process killed, each of `others` gone, and no
-    /// process left that holds an output pipe.
+    /// thread collected, the first process ended by `signal`, each of `others`
+    /// gone, and no process left that holds an output pipe.
     fn finish_cancelled(
         mut tree: Tree<'_>,
         live: &LiveProcesses,
         traced: &Traced,
         others: &[pid_t],
+        signal: c_int,
     ) {
         tree.run().unwrap();
         assert!(tree.tracees.is_empty());
         assert!(lock(live).is_empty());
         assert_eq!(
             tree.outcome.termination,
-            Some(Termination::Signaled(libc::SIGKILL))
+            Some(Termination::Signaled(signal))
         );
         for &pid in others.iter().chain([&traced.root]) {
             assert!(has_exited(pid), "process {pid} survived cancellation");
@@ -918,8 +1181,8 @@ mod tests {
 
     /// Trace the helper `mode` and follow it by hand until a thread stops at a
     /// creation event `event`, with the new thread's first stop still pending.
-    /// Then cancel, hand the event over as `handover` says, and let the loop
-    /// finish: the new thread must be gone too.
+    /// Then let the grace period end, hand the event over as `handover` says, and
+    /// let the loop finish: the new thread must be gone too.
     fn cancel_at_creation(
         mode: &str,
         event: c_int,
@@ -927,8 +1190,8 @@ mod tests {
     ) {
         let traced = trace_helper(mode);
         let live = LiveProcesses::default();
-        let cancel = Cancellation::new();
-        let mut tree = Tree::new(traced.root, &live, &cancel);
+        let escalation = Escalation::new();
+        let mut tree = Tree::new(traced.root, &live, &escalation);
         let (creator, status) = drive_until(&mut tree, &live, "creation event", |_, status| {
             is_event_stop(status, event)
         });
@@ -937,13 +1200,14 @@ mod tests {
             !tree.tracees.contains_key(&created),
             "the new thread {created} was already followed"
         );
-        cancel.cancel();
+        escalation.escalate();
         match handover {
             Handover::Event => tree.handle(creator, status).unwrap(),
             Handover::Watchdog => kill_all(&live),
+            Handover::Interrupt => panic!("a creation event is handed over after the escalation"),
         }
         assert_only_processes_are_live(&tree, &live);
-        finish_cancelled(tree, &live, &traced, &[created]);
+        finish_cancelled(tree, &live, &traced, &[created], libc::SIGKILL);
     }
 
     /// Trace a helper whose thread that does not lead the process runs `exec`, and
@@ -952,13 +1216,14 @@ mod tests {
     /// cancel, hand the event over as `handover` says, and let the loop finish.
     ///
     /// The former ID must never have been in the live set: the watchdog may signal
-    /// only the process, whose ID the thread took over.
+    /// only the process, whose ID the thread took over, with `SIGKILL` after the
+    /// escalation as with the `SIGINT` that interrupts the tree.
     fn cancel_at_non_leader_exec(handover: Handover) {
         let traced = trace_helper("thread-exec");
         let root = traced.root;
         let live = LiveProcesses::default();
-        let cancel = Cancellation::new();
-        let mut tree = Tree::new(root, &live, &cancel);
+        let escalation = Escalation::new();
+        let mut tree = Tree::new(root, &live, &escalation);
         let (runner, status) = drive_until(
             &mut tree,
             &live,
@@ -983,16 +1248,30 @@ mod tests {
         // The ID is released, and the loop has not seen that yet; the watchdog
         // would signal exactly the process.
         assert_eq!(*lock(&live), BTreeSet::from([root]));
-        cancel.cancel();
-        match handover {
+        let signal = match handover {
             Handover::Event => {
+                escalation.escalate();
                 tree.handle(runner, status).unwrap();
                 assert!(!tree.tracees.contains_key(&former));
+                libc::SIGKILL
             },
-            Handover::Watchdog => kill_all(&live),
-        }
+            Handover::Watchdog => {
+                escalation.escalate();
+                kill_all(&live);
+                libc::SIGKILL
+            },
+            Handover::Interrupt => {
+                // The program the thread ran, `sleep`, ends at the interrupt, which
+                // the loop delivers during the grace period.
+                interrupt_all(&live);
+                assert_only_processes_are_live(&tree, &live);
+                tree.handle(runner, status).unwrap();
+                assert!(!tree.tracees.contains_key(&former));
+                libc::SIGINT
+            },
+        };
         assert_only_processes_are_live(&tree, &live);
-        finish_cancelled(tree, &live, &traced, &[]);
+        finish_cancelled(tree, &live, &traced, &[], signal);
     }
 
     #[test]
@@ -1036,11 +1315,142 @@ mod tests {
     }
 
     #[test]
+    fn the_interrupt_never_signals_the_former_id_of_a_non_leader_exec() {
+        cancel_at_non_leader_exec(Handover::Interrupt);
+    }
+
+    /// The bit of `SIGINT`, signal 2, in a set of signals from `/proc`.
+    const INTERRUPT_BIT: u64 = 0b10;
+
+    /// Which thread of the helper takes the interrupt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Taker {
+        /// The thread that leads the process; the thread that runs `exec` takes
+        /// over its ID.
+        Leader,
+        /// A thread that does not lead the process.
+        Thread,
+    }
+
+    /// Trace a helper with a thread that does not lead its process and waits to run
+    /// `exec`, interrupt it, and follow it by hand until `taker` stops to receive
+    /// the interrupt. The loop takes that stop and, before it handles it, the
+    /// waiting thread runs `exec`, which kills every other thread of the process,
+    /// the taker included; only then does the loop handle the stop.
+    ///
+    /// The interrupt must not be lost with the taker: the stop was still in place,
+    /// so the killed taker queued the signal again for its process, and the
+    /// program that the `exec` started ends at it.
+    ///
+    /// A taker that does not lead the process is handed over once it has exited,
+    /// before the loop collects its exit, which the `exec` waits for. A taker that
+    /// leads it is handed over once the thread that ran `exec` has stopped at it
+    /// under the leader's ID, and handling the taker's stop then must leave that
+    /// `exec` stop alone for the loop to handle next.
+    fn interrupt_meets_non_leader_exec(taker: Taker) {
+        let mode = match taker {
+            Taker::Leader => "interrupt-leader-exec",
+            Taker::Thread => "interrupt-thread-exec",
+        };
+        let traced = trace_gated_helper(mode);
+        let root = traced.root;
+        let live = LiveProcesses::default();
+        let escalation = Escalation::new();
+        let mut tree = Tree::new(root, &live, &escalation);
+        if taker == Taker::Thread {
+            // The leader blocks `SIGINT` from its first stop on, before the
+            // process has any other thread, and every thread inherits that.
+            let (pid, status) = drive_until(&mut tree, &live, "first stop", |pid, status| {
+                pid == root && libc::WIFSTOPPED(status)
+            });
+            block_interrupt(pid);
+            tree.handle(pid, status).unwrap();
+        }
+        let (ready, status) =
+            drive_until(&mut tree, &live, "sign that it is ready", |pid, status| {
+                is_event_stop(status, libc::PTRACE_EVENT_SECCOMP)
+                    && sys::registers(pid).is_ok_and(|registers| {
+                        c_long::try_from(registers.orig_rax) == Ok(libc::SYS_chdir)
+                    })
+            });
+        tree.handle(ready, status).unwrap();
+        interrupt_all(&live);
+        let held = drive_until(&mut tree, &live, "stop for the interrupt", |_, status| {
+            libc::WIFSTOPPED(status)
+                && libc::WSTOPSIG(status) == libc::SIGINT
+                && sys::stop_event(status) == 0
+        });
+        match taker {
+            Taker::Leader => assert_eq!(held.0, root, "the leader did not take the interrupt"),
+            Taker::Thread => {
+                assert_ne!(held.0, root, "the leader took the interrupt");
+                assert_eq!(held.0, ready, "another thread took the interrupt");
+            },
+        }
+        // The loop has taken the stop. Now the waiting thread runs `exec`.
+        traced.gate.as_ref().unwrap().write_all(b"x").unwrap();
+        let (_, change) = drive_holding(
+            &mut tree,
+            &live,
+            held,
+            "exec from a thread that does not lead its process",
+            |pid, pending| {
+                match (taker, pending) {
+                    (Taker::Leader, sys::Pending::Stopped(status)) => {
+                        pid == root && is_event_stop(status, libc::PTRACE_EVENT_EXEC)
+                    },
+                    (Taker::Thread, sys::Pending::Ended) => pid == held.0,
+                    _ => false,
+                }
+            },
+        );
+        assert_ne!(
+            shared_pending(root) & INTERRUPT_BIT,
+            0,
+            "the interrupt was lost with the thread that took it"
+        );
+        tree.handle(held.0, held.1).unwrap();
+        let exec = match change {
+            sys::Pending::Stopped(exec) => {
+                assert_eq!(
+                    pending_known(&live, root),
+                    Some(exec),
+                    "handling the stop of the killed leader resumed the exec stop"
+                );
+                exec
+            },
+            sys::Pending::Ended => {
+                drive_until(&mut tree, &live, "exec", |pid, status| {
+                    pid == root && is_event_stop(status, libc::PTRACE_EVENT_EXEC)
+                })
+                .1
+            },
+        };
+        assert_ne!(
+            message_pid(sys::event_message(root).unwrap()).unwrap(),
+            root,
+            "the exec did not come from a thread that does not lead the process"
+        );
+        tree.handle(root, exec).unwrap();
+        finish_cancelled(tree, &live, &traced, &[held.0], libc::SIGINT);
+    }
+
+    #[test]
+    fn an_interrupt_taken_by_the_leader_survives_an_exec_by_another_thread() {
+        interrupt_meets_non_leader_exec(Taker::Leader);
+    }
+
+    #[test]
+    fn an_interrupt_taken_by_a_thread_survives_an_exec_by_another_thread() {
+        interrupt_meets_non_leader_exec(Taker::Thread);
+    }
+
+    #[test]
     fn a_cloned_thread_never_joins_the_live_set() {
         let traced = trace_helper("clone");
         let live = LiveProcesses::default();
-        let cancel = Cancellation::new();
-        let mut tree = Tree::new(traced.root, &live, &cancel);
+        let escalation = Escalation::new();
+        let mut tree = Tree::new(traced.root, &live, &escalation);
         let (creator, status) = drive_until(&mut tree, &live, "clone event", |_, status| {
             is_event_stop(status, libc::PTRACE_EVENT_CLONE)
         });
@@ -1050,8 +1460,8 @@ mod tests {
         assert!(!lock(&live).contains(&created));
         assert_eq!(*lock(&live), BTreeSet::from([traced.root]));
         assert_only_processes_are_live(&tree, &live);
-        cancel.cancel();
+        escalation.escalate();
         kill_all(&live);
-        finish_cancelled(tree, &live, &traced, &[created]);
+        finish_cancelled(tree, &live, &traced, &[created], libc::SIGKILL);
     }
 }
