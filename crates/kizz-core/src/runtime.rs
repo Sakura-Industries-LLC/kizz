@@ -12,9 +12,18 @@
 //!
 //! Programs use the extended Starlark dialect, so top-level `if` and `for` work.
 //! The globals are the standard ones with `json.encode` and `json.decode`, plus
-//! `run`, `print`, and `fail`; `load` is a statement, and `task` describes the
-//! running task. Functions from modules act on the task that calls them, and
-//! calling `run()` while a module is being loaded, outside any task, is an error.
+//! `run`, `env`, `fs`, `print`, and `fail`; `load` is a statement, and `task`
+//! describes the running task. Functions from modules act on the task that calls
+//! them, and calling `run()` while a module is being loaded, outside any task, is
+//! an error.
+//!
+//! The task environment starts empty, and only the `env` functions change it;
+//! `env.caller` and `env.inherit` read the caller environment that
+//! [`TaskProgram::run`] is given, never the process environment. The task
+//! environment and the caller environment exist only while the task runs, so while
+//! a module is being loaded, the `env` functions other than `env.read` are errors,
+//! like `run()`. The `fs` functions and `env.read` work there too, and every file
+//! access they make, like each module read, is recorded against the task.
 
 use std::{
     cell::RefCell,
@@ -35,12 +44,18 @@ use starlark::{
     starlark_module,
     syntax::{AstModule, Dialect},
     values::{
-        Heap, Value, dict::UnpackDictEntries, list_or_tuple::UnpackListOrTuple, none::NoneOr,
-        structs::AllocStruct, tuple::UnpackTuple,
+        Heap, Value,
+        dict::{AllocDict, UnpackDictEntries},
+        list_or_tuple::UnpackListOrTuple,
+        none::{NoneOr, NoneType},
+        structs::AllocStruct,
+        tuple::UnpackTuple,
     },
 };
 
 use crate::{
+    dotenv::{self, DotenvError},
+    files::{FileError, Files},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
     tasks::Task,
 };
@@ -225,12 +240,16 @@ impl TaskFailure {
     }
 }
 
-/// Errors that `run()` and module loading raise inside Starlark.
+/// Errors that `run()`, the `env` and `fs` functions, and module loading raise
+/// inside Starlark.
 #[derive(Debug, thiserror::Error)]
 enum RunError {
-    /// `run()` was called while a module was being loaded, outside any task.
-    #[error("run() cannot be called while {module} is being loaded, outside any task")]
+    /// A function that needs the running task was called while a module was being
+    /// loaded, outside any task.
+    #[error("{call} cannot be called while {module} is being loaded, outside any task")]
     WhileLoading {
+        /// The function, such as `run()`.
+        call: &'static str,
         /// The module being loaded, as messages show it.
         module: String,
     },
@@ -254,18 +273,59 @@ enum RunError {
     /// A loader was asked for a module it was not given.
     #[error("module `{0}` was not loaded")]
     NotLoaded(String),
+    /// A file operation of an `env` or `fs` function failed.
+    #[error("{call}: {error}")]
+    File {
+        /// The function, such as `fs.read()`.
+        call: &'static str,
+        /// What went wrong.
+        error: FileError,
+    },
+    /// A dotenv file has a syntax error.
+    #[error("{call}: {path}:{}: {}", .error.line, .error.message)]
+    Dotenv {
+        /// The function, `env.load_file()` or `env.read()`.
+        call: &'static str,
+        /// The dotenv file.
+        path: AbsolutePath,
+        /// The line and what is wrong with it.
+        error: DotenvError,
+    },
+    /// A variable name or value cannot be part of an environment.
+    #[error("{call}: invalid variable {name:?}: {reason}")]
+    Variable {
+        /// The function, such as `env.set()`.
+        call: &'static str,
+        /// The variable's name.
+        name: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// A value cannot be written as JSON.
+    #[error("fs.write_json(): {0}")]
+    NotJson(String),
+    /// `indent` was negative.
+    #[error("fs.write_json(): indent must be 0 or more, not {0}")]
+    Indent(i32),
+    /// A JSON number has no Starlark value.
+    #[error("fs.read_json(): the number {0} is out of range")]
+    NumberRange(String),
 }
 
 /// The state of the task whose program is being evaluated, reached by `run()`
-/// through the evaluator's `extra`.
+/// and the `env` and `fs` functions through the evaluator's `extra`.
 #[derive(ProvidesStaticType)]
 struct TaskState<'a> {
     /// The task.
     task: &'a TaskInfo,
     /// Runs the task's steps.
     executor: &'a dyn StepExecutor,
+    /// The caller environment, which `env.caller` and `env.inherit` read.
+    caller: &'a BTreeMap<String, String>,
     /// The task environment, which starts empty.
     env: RefCell<BTreeMap<String, String>>,
+    /// Every file access the program makes.
+    accesses: RefCell<Accesses>,
     /// The step whose exit status `expect` did not accept, if any.
     unexpected: RefCell<Option<UnexpectedExit>>,
 }
@@ -275,6 +335,131 @@ struct TaskState<'a> {
 struct LoadingModule {
     /// The module being loaded.
     path: AbsolutePath,
+    /// The directory of the task that loads it, against which `fs` paths resolve.
+    dir: AbsolutePath,
+    /// Every file access the module's top-level code makes.
+    accesses: RefCell<Accesses>,
+}
+
+/// The error for `call`, a function that needs the running task, when `eval`
+/// evaluates no task.
+fn outside_task(
+    eval: &Evaluator<'_, '_, '_>,
+    call: &'static str,
+) -> starlark::Error {
+    let module = eval
+        .extra
+        .and_then(|extra| extra.downcast_ref::<LoadingModule>())
+        .map_or_else(
+            || "a module".to_owned(),
+            |loading| format!("the module {}", loading.path),
+        );
+    starlark::Error::new_other(RunError::WhileLoading { call, module })
+}
+
+/// Call `f` with the state of the task that `eval` evaluates.
+///
+/// # Errors
+///
+/// Fails when `eval` loads a module, outside any task, or when `f` fails.
+fn with_task<R>(
+    eval: &Evaluator<'_, '_, '_>,
+    call: &'static str,
+    f: impl FnOnce(&TaskState<'_>) -> Result<R, RunError>,
+) -> starlark::Result<R> {
+    let state = eval
+        .extra
+        .and_then(|extra| extra.downcast_ref::<TaskState>())
+        .ok_or_else(|| outside_task(eval, call))?;
+    f(state).map_err(starlark::Error::new_other)
+}
+
+/// Call `f` with the file operations of the task that `eval` evaluates or loads a
+/// module for, so every access is recorded against that task.
+///
+/// # Errors
+///
+/// Fails when `f` fails.
+fn with_files<R>(
+    eval: &Evaluator<'_, '_, '_>,
+    call: &'static str,
+    f: impl FnOnce(&mut Files<'_>) -> Result<R, RunError>,
+) -> starlark::Result<R> {
+    let extra = eval.extra;
+    let result = if let Some(state) = extra.and_then(|extra| extra.downcast_ref::<TaskState>()) {
+        f(&mut Files::new(
+            &state.task.dir,
+            &mut state.accesses.borrow_mut(),
+        ))
+    } else if let Some(loading) = extra.and_then(|extra| extra.downcast_ref::<LoadingModule>()) {
+        f(&mut Files::new(
+            &loading.dir,
+            &mut loading.accesses.borrow_mut(),
+        ))
+    } else {
+        return Err(outside_task(eval, call));
+    };
+    result.map_err(starlark::Error::new_other)
+}
+
+/// Check that `name` and `value` can be a variable of an environment: a name that
+/// is not empty and holds no `=`, and neither holding a NUL character.
+fn check_variable(
+    call: &'static str,
+    name: &str,
+    value: &str,
+) -> Result<(), RunError> {
+    let reason = if name.is_empty() {
+        "the name is empty"
+    } else if name.contains('=') {
+        "the name contains ="
+    } else if name.contains('\0') || value.contains('\0') {
+        "it contains a NUL character"
+    } else {
+        return Ok(());
+    };
+    Err(RunError::Variable {
+        call,
+        name: name.to_owned(),
+        reason,
+    })
+}
+
+/// Read the dotenv file at `path` for `call`: its variables, or `None` when it is
+/// missing. The file is recorded as read, or probed when missing.
+fn read_dotenv(
+    files: &mut Files<'_>,
+    call: &'static str,
+    path: &str,
+) -> Result<Option<BTreeMap<String, String>>, RunError> {
+    let path = files.resolve(path);
+    let Some(bytes) = files
+        .read_bytes_if_present(&path)
+        .map_err(|error| RunError::File { call, error })?
+    else {
+        return Ok(None);
+    };
+    dotenv::parse(&String::from_utf8_lossy(&bytes))
+        .map(Some)
+        .map_err(|error| RunError::Dotenv { call, path, error })
+}
+
+/// The variables of the dotenv file at `path`, which must exist, for `call`.
+fn require_dotenv(
+    files: &mut Files<'_>,
+    call: &'static str,
+    path: &str,
+) -> Result<BTreeMap<String, String>, RunError> {
+    read_dotenv(files, call, path)?.ok_or_else(|| {
+        RunError::File {
+            call,
+            error: FileError::Io {
+                action: "cannot read",
+                path: files.resolve(path),
+                source: std::io::Error::from(ErrorKind::NotFound),
+            },
+        }
+    })
 }
 
 /// The modules one file loads, by the path its `load` statements give.
@@ -350,16 +535,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             .extra
             .and_then(|extra| extra.downcast_ref::<TaskState>())
         else {
-            let module = eval
-                .extra
-                .and_then(|extra| extra.downcast_ref::<LoadingModule>())
-                .map_or_else(
-                    || "a module".to_owned(),
-                    |loading| format!("the module {}", loading.path),
-                );
-            return Err(starlark::Error::new_other(RunError::WhileLoading {
-                module,
-            }));
+            return Err(outside_task(eval, "run()"));
         };
         if argv.items.is_empty() {
             return Err(starlark::Error::new_other(RunError::NoProgram));
@@ -447,10 +623,329 @@ fn result_value<'v>(
     heap.alloc(AllocStruct(fields))
 }
 
+/// The `env` functions, which read the caller environment and dotenv files and
+/// change the task environment.
+#[starlark_module]
+fn env_functions(builder: &mut GlobalsBuilder) {
+    /// Read the variable `name` from the caller environment, or `default` when it
+    /// is unset, without changing the task environment.
+    fn caller<'v>(
+        #[starlark(require = pos)] name: &str,
+        default: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let value = with_task(eval, "env.caller()", |state| {
+            Ok(state.caller.get(name).cloned())
+        })?;
+        Ok(value.map_or_else(
+            || default.unwrap_or_else(Value::new_none),
+            |value| eval.heap().alloc(value),
+        ))
+    }
+
+    /// Copy the named variables from the caller environment into the task
+    /// environment, skipping the unset ones.
+    fn inherit(
+        #[starlark(args)] names: UnpackTuple<&str>,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        with_task(eval, "env.inherit()", |state| {
+            let mut env = state.env.borrow_mut();
+            for name in names.items {
+                if let Some(value) = state.caller.get(name) {
+                    env.insert(name.to_owned(), value.clone());
+                }
+            }
+            Ok(NoneType)
+        })
+    }
+
+    /// Read the dotenv file at `path`, fill in `defaults` for the variables it does
+    /// not set, add the result to the task environment, and return it. The file is
+    /// recorded as a dependency of the task; with `required = False`, a missing
+    /// file means only the defaults apply.
+    fn load_file<'v>(
+        #[starlark(require = pos)] path: &str,
+        #[starlark(default = UnpackDictEntries::default())] defaults: UnpackDictEntries<&str, &str>,
+        #[starlark(default = true)] required: bool,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let call = "env.load_file()";
+        let vars = with_task(eval, call, |state| {
+            let mut vars = BTreeMap::new();
+            for (name, value) in defaults.entries {
+                check_variable(call, name, value)?;
+                vars.insert(name.to_owned(), value.to_owned());
+            }
+            let mut accesses = state.accesses.borrow_mut();
+            let mut files = Files::new(&state.task.dir, &mut accesses);
+            let file = if required {
+                Some(require_dotenv(&mut files, call, path)?)
+            } else {
+                read_dotenv(&mut files, call, path)?
+            };
+            vars.extend(file.unwrap_or_default());
+            state.env.borrow_mut().extend(vars.clone());
+            Ok(vars)
+        })?;
+        Ok(eval.heap().alloc(vars))
+    }
+
+    /// Read the dotenv file at `path` into a dict, without changing the task
+    /// environment.
+    fn read<'v>(
+        #[starlark(require = pos)] path: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let vars = with_files(eval, "env.read()", |files| {
+            require_dotenv(files, "env.read()", path)
+        })?;
+        Ok(eval.heap().alloc(vars))
+    }
+
+    /// Set the variable `name` of the task environment to `value`.
+    fn set(
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] value: &str,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        with_task(eval, "env.set()", |state| {
+            check_variable("env.set()", name, value)?;
+            state
+                .env
+                .borrow_mut()
+                .insert(name.to_owned(), value.to_owned());
+            Ok(NoneType)
+        })
+    }
+
+    /// Set every variable of the dict `values` in the task environment.
+    fn update(
+        #[starlark(require = pos)] values: UnpackDictEntries<&str, &str>,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        with_task(eval, "env.update()", |state| {
+            for (name, value) in &values.entries {
+                check_variable("env.update()", name, value)?;
+            }
+            state.env.borrow_mut().extend(
+                values
+                    .entries
+                    .iter()
+                    .map(|&(name, value)| (name.to_owned(), value.to_owned())),
+            );
+            Ok(NoneType)
+        })
+    }
+
+    /// Remove the variable `name` from the task environment, if it is set.
+    fn unset(
+        #[starlark(require = pos)] name: &str,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        with_task(eval, "env.unset()", |state| {
+            state.env.borrow_mut().remove(name);
+            Ok(NoneType)
+        })
+    }
+
+    /// Read the variable `name` from the task environment, or `default` when it
+    /// is unset.
+    fn get<'v>(
+        #[starlark(require = pos)] name: &str,
+        default: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let value = with_task(eval, "env.get()", |state| {
+            Ok(state.env.borrow().get(name).cloned())
+        })?;
+        Ok(value.map_or_else(
+            || default.unwrap_or_else(Value::new_none),
+            |value| eval.heap().alloc(value),
+        ))
+    }
+
+    /// The task environment as a new dict.
+    fn dict<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<Value<'v>> {
+        let env = with_task(eval, "env.dict()", |state| Ok(state.env.borrow().clone()))?;
+        Ok(eval.heap().alloc(env))
+    }
+
+    /// Empty the task environment.
+    fn clear(eval: &mut Evaluator<'_, '_, '_>) -> starlark::Result<NoneType> {
+        with_task(eval, "env.clear()", |state| {
+            state.env.borrow_mut().clear();
+            Ok(NoneType)
+        })
+    }
+}
+
+/// The `fs` functions, which read and write files and inspect the file system.
+/// Paths are relative to the task directory, and every access is recorded.
+#[starlark_module]
+fn fs_functions(builder: &mut GlobalsBuilder) {
+    /// The text of the file at `path`, with bytes that are not valid UTF-8
+    /// replaced.
+    fn read(
+        #[starlark(require = pos)] path: &str,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<String> {
+        with_files(eval, "fs.read()", |files| {
+            files.read_text(path).map_err(|error| {
+                RunError::File {
+                    call: "fs.read()",
+                    error,
+                }
+            })
+        })
+    }
+
+    /// Write `text` to the file at `path`, creating parent directories, unless the
+    /// file already holds exactly `text`.
+    fn write(
+        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos)] text: &str,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        with_files(eval, "fs.write()", |files| {
+            files
+                .write_bytes(path, text.as_bytes())
+                .map(|_| NoneType)
+                .map_err(|error| {
+                    RunError::File {
+                        call: "fs.write()",
+                        error,
+                    }
+                })
+        })
+    }
+
+    /// The JSON value in the file at `path`, as a Starlark value.
+    fn read_json<'v>(
+        #[starlark(require = pos)] path: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let value = with_files(eval, "fs.read_json()", |files| {
+            files.read_json(path).map_err(|error| {
+                RunError::File {
+                    call: "fs.read_json()",
+                    error,
+                }
+            })
+        })?;
+        json_value(eval.heap(), &value).map_err(starlark::Error::new_other)
+    }
+
+    /// Write `value` to the file at `path` as stable JSON, with sorted keys,
+    /// `indent` spaces per level, and a trailing newline, unless the file already
+    /// holds exactly that text.
+    fn write_json<'v>(
+        #[starlark(require = pos)] path: &str,
+        #[starlark(require = pos)] value: Value<'v>,
+        #[starlark(default = 2)] indent: i32,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        let indent = usize::try_from(indent)
+            .map_err(|_| starlark::Error::new_other(RunError::Indent(indent)))?;
+        let json = value
+            .to_json_value()
+            .map_err(|error| starlark::Error::new_other(RunError::NotJson(error.to_string())))?;
+        with_files(eval, "fs.write_json()", |files| {
+            files
+                .write_json(path, &json, indent)
+                .map(|_| NoneType)
+                .map_err(|error| {
+                    RunError::File {
+                        call: "fs.write_json()",
+                        error,
+                    }
+                })
+        })
+    }
+
+    /// Whether `path` exists, following symbolic links.
+    fn exists(
+        #[starlark(require = pos)] path: &str,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<bool> {
+        with_files(eval, "fs.exists()", |files| Ok(files.exists(path)))
+    }
+
+    /// The names of the entries of the directory at `path`, sorted.
+    fn list(
+        #[starlark(require = pos, default = ".")] path: &str,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<Vec<String>> {
+        with_files(eval, "fs.list()", |files| {
+            files.list(path).map_err(|error| {
+                RunError::File {
+                    call: "fs.list()",
+                    error,
+                }
+            })
+        })
+    }
+
+    /// The paths that match the glob `pattern`, sorted.
+    fn glob(
+        #[starlark(require = pos)] pattern: &str,
+        eval: &mut Evaluator<'_, '_, '_>,
+    ) -> starlark::Result<Vec<String>> {
+        with_files(eval, "fs.glob()", |files| {
+            files.glob(pattern).map_err(|error| {
+                RunError::File {
+                    call: "fs.glob()",
+                    error,
+                }
+            })
+        })
+    }
+}
+
+/// The Starlark value of the JSON `value`: `None`, a bool, an int for integers
+/// that fit in 64 bits, a float for other numbers, a string, a list, or a dict.
+fn json_value<'v>(
+    heap: Heap<'v>,
+    value: &serde_json::Value,
+) -> Result<Value<'v>, RunError> {
+    Ok(match value {
+        serde_json::Value::Null => Value::new_none(),
+        serde_json::Value::Bool(value) => Value::new_bool(*value),
+        serde_json::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                heap.alloc(int)
+            } else if let Some(int) = number.as_u64() {
+                heap.alloc(int)
+            } else if let Some(float) = number.as_f64().filter(|float| float.is_finite()) {
+                heap.alloc(float)
+            } else {
+                return Err(RunError::NumberRange(number.to_string()));
+            }
+        },
+        serde_json::Value::String(text) => heap.alloc(text.as_str()),
+        serde_json::Value::Array(items) => {
+            let items = items
+                .iter()
+                .map(|item| json_value(heap, item))
+                .collect::<Result<Vec<_>, _>>()?;
+            heap.alloc(items)
+        },
+        serde_json::Value::Object(members) => {
+            let members = members
+                .iter()
+                .map(|(key, member)| Ok((key.as_str(), json_value(heap, member)?)))
+                .collect::<Result<Vec<_>, RunError>>()?;
+            heap.alloc(AllocDict(members))
+        },
+    })
+}
+
 /// The globals of task programs and modules.
 fn globals() -> Globals {
     GlobalsBuilder::extended_by(&[LibraryExtension::Json, LibraryExtension::Print])
         .with(kizz_globals)
+        .with_namespace("env", env_functions)
+        .with_namespace("fs", fs_functions)
         .build()
 }
 
@@ -561,14 +1056,23 @@ impl ModuleLoader<'_> {
         let imports = self.load_imports(&ast, &parent_dir(path), &name);
         self.loading.pop();
         let imports = imports?;
-        let module = evaluate_module(ast, path, &imports, self.task, self.globals, self.printer)?;
+        let module = evaluate_module(
+            ast,
+            path,
+            &imports,
+            self.task,
+            self.globals,
+            self.printer,
+            &mut self.accesses,
+        )?;
         self.sources.push((path.clone(), source));
         self.loaded.insert(path.clone(), module.clone());
         Ok(module)
     }
 }
 
-/// Evaluate and freeze one module, outside any task.
+/// Evaluate and freeze one module, outside any task, recording the file accesses
+/// of its top-level code in `accesses`.
 fn evaluate_module(
     ast: AstModule,
     path: &AbsolutePath,
@@ -576,9 +1080,14 @@ fn evaluate_module(
     task: &TaskInfo,
     globals: &Globals,
     printer: &TaskPrinter<'_>,
+    accesses: &mut Accesses,
 ) -> Result<FrozenModule, TaskFailure> {
-    let marker = LoadingModule { path: path.clone() };
-    Module::with_temp_heap(|module| {
+    let marker = LoadingModule {
+        path: path.clone(),
+        dir: task.dir.clone(),
+        accesses: RefCell::new(Accesses::new()),
+    };
+    let result = Module::with_temp_heap(|module| {
         set_task_value(&module, task);
         {
             let mut eval = Evaluator::new(&module);
@@ -594,7 +1103,9 @@ fn evaluate_module(
                 error.err_msg
             ))
         })
-    })
+    });
+    accesses.merge(marker.accesses.into_inner());
+    result
 }
 
 /// Hash one length-prefixed field.
@@ -610,7 +1121,8 @@ fn hash_field(
 /// The result of [`TaskProgram::load`].
 #[derive(Debug)]
 pub struct ProgramLoad {
-    /// Every module the task read, and every module path it found missing.
+    /// Every module the task read and every module path it found missing, with the
+    /// file accesses of the modules' top-level code.
     pub accesses: Accesses,
     /// The loaded program, or why it could not be loaded.
     pub program: Result<TaskProgram, TaskFailure>,
@@ -712,24 +1224,16 @@ impl TaskProgram {
     /// Evaluate the task block, handing each `run()` call to `executor` in program
     /// order, with `print` output going to `print`.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TaskFailure`] when the program fails.
+    /// The task environment starts empty. `caller` is the caller environment, the
+    /// only one that `env.caller` and `env.inherit` read. The result holds every
+    /// file access the program made while it ran, whether or not it failed.
+    #[must_use]
     pub fn run(
         self,
+        caller: &BTreeMap<String, String>,
         executor: &dyn StepExecutor,
         print: &dyn PrintSink,
-    ) -> Result<(), TaskFailure> {
-        self.run_with_env(executor, print, BTreeMap::new())
-    }
-
-    /// [`TaskProgram::run`], with the task environment starting as `env`.
-    fn run_with_env(
-        self,
-        executor: &dyn StepExecutor,
-        print: &dyn PrintSink,
-        env: BTreeMap<String, String>,
-    ) -> Result<(), TaskFailure> {
+    ) -> TaskRun {
         let Self {
             task, ast, imports, ..
         } = self;
@@ -741,7 +1245,9 @@ impl TaskProgram {
         let state = TaskState {
             task: &task,
             executor,
-            env: RefCell::new(env),
+            caller,
+            env: RefCell::new(BTreeMap::new()),
+            accesses: RefCell::new(Accesses::new()),
             unexpected: RefCell::new(None),
         };
         let result = Module::with_temp_heap(|module| {
@@ -752,7 +1258,7 @@ impl TaskProgram {
             eval.extra = Some(&state);
             eval.eval_module(ast, &globals).map(|_| ())
         });
-        result.map_err(|error| {
+        let result = result.map_err(|error| {
             let message = error.to_string();
             match state.unexpected.take() {
                 Some(exit) => {
@@ -763,8 +1269,23 @@ impl TaskProgram {
                 },
                 None => TaskFailure::Program { message },
             }
-        })
+        });
+        TaskRun {
+            accesses: state.accesses.into_inner(),
+            result,
+        }
     }
+}
+
+/// The result of [`TaskProgram::run`].
+#[derive(Debug)]
+pub struct TaskRun {
+    /// Every file access the program made while it ran, through the `fs`
+    /// functions, `env.load_file`, and `env.read`, missing files and directory
+    /// listings included.
+    pub accesses: Accesses,
+    /// Whether the program succeeded, or why it failed.
+    pub result: Result<(), TaskFailure>,
 }
 
 /// Unit tests for the runtime's own logic.
@@ -829,8 +1350,8 @@ mod tests {
     fn per_run_env_sets_and_removes_task_variables() {
         let program = TaskProgram::load(
             task(
-                "run(\"a\", env = {\"REMOVED\": None, \"ADDED\": \"new\", \"KEPT\": \"changed\"})\n\
-                 run(\"b\")\n",
+                "env.update({\"KEPT\": \"old\", \"REMOVED\": \"gone\"})\nrun(\"a\", env = \
+                 {\"REMOVED\": None, \"ADDED\": \"new\", \"KEPT\": \"changed\"})\nrun(\"b\")\n",
             ),
             &NoPrint,
         )
@@ -842,7 +1363,8 @@ mod tests {
             ("REMOVED".to_owned(), "gone".to_owned()),
         ]);
         program
-            .run_with_env(&recorder, &NoPrint, start.clone())
+            .run(&BTreeMap::new(), &recorder, &NoPrint)
+            .result
             .unwrap();
         let envs: Vec<BTreeMap<String, String>> = recorder
             .steps

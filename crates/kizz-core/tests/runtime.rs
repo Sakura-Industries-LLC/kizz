@@ -204,7 +204,7 @@ fn run(
 ) -> TestResult<(Result<(), TaskFailure>, Vec<String>)> {
     let printed = Printed::default();
     let program = TaskProgram::load(task, &printed).program?;
-    let result = program.run(executor, &printed);
+    let result = program.run(&BTreeMap::new(), executor, &printed).result;
     Ok((result, printed.lines()))
 }
 
@@ -562,7 +562,9 @@ fn relative_absolute_and_nested_loads() -> TestResult {
     ))?;
     let printed = Printed::default();
     let load = TaskProgram::load(task, &printed);
-    load.program?.run(&FakeExecutor::new(), &printed)?;
+    load.program?
+        .run(&BTreeMap::new(), &FakeExecutor::new(), &printed)
+        .result?;
     assert_eq!(printed.lines(), ["Build it: hello 42"]);
     let read: Vec<(PathBuf, String)> = load
         .accesses

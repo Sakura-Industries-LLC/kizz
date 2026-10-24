@@ -1391,10 +1391,12 @@ name = "kizz-core"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "globset",
  "ignore",
  "kizz-store",
  "kizz-trace",
  "pulldown-cmark",
+ "serde_json",
  "starlark",
  "tempfile",
  "thiserror",

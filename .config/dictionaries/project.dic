@@ -48,6 +48,7 @@ fstat
 fstatat
 ftruncate
 futimesat
+getattr
 getdents
 geteuid
 GETEVENTMSG

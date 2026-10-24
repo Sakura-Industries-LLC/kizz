@@ -291,7 +291,7 @@ The exact environment passed to each command is part of that step's cache key, s
 
 * `env.caller(name, default = None)` reads a variable from the caller environment without changing the task environment.
 * `env.inherit(name, ...)` copies variables from the caller environment into the task environment; unset ones are skipped.
-* `env.load(path, defaults = {}, required = True)` reads a named dotenv file,
+* `env.load_file(path, defaults = {}, required = True)` reads a named dotenv file,
   fills in `defaults` for variables the file does not set, adds the result to the task environment, and returns it as a dict.
   The file is recorded as a dependency of the task.
   With `required = False`, a missing file means only the defaults apply.
@@ -347,7 +347,7 @@ and is tracked there.
 load("../build/common.star", "go_build")
 
 env.inherit("PATH", "HOME")
-env.load(".env", defaults = {"GOFLAGS": "-trimpath"}, required = False)
+env.load_file(".env", defaults = {"GOFLAGS": "-trimpath"}, required = False)
 
 described = run("git", "describe", "--tags", "--always", capture = "merged", expect = [0])
 version = described.output.strip()
@@ -882,7 +882,7 @@ Depends on phase 3.
 
 Acceptance, with a fake step executor:
 
-* The environment starts empty, and `inherit`, `load` with defaults, `set`, `unset` and `clear` behave as specified.
+* The environment starts empty, and `inherit`, `load_file` with defaults, `set`, `unset` and `clear` behave as specified.
 * `expect` fails the task only on unexpected exit codes; without it, `run()` always returns.
 * Captured output passed through arguments, `stdin` or the environment reaches the next step's specification.
 * JSON round-trips, and a write with unchanged content leaves the file untouched.
