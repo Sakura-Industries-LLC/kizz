@@ -6,8 +6,8 @@
 //!
 //! This module owns parsing and dispatch only. Every command is parsed with all of
 //! its options; `kizz build` runs in the `build` module, `kizz list` in the `list`
-//! module, and `kizz why` in the `why` module, and the other commands are scaffolds
-//! until later phases implement them.
+//! module, `kizz why` in the `why` module, and `kizz cache` in the `cache` module,
+//! and the other commands are scaffolds until later phases implement them.
 
 use std::{fmt, path::PathBuf, process::ExitCode, str::FromStr};
 
@@ -85,23 +85,9 @@ impl Cli {
             },
             Command::Why { path } => crate::why::run(path.as_deref(), self.verbose),
             Command::List { targets } => crate::list::run(targets.as_deref()),
-            Command::Cache(CacheCommand::Clean) => {
-                stub(
-                    "cache clean",
-                    "Remove entries for files and dependencies that no longer exist.",
-                    None,
-                )
-            },
-            Command::Cache(CacheCommand::Reset { all, path, .. }) => {
-                stub(
-                    "cache reset",
-                    "Wipe the cache entries under a path, or the whole cache with --all.",
-                    if all {
-                        Some("--all".to_owned())
-                    } else {
-                        path.map(|path| path.display().to_string())
-                    },
-                )
+            Command::Cache(CacheCommand::Clean) => crate::cache::clean(),
+            Command::Cache(CacheCommand::Reset { all, yes, path }) => {
+                crate::cache::reset(path.as_deref(), all, yes)
             },
             Command::Graph => stub("graph", "Show the learned task graph.", None),
             Command::Run => {

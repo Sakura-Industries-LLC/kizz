@@ -38,4 +38,4 @@ pub use step::{
     MAX_LISTED_NAMES, NotCachedReason, Observation, PathState, ProgramPath, RecordedOutput,
     RunReason, SpecialKind, StepExit, StepRecord, StepSpecRecord,
 };
-pub use store::{DATABASE_DIR, SCHEMA_VERSION, Store, StoreError, Txn};
+pub use store::{DATABASE_DIR, EntryCounts, Inventory, SCHEMA_VERSION, Store, StoreError, Txn};

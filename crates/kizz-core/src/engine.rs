@@ -61,10 +61,23 @@
 //! position is stored when [`TaskSteps::finish`] stores the task record, which also
 //! removes the positions the run no longer reached. A step that re-runs in
 //! consecutive builds for the same self-inflicted reason adds a [`RepeatedWarning`].
+//!
+//! Owners ("Cleaning up the cache"): every step record carries the tasks that own
+//! it, by [`TaskId`](kizz_store::TaskId). A run made with [`Engine::task_for`] adds
+//! its task to the owners of the record it stores, in the transaction that stores
+//! it, and keeps the owners of the record it replaces under the same key, a record
+//! marked as not cached included; a run without a task identity
+//! adds no owner and keeps the others. A step noted as cached, whether a hit on a
+//! stored record or a result reused within the build, makes its task an owner of
+//! the record under its key in the transaction of [`TaskSteps::finish`] that stores
+//! its position; a hit that refreshes a record's observations keeps its owners. So
+//! after a build, every task that stores a step position for a key owns the record
+//! under that key. A path reset and `kizz cache clean` use the owners (see
+//! [`cleanup`](crate::cleanup)).
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     fmt,
     path::PathBuf,
@@ -276,7 +289,8 @@ impl<'a> Engine<'a> {
     /// The step executor of one run of a task program whose hash is `program` and
     /// whose directory is `task_dir`, without a task identity: its steps are checked,
     /// run, recorded, and explained, but no step position, last writer, or task
-    /// record is stored for them. Builds use [`Engine::task_for`].
+    /// record is stored for them, and no task becomes an owner of their records,
+    /// whose other owners are kept. Builds use [`Engine::task_for`].
     #[must_use]
     pub fn task(
         &self,
@@ -296,8 +310,9 @@ impl<'a> Engine<'a> {
     }
 
     /// The step executor of one run of the task `identity`, which stores the step
-    /// positions and last writers of its steps, and its task record when the run
-    /// ends with [`TaskSteps::finish`].
+    /// positions and last writers of its steps, makes the task an owner of the
+    /// record of every step it runs or finds cached, and stores its task record when
+    /// the run ends with [`TaskSteps::finish`].
     #[must_use]
     pub fn task_for(
         &self,
@@ -371,7 +386,8 @@ pub struct TaskSteps<'a> {
     keys: RefCell<Vec<StepKey>>,
     /// What the build decided about each step of the run, in order.
     decisions: RefCell<Vec<StepDecision>>,
-    /// The step positions of the cached steps, stored by [`TaskSteps::finish`].
+    /// The step positions of the cached steps, stored by [`TaskSteps::finish`],
+    /// which also makes the task an owner of the record each of them names.
     cached_positions: RefCell<Vec<(PositionKey, StepPosition)>>,
 }
 
@@ -552,10 +568,17 @@ impl TaskSteps<'_> {
         self.decisions.borrow().clone()
     }
 
-    /// End the run of the task: store the step positions of its cached steps, remove
-    /// the positions beyond its last step, and store its task record, with
+    /// End the run of the task: store the step positions of its cached steps, add
+    /// the task to the owners of the record each of them names, remove the positions
+    /// beyond its last step, and store its task record, all in one transaction, with
     /// `succeeded` saying whether the run succeeded. Without a task identity this
     /// stores nothing.
+    ///
+    /// Every way a step is noted as cached makes its task an owner here: a hit on a
+    /// stored record, and a result reused within the build, an `always` result or a
+    /// result that was not cached, whose run stored the record under the key. A
+    /// record that the task already owns is not written again for its owners. A step
+    /// that ran stored its position and became its record's owner when it ran.
     ///
     /// # Errors
     ///
@@ -570,6 +593,11 @@ impl TaskSteps<'_> {
         let steps = u32::try_from(self.keys.borrow().len()).unwrap_or(u32::MAX);
         let mut txn = self.engine.store.write()?;
         for (key, position) in self.cached_positions.take() {
+            if let Some(mut record) = txn.get::<StepRecord>(&position.step)?
+                && record.owners.insert(identity.id.clone())
+            {
+                txn.put(&position.step, &record)?;
+            }
             txn.put(&key, &position)?;
         }
         for (key, _) in txn.scan::<StepPosition>(&identity.id.key_prefix())? {
@@ -605,20 +633,23 @@ impl TaskSteps<'_> {
             .map_err(|error| store_error(&error))
     }
 
-    /// Store `record` under `key`, and forget any result of the build under `key`
-    /// that was not cached.
+    /// Store `record`, the record of a cache hit with refreshed observations, under
+    /// `key`, keeping the owners of the record stored there; and forget any result
+    /// of the build under `key` that was not cached.
     fn put(
         &self,
         key: &StepKey,
-        record: &StepRecord,
+        record: &mut StepRecord,
     ) -> Result<(), StepError> {
-        let mut txn = self
-            .engine
-            .store
-            .write()
-            .map_err(|error| store_error(&error))?;
-        txn.put(key, record).map_err(|error| store_error(&error))?;
-        txn.commit().map_err(|error| store_error(&error))?;
+        let write = |record: &mut StepRecord| -> Result<(), StoreError> {
+            let mut txn = self.engine.store.write()?;
+            if let Some(stored) = txn.get::<StepRecord>(key)? {
+                record.owners.extend(stored.owners);
+            }
+            txn.put(key, record)?;
+            txn.commit()
+        };
+        write(record).map_err(|error| store_error(&error))?;
         lock(&self.engine.not_cached).remove(key);
         Ok(())
     }
@@ -627,13 +658,24 @@ impl TaskSteps<'_> {
     /// identity, a last-writer record for every path the step wrote and the step's
     /// position with its explanation, all in one transaction; then forget any
     /// result of the build under its key that was not cached.
+    ///
+    /// The record keeps the owners of the record it replaces under the same key,
+    /// whether the run is a run for changed inputs or one whose result is not
+    /// cached, and with a task identity it adds the task to them, in the same
+    /// transaction, so the task owns the record that its step position names.
     fn put_run(
         &self,
         pending: &Pending,
-        record: &StepRecord,
+        record: &mut StepRecord,
     ) -> Result<(), StepError> {
-        let write = || -> Result<(), StoreError> {
+        let write = |record: &mut StepRecord| -> Result<(), StoreError> {
             let mut txn = self.engine.store.write()?;
+            if let Some(stored) = txn.get::<StepRecord>(&pending.key)? {
+                record.owners.extend(stored.owners);
+            }
+            if let Some(identity) = &self.identity {
+                record.owners.insert(identity.id.clone());
+            }
             txn.put(&pending.key, record)?;
             if let Some(identity) = &self.identity {
                 for observation in &record.observations {
@@ -662,7 +704,7 @@ impl TaskSteps<'_> {
             }
             txn.commit()
         };
-        write().map_err(|error| store_error(&error))?;
+        write(record).map_err(|error| store_error(&error))?;
         lock(&self.engine.not_cached).remove(&pending.key);
         Ok(())
     }
@@ -846,8 +888,9 @@ impl TaskSteps<'_> {
     }
 
     /// Note that the step `step` at `position`, whose key is `key`, was cached; its
-    /// position is stored when the run finishes, unless it already ran in this
-    /// build with the same key, whose reasons it keeps.
+    /// position is stored, and its task becomes an owner of the record under `key`,
+    /// when the run finishes, unless it already ran in this build with the same key,
+    /// whose reasons it keeps and whose record its run made it an owner of.
     fn note_cached(
         &self,
         position: u32,
@@ -915,7 +958,9 @@ impl TaskSteps<'_> {
     }
 
     /// Return the result of the cache hit on `record`, stored under `key`, after
-    /// storing the new metadata in `checked` when it has any.
+    /// storing the new metadata in `checked` when it has any, with the owners of the
+    /// stored record. The task becomes an owner when [`TaskSteps::finish`] stores
+    /// the step's position, and only if it is not one already.
     fn hit(
         &self,
         key: &StepKey,
@@ -926,7 +971,7 @@ impl TaskSteps<'_> {
         if checked.refresh {
             record.observations = checked.observations;
             record.recorded_at_nanos = checked_at_nanos;
-            self.put(key, &record)?;
+            self.put(key, &mut record)?;
         }
         replay(record)
     }
@@ -1063,9 +1108,9 @@ impl TaskSteps<'_> {
     }
 
     /// Store the record of `step`, which ended as `finished` with a result that is
-    /// not cached for the reason `why`, in place of any older record of its key, so
-    /// no older result is replayed; and keep the result in memory for the rest of
-    /// the build, with the states of the paths it touched.
+    /// not cached for the reason `why`, in place of any older record of its key,
+    /// whose owners it keeps, so no older result is replayed; and keep the result in
+    /// memory for the rest of the build, with the states of the paths it touched.
     fn remember(
         &self,
         step: &StepSpec,
@@ -1074,8 +1119,8 @@ impl TaskSteps<'_> {
         why: NotCachedReason,
         result: Result<StepOutcome, StepError>,
     ) -> Result<(), StepError> {
-        let record = self.record_of(step, pending, finished, Some(why.clone()));
-        self.put_run(pending, &record)?;
+        let mut record = self.record_of(step, pending, finished, Some(why.clone()));
+        self.put_run(pending, &mut record)?;
         let result = result.map(|outcome| {
             StepOutcome {
                 cached: true,
@@ -1092,15 +1137,15 @@ impl TaskSteps<'_> {
     }
 
     /// Record the state of every path `finished` touched and store the record of
-    /// `step`.
+    /// `step`, with the owners of the record it replaces and its task.
     fn store(
         &self,
         step: &StepSpec,
         pending: &Pending,
         finished: Finished,
     ) -> Result<(), StepError> {
-        let record = self.record_of(step, pending, finished, None);
-        self.put_run(pending, &record)
+        let mut record = self.record_of(step, pending, finished, None);
+        self.put_run(pending, &mut record)
     }
 
     /// The specification of `step`, whose occurrence number is `occurrence`, as its
@@ -1127,7 +1172,8 @@ impl TaskSteps<'_> {
     }
 
     /// The record of `step`, which ended as `finished`, with the state of every path
-    /// it touched; `not_cached` says why its result is not cached, if it is not.
+    /// it touched; `not_cached` says why its result is not cached, if it is not. Its
+    /// owners are empty until [`TaskSteps::put_run`] stores it.
     fn record_of(
         &self,
         step: &StepSpec,
@@ -1157,6 +1203,7 @@ impl TaskSteps<'_> {
             recorded_at_nanos,
             failure: finished.failure,
             not_cached,
+            owners: BTreeSet::new(),
         }
     }
 

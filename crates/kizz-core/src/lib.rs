@@ -38,9 +38,12 @@
 //! * [`why`](mod@why): the report of `kizz why`, read from the cache.
 //! * [`build`](mod@build): building the selected tasks in passes, in the default or
 //!   learned order, until a pass runs nothing, with failure handling and the pass limit.
+//! * [`cleanup`]: the entries `kizz cache clean` removes because their files are gone,
+//!   and the entries `kizz cache reset` wipes for the tasks under a path.
 
 pub mod build;
 pub mod check;
+pub mod cleanup;
 pub mod discovery;
 pub mod dotenv;
 pub mod engine;
@@ -65,6 +68,7 @@ pub use build::{
     TaskResult, build, learned_order, pass_limit, task_id, task_label,
 };
 pub use check::{Checked, RACY_WINDOW_NANOS, check};
+pub use cleanup::{Cleaned, ResetPlan, clean, plan_reset};
 pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
 pub use dotenv::DotenvError;
 pub use engine::{Engine, TaskSteps};

@@ -6,18 +6,22 @@
 //!
 //! A [`StepRecord`] holds what kizz knows about one run of a step: the full step
 //! specification, every [`Observation`] with its recorded [`PathState`], how the
-//! command ended, its raw captured output, how long it ran, when it ran, and why it
-//! ran.
+//! command ended, its raw captured output, how long it ran, when it ran, why it
+//! ran, and the tasks that own it.
 //!
 //! Every type here is encoded by the rules of "Step keys": definite lengths, fields
 //! in a fixed order, and maps sorted by key. Paths and names are byte strings, so
 //! paths that are not UTF-8 survive unchanged.
 
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+};
 
 use minicbor::{Decode, Decoder, Encode, Encoder, bytes::ByteArray, decode, encode};
 
-use crate::records::{Family, Record, StepKey};
+use crate::records::{Family, Record, StepKey, TaskId};
 
 /// Encodes and decodes a path as a CBOR byte string of its bytes.
 pub(crate) mod path_bytes {
@@ -636,7 +640,8 @@ pub enum RunReason {
     },
 }
 
-/// What is recorded about one run of a step, by step key.
+/// What is recorded about one run of a step, by step key, and the tasks that own
+/// the record.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct StepRecord {
     /// The full step specification.
@@ -686,6 +691,19 @@ pub struct StepRecord {
     /// runs the step again with this reason.
     #[n(11)]
     pub not_cached: Option<NotCachedReason>,
+    /// The tasks that own the record, without repeats: every task that produced it
+    /// or used it, by its [`TaskId`], the absolute path of its `kizz.md` and the
+    /// index of its block in the file.
+    ///
+    /// The owners belong to the record of the step key, not to one run: a run of a
+    /// task whose identity the engine knows adds the task and keeps the owners of
+    /// the record it replaces, and a step that its task notes as cached adds the
+    /// task. A path reset (`kizz cache reset PATH`) removes the record only when
+    /// every owner is a task under the path, and otherwise only takes those tasks
+    /// out; `kizz cache clean` takes out the tasks whose `kizz.md` no longer exists.
+    /// A record with no owner is no task's entry, so no path reset changes it.
+    #[n(12)]
+    pub owners: BTreeSet<TaskId>,
 }
 
 impl Record for StepRecord {
@@ -803,6 +821,21 @@ mod tests {
             recorded_at_nanos: 12,
             failure: Some("program `cc` is not executable".to_owned()),
             not_cached: Some(NotCachedReason::Signaled { signal: 9 }),
+            owners: [
+                TaskId {
+                    file: PathBuf::from("/b/kizz.md"),
+                    index: 0,
+                },
+                TaskId {
+                    file: PathBuf::from("/a\u{e9}/kizz.md"),
+                    index: 3,
+                },
+                TaskId {
+                    file: PathBuf::from("/a\u{e9}/kizz.md"),
+                    index: 1,
+                },
+            ]
+            .into(),
         }
     }
 
@@ -965,13 +998,42 @@ mod tests {
     #[test]
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
-        // A definite-length array of twelve fields, then the specification as a
+        // A definite-length array of thirteen fields, then the specification as a
         // definite-length array of twelve.
-        assert_eq!(bytes.get(..2), Some(&[0x8C, 0x8C][..]));
+        assert_eq!(bytes.get(..2), Some(&[0x8D, 0x8C][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
         assert_eq!(encoded_env, b"\xa2\x61A\x611\x61B\x612");
+    }
+
+    #[test]
+    fn owners_round_trip_sorted_and_without_repeats() {
+        let record = record();
+        let bytes = minicbor::to_vec(&record).unwrap();
+        let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
+        assert_eq!(decoded.owners, record.owners);
+        let order: Vec<(&str, u32)> = decoded
+            .owners
+            .iter()
+            .map(|owner| (owner.file.to_str().unwrap(), owner.index))
+            .collect();
+        assert_eq!(order, [
+            ("/a\u{e9}/kizz.md", 1),
+            ("/a\u{e9}/kizz.md", 3),
+            ("/b/kizz.md", 0)
+        ]);
+        // The owners are the last field, a definite-length array of three task
+        // identities, each an array of the file's bytes and the block index.
+        let owners = minicbor::to_vec(&record.owners).unwrap();
+        assert!(bytes.ends_with(&owners));
+        assert_eq!(owners.first(), Some(&0x83));
+        // A record with no owner keeps an empty set.
+        let mut unowned = record;
+        unowned.owners.clear();
+        let bytes = minicbor::to_vec(&unowned).unwrap();
+        assert_eq!(bytes.last(), Some(&0x80));
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), unowned);
     }
 
     #[test]

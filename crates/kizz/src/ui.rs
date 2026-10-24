@@ -105,6 +105,12 @@ pub(crate) fn print_waiting(holder: &str) {
     );
 }
 
+/// Print a question to standard error, followed by a space and no line break, so
+/// the answer follows it on the same line.
+pub(crate) fn print_question(question: &str) {
+    eprint!("{} ", style(question).for_stderr().bold());
+}
+
 /// Repeat every warning in a final summary on standard error; print nothing when
 /// there are none.
 pub(crate) fn print_warning_summary(warnings: &[String]) {

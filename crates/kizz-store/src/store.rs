@@ -15,19 +15,26 @@
 //!
 //! When the store creates the database it writes [`SCHEMA_VERSION`] into it, and it
 //! refuses to open a database with another version. It never wipes a cache by
-//! itself: `kizz cache reset --all` does, after asking.
+//! itself: `kizz cache reset --all` does, after asking, through [`Store::inventory`],
+//! which counts the entries of a cache of any schema version, and [`Store::wipe`].
 
 use std::{
+    collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
 };
 
 use surrealkv::{Durability, LSMIterator as _, Mode, ReadOptions, Transaction, Tree, TreeBuilder};
 
-use crate::records::{Family, Record, RecordKey, SchemaKey, SchemaVersion, database_key};
+use crate::records::{
+    Family, PositionKey, Record, RecordKey, SchemaKey, SchemaVersion, TaskId, database_key,
+};
 
 /// The name of the database directory in the cache directory.
 pub const DATABASE_DIR: &str = "db";
+
+/// The name a wiped database directory has while [`Store::wipe`] removes it.
+const WIPED_DIR: &str = "db.wiped";
 
 /// The version of the record encoding that this build of kizz reads and writes.
 ///
@@ -42,8 +49,10 @@ pub const DATABASE_DIR: &str = "db";
 /// output names the task in task records, and the position, build, and time of
 /// each last writer. Version 6 added the reason for the result of a command that
 /// exited with a code of its own after the build was interrupted, which, like a
-/// command that a signal stopped then, is never a cache hit.
-pub const SCHEMA_VERSION: u32 = 6;
+/// command that a signal stopped then, is never a cache hit. Version 7 added the
+/// owners of step records: the tasks that produced or used each record, which path
+/// resets and `kizz cache clean` use.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +113,60 @@ pub enum StoreError {
         /// The version this build uses, [`SCHEMA_VERSION`].
         expected: u32,
     },
+    /// The database directory could not be removed.
+    #[error("cannot remove the cache database `{}`", path.display())]
+    Wipe {
+        /// The directory that could not be removed.
+        path: PathBuf,
+        /// The cause.
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// How many entries of each family a set of cache entries holds, and how many tasks
+/// they belong to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntryCounts {
+    /// The distinct tasks of the task records, step positions, and learned order,
+    /// and the tasks taken out of the owners of step records.
+    pub tasks: usize,
+    /// Step records.
+    pub steps: usize,
+    /// Step records that are kept but lose owners, apart from the step records
+    /// counted in [`EntryCounts::steps`].
+    pub shared_steps: usize,
+    /// Step positions.
+    pub positions: usize,
+    /// Task records.
+    pub task_records: usize,
+    /// Learned-order entries.
+    pub orders: usize,
+    /// Last-writer entries.
+    pub writers: usize,
+}
+
+impl EntryCounts {
+    /// Whether there is no entry at all and no step record loses an owner.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.steps == 0
+            && self.shared_steps == 0
+            && self.positions == 0
+            && self.task_records == 0
+            && self.orders == 0
+            && self.writers == 0
+    }
+}
+
+/// What a whole cache holds, as [`Store::inventory`] counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Inventory {
+    /// The entries of every family but the schema version.
+    pub entries: EntryCounts,
+    /// The schema version stored in the database, or `None` when there is no
+    /// database or it holds no readable version.
+    pub schema_version: Option<u32>,
 }
 
 /// The cache database, shared by the threads of one process.
@@ -138,6 +201,102 @@ impl Store {
     /// [`StoreError::SchemaMismatch`] when the database has another schema version,
     /// and another [`StoreError`] when the database cannot be created or opened.
     pub fn open(cache_dir: &Path) -> Result<Self, StoreError> {
+        let store = Self::open_tree(cache_dir)?;
+        store.check_schema()?;
+        Ok(store)
+    }
+
+    /// Counts the entries of the database in the `db` directory of `cache_dir`,
+    /// whatever its schema version, by their keys alone, without decoding a record
+    /// or changing anything. A cache without a database has no entries.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when the database cannot be opened or read.
+    pub fn inventory(cache_dir: &Path) -> Result<Inventory, StoreError> {
+        if !cache_dir.join(DATABASE_DIR).is_dir() {
+            return Ok(Inventory::default());
+        }
+        let store = Self::open_tree(cache_dir)?;
+        let inventory = {
+            let txn = store.read()?;
+            let schema_version = txn
+                .inner
+                .get(database_key::<SchemaVersion>(&SchemaKey))?
+                .and_then(|bytes| decode::<SchemaVersion>(&bytes).ok())
+                .map(|schema| schema.version);
+            let task_keys = txn.raw_keys(Family::Task)?;
+            let position_keys = txn.raw_keys(Family::Position)?;
+            let order_keys = txn.raw_keys(Family::Order)?;
+            let tasks: BTreeSet<TaskId> = task_keys
+                .iter()
+                .chain(&order_keys)
+                .filter_map(|key| TaskId::decode_key(key))
+                .chain(
+                    position_keys
+                        .iter()
+                        .filter_map(|key| PositionKey::decode_key(key))
+                        .map(|key| key.task),
+                )
+                .collect();
+            Inventory {
+                entries: EntryCounts {
+                    tasks: tasks.len(),
+                    steps: txn.raw_keys(Family::Step)?.len(),
+                    shared_steps: 0,
+                    positions: position_keys.len(),
+                    task_records: task_keys.len(),
+                    orders: order_keys.len(),
+                    writers: txn.raw_keys(Family::Writer)?.len(),
+                },
+                schema_version,
+            }
+        };
+        store.close()?;
+        Ok(inventory)
+    }
+
+    /// Wipes the whole cache database in the `db` directory of `cache_dir`, whatever
+    /// its schema version; the next [`Store::open`] creates an empty one. The caller
+    /// holds the cache lock, so no process has the database open.
+    ///
+    /// The directory is first renamed, in one step, so a crash during the removal
+    /// leaves no partial database behind, only a directory that the next wipe
+    /// removes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Wipe`] when the directory cannot be renamed or removed.
+    pub fn wipe(cache_dir: &Path) -> Result<(), StoreError> {
+        let path = cache_dir.join(DATABASE_DIR);
+        let wiped = cache_dir.join(WIPED_DIR);
+        let remove = |dir: &Path| {
+            match fs::remove_dir_all(dir) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    Err(StoreError::Wipe {
+                        path: dir.to_path_buf(),
+                        source: error,
+                    })
+                },
+                _ => Ok(()),
+            }
+        };
+        remove(&wiped)?;
+        match fs::rename(&path, &wiped) {
+            Ok(()) => remove(&wiped),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(StoreError::Wipe {
+                    path,
+                    source: error,
+                })
+            },
+        }
+    }
+
+    /// Opens the database in the `db` directory of `cache_dir`, creating it if it does
+    /// not exist, without checking or writing the schema version.
+    fn open_tree(cache_dir: &Path) -> Result<Self, StoreError> {
         let path = cache_dir.join(DATABASE_DIR);
         fs::create_dir_all(&path).map_err(|source| {
             StoreError::CreateDir {
@@ -156,14 +315,12 @@ impl Store {
             let _entered = runtime.enter();
             TreeBuilder::new().with_path(path.clone()).build()?
         };
-        let store = Self {
+        Ok(Self {
             tree,
             runtime,
             path,
             closed: false,
-        };
-        store.check_schema()?;
-        Ok(store)
+        })
     }
 
     /// The database directory.
@@ -355,6 +512,28 @@ impl Txn<'_> {
         Ok(records)
     }
 
+    /// The key of every entry of `family`, after the family prefix, in key order,
+    /// without decoding a key or a record.
+    fn raw_keys(
+        &self,
+        family: Family,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let start = family.prefix().to_vec();
+        let mut options = ReadOptions::new();
+        options.set_iterate_upper_bound(prefix_end(&start));
+        options.set_iterate_lower_bound(Some(start));
+        let mut iter = self.inner.range_with_options(&options)?;
+        let mut keys = Vec::new();
+        let mut valid = iter.seek_first()?;
+        while valid {
+            if let Some(key) = iter.key().user_key().strip_prefix(family.prefix()) {
+                keys.push(key.to_vec());
+            }
+            valid = iter.next()?;
+        }
+        Ok(keys)
+    }
+
     /// Commits every change of the transaction, or none of them.
     ///
     /// # Errors
@@ -416,11 +595,11 @@ mod tests {
     fn schema_mismatch_names_both_versions_and_the_reset_command() {
         let message = StoreError::SchemaMismatch {
             path: PathBuf::from("/cache/db"),
-            found: 7,
+            found: 5,
             expected: SCHEMA_VERSION,
         }
         .to_string();
-        assert!(message.contains("schema version 7"), "{message}");
+        assert!(message.contains("schema version 5"), "{message}");
         assert!(
             message.contains(&format!("schema version {SCHEMA_VERSION}")),
             "{message}"

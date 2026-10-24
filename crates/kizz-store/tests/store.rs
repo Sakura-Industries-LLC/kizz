@@ -19,10 +19,11 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, BuildId, Capture, ContentHash, DATABASE_DIR, FileMeta, LastWriter, LearnedOrder,
-    Observation, PathKey, PathState, PositionKey, ProgramPath, RecordedOutput, RunReason,
-    SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey, StepPosition, StepRecord,
-    StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Verdict, path_prefix,
+    AccessBits, BuildId, Capture, ContentHash, DATABASE_DIR, EntryCounts, FileMeta, Inventory,
+    LastWriter, LearnedOrder, Observation, PathKey, PathState, PositionKey, ProgramPath,
+    RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey,
+    StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Verdict,
+    path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -32,7 +33,7 @@ const CACHE_VARIABLE: &str = "KIZZ_STORE_TEST_CACHE";
 /// The start of every line a helper reports.
 const MARK: &str = "kizz-store-helper\t";
 
-/// A step record whose fields all derive from `n`.
+/// A step record whose fields all derive from `n`, owned by two tasks.
 fn step_record(n: u8) -> StepRecord {
     StepRecord {
         spec: StepSpecRecord {
@@ -78,6 +79,7 @@ fn step_record(n: u8) -> StepRecord {
         recorded_at_nanos: u64::from(n),
         failure: None,
         not_cached: None,
+        owners: [task(&format!("/w/{n}"), u32::from(n)), task("/w/shared", 0)].into(),
     }
 }
 
@@ -151,6 +153,9 @@ fn records_survive_closing_and_reopening_the_store() {
     assert_eq!(store.path(), cache.join(DATABASE_DIR));
     let mut txn = store.write().unwrap();
     txn.put(&StepKey([1; 32]), &step_record(1)).unwrap();
+    let mut unowned = step_record(2);
+    unowned.owners.clear();
+    txn.put(&StepKey([2; 32]), &unowned).unwrap();
     txn.put(&task("/w/a", 0), &task_record(2)).unwrap();
     txn.put(&PathKey(PathBuf::from("/w/a/out")), &LastWriter {
         task: task("/w/a", 0),
@@ -177,7 +182,13 @@ fn records_survive_closing_and_reopening_the_store() {
 
     let store = Store::open(&cache).unwrap();
     let txn = store.read().unwrap();
-    assert_eq!(txn.get(&StepKey([1; 32])).unwrap(), Some(step_record(1)));
+    let owned = txn.get::<StepRecord>(&StepKey([1; 32])).unwrap();
+    assert_eq!(owned, Some(step_record(1)));
+    assert_eq!(
+        owned.map(|record| record.owners.into_iter().collect::<Vec<_>>()),
+        Some(vec![task("/w/1", 1), task("/w/shared", 0)])
+    );
+    assert_eq!(txn.get(&StepKey([2; 32])).unwrap(), Some(unowned));
     assert_eq!(txn.get(&task("/w/a", 0)).unwrap(), Some(task_record(2)));
     assert_eq!(
         txn.get::<LastWriter>(&PathKey(PathBuf::from("/w/a/out")))
@@ -432,6 +443,89 @@ fn a_schema_version_mismatch_is_refused_and_the_cache_is_kept() {
         "{message}"
     );
     assert!(message.contains("kizz cache reset --all"), "{message}");
+}
+
+/// The inventory counts every family and the distinct tasks of a cache of another
+/// schema version without decoding a record, and a wipe empties it, so the next open
+/// creates an empty database with the current version. A cache without a database
+/// has no entries, and neither the inventory nor the wipe creates one.
+#[test]
+fn the_inventory_counts_any_cache_and_a_wipe_empties_it() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(Store::inventory(dir.path()).unwrap(), Inventory::default());
+    Store::wipe(dir.path()).unwrap();
+    assert!(!dir.path().join(DATABASE_DIR).exists());
+
+    let store = Store::open(dir.path()).unwrap();
+    let mut txn = store.write().unwrap();
+    let other = SCHEMA_VERSION.checked_add(1).unwrap();
+    txn.put(&SchemaKey, &SchemaVersion { version: other })
+        .unwrap();
+    for n in 1..=3 {
+        txn.put(&StepKey([n; 32]), &step_record(n)).unwrap();
+    }
+    txn.put(&task("/w/a", 0), &task_record(1)).unwrap();
+    txn.put(&task("/w/b", 0), &LearnedOrder {
+        producers: [task("/w/a", 0)].into(),
+    })
+    .unwrap();
+    for (id, position) in [
+        (task("/w/a", 0), 0),
+        (task("/w/a", 0), 1),
+        (task("/w/c", 2), 0),
+    ] {
+        txn.put(&PositionKey { task: id, position }, &step_position(1))
+            .unwrap();
+    }
+    txn.put(&PathKey(PathBuf::from("/w/a/out")), &LastWriter {
+        task: task("/w/a", 0),
+        step: StepKey([1; 32]),
+        position: 0,
+        build: BuildId(1),
+        written_at_nanos: 1,
+    })
+    .unwrap();
+    txn.commit().unwrap();
+    store.close().unwrap();
+
+    let inventory = Store::inventory(dir.path()).unwrap();
+    assert_eq!(inventory, Inventory {
+        entries: EntryCounts {
+            tasks: 3,
+            steps: 3,
+            shared_steps: 0,
+            positions: 3,
+            task_records: 1,
+            orders: 1,
+            writers: 1,
+        },
+        schema_version: Some(other),
+    });
+    assert!(!inventory.entries.is_empty());
+    // Counting changed nothing: the cache is still refused.
+    assert!(matches!(
+        Store::open(dir.path()),
+        Err(StoreError::SchemaMismatch { .. })
+    ));
+
+    Store::wipe(dir.path()).unwrap();
+    assert!(!dir.path().join(DATABASE_DIR).exists());
+    assert_eq!(Store::inventory(dir.path()).unwrap(), Inventory::default());
+    let store = Store::open(dir.path()).unwrap();
+    let txn = store.read().unwrap();
+    assert_eq!(
+        txn.get::<SchemaVersion>(&SchemaKey).unwrap(),
+        Some(SchemaVersion {
+            version: SCHEMA_VERSION,
+        })
+    );
+    assert_eq!(txn.scan::<StepRecord>(b"").unwrap(), Vec::new());
+    drop(txn);
+    store.close().unwrap();
+    assert_eq!(Store::inventory(dir.path()).unwrap(), Inventory {
+        entries: EntryCounts::default(),
+        schema_version: Some(SCHEMA_VERSION),
+    });
 }
 
 #[test]

@@ -10,6 +10,7 @@
 //! to the Linux tracer of `kizz_trace_linux`.
 
 mod build;
+mod cache;
 pub mod cli;
 mod list;
 mod ui;

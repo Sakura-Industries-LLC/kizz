@@ -62,6 +62,7 @@ GETSIGINFO
 gettid
 globset
 GOFLAGS
+grantpt
 hasattr
 hermeticity
 idents
@@ -85,8 +86,10 @@ mmap
 newfstatat
 nlink
 nocapture
+NOCTTY
 nsec
 openat
+openpt
 pids
 pipefail
 pointee
@@ -94,6 +97,7 @@ prctl
 PRIVS
 pthread
 ptrace
+ptsname
 RDONLY
 RDWR
 readlink
@@ -152,6 +156,7 @@ TRUNC
 uncacheable
 uninit
 unlinkat
+unlockpt
 untrackable
 uring
 utime

@@ -48,12 +48,9 @@ fn kizz(args: &[&str]) -> io::Result<Run> {
 }
 
 /// Every scaffolded command, with the name its scaffold message shows. `kizz build`,
-/// `kizz list`, and `kizz why` are implemented, and `tests/build.rs`, `tests/list.rs`,
-/// and `tests/why.rs` cover them.
-const STUBS: [(&[&str], &str); 6] = [
-    (&["cache", "clean"], "cache clean"),
-    (&["cache", "reset"], "cache reset"),
-    (&["cache", "reset", "--all", "--yes"], "cache reset"),
+/// `kizz list`, `kizz why`, and `kizz cache` are implemented, and `tests/build.rs`,
+/// `tests/list.rs`, `tests/why.rs`, and `tests/cache.rs` cover them.
+const STUBS: [(&[&str], &str); 3] = [
     (&["graph"], "graph"),
     (&["run"], "run"),
     (&["image"], "image"),
@@ -136,11 +133,13 @@ fn each_subcommand_prints_its_stub_message() {
     }
 }
 
-/// A scaffold message names the target or path it was given.
+/// A scaffold message says that its command was given no target.
 #[test]
-fn stub_messages_name_their_target() {
-    let reset = kizz(&["cache", "reset", "sub/dir"]).unwrap();
-    assert!(reset.stdout.contains("target: sub/dir"), "{reset:?}");
+fn stub_messages_name_no_target() {
+    for (args, _) in STUBS {
+        let run = kizz(args).unwrap();
+        assert!(run.stdout.contains("target: <none>\n"), "{args:?}: {run:?}");
+    }
 }
 
 /// `kizz build --parallel` fails with the not-implemented error and status 2,
@@ -178,6 +177,7 @@ fn command_line_errors_exit_with_status_2() {
         &["--color", "sometimes", "graph"][..],
         &["cache"][..],
         &["cache", "nonexistent"][..],
+        &["cache", "reset", "--all", "sub"][..],
         &["graph", "extra"][..],
     ] {
         let run = kizz(args).unwrap();
