@@ -1,0 +1,910 @@
+// Copyright (c) 2026 Sakura Industries LLC.
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! The event loop that follows a traced process tree until all of it has exited.
+//!
+//! The loop runs on a thread that each run creates only to start and trace its
+//! tree. Linux makes that thread the tracer of every process and thread in the
+//! tree, and its waits report only its own children and tracees. Its only child is
+//! the tree's first process, so every state change it waits for belongs to the
+//! tree: no other child of the process, whichever thread started it, is ever
+//! collected, signaled or adopted, and tracers on other threads never see each
+//! other's events.
+//!
+//! The tree has ended when the thread has nothing left to wait for. A process or
+//! thread whose creation the loop has not seen yet is still a tracee of the thread,
+//! so the loop keeps waiting for it, and kills it after cancellation, before it
+//! ends.
+//!
+//! # Which IDs are signaled
+//!
+//! Linux gives a released process or thread ID to the next process or thread it
+//! creates, so the tracer signals an ID only while it can prove the ID still names
+//! a thread of its own tree. Holding a lock cannot prove that for a thread ID: a
+//! thread that is not its process's leader and runs `exec` takes over the leader's
+//! ID, and the kernel releases its former ID at once, without an exit for the loop
+//! to collect and before the loop sees the `exec` event.
+//!
+//! The loop therefore shares with the cancellation watchdog, in a mutex, the set of
+//! live processes of the tree, by process ID, and never the ID of a thread that
+//! does not lead its process. A process ID stays with the process while the loop
+//! has not collected the leader's exit: Linux keeps an exited leader until every
+//! other thread of its process has exited, and an `exec` by another thread hands
+//! that thread the same ID. The loop collects a leader's exit only while it holds
+//! the mutex, and removes the ID at the same time, so every ID in the set names a
+//! process of the tree, and the watchdog's `SIGKILL`, which kills every thread of
+//! a process, never reaches another process.
+//!
+//! The loop itself signals a thread by its own ID only when the thread cannot run
+//! `exec`: it is in a `ptrace` stop that the loop collected and has not resumed, or
+//! it was just created and has not run yet.
+
+use std::{
+    collections::{BTreeMap, BTreeSet, btree_map},
+    io,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
+
+use kizz_trace::{Cancellation, IncompleteReason, Termination};
+use libc::{c_int, c_ulong, pid_t};
+
+use crate::{filter, sys};
+
+/// The process IDs of the live processes of a traced tree, shared with the
+/// cancellation watchdog. It never holds the ID of a thread that does not lead its
+/// process.
+pub(crate) type LiveProcesses = Mutex<BTreeSet<pid_t>>;
+
+/// Lock the live processes, recovering the set if a thread panicked while holding
+/// the lock.
+pub(crate) fn lock(live: &LiveProcesses) -> MutexGuard<'_, BTreeSet<pid_t>> {
+    live.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Send `SIGKILL` to every live process, which kills all of its threads.
+///
+/// The set stays locked while the signals are sent, so the loop cannot collect the
+/// exit of a process in between, and every ID still names a process of the tree.
+pub(crate) fn kill_all(live: &LiveProcesses) {
+    for &pid in lock(live).iter() {
+        // A process that already exited needs no signal.
+        drop(sys::kill(pid, libc::SIGKILL));
+    }
+}
+
+/// Whether a traced thread leads its process, so its ID is the process ID.
+///
+/// The thread must be one the loop has not resumed since it was created, or one in
+/// a `ptrace` stop, so its ID cannot have been released. When the answer cannot be
+/// read, the thread is taken not to lead, so the watchdog never signals its ID; the
+/// loop still kills it at its next stop after cancellation.
+fn leads_its_process(tid: pid_t) -> bool {
+    sys::thread_group(tid).is_ok_and(|process| process == tid)
+}
+
+/// What the loop observed about a tree that has exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Outcome {
+    /// How the first process ended, if the loop saw it end.
+    pub termination: Option<Termination>,
+    /// Why the trace is incomplete, if it is.
+    pub incomplete: Option<IncompleteReason>,
+}
+
+/// What the loop knows about one traced thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tracee {
+    /// Whether the thread still has to report the `SIGSTOP` with which every
+    /// automatically traced thread starts.
+    awaiting_initial_stop: bool,
+    /// Whether the loop has seen the event of the thread that created this one.
+    /// A new thread can report its first stop, and even its exit, before that
+    /// event.
+    announced: bool,
+}
+
+/// The state of the loop.
+struct Tree<'a> {
+    /// The first process, whose end is the command's termination.
+    root: pid_t,
+    /// Every traced thread that has not exited.
+    tracees: BTreeMap<pid_t, Tracee>,
+    /// The threads that exited before the loop saw the event that created them, so
+    /// that event, when it arrives, does not follow a thread that is gone.
+    exited_unannounced: BTreeSet<pid_t>,
+    /// The processes of the threads in `tracees`, by the IDs of the threads that
+    /// lead them, shared with the cancellation watchdog.
+    live: &'a LiveProcesses,
+    /// The request's cancellation flag.
+    cancel: &'a Cancellation,
+    /// Whether the loop has already killed every live process after cancellation.
+    killed: bool,
+    /// What the loop has observed so far.
+    outcome: Outcome,
+}
+
+/// Whether an error means the thread no longer exists, which happens when it was
+/// killed while the loop handled it; its exit arrives later.
+fn vanished(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Ignore an error that only means the thread vanished.
+fn unless_vanished(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if !vanished(&error) => Err(error),
+        Ok(()) | Err(_) => Ok(()),
+    }
+}
+
+/// A thread ID from a `ptrace` event message.
+fn message_pid(message: c_ulong) -> io::Result<pid_t> {
+    pid_t::try_from(message).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Whether a wait status reports the end of a thread.
+fn ended(status: c_int) -> bool {
+    libc::WIFEXITED(status) || libc::WIFSIGNALED(status)
+}
+
+/// A collected state change: the thread, and its wait status, or `None` when the
+/// change was gone by the time it was collected.
+type Change = (pid_t, Option<c_int>);
+
+/// Collect the next state change of a thread of the tree, or return `None` when the
+/// calling thread has nothing left to wait for, which means that every process and
+/// thread of the tree has exited and been collected.
+///
+/// An exit is collected while the live set is locked. When the thread leads its
+/// process, the process has ended and leaves the set at the same time; any other
+/// thread's ID was never in the set.
+fn next_change(live: &LiveProcesses) -> io::Result<Option<Change>> {
+    let Some(pid) = sys::wait_pending()? else {
+        return Ok(None);
+    };
+    let mut live = lock(live);
+    let status = sys::collect(pid)?;
+    if let Some(status) = status
+        && ended(status)
+    {
+        live.remove(&pid);
+    }
+    Ok(Some((pid, status)))
+}
+
+impl<'a> Tree<'a> {
+    /// The state of a tree whose first process is `root`, already resumed.
+    fn new(
+        root: pid_t,
+        live: &'a LiveProcesses,
+        cancel: &'a Cancellation,
+    ) -> Self {
+        lock(live).insert(root);
+        Self {
+            root,
+            tracees: BTreeMap::from([(root, Tracee {
+                awaiting_initial_stop: false,
+                announced: true,
+            })]),
+            exited_unannounced: BTreeSet::new(),
+            live,
+            cancel,
+            killed: false,
+            outcome: Outcome {
+                termination: None,
+                incomplete: None,
+            },
+        }
+    }
+
+    /// Start following a thread, unless it is already followed. A thread that
+    /// leads its process brings the process into the live set.
+    fn adopt(
+        &mut self,
+        pid: pid_t,
+        tracee: Tracee,
+        leader: bool,
+    ) {
+        if let btree_map::Entry::Vacant(entry) = self.tracees.entry(pid) {
+            entry.insert(tracee);
+            if leader {
+                lock(self.live).insert(pid);
+            }
+        }
+    }
+
+    /// Stop following a thread that no longer exists.
+    ///
+    /// Only the former ID of a thread that ran `exec` disappears this way, and
+    /// that thread did not lead its process, so its ID was never in the live set.
+    fn forget(
+        &mut self,
+        pid: pid_t,
+    ) {
+        self.tracees.remove(&pid);
+    }
+
+    /// Follow the tree until every thread in it has exited and been collected.
+    ///
+    /// The loop ends only when the calling thread has nothing left to wait for, so
+    /// it also waits for threads whose creation it has not seen.
+    fn run(&mut self) -> io::Result<()> {
+        while let Some((pid, status)) = next_change(self.live)? {
+            if let Some(status) = status {
+                self.handle(pid, status)?;
+            }
+        }
+        // Every thread has been collected; an ID left behind is one whose
+        // disappearance the loop could not read, and must never be signaled.
+        self.tracees.clear();
+        lock(self.live).clear();
+        Ok(())
+    }
+
+    /// Handle one collected wait status of a thread.
+    fn handle(
+        &mut self,
+        pid: pid_t,
+        status: c_int,
+    ) -> io::Result<()> {
+        if ended(status) {
+            self.exited(pid, status);
+            Ok(())
+        } else if libc::WIFSTOPPED(status) {
+            self.stopped(pid, status)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Handle the exit of a thread.
+    fn exited(
+        &mut self,
+        pid: pid_t,
+        status: c_int,
+    ) {
+        let announced = self
+            .tracees
+            .remove(&pid)
+            .is_some_and(|tracee| tracee.announced);
+        if !announced {
+            self.exited_unannounced.insert(pid);
+        }
+        if pid == self.root {
+            self.outcome.termination = Some(if libc::WIFEXITED(status) {
+                Termination::Exited(libc::WEXITSTATUS(status))
+            } else {
+                Termination::Signaled(libc::WTERMSIG(status))
+            });
+        }
+    }
+
+    /// Kill the process of a stopped thread after cancellation; the first time,
+    /// kill every live process as well.
+    ///
+    /// The thread is in a stop that the loop collected and has not resumed, so it
+    /// cannot have run `exec`, and its ID still names it.
+    fn kill(
+        &mut self,
+        pid: pid_t,
+    ) -> io::Result<()> {
+        if !self.killed {
+            self.killed = true;
+            kill_all(self.live);
+        }
+        unless_vanished(sys::kill(pid, libc::SIGKILL))
+    }
+
+    /// Handle a `ptrace` stop of a thread.
+    fn stopped(
+        &mut self,
+        pid: pid_t,
+        status: c_int,
+    ) -> io::Result<()> {
+        let signal = libc::WSTOPSIG(status);
+        let event = sys::stop_event(status);
+        // A new thread or process can report its first stop before the event of
+        // the thread that created it. It is stopped, so its ID still names it.
+        if !self.tracees.contains_key(&pid) {
+            let leader = leads_its_process(pid);
+            self.adopt(
+                pid,
+                Tracee {
+                    awaiting_initial_stop: true,
+                    announced: false,
+                },
+                leader,
+            );
+        }
+        if signal == libc::SIGTRAP && event != 0 {
+            return self.event_stop(pid, event);
+        }
+        if self.cancel.is_cancelled() {
+            return self.kill(pid);
+        }
+        if let Some(tracee) = self.tracees.get_mut(&pid)
+            && tracee.awaiting_initial_stop
+            && signal == libc::SIGSTOP
+            && event == 0
+        {
+            tracee.awaiting_initial_stop = false;
+            return unless_vanished(sys::resume(pid, 0));
+        }
+        match sys::has_signal_info(pid) {
+            // A signal-delivery stop: deliver the signal.
+            Ok(true) => unless_vanished(sys::resume(pid, signal)),
+            // A group stop: let the thread continue.
+            Ok(false) => unless_vanished(sys::resume(pid, 0)),
+            Err(error) => unless_vanished(Err(error)),
+        }
+    }
+
+    /// Follow a thread or process that a thread just created at an `event`.
+    ///
+    /// After cancellation a new thread is killed at once: its first stop may still
+    /// be pending, and nothing else would signal it before then.
+    fn created(
+        &mut self,
+        child: pid_t,
+        event: c_int,
+    ) -> io::Result<()> {
+        if self.exited_unannounced.remove(&child) {
+            // It already exited, and its exit has been collected.
+            return Ok(());
+        }
+        if let Some(tracee) = self.tracees.get_mut(&child) {
+            // Its first stop came first and was handled: after cancellation it was
+            // killed then; otherwise it may be running now, and only the live set
+            // and its next stop may signal it.
+            tracee.announced = true;
+            return Ok(());
+        }
+        // A fork or vfork always starts a process; a clone starts a thread unless
+        // it was asked for a process.
+        let leader = event != libc::PTRACE_EVENT_CLONE || leads_its_process(child);
+        self.adopt(
+            child,
+            Tracee {
+                awaiting_initial_stop: true,
+                announced: true,
+            },
+            leader,
+        );
+        if self.cancel.is_cancelled() {
+            // The new thread has not run since it was created, so it cannot have
+            // run `exec`, and its ID still names it.
+            return unless_vanished(sys::kill(child, libc::SIGKILL));
+        }
+        Ok(())
+    }
+
+    /// Handle a `ptrace` event stop, then resume the thread, or kill it after
+    /// cancellation.
+    ///
+    /// The event is handled even after cancellation, so a thread or process
+    /// created at this stop is followed and killed before the loop can end.
+    fn event_stop(
+        &mut self,
+        pid: pid_t,
+        event: c_int,
+    ) -> io::Result<()> {
+        let message = match sys::event_message(pid) {
+            Ok(message) => message,
+            // A thread that vanished cannot say what it created; a created thread
+            // still reports its first stop, and the loop waits for it.
+            Err(error) => return unless_vanished(Err(error)),
+        };
+        let cancelled = self.cancel.is_cancelled();
+        match event {
+            libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
+                self.created(message_pid(message)?, event)?;
+            },
+            libc::PTRACE_EVENT_EXEC => {
+                // A thread other than the leader that runs `exec` takes over the
+                // leader's ID, and its former ID disappears without an exit. The
+                // live set never held that ID, so nothing has signaled it.
+                let former = message_pid(message)?;
+                if former != pid {
+                    self.forget(former);
+                }
+            },
+            libc::PTRACE_EVENT_SECCOMP if !cancelled => self.seccomp_stop(pid, message),
+            _ => {},
+        }
+        if cancelled {
+            return self.kill(pid);
+        }
+        unless_vanished(sys::resume(pid, 0))
+    }
+
+    /// Handle a seccomp stop with the filter's return data. A tracked call only
+    /// continues until the decoding of the second part of phase 1 is added. A
+    /// non-native call marks the run as incompletely traced.
+    fn seccomp_stop(
+        &mut self,
+        pid: pid_t,
+        data: c_ulong,
+    ) {
+        let interface = match u16::try_from(data) {
+            Ok(filter::DATA_FOREIGN_ARCH) => "the 32-bit `int 0x80` interface",
+            Ok(filter::DATA_X32) => "the x32 interface",
+            Ok(_) | Err(_) => return,
+        };
+        if self.outcome.incomplete.is_some() {
+            return;
+        }
+        let call = match sys::registers(pid) {
+            Ok(registers) => {
+                format!(
+                    "system call {}",
+                    registers.orig_rax & !c_ulong::from(filter::X32_SYSCALL_BIT)
+                )
+            },
+            Err(_) => "a system call".to_owned(),
+        };
+        self.outcome.incomplete = Some(IncompleteReason::NonNativeSystemCall {
+            detail: format!("process {pid} made {call} through {interface}"),
+        });
+    }
+}
+
+/// Follow the tree whose first process is `root` until all of it has exited.
+///
+/// `root` must be a resumed tracee, and the only child, of the calling thread.
+/// When `cancel` is set, every thread the loop sees is killed.
+///
+/// # Errors
+///
+/// Returns the error of a wait or a `ptrace` request. The tree may then still be
+/// running; the caller kills and collects it with [`abandon`].
+pub(crate) fn follow(
+    root: pid_t,
+    live: &LiveProcesses,
+    cancel: &Cancellation,
+) -> io::Result<Outcome> {
+    let mut tree = Tree::new(root, live, cancel);
+    tree.run()?;
+    Ok(tree.outcome)
+}
+
+/// Kill every thread of a tree the loop could not follow to its end, including
+/// threads whose creation it never saw, and collect each one.
+pub(crate) fn abandon(live: &LiveProcesses) {
+    kill_all(live);
+    // Every thread still to report belongs to the tree; a stopped one is killed,
+    // and the waits go on until nothing is left or waiting fails.
+    while let Ok(Some((pid, status))) = next_change(live) {
+        if status.is_some_and(|status| libc::WIFSTOPPED(status)) {
+            // The thread is in a stop that was just collected and not resumed, so
+            // it cannot have run `exec`, and its ID still names it.
+            drop(sys::kill(pid, libc::SIGKILL));
+        }
+    }
+    lock(live).clear();
+}
+
+/// Tests that drive the loop by hand with real traced processes, to stop it at
+/// exactly the moment a test needs.
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        ffi::OsString,
+        fs,
+        os::fd::OwnedFd,
+        path::Path,
+        ptr,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use kizz_trace::{AbsolutePath, CaptureMode, EchoSink, RunRequest};
+    use libc::c_long;
+
+    use super::*;
+    use crate::{
+        capture,
+        spawn::{self, Program, Started},
+    };
+
+    /// The variable that selects the helper mode of this test executable.
+    const HELPER_VARIABLE: &str = "KIZZ_TRACE_UNIT_TEST_HELPER";
+    /// How long a test waits for something another process does.
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    /// Suspend the calling thread for good.
+    fn pause_forever() -> ! {
+        loop {
+            // SAFETY: `pause` has no requirements and is async-signal-safe.
+            unsafe { libc::pause() };
+        }
+    }
+
+    /// Park the calling thread for good.
+    fn park_forever() {
+        loop {
+            thread::park();
+        }
+    }
+
+    /// The work of a helper mode, run by this test executable when a test traces it
+    /// with [`HELPER_VARIABLE`] set. In a normal test run it does nothing.
+    #[test]
+    fn helper_process() {
+        let Some(mode) = std::env::var_os(HELPER_VARIABLE) else {
+            return;
+        };
+        match mode.to_str() {
+            Some("fork") => {
+                // SAFETY: both sides only call `pause`, which is async-signal-safe.
+                unsafe { libc::fork() };
+                pause_forever();
+            },
+            Some("vfork") => {
+                let unused: c_long = 0;
+                // SAFETY: without `CLONE_VM` the child gets its own copy of memory,
+                // as with `fork`, and both sides only call `pause`.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_clone,
+                        c_long::from(libc::CLONE_VFORK | libc::SIGCHLD),
+                        unused,
+                        unused,
+                        unused,
+                        unused,
+                    )
+                };
+                pause_forever();
+            },
+            Some("clone") => {
+                drop(thread::spawn(park_forever));
+                pause_forever();
+            },
+            Some("thread-exec") => {
+                // A thread that does not lead the process runs `exec`.
+                drop(thread::spawn(|| {
+                    let argv = [c"sleep".as_ptr(), c"1000".as_ptr(), ptr::null()];
+                    // SAFETY: the program and the arguments are NUL-terminated
+                    // strings, and `argv` is a null-terminated array.
+                    unsafe { libc::execv(c"/bin/sleep".as_ptr(), argv.as_ptr()) };
+                    panic!("could not run sleep: {}", io::Error::last_os_error());
+                }));
+                pause_forever();
+            },
+            other => panic!("unknown helper mode {other:?}"),
+        }
+    }
+
+    /// A request that runs this test executable in a helper mode.
+    fn helper(mode: &str) -> RunRequest {
+        let executable = std::env::current_exe().unwrap();
+        let args = [
+            "kizz_trace_linux",
+            "--exact",
+            "follow::tests::helper_process",
+            "--nocapture",
+            "--test-threads=1",
+            "--quiet",
+        ];
+        RunRequest {
+            program: AbsolutePath::new(executable).unwrap(),
+            args: args.iter().map(OsString::from).collect(),
+            env: BTreeMap::from([(OsString::from(HELPER_VARIABLE), OsString::from(mode))]),
+            cwd: AbsolutePath::new("/").unwrap(),
+            stdin: None,
+            capture: CaptureMode::Split,
+            echo: false,
+        }
+    }
+
+    /// Whether a process or thread has exited: it no longer exists, or it is a
+    /// zombie that only waits to be collected.
+    fn has_exited(pid: pid_t) -> bool {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+        matches!(state, Some('Z' | 'X'))
+    }
+
+    /// Collect the waiting state change of a known thread, if it has one, keeping
+    /// the live set as [`next_change`] does. A thread whose ID was released by an
+    /// `exec` that the loop has not handled yet has nothing to collect.
+    fn collect_known(
+        live: &LiveProcesses,
+        pid: pid_t,
+    ) -> Option<c_int> {
+        let mut live = lock(live);
+        let status = match sys::collect(pid) {
+            Ok(status) => status,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => None,
+            Err(error) => panic!("could not collect thread {pid}: {error}"),
+        };
+        if let Some(status) = status
+            && ended(status)
+        {
+            live.remove(&pid);
+        }
+        status
+    }
+
+    /// How the test hands an event to the loop after cancellation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Handover {
+        /// The loop handles the event after cancellation.
+        Event,
+        /// The watchdog kills the live processes before the loop handles the event,
+        /// as when it acts while the event happens. For a creation event, the
+        /// creator is killed, so the loop never learns of the new thread from it.
+        Watchdog,
+    }
+
+    /// A helper that a test traces and follows by hand.
+    struct Traced {
+        /// The helper's first process.
+        root: pid_t,
+        /// One report per output pipe: whether its reader reached end of file.
+        finished: mpsc::Receiver<bool>,
+        /// The read end of the start-failure pipe, kept open while the test runs.
+        _report: OwnedFd,
+    }
+
+    /// Start the helper `mode` under `ptrace`, with a reader on each output pipe.
+    fn trace_helper(mode: &str) -> Traced {
+        let request = helper(mode);
+        let program = Program::prepare(&request).unwrap();
+        let filter = filter::program().unwrap();
+        let (child_stdio, tracer_stdio) = capture::pipes(&request).unwrap();
+        let (report, report_write) = sys::pipe().unwrap();
+        let started = spawn::start(&request, &program, &filter, &child_stdio, report_write);
+        drop(child_stdio);
+        let Ok(Started::Running(root)) = started else {
+            panic!("the helper did not start: {started:?}");
+        };
+        let (done, finished) = mpsc::channel();
+        for (stream, pipe) in tracer_stdio.outputs {
+            let done = done.clone();
+            thread::spawn(move || {
+                let echo: Option<&dyn EchoSink> = None;
+                done.send(capture::collect(pipe, stream, echo).is_ok()).ok();
+            });
+        }
+        Traced {
+            root,
+            finished,
+            _report: report,
+        }
+    }
+
+    /// Assert the invariant that keeps the watchdog's signals inside the tree:
+    /// every ID in the live set names a followed thread that leads its process.
+    fn assert_only_processes_are_live(
+        tree: &Tree<'_>,
+        live: &LiveProcesses,
+    ) {
+        for &pid in lock(live).iter() {
+            assert!(
+                tree.tracees.contains_key(&pid),
+                "the live ID {pid} is not followed"
+            );
+            assert_eq!(
+                sys::thread_group(pid).unwrap(),
+                pid,
+                "the live ID {pid} names a thread that does not lead its process"
+            );
+        }
+    }
+
+    /// Follow the tree by hand, waiting only for threads the loop already knows, so
+    /// a new thread's first stop stays pending, until `wanted` picks a stop, and
+    /// return that thread and its wait status, not yet handled. The live-set
+    /// invariant is checked before every round of waits.
+    fn drive_until(
+        tree: &mut Tree<'_>,
+        live: &LiveProcesses,
+        what: &str,
+        wanted: impl Fn(pid_t, c_int) -> bool,
+    ) -> (pid_t, c_int) {
+        let deadline = Instant::now().checked_add(PATIENCE).unwrap();
+        loop {
+            assert!(Instant::now() < deadline, "the helper made no {what}");
+            assert_only_processes_are_live(tree, live);
+            let mut idle = true;
+            let known: Vec<pid_t> = tree.tracees.keys().copied().collect();
+            for pid in known {
+                let Some(status) = collect_known(live, pid) else {
+                    continue;
+                };
+                idle = false;
+                if wanted(pid, status) {
+                    return (pid, status);
+                }
+                tree.handle(pid, status).unwrap();
+            }
+            if idle {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Whether a wait status is a `ptrace` stop at `event`.
+    fn is_event_stop(
+        status: c_int,
+        event: c_int,
+    ) -> bool {
+        libc::WIFSTOPPED(status)
+            && libc::WSTOPSIG(status) == libc::SIGTRAP
+            && sys::stop_event(status) == event
+    }
+
+    /// Let the loop finish after cancellation, and assert that it ended with every
+    /// thread collected, the first process killed, each of `others` gone, and no
+    /// process left that holds an output pipe.
+    fn finish_cancelled(
+        mut tree: Tree<'_>,
+        live: &LiveProcesses,
+        traced: &Traced,
+        others: &[pid_t],
+    ) {
+        tree.run().unwrap();
+        assert!(tree.tracees.is_empty());
+        assert!(lock(live).is_empty());
+        assert_eq!(
+            tree.outcome.termination,
+            Some(Termination::Signaled(libc::SIGKILL))
+        );
+        for &pid in others.iter().chain([&traced.root]) {
+            assert!(has_exited(pid), "process {pid} survived cancellation");
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                traced.finished.recv_timeout(PATIENCE),
+                Ok(true),
+                "an output pipe stayed open after cancellation"
+            );
+        }
+    }
+
+    /// Trace the helper `mode` and follow it by hand until a thread stops at a
+    /// creation event `event`, with the new thread's first stop still pending.
+    /// Then cancel, hand the event over as `handover` says, and let the loop
+    /// finish: the new thread must be gone too.
+    fn cancel_at_creation(
+        mode: &str,
+        event: c_int,
+        handover: Handover,
+    ) {
+        let traced = trace_helper(mode);
+        let live = LiveProcesses::default();
+        let cancel = Cancellation::new();
+        let mut tree = Tree::new(traced.root, &live, &cancel);
+        let (creator, status) = drive_until(&mut tree, &live, "creation event", |_, status| {
+            is_event_stop(status, event)
+        });
+        let created = message_pid(sys::event_message(creator).unwrap()).unwrap();
+        assert!(
+            !tree.tracees.contains_key(&created),
+            "the new thread {created} was already followed"
+        );
+        cancel.cancel();
+        match handover {
+            Handover::Event => tree.handle(creator, status).unwrap(),
+            Handover::Watchdog => kill_all(&live),
+        }
+        assert_only_processes_are_live(&tree, &live);
+        finish_cancelled(tree, &live, &traced, &[created]);
+    }
+
+    /// Trace a helper whose thread that does not lead the process runs `exec`, and
+    /// follow it by hand until the `exec` event, which the loop has not handled
+    /// yet while the kernel has already released the thread's former ID. Then
+    /// cancel, hand the event over as `handover` says, and let the loop finish.
+    ///
+    /// The former ID must never have been in the live set: the watchdog may signal
+    /// only the process, whose ID the thread took over.
+    fn cancel_at_non_leader_exec(handover: Handover) {
+        let traced = trace_helper("thread-exec");
+        let root = traced.root;
+        let live = LiveProcesses::default();
+        let cancel = Cancellation::new();
+        let mut tree = Tree::new(root, &live, &cancel);
+        let (runner, status) = drive_until(
+            &mut tree,
+            &live,
+            "exec from a thread that does not lead its process",
+            |pid, status| {
+                is_event_stop(status, libc::PTRACE_EVENT_EXEC)
+                    && sys::event_message(pid)
+                        .and_then(message_pid)
+                        .is_ok_and(|former| former != pid)
+            },
+        );
+        let former = message_pid(sys::event_message(runner).unwrap()).unwrap();
+        assert_eq!(runner, root, "the thread did not take over the leader's ID");
+        assert!(
+            tree.tracees.contains_key(&former),
+            "the thread {former} was not followed before its exec"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{root}/task/{former}")).exists(),
+            "the former ID {former} still names a thread of the process"
+        );
+        // The ID is released, and the loop has not seen that yet; the watchdog
+        // would signal exactly the process.
+        assert_eq!(*lock(&live), BTreeSet::from([root]));
+        cancel.cancel();
+        match handover {
+            Handover::Event => {
+                tree.handle(runner, status).unwrap();
+                assert!(!tree.tracees.contains_key(&former));
+            },
+            Handover::Watchdog => kill_all(&live),
+        }
+        assert_only_processes_are_live(&tree, &live);
+        finish_cancelled(tree, &live, &traced, &[]);
+    }
+
+    #[test]
+    fn cancellation_at_a_fork_event_kills_the_new_process() {
+        cancel_at_creation("fork", libc::PTRACE_EVENT_FORK, Handover::Event);
+    }
+
+    #[test]
+    fn cancellation_at_a_vfork_event_kills_the_new_process() {
+        cancel_at_creation("vfork", libc::PTRACE_EVENT_VFORK, Handover::Event);
+    }
+
+    #[test]
+    fn cancellation_at_a_clone_event_kills_the_new_thread() {
+        cancel_at_creation("clone", libc::PTRACE_EVENT_CLONE, Handover::Event);
+    }
+
+    #[test]
+    fn a_process_created_while_its_creator_is_killed_is_still_killed() {
+        cancel_at_creation("fork", libc::PTRACE_EVENT_FORK, Handover::Watchdog);
+    }
+
+    #[test]
+    fn a_vforked_process_created_while_its_creator_is_killed_is_still_killed() {
+        cancel_at_creation("vfork", libc::PTRACE_EVENT_VFORK, Handover::Watchdog);
+    }
+
+    #[test]
+    fn a_thread_created_while_its_creator_is_killed_is_still_collected() {
+        cancel_at_creation("clone", libc::PTRACE_EVENT_CLONE, Handover::Watchdog);
+    }
+
+    #[test]
+    fn cancellation_at_a_non_leader_exec_signals_only_the_process() {
+        cancel_at_non_leader_exec(Handover::Event);
+    }
+
+    #[test]
+    fn the_watchdog_never_signals_the_former_id_of_a_non_leader_exec() {
+        cancel_at_non_leader_exec(Handover::Watchdog);
+    }
+
+    #[test]
+    fn a_cloned_thread_never_joins_the_live_set() {
+        let traced = trace_helper("clone");
+        let live = LiveProcesses::default();
+        let cancel = Cancellation::new();
+        let mut tree = Tree::new(traced.root, &live, &cancel);
+        let (creator, status) = drive_until(&mut tree, &live, "clone event", |_, status| {
+            is_event_stop(status, libc::PTRACE_EVENT_CLONE)
+        });
+        let created = message_pid(sys::event_message(creator).unwrap()).unwrap();
+        tree.handle(creator, status).unwrap();
+        assert!(tree.tracees.contains_key(&created));
+        assert!(!lock(&live).contains(&created));
+        assert_eq!(*lock(&live), BTreeSet::from([traced.root]));
+        assert_only_processes_are_live(&tree, &live);
+        cancel.cancel();
+        kill_all(&live);
+        finish_cancelled(tree, &live, &traced, &[created]);
+    }
+}

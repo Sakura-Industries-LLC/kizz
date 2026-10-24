@@ -452,6 +452,8 @@ name = "kizz-trace-linux"
 version = "0.0.1"
 dependencies = [
  "kizz-trace",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
