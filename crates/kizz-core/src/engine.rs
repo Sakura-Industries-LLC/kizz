@@ -55,6 +55,11 @@
 //! again without running. In a later build, the marked record makes the step run
 //! again, with that stated as the reason.
 //!
+//! A run's connections to IPv4 and IPv6 addresses and to Unix sockets, which the
+//! tracer reports, never keep its result out of the cache: the record lists them,
+//! and the engine keeps each run that made any for the build's warnings (see
+//! [`Engine::connections`]). A cache hit runs nothing, so it adds no warning.
+//!
 //! A missing or non-executable program fails the task and is recorded like any
 //! other failure, with every path checked and the failure message, which a cache hit
 //! fails with again. A bare program name without `PATH` in the step's environment,
@@ -90,6 +95,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     ffi::OsString,
     fmt, mem,
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         Mutex, MutexGuard, PoisonError,
@@ -99,10 +105,10 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, BuildId, Capture, ContentHash, Explanation, LastWriter, NotCachedReason,
-    Observation, PathKey, PositionKey, ProgramPath, Reason, RecordedOutput, RunReason, StepExit,
-    StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Txn,
-    Verdict, WrittenBy,
+    AccessBits, BuildId, Capture, Connection, ContentHash, Explanation, LastWriter,
+    NotCachedReason, Observation, PathKey, PositionKey, ProgramPath, Reason, RecordedOutput,
+    RunReason, StepExit, StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError,
+    TaskId, TaskRecord, Txn, Verdict, WrittenBy,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -170,6 +176,19 @@ pub struct UnknownCalls {
     pub cached: bool,
 }
 
+/// A run of a step that connected to IPv4 or IPv6 addresses or to Unix sockets, as
+/// the engine keeps it for the build's warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepConnections {
+    /// The step key.
+    pub key: StepKey,
+    /// Each connection, sorted and without repeats.
+    pub connections: Vec<Connection>,
+    /// Whether the result was cached: connections never keep it out of the cache,
+    /// but another reason may.
+    pub cached: bool,
+}
+
 /// What every task of a build shares to run, check, and record its steps.
 pub struct Engine<'a> {
     /// Runs and traces the commands.
@@ -200,6 +219,8 @@ pub struct Engine<'a> {
     /// The runs of the build that made system calls that the tracer does not know,
     /// in the order they ended.
     unknown_calls: Mutex<Vec<UnknownCalls>>,
+    /// The runs of the build that made connections, in the order they ended.
+    connections: Mutex<Vec<StepConnections>>,
 }
 
 impl fmt::Debug for Engine<'_> {
@@ -220,6 +241,7 @@ impl fmt::Debug for Engine<'_> {
                 &self.cache_unknown_system_calls,
             )
             .field("unknown_calls", &self.unknown_calls)
+            .field("connections", &self.connections)
             .finish_non_exhaustive()
     }
 }
@@ -254,6 +276,7 @@ impl<'a> Engine<'a> {
             warnings: Mutex::new(Vec::new()),
             cache_unknown_system_calls: false,
             unknown_calls: Mutex::new(Vec::new()),
+            connections: Mutex::new(Vec::new()),
         }
     }
 
@@ -283,6 +306,14 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn unknown_system_calls(&self) -> Vec<UnknownCalls> {
         lock(&self.unknown_calls).clone()
+    }
+
+    /// The runs of the build that connected to IPv4 or IPv6 addresses or to Unix
+    /// sockets, in the order they ended, each with its connections and whether its
+    /// result was cached. A cache hit is no run, so it adds nothing.
+    #[must_use]
+    pub fn connections(&self) -> Vec<StepConnections> {
+        lock(&self.connections).clone()
     }
 
     /// The identity of the build.
@@ -562,6 +593,47 @@ struct Finished {
     /// does not know, sorted and without repeats; empty for a command that did not
     /// run.
     unknown_system_calls: Vec<u32>,
+    /// The connections that the command made, sorted and without repeats; empty
+    /// for a command that did not run.
+    connections: Vec<Connection>,
+}
+
+/// The connection `connection` that the tracer reported, as a record keeps it.
+fn stored_connection(connection: &kizz_trace::Connection) -> Connection {
+    match connection {
+        kizz_trace::Connection::Ip(SocketAddr::V4(address)) => {
+            Connection::Ipv4 {
+                address: address.ip().octets(),
+                port: address.port(),
+            }
+        },
+        kizz_trace::Connection::Ip(SocketAddr::V6(address)) => {
+            Connection::Ipv6 {
+                address: address.ip().octets(),
+                port: address.port(),
+                scope: address.scope_id(),
+            }
+        },
+        kizz_trace::Connection::UnixPath(path) => {
+            Connection::UnixPath {
+                path: path.as_path().to_path_buf(),
+            }
+        },
+        kizz_trace::Connection::UnixAbstract(name) => {
+            Connection::UnixAbstract { name: name.clone() }
+        },
+    }
+}
+
+/// The connections `connections` that the tracer reported, as a record keeps them:
+/// sorted and without repeats.
+fn stored_connections(connections: &BTreeSet<kizz_trace::Connection>) -> Vec<Connection> {
+    connections
+        .iter()
+        .map(stored_connection)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// A step error from a store error.
@@ -1147,6 +1219,7 @@ impl TaskSteps<'_> {
                     failure: None,
                     first_reads: result.first_reads,
                     unknown_system_calls: result.unknown_system_calls.into_iter().collect(),
+                    connections: stored_connections(&result.connections),
                 };
                 self.finish_run(step, pending, finished, why, Ok(outcome.clone()))?;
                 Ok(outcome)
@@ -1175,6 +1248,7 @@ impl TaskSteps<'_> {
                     failure: Some(message.clone()),
                     first_reads: FirstReads::new(),
                     unknown_system_calls: Vec::new(),
+                    connections: Vec::new(),
                 })?;
                 Err(StepError::new(message))
             },
@@ -1195,6 +1269,7 @@ impl TaskSteps<'_> {
                     failure: Some(message.clone()),
                     first_reads: FirstReads::new(),
                     unknown_system_calls: Vec::new(),
+                    connections: Vec::new(),
                 };
                 let why = NotCachedReason::StartFailed { message };
                 self.finish_run(step, pending, finished, Some(why), Err(failure.clone()))?;
@@ -1249,8 +1324,8 @@ impl TaskSteps<'_> {
     /// marked with the reason and replaces any older record of its key, so no older
     /// result is replayed, and the result is kept in memory for the rest of the
     /// build, with the states of the paths it touched. A run that made system calls
-    /// that the tracer does not know is kept for the build's warnings, with whether
-    /// its result was cached.
+    /// that the tracer does not know, and a run that made connections, is kept for
+    /// the build's warnings, with whether its result was cached.
     fn finish_run(
         &self,
         step: &StepSpec,
@@ -1269,6 +1344,13 @@ impl TaskSteps<'_> {
             lock(&self.engine.unknown_calls).push(UnknownCalls {
                 key: pending.key,
                 numbers: record.unknown_system_calls.clone(),
+                cached: why.is_none(),
+            });
+        }
+        if !record.connections.is_empty() {
+            lock(&self.engine.connections).push(StepConnections {
+                key: pending.key,
+                connections: record.connections.clone(),
                 cached: why.is_none(),
             });
         }
@@ -1363,6 +1445,7 @@ impl TaskSteps<'_> {
             not_cached: None,
             owners: BTreeSet::new(),
             unknown_system_calls: finished.unknown_system_calls,
+            connections: finished.connections,
         }
     }
 
@@ -1393,6 +1476,7 @@ impl TaskSteps<'_> {
             failure: Some(message.clone()),
             first_reads: FirstReads::new(),
             unknown_system_calls: Vec::new(),
+            connections: Vec::new(),
         })?;
         Err(StepError::new(message))
     }

@@ -12,6 +12,7 @@ cmark
 cowextsize
 creat
 dashmap
+datagram
 debugserver
 dedup
 Deque
@@ -21,8 +22,11 @@ DONT
 dotenv
 DUPFD
 EACCES
+EADDRINUSE
+EAGAIN
 EBADF
 ECHILD
+ECONNREFUSED
 EEXIST
 EFAULT
 EINTR
@@ -120,6 +124,7 @@ llistxattr
 lremovexattr
 lsetxattr
 MAXINSNS
+MAXIOV
 MAXSYMLINKS
 minicbor
 mkdirat
@@ -127,6 +132,11 @@ mkfifo
 mknod
 mknodat
 mmap
+MMSG
+mmsghdr
+msghdr
+namelen
+netlink
 newfstatat
 NEWNET
 NEWNS
@@ -181,6 +191,9 @@ Sakura
 sccache
 seccomp
 SEGV
+sendmmsg
+sendmsg
+sendto
 setattr
 setext
 SETMASK
@@ -205,6 +218,7 @@ sigset
 SIGSTOP
 SIGTRAP
 SIGUSR
+sockaddr
 Starlark
 statfs
 statx

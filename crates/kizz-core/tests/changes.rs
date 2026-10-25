@@ -102,6 +102,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
         incomplete: None,
         first_reads,
         unknown_system_calls: BTreeSet::new(),
+        connections: BTreeSet::new(),
     })
 }
 

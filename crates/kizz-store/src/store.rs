@@ -73,8 +73,11 @@ const WIPED_DIR: &str = "db.wiped";
 /// numbers of the system calls that a command made and that the tracer does not
 /// know to every step record, whether or not its result was cached, and the reason
 /// for a run that made such calls, which, like the other reasons a run's result is
-/// not cached, marks a record that is never a cache hit.
-pub const SCHEMA_VERSION: u32 = 14;
+/// not cached, marks a record that is never a cache hit. Version 15 adds the
+/// connections that a command made to IPv4 and IPv6 addresses and to Unix sockets,
+/// by path or abstract name, to every step record, whether or not its result was
+/// cached; they never keep a result out of the cache.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -630,11 +633,11 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 14 adds the unknown system calls of a run to step records and the
-    /// reason for a run that made them, one more than version 13, which added
-    /// extended attributes to recorded states.
+    /// Version 15 adds the connections of a run to step records, one more than
+    /// version 14, which added the unknown system calls of a run and the reason for
+    /// a run that made them.
     #[test]
-    fn schema_version_14_records_unknown_system_calls() {
-        assert_eq!(SCHEMA_VERSION, 14);
+    fn schema_version_15_records_connections() {
+        assert_eq!(SCHEMA_VERSION, 15);
     }
 }

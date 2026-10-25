@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The report of `kizz why`: the reasons stored by the most recent build for the
-//! tasks under a path, with each step's untracked `/proc` and `/sys` accesses, the
-//! system calls it made that the tracer does not know, and how many accesses it
-//! ignored.
+//! tasks under a path, with each step's untracked `/proc` and `/sys` accesses, its
+//! connections to the network and to Unix sockets, the system calls it made that
+//! the tracer does not know, and how many accesses it ignored.
 //!
 //! The tasks under a directory are the task records whose `kizz.md` is under it; a
 //! path that names a file selects the tasks of that file. Among those, the most
@@ -19,8 +19,8 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, BuildId, PathState, StepKey, StepPosition, StepRecord, Store, StoreError, TaskId,
-    TaskLabel, TaskRecord, Verdict, path_prefix,
+    AccessBits, BuildId, Connection, PathState, StepKey, StepPosition, StepRecord, Store,
+    StoreError, TaskId, TaskLabel, TaskRecord, Verdict, path_prefix,
 };
 
 use crate::{explain::RepeatedWarning, render::Render};
@@ -44,6 +44,9 @@ pub struct WhyStep {
     /// The numbers of the system calls that the step's command made and that the
     /// tracer does not know, sorted, as its record lists them.
     pub unknown_system_calls: Vec<u32>,
+    /// The connections that the step's command made to IPv4 or IPv6 addresses or to
+    /// Unix sockets, sorted, as its record lists them.
+    pub connections: Vec<Connection>,
 }
 
 impl WhyStep {
@@ -173,8 +176,8 @@ fn step(
     position: u32,
     stored: StepPosition,
 ) -> WhyStep {
-    let (argv, untracked, ignored, unknown_system_calls) = record.map_or_else(
-        || (None, Vec::new(), 0, Vec::new()),
+    let (argv, untracked, ignored, unknown_system_calls, connections) = record.map_or_else(
+        || (None, Vec::new(), 0, Vec::new(), Vec::new()),
         |record| {
             let untracked = record
                 .observations
@@ -187,6 +190,7 @@ fn step(
                 untracked,
                 record.ignored,
                 record.unknown_system_calls,
+                record.connections,
             )
         },
     );
@@ -198,14 +202,16 @@ fn step(
         untracked,
         ignored,
         unknown_system_calls,
+        connections,
     }
 }
 
 impl Render {
     /// The report of `kizz why` as text: each task with its targets, and each step
     /// with its command, its full reasons, its untracked `/proc` and `/sys` accesses,
-    /// on a line of their own the system calls it made that the tracer does not
-    /// know, when there are any, and how many accesses it ignored.
+    /// on a line of their own its connections, or that it made none, and the system
+    /// calls it made that the tracer does not know, when there are any, and how many
+    /// accesses it ignored.
     #[must_use]
     pub fn why(
         &self,
@@ -248,6 +254,7 @@ impl Render {
                         .map(|line| format!("    {line}")),
                 );
                 lines.push(format!("    {}", self.untracked(&step.untracked)));
+                lines.push(format!("    {}", self.connections(&step.connections)));
                 if !step.unknown_system_calls.is_empty() {
                     let numbers: Vec<String> = step
                         .unknown_system_calls
@@ -264,6 +271,22 @@ impl Render {
         }
         lines.push(String::new());
         lines.join("\n")
+    }
+
+    /// The connections of a step on one line, each Unix socket path relative to the
+    /// base and in backticks, or `none`.
+    fn connections(
+        &self,
+        connections: &[Connection],
+    ) -> String {
+        if connections.is_empty() {
+            return "connections: none".to_owned();
+        }
+        let shown: Vec<String> = connections
+            .iter()
+            .map(|connection| connection.text(|path| format!("`{}`", self.path(path))))
+            .collect();
+        format!("connections: {}", shown.join(", "))
     }
 
     /// The untracked `/proc` and `/sys` accesses of a step on one line.

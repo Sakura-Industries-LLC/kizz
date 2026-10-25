@@ -52,6 +52,7 @@ kizz.md:3 (Build) [ci]
     ran because:
       never run: there is no record for this step
     untracked /proc and /sys accesses: `/proc/cpuinfo` (read), `/sys/kernel` (probe)
+    connections: none
     ignored accesses: 1
 ";
 
@@ -104,6 +105,7 @@ impl Tracer for FakeTracer {
             incomplete: None,
             first_reads,
             unknown_system_calls: BTreeSet::new(),
+            connections: BTreeSet::new(),
         })
     }
 
@@ -329,6 +331,7 @@ kizz.md:3 (Build) [ci]
       the environment changed:
         {change}
     untracked /proc and /sys accesses: `/proc/cpuinfo` (read), `/sys/kernel` (probe)
+    connections: none
     ignored accesses: 1
 "
         )

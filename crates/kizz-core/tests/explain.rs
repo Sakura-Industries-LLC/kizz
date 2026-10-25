@@ -7,7 +7,7 @@
 //! that writes a file and also reads it, the warning for consecutive builds, the
 //! one-line reasons, permission and owner changes, timestamp changes and the
 //! `timestamps` option, order and entries changes of listed directories, system
-//! calls that the tracer does not know, and the report of `kizz why`.
+//! calls that the tracer does not know, connections, and the report of `kizz why`.
 //!
 //! Each test builds a project directory and a cache in temporary directories. A
 //! build is one [`Engine`] on a store opened in the cache, and each task runs through
@@ -25,6 +25,10 @@
 //! * `signal` makes a signal kill the command;
 //! * `unknown:NUMBER` reports the system call `NUMBER` as one that the tracer does not
 //!   know;
+//! * `tcp:ADDRESS` reports a connection to the IP address and port `ADDRESS`, such as
+//!   `127.0.0.1:80` or `[::1]:80`;
+//! * `unix:PATH` reports a connection to the Unix socket `PATH`;
+//! * `abstract:NAME` reports a connection to the abstract Unix socket `NAME`;
 //!
 //! and any other argument does nothing. Relative paths are relative to the step's
 //! working directory. As the Linux tracer does, the fake notes the metadata of each
@@ -36,6 +40,7 @@ use std::{
     error::Error,
     fs::{self, File, FileTimes},
     io,
+    net::SocketAddr,
     os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
@@ -52,8 +57,8 @@ use kizz_store::{
     TaskRecord, Verdict, Writer,
 };
 use kizz_trace::{
-    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Connection,
+    EchoSink, FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -86,6 +91,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
     accesses.record(request.program.clone(), AccessKind::Exec);
     let mut termination = Termination::Exited(0);
     let mut unknown = BTreeSet::new();
+    let mut connections = BTreeSet::new();
     let mut record = |path: PathBuf, kind: AccessKind| -> Result<(), TraceError> {
         let path = AbsolutePath::new(path).map_err(|error| tracer_failure(&error))?;
         if matches!(kind, AccessKind::Read | AccessKind::Exec) {
@@ -132,6 +138,20 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
                         .map_err(|error| tracer_failure(&error))?,
                 );
             },
+            "tcp" => {
+                connections.insert(Connection::Ip(
+                    rest.parse::<SocketAddr>()
+                        .map_err(|error| tracer_failure(&error))?,
+                ));
+            },
+            "unix" => {
+                connections.insert(Connection::UnixPath(
+                    AbsolutePath::new(&path).map_err(|error| tracer_failure(&error))?,
+                ));
+            },
+            "abstract" => {
+                connections.insert(Connection::UnixAbstract(rest.as_bytes().to_vec()));
+            },
             _ => {},
         }
     }
@@ -142,6 +162,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
         incomplete: None,
         first_reads,
         unknown_system_calls: unknown,
+        connections,
     })
 }
 
@@ -721,6 +742,7 @@ kizz.md:3 (Build) [ci]
       1 input changed:
         {input}
     untracked /proc and /sys accesses: none
+    connections: none
     ignored accesses: 0
 "
     )
@@ -901,6 +923,7 @@ kizz.md:3 (Build) [ci]
     ran because:
       {option}
     untracked /proc and /sys accesses: none
+    connections: none
     ignored accesses: 0
 "
         )
@@ -926,6 +949,7 @@ kizz.md:3 (Build) [ci]
       1 input changed:
         {input}
     untracked /proc and /sys accesses: none
+    connections: none
     ignored accesses: 0
 "
     )
@@ -1334,11 +1358,13 @@ kizz.md:3 (Build) [ci]
     ran because:
       never run: there is no record for this step
     untracked /proc and /sys accesses: `/proc/cpuinfo` (read), `/sys/kernel` (probe)
+    connections: none
     ignored accesses: 1
   step 2: `tool second`
     ran because:
       never run: there is no record for this step
     untracked /proc and /sys accesses: none
+    connections: none
     ignored accesses: 0
 "
     );
@@ -1434,6 +1460,7 @@ kizz.md:3 (Build) [ci]
   step 1: `tool unknown:1000000 unknown:400`
 {reasons}
     untracked /proc and /sys accesses: none
+    connections: none
     system calls that the tracer does not know: 400, 1000000
     ignored accesses: 0
 "
@@ -1480,5 +1507,60 @@ fn unknown_system_calls_are_explained() -> TestResult {
         why_for_unknown_system_calls("    cached: no recorded input changed")
     );
     assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// its connecting command once, with the lines `reasons` and the line of its
+/// connections.
+fn why_for_connections(reasons: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool abstract:kizz unix:run/s.sock tcp:[::1]:443 tcp:127.0.0.1:80 tcp:127.0.0.1:80`
+{reasons}
+    untracked /proc and /sys accesses: none
+    connections: 127.0.0.1:80, [::1]:443, Unix socket `run/s.sock`, abstract Unix socket @kizz
+    ignored accesses: 0
+"
+    )
+}
+
+/// A run that made connections is cached, and its explanations say nothing of
+/// them: `kizz why` lists them, sorted and once each, on a line of their own, with
+/// a Unix socket path relative to the base, after the run and after a later cache
+/// hit alike.
+#[test]
+fn connections_are_listed_by_why() -> TestResult {
+    let fixture = Fixture::new()?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let step = fixture.step(&[
+        "tool",
+        "abstract:kizz",
+        "unix:run/s.sock",
+        "tcp:[::1]:443",
+        "tcp:127.0.0.1:80",
+        "tcp:127.0.0.1:80",
+    ])?;
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    let reason = "never run: there is no record for this step";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {reason}")])
+    );
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_connections(&format!("    ran because:\n      {reason}"))
+    );
+
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_connections("    cached: no recorded input changed")
+    );
+    assert_eq!(tracer.runs(), 1);
     Ok(())
 }

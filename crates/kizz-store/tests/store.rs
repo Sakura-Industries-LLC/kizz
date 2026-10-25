@@ -113,6 +113,7 @@ fn step_record(n: u8) -> StepRecord {
         not_cached: None,
         owners: [task(&format!("/w/{n}"), u32::from(n)), task("/w/shared", 0)].into(),
         unknown_system_calls: Vec::new(),
+        connections: Vec::new(),
     }
 }
 

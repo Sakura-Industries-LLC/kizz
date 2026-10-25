@@ -18,6 +18,7 @@ use std::{
     ffi::CString,
     fs,
     io::{self, BufRead as _, BufReader, Lines},
+    net::{Ipv4Addr, TcpListener},
     os::unix::{
         ffi::OsStrExt as _,
         fs::{MetadataExt as _, PermissionsExt as _, symlink},
@@ -29,7 +30,8 @@ use std::{
 };
 
 use kizz_store::{
-    Change, ChangedRead, LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store, Times,
+    Change, ChangedRead, Connection, LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store,
+    Times,
 };
 use tempfile::TempDir;
 
@@ -1532,5 +1534,68 @@ fn a_file_changed_by_something_else_during_a_run_is_a_loud_warning() -> TestResu
         "{record:?}"
     );
     assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// A command that connects to a loopback address, here `bash` through `/dev/tcp`
+/// to a listener that the test opens, is cached, and the build warns once, naming
+/// the command and the address, that kizz cannot see what came back, that the
+/// result is still cached, and that `always = True` runs a command on every build;
+/// the summary repeats the warning. The record lists the connection, the next build
+/// is a cache hit without the warning, and `kizz why` lists the connection.
+#[test]
+fn a_command_that_connects_warns_and_is_still_cached() -> TestResult {
+    let project = Project::new()?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
+    project.kizz_md("", &[(
+        "Connect",
+        &format!("run(\"bash\", \"-c\", \"{script}\", expect = [0])"),
+    )])?;
+    let command = format!("bash -c {script}");
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first.stdout.starts_with(&format!(
+            "{}\n",
+            ran(&command, "kizz.md:3 (Connect)", NEVER_RUN)
+        )),
+        "{first:?}"
+    );
+    let message = format!(
+        "`{command}` in . connected to 127.0.0.1:{port}; kizz cannot see what came back, and \
+         its result is still cached; `always = True` runs a command on every build"
+    );
+    assert_eq!(
+        first.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{first:?}"
+    );
+    let records = project.step_records()?;
+    let [record] = records.as_slice() else {
+        return Err(format!("expected one record, found {records:?}").into());
+    };
+    assert_eq!(record.not_cached, None, "{record:?}");
+    assert_eq!(record.connections, [Connection::Ipv4 {
+        address: [127, 0, 0, 1],
+        port,
+    }]);
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(second.stderr, "", "{second:?}");
+    assert!(!second.stdout.contains("ran `"), "{second:?}");
+    assert!(second.stdout.contains(", 1 cached"), "{second:?}");
+
+    let why = project.run("", &["why"])?;
+    assert_eq!(why.status, Some(0), "{why:?}");
+    assert!(
+        why.stdout
+            .contains(&format!("\n    connections: 127.0.0.1:{port}\n")),
+        "{why:?}"
+    );
+    drop(listener);
     Ok(())
 }

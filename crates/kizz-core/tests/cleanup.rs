@@ -97,6 +97,7 @@ fn step(
         not_cached: None,
         owners: BTreeSet::new(),
         unknown_system_calls: Vec::new(),
+        connections: Vec::new(),
     }
 }
 

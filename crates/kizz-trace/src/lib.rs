@@ -11,7 +11,8 @@
 //! the command and returns a [`RunResult`]: how the command ended, its raw captured
 //! output, every path its process tree touched with the combined [`AccessKinds`]
 //! for each path, the [`FirstReads`] of the run, the system calls of the run that
-//! the tracer does not know, and a report when the trace is incomplete.
+//! the tracer does not know, the [`Connection`]s of the run, and a report when the
+//! trace is incomplete.
 //!
 //! The first reads hold, for each path whose first read or run of a regular file
 //! came before any write of that path in the run, the file's [`FileMetadata`] at
@@ -23,6 +24,11 @@
 //! A system call that the tracer does not know is not a reason for an incomplete
 //! trace: the tracer reports its number in [`RunResult::unknown_system_calls`], and
 //! the engine decides whether such a run is cached.
+//!
+//! A connection to an IPv4 or IPv6 address, or to a Unix socket by path or abstract
+//! name, is an input that the tracer cannot see: the tracer reports it in
+//! [`RunResult::connections`], and the engine records it, warns about it and still
+//! caches the result.
 //!
 //! Through the same interface, the engine reads what the standard library cannot:
 //! the extended attributes of a path, with [`Tracer::extended_attributes`].
@@ -38,6 +44,7 @@ use std::{
     ffi::OsString,
     fmt, fs,
     io::{self, Write},
+    net::SocketAddr,
     ops::{BitOr, BitOrAssign},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
@@ -868,6 +875,42 @@ impl fmt::Display for IncompleteReason {
     }
 }
 
+/// A connection that a process of the run made to a service outside the trace,
+/// whose answer is an input that the tracer cannot see.
+///
+/// Connections are ordered by their kind, then by address or path, so a set of
+/// them is sorted and without repeats.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Connection {
+    /// An IPv4 or IPv6 address and port. An IPv6 address keeps its scope, and its
+    /// flow information is zero, because it does not name a destination.
+    Ip(SocketAddr),
+    /// A Unix socket by its path, absolute and normalized like every recorded
+    /// path.
+    UnixPath(AbsolutePath),
+    /// A Unix socket in the abstract namespace, by its name without the zero byte
+    /// that starts it; the name may hold more zero bytes.
+    UnixAbstract(Vec<u8>),
+}
+
+impl fmt::Display for Connection {
+    /// An IP address with its port, such as `127.0.0.1:80` or `[fe80::1%2]:80`;
+    /// `Unix socket /path`; or `abstract Unix socket @name`, with each byte of the
+    /// name that is not printable ASCII escaped, such as `\x00`.
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        match self {
+            Self::Ip(address) => write!(f, "{address}"),
+            Self::UnixPath(path) => write!(f, "Unix socket {path}"),
+            Self::UnixAbstract(name) => {
+                write!(f, "abstract Unix socket @{}", name.escape_ascii())
+            },
+        }
+    }
+}
+
 /// The result of a request that started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
@@ -888,6 +931,10 @@ pub struct RunResult {
     /// repeats. They do not make the trace incomplete: the engine decides whether a
     /// run that made any is cached.
     pub unknown_system_calls: BTreeSet<u32>,
+    /// The connections that a process of the tree made, sorted and without
+    /// repeats, as [`Connection`] describes them. They do not make the trace
+    /// incomplete: the engine records them and warns about them.
+    pub connections: BTreeSet<Connection>,
 }
 
 impl RunResult {
@@ -1030,8 +1077,8 @@ mod tests {
 
     use super::{
         AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
-        FileMetadata, FirstReads, IncompleteReason, NotAbsoluteError, RunResult, Termination,
-        TraceError,
+        Connection, FileMetadata, FirstReads, IncompleteReason, NotAbsoluteError, RunResult,
+        Termination, TraceError,
     };
 
     /// Build an absolute path for a test.
@@ -1294,6 +1341,7 @@ mod tests {
             incomplete: None,
             first_reads: FirstReads::new(),
             unknown_system_calls: BTreeSet::new(),
+            connections: BTreeSet::new(),
         };
         assert!(result.is_complete());
         result.incomplete = Some(IncompleteReason::NonNativeSystemCall {
@@ -1322,6 +1370,45 @@ mod tests {
         result.incomplete = None;
         result.unknown_system_calls = BTreeSet::from([400, 1_000_000]);
         assert!(result.is_complete());
+        // Connections alone leave the trace complete too.
+        result.connections = BTreeSet::from([Connection::UnixAbstract(b"kizz".to_vec())]);
+        assert!(result.is_complete());
+    }
+
+    /// Connections read as an address and port, or as a Unix socket by path or
+    /// abstract name with its unprintable bytes escaped, and sort by kind, then by
+    /// address, path or name, without repeats.
+    #[test]
+    fn connections_display_and_sort() {
+        let v4 = Connection::Ip("127.0.0.1:80".parse().unwrap());
+        let v6 = Connection::Ip(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            443,
+            0,
+            2,
+        )));
+        let unix = Connection::UnixPath(path("/run/kizz.sock"));
+        let abstract_name = Connection::UnixAbstract(b"kizz\0x".to_vec());
+        assert_eq!(v4.to_string(), "127.0.0.1:80");
+        assert_eq!(v6.to_string(), "[fe80::1%2]:443");
+        assert_eq!(unix.to_string(), "Unix socket /run/kizz.sock");
+        assert_eq!(
+            abstract_name.to_string(),
+            "abstract Unix socket @kizz\\x00x"
+        );
+        let set = BTreeSet::from([
+            abstract_name.clone(),
+            unix.clone(),
+            v6.clone(),
+            v4.clone(),
+            v4.clone(),
+        ]);
+        assert_eq!(set.into_iter().collect::<Vec<_>>(), [
+            v4,
+            v6,
+            unix,
+            abstract_name
+        ]);
     }
 
     /// Errors tell a missing program, another failure to start, and a tracer

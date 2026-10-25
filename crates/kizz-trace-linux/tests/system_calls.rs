@@ -37,17 +37,28 @@
 //! when its checks are skipped and a notice that starts with `NOTICE:` names it.
 //! Either way the helper must have exited with 0, and a call or number that the
 //! tracer saw is checked in full.
+//!
+//! The socket tests open a listener, a receiver or a Unix socket in the test
+//! process, which no tracer follows, and run a helper that connects or sends to it:
+//! the run lists exactly the connection the helper made, and a Unix socket path is
+//! recorded like any path. Every socket call exists on every kernel that the
+//! tracer runs on, so none is gated.
 
 use std::{
     collections::BTreeMap,
     error::Error,
     ffi::{CString, OsStr, OsString},
     fmt, fs,
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     mem,
-    os::unix::{
-        ffi::OsStrExt as _,
-        fs::{PermissionsExt as _, symlink},
+    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
+    os::{
+        linux::net::SocketAddrExt as _,
+        unix::{
+            ffi::OsStrExt as _,
+            fs::{PermissionsExt as _, symlink},
+            net::{SocketAddr as UnixSocketAddr, UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
     ptr,
@@ -91,6 +102,9 @@ const GATED_CALLS: [&str; 6] = [
 const SKIP_VARIABLE: &str = "KIZZ_TEST_SKIP_BLOCKED_SYSCALLS";
 /// The system calls that the tests make and that the tracer does not know.
 const UNKNOWN_NUMBERS: [u32; 2] = [400, 1_000_000];
+/// The variable that gives a socket helper the port or the abstract name that it
+/// connects or sends to.
+const TARGET_VARIABLE: &str = "KIZZ_TRACE_TEST_TARGET";
 
 /// The result of a test helper.
 type Outcome<T> = Result<T, Box<dyn Error>>;
@@ -252,6 +266,12 @@ fn helper_process() {
         "clone3_thread" => helper_clone3_thread().unwrap(),
         "unknown_calls" => helper_unknown_calls(true).unwrap(),
         "known_calls" => helper_unknown_calls(false).unwrap(),
+        "tcp_connect" => helper_tcp_connect(false).unwrap(),
+        "tcp_refused" => helper_tcp_connect(true).unwrap(),
+        "udp_sendto" => helper_udp_sendto().unwrap(),
+        "unix_stream" => helper_unix_stream().unwrap(),
+        "unix_missing" => helper_unix_missing().unwrap(),
+        "unix_abstract" => helper_unix_abstract().unwrap(),
         other => panic!("unknown helper mode {other}"),
     }
 }
@@ -2753,6 +2773,7 @@ fn finished(
         incomplete,
         first_reads: FirstReads::default(),
         unknown_system_calls: unknown.iter().copied().collect(),
+        connections: std::collections::BTreeSet::new(),
     }
 }
 
@@ -2900,4 +2921,187 @@ fn the_skip_notice_names_the_test_the_variable_and_each_skipped_call() {
     let mut strict = Skips::new(false);
     assert_eq!(strict.never_saw(Made::Call("acct"), Vec::new()).len(), 1);
     assert_eq!(strict.notice("t"), None);
+}
+
+/// The port or abstract name that [`TARGET_VARIABLE`] gives a socket helper.
+fn target() -> Outcome<String> {
+    Ok(std::env::var(TARGET_VARIABLE)?)
+}
+
+/// The address 127.0.0.1 with the port `port`.
+fn loopback(port: &str) -> Outcome<SocketAddr> {
+    Ok(SocketAddr::from(([127, 0, 0, 1], port.parse::<u16>()?)))
+}
+
+/// Connect over TCP to 127.0.0.1 on the port of [`target`], which must succeed,
+/// or with `refused`, fail with `ECONNREFUSED`.
+fn helper_tcp_connect(refused: bool) -> Outcome<()> {
+    let address = loopback(&target()?)?;
+    match (TcpStream::connect(address), refused) {
+        (Ok(_), false) => Ok(()),
+        (Err(error), true) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(()),
+        (outcome, _) => Err(format!("connecting to {address} gave {outcome:?}").into()),
+    }
+}
+
+/// Send the datagram `kizz` from a UDP socket on 127.0.0.1 to 127.0.0.1 on the port
+/// of [`target`].
+fn helper_udp_sendto() -> Outcome<()> {
+    let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    socket.send_to(b"kizz", loopback(&target()?)?)?;
+    Ok(())
+}
+
+/// Bind a Unix stream socket of its own to `bound.sock`, and connect to the one
+/// that the test listens on at `server.sock`, both by relative paths.
+fn helper_unix_stream() -> Outcome<()> {
+    let _bound = UnixListener::bind("bound.sock")?;
+    UnixStream::connect("server.sock")?;
+    Ok(())
+}
+
+/// Connect to the Unix socket `missing.sock`, which does not exist, and check that
+/// the connection fails with `ENOENT`.
+fn helper_unix_missing() -> Outcome<()> {
+    match UnixStream::connect("missing.sock") {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => Err(format!("connecting to missing.sock gave {other:?}").into()),
+    }
+}
+
+/// Connect to the abstract Unix socket that [`target`] names.
+fn helper_unix_abstract() -> Outcome<()> {
+    let address = UnixSocketAddr::from_abstract_name(target()?.as_bytes())?;
+    UnixStream::connect_addr(&address)?;
+    Ok(())
+}
+
+/// A request to run the socket helper `mode` in `cwd`, with `target` in
+/// [`TARGET_VARIABLE`].
+fn socket_helper(
+    mode: &str,
+    cwd: &Path,
+    target: &str,
+) -> Outcome<RunRequest> {
+    let mut request = helper(mode, cwd)?;
+    request
+        .env
+        .insert(OsString::from(TARGET_VARIABLE), OsString::from(target));
+    Ok(request)
+}
+
+/// The connections of `result`, as text, in order.
+fn connections(result: &RunResult) -> Vec<String> {
+    result.connections.iter().map(ToString::to_string).collect()
+}
+
+/// A TCP connection to a listener that the test opens on 127.0.0.1 is recorded
+/// with the address and port, in a run that stays completely traced.
+#[test]
+fn a_tcp_connection_to_a_listener_is_recorded() {
+    let workspace = Workspace::new().unwrap();
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let request = socket_helper("tcp_connect", &workspace.root, &port).unwrap();
+    let result = run_successfully(&request).unwrap();
+    assert_eq!(connections(&result), [format!("127.0.0.1:{port}")]);
+    drop(listener);
+}
+
+/// A TCP connection to a port on which nothing listens fails with
+/// `ECONNREFUSED`, and is recorded all the same, because an IP destination is
+/// recorded whatever the outcome of the call.
+#[test]
+fn a_refused_tcp_connection_is_recorded() {
+    let workspace = Workspace::new().unwrap();
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let request = socket_helper("tcp_refused", &workspace.root, &port).unwrap();
+    let result = run_successfully(&request).unwrap();
+    assert_eq!(connections(&result), [format!("127.0.0.1:{port}")]);
+}
+
+/// A UDP datagram that `sendto` sends to an address is recorded with the address
+/// and port, and the test receives it; binding the sending socket to an IP address
+/// records nothing.
+#[test]
+fn a_udp_sendto_is_recorded() {
+    let workspace = Workspace::new().unwrap();
+    let receiver = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    receiver.set_read_timeout(Some(PATIENCE)).unwrap();
+    let port = receiver.local_addr().unwrap().port().to_string();
+    let request = socket_helper("udp_sendto", &workspace.root, &port).unwrap();
+    let result = run_successfully(&request).unwrap();
+    assert_eq!(connections(&result), [format!("127.0.0.1:{port}")]);
+    let mut datagram = [0_u8; 16];
+    let length = receiver.recv(&mut datagram).unwrap();
+    assert_eq!(datagram.get(..length), Some(&b"kizz"[..]));
+}
+
+/// A Unix stream socket is recorded by its path: connecting to the socket that the
+/// test listens on probes its path and records the connection, and binding the
+/// helper's own socket writes its path and records no connection.
+#[test]
+fn a_unix_stream_socket_is_recorded_by_path() {
+    let workspace = Workspace::new().unwrap();
+    let listener = UnixListener::bind(workspace.path("server.sock")).unwrap();
+    let request = helper("unix_stream", &workspace.root).unwrap();
+    let result = run_successfully(&request).unwrap();
+    assert_eq!(connections(&result), [format!(
+        "Unix socket {}",
+        workspace.path("server.sock").display()
+    )]);
+    assert_eq!(
+        workspace.kinds(&result, "server.sock").unwrap(),
+        Some(kinds(PROBE))
+    );
+    assert_eq!(
+        workspace.kinds(&result, "bound.sock").unwrap(),
+        Some(kinds(WRITE))
+    );
+    let mut nothing = Vec::new();
+    let (mut accepted, _) = listener.accept().unwrap();
+    accepted.read_to_end(&mut nothing).unwrap();
+    assert_eq!(nothing, Vec::<u8>::new());
+}
+
+/// A connection to a Unix socket path that does not exist fails with `ENOENT`, and
+/// records only a probe of the path, a dependency like a missing file, and no
+/// connection.
+#[test]
+fn a_missing_unix_socket_records_only_a_probe() {
+    let workspace = Workspace::new().unwrap();
+    let result = run_successfully(&helper("unix_missing", &workspace.root).unwrap()).unwrap();
+    assert_eq!(connections(&result), Vec::<String>::new());
+    assert_eq!(
+        workspace.kinds(&result, "missing.sock").unwrap(),
+        Some(kinds(PROBE))
+    );
+}
+
+/// A connection to an abstract Unix socket that the test listens on is recorded by
+/// its name, and touches no path.
+#[test]
+fn an_abstract_unix_socket_is_recorded_by_name() {
+    let workspace = Workspace::new().unwrap();
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let name = format!("kizz-test-{}-{}", std::process::id(), since.as_nanos());
+    let address = UnixSocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let listener = UnixListener::bind_addr(&address).unwrap();
+    let request = socket_helper("unix_abstract", &workspace.root, &name).unwrap();
+    let result = run_successfully(&request).unwrap();
+    assert_eq!(connections(&result), [format!(
+        "abstract Unix socket @{name}"
+    )]);
+    let under: Vec<String> = result
+        .accesses
+        .iter()
+        .filter(|(path, _)| path.as_path().starts_with(&workspace.root))
+        .map(|(path, kinds)| format!("{path} {kinds}"))
+        .collect();
+    assert_eq!(under, Vec::<String>::new());
+    drop(listener);
 }

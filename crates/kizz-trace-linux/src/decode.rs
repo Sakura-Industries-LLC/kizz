@@ -62,15 +62,29 @@
 //! at its entry; and `execve` and `execveat` through the path of the program and of
 //! each interpreter and loader that the kernel loaded. Reading a link opens no
 //! file, so `readlink` and `readlinkat` give nothing.
+//!
+//! The socket calls `bind`, `connect`, `sendto`, `sendmsg` and `sendmmsg` name a
+//! socket address: the one that their arguments point to, the `msg_name` of the
+//! `struct msghdr` of `sendmsg`, and the `msg_name` of every `struct mmsghdr` of
+//! `sendmmsg`. The decoder reads each address as the kernel does. A Unix socket
+//! path, neither abstract nor unnamed, is resolved like any path against the
+//! working directory: `bind` writes it, and the other calls probe it. Every call
+//! but `bind` also notes its destination as a connection, which
+//! [`Call::connections`] gives at the exit: an IPv4 or IPv6 address and port
+//! whatever the outcome of the call, and a Unix socket, by path or abstract name,
+//! unless the call failed with `ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG` or
+//! `EACCES`, which say that its path was not found. A null address, a family other
+//! than these, and an address that the kernel rejects for its length name nothing.
 
 use std::{
     ffi::OsStr,
     io,
+    net::{SocketAddr, SocketAddrV6},
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
 
-use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, FileMetadata};
+use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, Connection, FileMetadata};
 use libc::{c_int, c_long};
 
 use crate::filter::{UNTRACEABLE_SYSTEM_CALLS, numbers};
@@ -154,6 +168,43 @@ const PT_INTERP: u32 = 3;
 const PROGRAM_HEADER_OFFSET: usize = 8;
 /// The offset of `p_filesz` in a 64-bit program header.
 const PROGRAM_HEADER_FILE_SIZE: usize = 32;
+/// The size of `struct sockaddr_storage`: the longest socket address that `bind`,
+/// `connect` and `sendto` accept, and the length to which `sendmsg` and `sendmmsg`
+/// cut a longer `msg_namelen`.
+const SOCKADDR_STORAGE_SIZE: usize = 128;
+/// The size of `struct sockaddr_in`, the shortest IPv4 address the kernel accepts.
+const SOCKADDR_IN_SIZE: usize = 16;
+/// The shortest IPv6 address the kernel accepts, `SIN6_LEN_RFC2133`: a
+/// `struct sockaddr_in6` without its `sin6_scope_id`.
+const SOCKADDR_IN6_MINIMUM: usize = 24;
+/// The size of `struct sockaddr_in6`, with its `sin6_scope_id`.
+const SOCKADDR_IN6_SIZE: usize = 28;
+/// The offset of `sun_path` in `struct sockaddr_un`: an address no longer than
+/// this is unnamed.
+const SUN_PATH_OFFSET: usize = 2;
+/// The size of `struct sockaddr_un`, the longest Unix socket address the kernel
+/// accepts.
+const SOCKADDR_UN_SIZE: usize = 110;
+/// The size of the start of `struct msghdr` that the decoder reads: `msg_name`, a
+/// pointer, then `msg_namelen`.
+const MSGHDR_NAME_SIZE: usize = 12;
+/// The offset of `msg_namelen` in `struct msghdr`.
+const MSGHDR_NAMELEN: usize = 8;
+/// The size of `struct mmsghdr`, the elements of the array of `sendmmsg`: a
+/// `struct msghdr` of 56 bytes, then `msg_len` and padding.
+const MMSGHDR_SIZE: u64 = 64;
+/// The most messages that one `sendmmsg` sends, `UIO_MAXIOV`: the kernel cuts a
+/// longer count to it.
+const UIO_MAXIOV: u32 = 1024;
+/// The errors with which a call on a Unix socket path says that the path was not
+/// found, so it made no connection.
+const NOT_FOUND: [c_int; 5] = [
+    libc::ENOENT,
+    libc::ENOTDIR,
+    libc::ELOOP,
+    libc::ENAMETOOLONG,
+    libc::EACCES,
+];
 
 /// A file system object, as `stat` identifies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +384,24 @@ enum Operand {
     /// directory descriptor in its fourth, where a null path names the descriptor
     /// itself, and no path at all with `FAN_MARK_FLUSH` in the flags of its second.
     FanotifyMark,
+    /// The socket address that the argument at `address` points to, as long as the
+    /// argument at `length` says: a Unix socket path in it has the rule's kinds,
+    /// and with `connects`, its destination is a connection.
+    SocketAddress {
+        /// The index of the address argument.
+        address: usize,
+        /// The index of the length argument.
+        length: usize,
+        /// Whether the destination is a connection: for every call but `bind`.
+        connects: bool,
+    },
+    /// The destination of `sendmsg`: the `msg_name` of the `struct msghdr` that its
+    /// second argument points to.
+    MessageName,
+    /// The destinations of `sendmmsg`: the `msg_name` of each `struct mmsghdr` of
+    /// the array that its second argument points to, as many as its third argument
+    /// says.
+    MessageNames,
 }
 
 /// The access kinds a call records for a path when it succeeds.
@@ -420,6 +489,23 @@ const fn descriptor(
 ) -> Rule {
     Rule {
         operand: Operand::Descriptor(fd),
+        kinds,
+    }
+}
+
+/// The rule for the socket address of `bind` or `connect`, which the second
+/// argument points to, as long as the third says; with `connects`, its destination
+/// is a connection.
+const fn socket_address(
+    connects: bool,
+    kinds: Kinds,
+) -> Rule {
+    Rule {
+        operand: Operand::SocketAddress {
+            address: 1,
+            length: 2,
+            connects,
+        },
         kinds,
     }
 }
@@ -664,6 +750,26 @@ pub(crate) const SYSTEM_CALLS: &[SystemCall] = &[
     call(libc::SYS_fchmod, "fchmod", &[descriptor(0, WRITE)]),
     call(libc::SYS_fchown, "fchown", &[descriptor(0, WRITE)]),
     call(libc::SYS_fallocate, "fallocate", &[descriptor(0, WRITE)]),
+    // Sockets: binding a Unix socket path writes it, and connecting or sending to
+    // one probes it.
+    call(libc::SYS_bind, "bind", &[socket_address(false, WRITE)]),
+    call(libc::SYS_connect, "connect", &[socket_address(true, PROBE)]),
+    call(libc::SYS_sendto, "sendto", &[Rule {
+        operand: Operand::SocketAddress {
+            address: 4,
+            length: 5,
+            connects: true,
+        },
+        kinds: PROBE,
+    }]),
+    call(libc::SYS_sendmsg, "sendmsg", &[Rule {
+        operand: Operand::MessageName,
+        kinds: PROBE,
+    }]),
+    call(libc::SYS_sendmmsg, "sendmmsg", &[Rule {
+        operand: Operand::MessageNames,
+        kinds: PROBE,
+    }]),
 ];
 
 /// A tracked call decoded at its entry, waiting for its result.
@@ -688,6 +794,9 @@ pub(crate) struct Call {
     /// What the call reads or runs first, whose metadata [`Call::first_reads`]
     /// gives when the call succeeds.
     first_read: FirstRead,
+    /// The destinations that the call connects or sends to, which
+    /// [`Call::connections`] gives at its exit.
+    connections: Vec<Connection>,
 }
 
 /// The files whose metadata a call gives when it succeeds, as reads or runs that
@@ -877,6 +986,26 @@ impl Call {
                     .collect()
             },
         }
+    }
+
+    /// The connections of the call, now that it returned `result`, or `None` when
+    /// its result was never seen: each IPv4 or IPv6 destination whatever the
+    /// outcome, and each Unix socket, by path or abstract name, unless the call
+    /// failed with one of [`NOT_FOUND`], which say that its path was not found.
+    /// `bind`, and every call that is not a socket call, gives nothing.
+    pub(crate) fn connections(
+        &self,
+        result: Option<i64>,
+    ) -> Vec<Connection> {
+        let not_found = result
+            .filter(|result| (LOWEST_ERROR_RESULT..0).contains(result))
+            .and_then(i64::checked_neg)
+            .is_some_and(|errno| NOT_FOUND.into_iter().any(|code| i64::from(code) == errno));
+        self.connections
+            .iter()
+            .filter(|connection| matches!(connection, Connection::Ip(_)) || !not_found)
+            .cloned()
+            .collect()
     }
 
     /// Record the paths of the call, now that it returned `result`, or `None` when
@@ -1755,6 +1884,147 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
                     );
                 }
             },
+            Operand::SocketAddress {
+                address,
+                length,
+                connects,
+            } => {
+                self.socket_address(
+                    self.argument(address),
+                    int(self.argument(length)),
+                    false,
+                    kinds,
+                    connects,
+                );
+            },
+            Operand::MessageName => self.message_name(self.argument(1), kinds),
+            Operand::MessageNames => {
+                let count =
+                    u32::try_from(self.argument(2) & u64::from(u32::MAX)).unwrap_or_default();
+                self.message_names(self.argument(1), count, kinds);
+            },
+        }
+    }
+
+    /// Decode the socket address at `address`, `length` bytes long as the call
+    /// gave it, or cut to [`SOCKADDR_STORAGE_SIZE`] when `cut` is set, as `sendmsg`
+    /// and `sendmmsg` cut `msg_namelen`: record a Unix socket path in it with
+    /// `kinds`, and with `connects`, note its destination as a connection. A null
+    /// address, a length of 0 or less, a longer length than `bind`, `connect` and
+    /// `sendto` accept, and what [`socket_name`] finds no name in name nothing; an
+    /// address that cannot be read is a problem.
+    fn socket_address(
+        &mut self,
+        address: u64,
+        length: c_int,
+        cut: bool,
+        kinds: AccessKinds,
+        connects: bool,
+    ) {
+        let Ok(length) = usize::try_from(length) else {
+            return;
+        };
+        if address == 0 || length == 0 || (!cut && length > SOCKADDR_STORAGE_SIZE) {
+            return;
+        }
+        let length = length.min(SOCKADDR_STORAGE_SIZE);
+        let mut bytes = vec![0_u8; length];
+        match read_memory(self.inspect, address, &mut bytes, false) {
+            Ok(filled) if filled == length => {},
+            Ok(_) => {
+                self.problem(format!("could not read the socket address at {address:#x}"));
+                return;
+            },
+            Err(problem) => {
+                self.problem(problem);
+                return;
+            },
+        }
+        let connection = match socket_name(&bytes) {
+            None => return,
+            Some(SocketName::Ip(destination)) => Connection::Ip(destination),
+            Some(SocketName::Abstract(name)) => Connection::UnixAbstract(name),
+            Some(SocketName::Path(path)) => {
+                let Some(resolved) = self.socket_path(&path, kinds) else {
+                    return;
+                };
+                Connection::UnixPath(resolved)
+            },
+        };
+        if connects {
+            self.call.connections.push(connection);
+        }
+    }
+
+    /// Record the Unix socket path `path` with `kinds`, resolved against the working
+    /// directory when it is relative, as the kernel resolves it, and return it; or
+    /// `None` when the working directory names no path, or cannot be read, which is
+    /// a problem.
+    fn socket_path(
+        &mut self,
+        path: &[u8],
+        kinds: AccessKinds,
+    ) -> Option<AbsolutePath> {
+        let resolved = if path.starts_with(b"/") {
+            AbsolutePath::new(OsStr::from_bytes(path)).ok()
+        } else {
+            match self.base(libc::AT_FDCWD) {
+                Ok(base) => base.map(|base| base.join(OsStr::from_bytes(path))),
+                Err(problem) => {
+                    self.problem(problem);
+                    None
+                },
+            }
+        };
+        self.record(resolved.clone(), kinds);
+        resolved
+    }
+
+    /// Decode the `msg_name` of the `struct msghdr` at `header`, with its
+    /// `msg_namelen`, as the destination of a send call; a header that cannot be
+    /// read is a problem.
+    fn message_name(
+        &mut self,
+        header: u64,
+        kinds: AccessKinds,
+    ) {
+        let mut bytes = [0_u8; MSGHDR_NAME_SIZE];
+        match read_memory(self.inspect, header, &mut bytes, false) {
+            Ok(MSGHDR_NAME_SIZE) => {},
+            Ok(_) => {
+                self.problem(format!("could not read the message header at {header:#x}"));
+                return;
+            },
+            Err(problem) => {
+                self.problem(problem);
+                return;
+            },
+        }
+        if let (Some(name), Some(length)) = (u64_at(&bytes, 0), u32_at(&bytes, MSGHDR_NAMELEN)) {
+            self.socket_address(name, int(u64::from(length)), true, kinds, true);
+        }
+    }
+
+    /// Decode the `msg_name` of each `struct mmsghdr` of the array at `array`, the
+    /// first `count` of them, cut to [`UIO_MAXIOV`] as the kernel cuts it, until one
+    /// cannot be read.
+    fn message_names(
+        &mut self,
+        array: u64,
+        count: u32,
+        kinds: AccessKinds,
+    ) {
+        for index in 0..count.min(UIO_MAXIOV) {
+            let Some(header) = u64::from(index)
+                .checked_mul(MMSGHDR_SIZE)
+                .and_then(|offset| array.checked_add(offset))
+            else {
+                break;
+            };
+            self.message_name(header, kinds);
+            if self.call.problem.is_some() {
+                break;
+            }
         }
     }
 
@@ -1791,6 +2061,65 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
     }
 }
 
+/// What a socket address names, as the kernel reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SocketName {
+    /// An IPv4 or IPv6 address and port, with the scope of an IPv6 address.
+    Ip(SocketAddr),
+    /// A Unix socket path, up to its first NUL byte.
+    Path(Vec<u8>),
+    /// A Unix socket in the abstract namespace, by its name after the zero byte
+    /// that starts it.
+    Abstract(Vec<u8>),
+}
+
+/// What the socket address `bytes`, as long as the call gave it, names: an IPv4
+/// address and port in a `struct sockaddr_in`; an IPv6 address and port in a
+/// `struct sockaddr_in6`, with its scope when the address is long enough to hold
+/// one; or a Unix socket path or abstract name in a `struct sockaddr_un`. `None`
+/// for another family, an unnamed Unix socket, and an address that is shorter or
+/// longer than the kernel accepts for its family, which it rejects with `EINVAL`.
+fn socket_name(bytes: &[u8]) -> Option<SocketName> {
+    let port = || {
+        bytes
+            .get(2..)?
+            .first_chunk::<2>()
+            .map(|port| u16::from_be_bytes(*port))
+    };
+    match c_int::from(u16_at(bytes, 0)?) {
+        libc::AF_INET if bytes.len() >= SOCKADDR_IN_SIZE => {
+            let address = *bytes.get(4..)?.first_chunk::<4>()?;
+            Some(SocketName::Ip(SocketAddr::from((address, port()?))))
+        },
+        libc::AF_INET6 if bytes.len() >= SOCKADDR_IN6_MINIMUM => {
+            let address = *bytes.get(8..)?.first_chunk::<16>()?;
+            let scope = if bytes.len() >= SOCKADDR_IN6_SIZE {
+                u32_at(bytes, SOCKADDR_IN6_MINIMUM)?
+            } else {
+                0
+            };
+            Some(SocketName::Ip(SocketAddr::V6(SocketAddrV6::new(
+                address.into(),
+                port()?,
+                0,
+                scope,
+            ))))
+        },
+        libc::AF_UNIX if bytes.len() > SUN_PATH_OFFSET && bytes.len() <= SOCKADDR_UN_SIZE => {
+            let name = bytes.get(SUN_PATH_OFFSET..)?;
+            if let Some((0, rest)) = name.split_first() {
+                return Some(SocketName::Abstract(rest.to_vec()));
+            }
+            let end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name.len());
+            Some(SocketName::Path(name.get(..end)?.to_vec()))
+        },
+        _ => None,
+    }
+}
+
 /// The decoding of the tracked system call `number`, if it is tracked.
 pub(crate) fn system_call(number: c_long) -> Option<&'static SystemCall> {
     SYSTEM_CALLS.iter().find(|call| call.number == number)
@@ -1818,6 +2147,7 @@ pub(crate) fn enter(
             directory: None,
             unfollowed: None,
             first_read: FirstRead::Nothing,
+            connections: Vec::new(),
         },
         open_flags: None,
     };
@@ -4448,5 +4778,428 @@ mod tests {
                 "{number}"
             );
         }
+    }
+
+    /// The address of a `struct sockaddr_in` for 127.0.0.1 port 80, padded with
+    /// zeros to 128 bytes.
+    const SOCK_V4: u64 = 0x2_0000;
+    /// The address of a `struct sockaddr_in6` for `fe80::1` port 443 with scope 2.
+    const SOCK_V6: u64 = 0x2_1000;
+    /// The address of a `struct sockaddr_un` for the relative path `sock`, with its
+    /// NUL byte.
+    const SOCK_UNIX: u64 = 0x2_2000;
+    /// The address of a `struct sockaddr_un` for the absolute path `/abs/s`, with its
+    /// NUL byte, padded with zeros to 120 bytes.
+    const SOCK_ABSOLUTE: u64 = 0x2_3000;
+    /// The address of a `struct sockaddr_un` for the abstract name `k`, a zero byte
+    /// and `x`.
+    const SOCK_ABSTRACT: u64 = 0x2_4000;
+    /// The address of a `struct sockaddr_nl`, a netlink address.
+    const SOCK_NETLINK: u64 = 0x2_5000;
+    /// The address of a `struct msghdr` whose `msg_name` is [`SOCK_V4`], 16 bytes.
+    const MSG_V4: u64 = 0x2_6000;
+    /// The address of a `struct msghdr` with a null `msg_name`.
+    const MSG_NULL: u64 = 0x2_7000;
+    /// The address of a `struct msghdr` whose `msg_name` is [`SOCK_V4`] with a
+    /// `msg_namelen` of 4,096, which the kernel cuts to 128.
+    const MSG_LONG: u64 = 0x2_8000;
+    /// The address of an array of two `struct mmsghdr`, whose names are [`SOCK_UNIX`]
+    /// and [`SOCK_V6`].
+    const MMSG: u64 = 0x2_9000;
+    /// The address of an array of one `struct mmsghdr`, whose name is not mapped.
+    const MMSG_UNMAPPED: u64 = 0x2_A000;
+
+    /// The two bytes of the address family `family`, as a `sa_family_t`.
+    fn family(family: c_int) -> Vec<u8> {
+        u16::try_from(family).unwrap().to_ne_bytes().to_vec()
+    }
+
+    /// A `struct sockaddr_in` for `address` and `port`, padded with zeros to `size`.
+    fn sockaddr_in(
+        address: [u8; 4],
+        port: u16,
+        size: usize,
+    ) -> Vec<u8> {
+        let mut bytes = family(libc::AF_INET);
+        bytes.extend(port.to_be_bytes());
+        bytes.extend(address);
+        bytes.resize(size, 0);
+        bytes
+    }
+
+    /// A `struct sockaddr_in6` for `address`, `port` and `scope`, with a flow
+    /// information that is not zero, which names no destination.
+    fn sockaddr_in6(
+        address: [u8; 16],
+        port: u16,
+        scope: u32,
+    ) -> Vec<u8> {
+        let mut bytes = family(libc::AF_INET6);
+        bytes.extend(port.to_be_bytes());
+        bytes.extend(7_u32.to_ne_bytes());
+        bytes.extend(address);
+        bytes.extend(scope.to_ne_bytes());
+        bytes
+    }
+
+    /// A `struct sockaddr_un` with the bytes `name` after its family, padded with
+    /// zeros to `size`.
+    fn sockaddr_un(
+        name: &[u8],
+        size: usize,
+    ) -> Vec<u8> {
+        let mut bytes = family(libc::AF_UNIX);
+        bytes.extend(name);
+        bytes.resize(size.max(bytes.len()), 0);
+        bytes
+    }
+
+    /// The first bytes of a `struct msghdr` whose `msg_name` is `name` with
+    /// `length` bytes, padded with zeros to its 56 bytes.
+    fn msghdr(
+        name: u64,
+        length: u32,
+    ) -> Vec<u8> {
+        let mut bytes = name.to_le_bytes().to_vec();
+        bytes.extend(length.to_le_bytes());
+        bytes.resize(56, 0);
+        bytes
+    }
+
+    /// The IPv6 address `fe80::1`.
+    const LINK_LOCAL: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+    /// The fake thread of every test, with the socket addresses and message headers
+    /// of the socket tests in its memory.
+    fn socket_thread() -> Fake {
+        let mut fake = Fake::new();
+        let mut messages = msghdr(SOCK_UNIX, 7);
+        messages.resize(64, 0);
+        messages.extend(msghdr(SOCK_V6, 28));
+        messages.resize(128, 0);
+        fake.memory.extend([
+            (SOCK_V4, sockaddr_in([127, 0, 0, 1], 80, 128)),
+            (SOCK_V6, sockaddr_in6(LINK_LOCAL, 443, 2)),
+            (SOCK_UNIX, sockaddr_un(b"sock\0", 0)),
+            (SOCK_ABSOLUTE, sockaddr_un(b"/abs/s\0", 120)),
+            (SOCK_ABSTRACT, sockaddr_un(b"\0k\0x", 0)),
+            (SOCK_NETLINK, {
+                let mut bytes = family(libc::AF_NETLINK);
+                bytes.resize(12, 0);
+                bytes
+            }),
+            (MSG_V4, msghdr(SOCK_V4, 16)),
+            (MSG_NULL, msghdr(0, 16)),
+            (MSG_LONG, msghdr(SOCK_V4, 4096)),
+            (MMSG, messages),
+            (MMSG_UNMAPPED, msghdr(UNMAPPED, 16)),
+        ]);
+        fake
+    }
+
+    /// The accesses, the connections as text and the incomplete-trace report of the
+    /// socket call `name` with `arguments` when it returns `result`.
+    fn connected(
+        name: &str,
+        arguments: &[u64],
+        result: Option<i64>,
+    ) -> (Vec<(String, String)>, Vec<String>, Option<String>) {
+        let call = decode(&socket_thread(), name, arguments);
+        let connections = call
+            .connections(result)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let mut accesses = Accesses::new();
+        let problem = call.finish(result, &mut accesses);
+        let paths = accesses
+            .iter()
+            .map(|(path, kinds)| (path.to_string(), kinds.to_string()))
+            .collect();
+        (paths, connections, problem)
+    }
+
+    /// The expected connections, as text.
+    fn named(connections: &[&str]) -> Vec<String> {
+        connections.iter().map(|text| (*text).to_owned()).collect()
+    }
+
+    /// One destination case of a socket call: the address, its length, the paths
+    /// that a success records with their kinds, and the connection as text.
+    type DestinationCase = (
+        u64,
+        u64,
+        &'static [(&'static str, &'static str)],
+        &'static str,
+    );
+
+    /// `connect` and `sendto` record an IPv4 address, an IPv6 address with its scope,
+    /// a relative or absolute Unix socket path, which they probe, and an abstract
+    /// name, which touches no path; an IPv6 address too short for its scope has
+    /// none.
+    #[test]
+    fn connect_and_sendto_record_each_kind_of_destination() {
+        let cases: [DestinationCase; 6] = [
+            (SOCK_V4, 16, &[], "127.0.0.1:80"),
+            (SOCK_V6, 28, &[], "[fe80::1%2]:443"),
+            (SOCK_V6, 24, &[], "[fe80::1]:443"),
+            (
+                SOCK_UNIX,
+                7,
+                &[("/work/sock", "probe")],
+                "Unix socket /work/sock",
+            ),
+            (
+                SOCK_ABSOLUTE,
+                9,
+                &[("/abs/s", "probe")],
+                "Unix socket /abs/s",
+            ),
+            (SOCK_ABSTRACT, 6, &[], "abstract Unix socket @k\\x00x"),
+        ];
+        for (address, length, paths, connection) in cases {
+            for (name, arguments) in [
+                ("connect", vec![3, address, length]),
+                ("sendto", vec![3, REL, 1, 0, address, length]),
+            ] {
+                assert_eq!(
+                    connected(name, &arguments, Some(0)),
+                    (expect(paths), named(&[connection]), None),
+                    "{name} {address:#x} {length}"
+                );
+            }
+        }
+    }
+
+    /// A Unix socket path ends at its first NUL byte or at the length the call
+    /// gives, whichever comes first.
+    #[test]
+    fn unix_socket_paths_end_at_a_nul_byte_or_the_length() {
+        for length in [6, 8, 9, 20] {
+            assert_eq!(
+                connected("connect", &[3, SOCK_ABSOLUTE, length], Some(0)).1,
+                named(&[if length == 6 {
+                    "Unix socket /abs"
+                } else {
+                    "Unix socket /abs/s"
+                }]),
+                "{length}"
+            );
+        }
+    }
+
+    /// An address shorter or longer than the kernel accepts for its family, an
+    /// unnamed Unix socket, a length of 0 or less, a null address, and a family
+    /// other than IPv4, IPv6 and Unix, such as netlink, name nothing, and leave the
+    /// trace complete; a long IPv4 length that the kernel accepts still names the
+    /// address.
+    #[test]
+    fn short_long_null_and_other_addresses_name_nothing() {
+        let nothing = (expect(&[]), Vec::new(), None);
+        for (address, length) in [
+            (SOCK_V4, 15),
+            (SOCK_V4, 129),
+            (SOCK_V6, 23),
+            (SOCK_UNIX, 2),
+            (SOCK_UNIX, 1),
+            (SOCK_ABSOLUTE, 111),
+            (SOCK_V4, 0),
+            (SOCK_V4, reg(-1)),
+            (0, 16),
+            (SOCK_NETLINK, 12),
+        ] {
+            assert_eq!(
+                connected("connect", &[3, address, length], Some(0)),
+                nothing,
+                "{address:#x} {length}"
+            );
+        }
+        assert_eq!(
+            connected("connect", &[3, SOCK_V4, 128], Some(0)).1,
+            named(&["127.0.0.1:80"])
+        );
+        assert_eq!(
+            connected("connect", &[3, SOCK_ABSOLUTE, 110], Some(0)).1,
+            named(&["Unix socket /abs/s"])
+        );
+        // `sendto` without a destination, as `send` makes it.
+        assert_eq!(connected("sendto", &[3, REL, 1, 0, 0, 0], Some(1)), nothing);
+        assert_eq!(
+            connected("sendto", &[3, REL, 1, 0, 0, 16], Some(1)),
+            nothing
+        );
+    }
+
+    /// An address that cannot be read makes the trace incomplete, unless the call
+    /// failed with `EFAULT`, which the kernel gives for it before it acts.
+    #[test]
+    fn unreadable_addresses_are_problems_unless_the_call_rejected_them() {
+        let (paths, connections, problem) = connected("connect", &[3, UNMAPPED, 16], Some(0));
+        assert_eq!((paths, connections), (expect(&[]), Vec::new()));
+        assert!(
+            problem.is_some_and(|problem| problem.starts_with("could not decode connect: ")),
+            "unmapped"
+        );
+        assert_eq!(
+            connected("connect", &[3, UNMAPPED, 16], failed(libc::EFAULT)),
+            (expect(&[]), Vec::new(), None)
+        );
+        // An address that ends before the length the call gives.
+        assert!(connected("connect", &[3, SOCK_V6, 64], Some(0)).2.is_some());
+        assert!(connected("sendmsg", &[3, UNMAPPED, 0], Some(0)).2.is_some());
+        assert!(
+            connected("sendmmsg", &[3, MMSG_UNMAPPED, 1, 0], Some(0))
+                .2
+                .is_some()
+        );
+        assert_eq!(
+            connected("sendmmsg", &[3, MMSG_UNMAPPED, 1, 0], failed(libc::EFAULT)).2,
+            None
+        );
+    }
+
+    /// `sendmsg` reads the destination from the `msg_name` of its `struct msghdr`,
+    /// whose `msg_namelen` the kernel cuts to 128 bytes, and a null `msg_name` names
+    /// none; `sendmmsg` reads the `msg_name` of each of the messages its count
+    /// gives.
+    #[test]
+    fn sendmsg_and_sendmmsg_read_the_names_of_their_messages() {
+        assert_eq!(
+            connected("sendmsg", &[3, MSG_V4, 0], Some(1)),
+            (expect(&[]), named(&["127.0.0.1:80"]), None)
+        );
+        assert_eq!(
+            connected("sendmsg", &[3, MSG_LONG, 0], Some(1)),
+            (expect(&[]), named(&["127.0.0.1:80"]), None)
+        );
+        assert_eq!(
+            connected("sendmsg", &[3, MSG_NULL, 0], Some(1)),
+            (expect(&[]), Vec::new(), None)
+        );
+        assert_eq!(
+            connected("sendmmsg", &[3, MMSG, 2, 0], Some(2)),
+            (
+                expect(&[("/work/sock", "probe")]),
+                named(&["Unix socket /work/sock", "[fe80::1%2]:443"]),
+                None
+            )
+        );
+        assert_eq!(
+            connected("sendmmsg", &[3, MMSG, 1, 0], Some(1)),
+            (
+                expect(&[("/work/sock", "probe")]),
+                named(&["Unix socket /work/sock"]),
+                None
+            )
+        );
+        assert_eq!(
+            connected("sendmmsg", &[3, MMSG, 0, 0], Some(0)),
+            (expect(&[]), Vec::new(), None)
+        );
+    }
+
+    /// `bind` writes a Unix socket path, and probes it when it fails, but records
+    /// no connection, whatever its family.
+    #[test]
+    fn bind_writes_a_unix_socket_path_and_records_no_connection() {
+        assert_eq!(
+            connected("bind", &[3, SOCK_UNIX, 7], Some(0)),
+            (expect(&[("/work/sock", "write")]), Vec::new(), None)
+        );
+        assert_eq!(
+            connected("bind", &[3, SOCK_UNIX, 7], failed(libc::EADDRINUSE)),
+            (expect(&[("/work/sock", "probe")]), Vec::new(), None)
+        );
+        for (address, length) in [(SOCK_V4, 16), (SOCK_ABSTRACT, 6)] {
+            assert_eq!(
+                connected("bind", &[3, address, length], Some(0)),
+                (expect(&[]), Vec::new(), None),
+                "{address:#x}"
+            );
+        }
+    }
+
+    /// A call that fails with an error that says that a Unix socket path was not
+    /// found records no Unix connection, by path or abstract name, but still the IP
+    /// destinations of the same call; any other failure, such as a refused
+    /// connection, and a result that was never seen, keep every connection. Every
+    /// failure probes the path.
+    #[test]
+    fn failures_that_find_no_path_record_no_unix_connection() {
+        for errno in NOT_FOUND {
+            assert_eq!(
+                connected("connect", &[3, SOCK_UNIX, 7], failed(errno)),
+                (expect(&[("/work/sock", "probe")]), Vec::new(), None),
+                "{errno}"
+            );
+            assert_eq!(
+                connected("connect", &[3, SOCK_ABSTRACT, 6], failed(errno)).1,
+                Vec::<String>::new(),
+                "{errno}"
+            );
+            assert_eq!(
+                connected("connect", &[3, SOCK_V4, 16], failed(errno)).1,
+                named(&["127.0.0.1:80"]),
+                "{errno}"
+            );
+            assert_eq!(
+                connected("sendmmsg", &[3, MMSG, 2, 0], failed(errno)).1,
+                named(&["[fe80::1%2]:443"]),
+                "{errno}"
+            );
+        }
+        for result in [failed(libc::ECONNREFUSED), failed(libc::EAGAIN), None] {
+            assert_eq!(
+                connected("connect", &[3, SOCK_UNIX, 7], result).1,
+                named(&["Unix socket /work/sock"]),
+                "{result:?}"
+            );
+            assert_eq!(
+                connected("connect", &[3, SOCK_V4, 16], result).1,
+                named(&["127.0.0.1:80"]),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            connected("connect", &[3, SOCK_UNIX, 7], failed(libc::ECONNREFUSED)).0,
+            expect(&[("/work/sock", "probe")])
+        );
+        // A call that is not a socket call has no connection.
+        let call = decode(&socket_thread(), "stat", &[REL]);
+        assert_eq!(call.connections(Some(0)), Vec::new());
+    }
+
+    /// The socket names that the kernel reads from addresses of each family and
+    /// length.
+    #[test]
+    fn socket_names_are_read_as_the_kernel_reads_them() {
+        let ip = |text: &str| Some(SocketName::Ip(text.parse().unwrap()));
+        assert_eq!(
+            socket_name(&sockaddr_in([10, 0, 0, 2], 8080, 16)),
+            ip("10.0.0.2:8080")
+        );
+        assert_eq!(socket_name(&sockaddr_in([10, 0, 0, 2], 8080, 15)), None);
+        assert_eq!(
+            socket_name(&sockaddr_in6(LINK_LOCAL, 1, 9)),
+            ip("[fe80::1%9]:1")
+        );
+        assert_eq!(
+            sockaddr_in6(LINK_LOCAL, 1, 9)
+                .first_chunk::<24>()
+                .and_then(|short| socket_name(short.as_slice())),
+            ip("[fe80::1]:1")
+        );
+        assert_eq!(
+            socket_name(&sockaddr_un(b"p\0q", 0)),
+            Some(SocketName::Path(b"p".to_vec()))
+        );
+        assert_eq!(
+            socket_name(&sockaddr_un(b"\0", 0)),
+            Some(SocketName::Abstract(Vec::new()))
+        );
+        assert_eq!(socket_name(&family(libc::AF_UNIX)), None);
+        assert_eq!(socket_name(&family(libc::AF_INET6)), None);
+        assert_eq!(socket_name(&[]), None);
+        assert_eq!(socket_name(&[1]), None);
     }
 }

@@ -90,6 +90,9 @@
 //! lets the call run. A native call that the tracer does not know stops once too:
 //! the loop notes its number, as the filter saw it, and lets it run, so the trace
 //! stays complete.
+//!
+//! A socket call that connects or sends to a destination adds, when it returns,
+//! the connections that [`decode::Call::connections`] gives to the outcome.
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map},
@@ -100,7 +103,7 @@ use std::{
     },
 };
 
-use kizz_trace::{Accesses, FirstReads, IncompleteReason, Termination};
+use kizz_trace::{Accesses, Connection, FirstReads, IncompleteReason, Termination};
 use libc::{c_int, c_long, c_ulong, pid_t};
 
 use crate::{decode, filter, sys};
@@ -196,6 +199,8 @@ pub(crate) struct Outcome {
     /// The numbers of the native system calls outside the known table that the
     /// tree made, as the filter saw them.
     pub unknown_system_calls: BTreeSet<u32>,
+    /// The connections that the tree made, sorted and without repeats.
+    pub connections: BTreeSet<Connection>,
 }
 
 /// What the loop knows about one traced thread.
@@ -342,6 +347,7 @@ impl<'a> Tree<'a> {
                 incomplete: None,
                 first_reads: FirstReads::new(),
                 unknown_system_calls: BTreeSet::new(),
+                connections: BTreeSet::new(),
             },
         }
     }
@@ -386,7 +392,7 @@ impl<'a> Tree<'a> {
 
     /// Record the paths of a tracked call of the thread `pid` that returned
     /// `result`, or whose result was never seen, with what the kernel loaded to run
-    /// the program of an `exec`.
+    /// the program of an `exec`, and the connections of a socket call.
     ///
     /// The first-read metadata of the files the call opened for reading or ran is
     /// noted first, while the accesses hold only the calls that returned earlier,
@@ -404,6 +410,7 @@ impl<'a> Tree<'a> {
                 .first_reads
                 .note(&path, metadata, &self.outcome.accesses);
         }
+        self.outcome.connections.extend(call.connections(result));
         if let Some(detail) = call.finish(result, &mut self.outcome.accesses) {
             self.incomplete(IncompleteReason::Other { detail });
         }

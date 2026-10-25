@@ -2,9 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Cache checks, replay, `always` steps, results that are not cached, and runs that
-//! made system calls that the tracer does not know, with a fake tracer and real
-//! files.
+//! Cache checks, replay, `always` steps, results that are not cached, runs that
+//! made system calls that the tracer does not know, and runs that made connections,
+//! with a fake tracer and real files.
 //!
 //! Each test builds a project directory and a cache in temporary directories and
 //! opens the store in that cache. A build is one [`Engine`]: a test runs a build,
@@ -21,6 +21,7 @@ use std::{
     error::Error,
     fs::{self, File, FileTimes},
     io,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
@@ -29,18 +30,18 @@ use std::{
 };
 
 use kizz_core::{
-    Engine, PrintSink, ProgramHash, StepExecutor, StepOutcome, StepSpec, TaskInfo, TaskProgram,
-    UnknownCalls, observe::listing, parse_tasks, step_key,
+    Engine, PrintSink, ProgramHash, StepConnections, StepExecutor, StepOutcome, StepSpec, TaskInfo,
+    TaskProgram, UnknownCalls, observe::listing, parse_tasks, step_key,
 };
 use kizz_store::{
-    AccessBits, Attribute, Attributes, Change, ContentHash, Difference, DirEntry, EntryKind,
-    FileMeta, Listing, NotCachedReason, Observation, Owner, PathState, RunReason, StepExit,
-    StepKey, StepRecord, Store, Times,
+    AccessBits, Attribute, Attributes, Change, Connection as StoredConnection, ContentHash,
+    Difference, DirEntry, EntryKind, FileMeta, Listing, NotCachedReason, Observation, Owner,
+    PathState, RunReason, StepExit, StepKey, StepRecord, Store, Times,
 };
 use kizz_trace::{
-    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    ExtendedAttributes, FirstReads, IncompleteReason, OutputStream, RunRequest, RunResult,
-    Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Connection,
+    EchoSink, ExtendedAttributes, FirstReads, IncompleteReason, OutputStream, RunRequest,
+    RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -217,6 +218,7 @@ fn finished(
         incomplete: None,
         first_reads,
         unknown_system_calls: BTreeSet::new(),
+        connections: BTreeSet::new(),
     })
 }
 
@@ -413,6 +415,7 @@ impl Fixture {
             hashed: engine.files_hashed(),
             not_cached: engine.not_cached(),
             unknown: engine.unknown_system_calls(),
+            connections: engine.connections(),
         };
         drop(task);
         drop(engine);
@@ -461,6 +464,8 @@ struct Built {
     not_cached: Vec<(StepKey, NotCachedReason)>,
     /// The runs that made system calls that the tracer does not know.
     unknown: Vec<UnknownCalls>,
+    /// The runs that made connections.
+    connections: Vec<StepConnections>,
 }
 
 impl Built {
@@ -1240,7 +1245,9 @@ fn show(
 /// `interrupt` (a signal stops the command), `handled` (the command handles the
 /// interrupt and exits with code 130), `incomplete`, `start`, `unknown` (the command
 /// makes the system calls 1,000,000 and 400, which the tracer does not know, and
-/// 400 again), `incomplete-unknown` (both), or anything else for exit status 0.
+/// 400 again), `incomplete-unknown` (both), `connect` (the command makes the
+/// connections of [`connections_made`], one of them twice), `incomplete-connect`
+/// (both), or anything else for exit status 0.
 fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
     FakeTracer::new(move |request| {
         let text = fs::read_to_string(&outcome).map_err(|error| tracer_failure(&error))?;
@@ -1267,6 +1274,9 @@ fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
         if text.ends_with("unknown") {
             result.unknown_system_calls = [1_000_000, 400, 400].into_iter().collect();
         }
+        if text.ends_with("connect") {
+            result.connections = connections_made(&request.cwd);
+        }
         Ok(result)
     })
 }
@@ -1287,7 +1297,7 @@ fn not_cached_reason(
         "signal" => NotCachedReason::Signaled { signal: 9 },
         "interrupt" => NotCachedReason::Interrupted { signal: 2 },
         "handled" => NotCachedReason::InterruptedExited { code: 130 },
-        "incomplete" | "incomplete-unknown" => {
+        "incomplete" | "incomplete-unknown" | "incomplete-connect" => {
             NotCachedReason::Incomplete {
                 detail: "a system call used a non-native interface: int 0x80".to_owned(),
             }
@@ -1581,6 +1591,120 @@ fn an_incomplete_run_with_unknown_system_calls_keeps_its_reason() -> TestResult 
         assert_eq!(marker.not_cached, Some(why), "{cache_unknown}");
         assert_eq!(marker.unknown_system_calls, UNKNOWN, "{cache_unknown}");
     }
+    Ok(())
+}
+
+/// The connections that the outcome tracer's `connect` runs make in the task
+/// directory `dir`: the IPv4 address 127.0.0.1 on port 8080, twice, the IPv6
+/// address `::1` on port 443, the Unix socket `run/s.sock` in `dir`, and the
+/// abstract Unix socket `kizz` followed by a zero byte.
+fn connections_made(dir: &AbsolutePath) -> BTreeSet<Connection> {
+    [
+        Connection::Ip(SocketAddr::from(([127, 0, 0, 1], 8080))),
+        Connection::UnixAbstract(b"kizz\0".to_vec()),
+        Connection::UnixPath(dir.join("run/s.sock")),
+        Connection::Ip(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            443,
+            0,
+            0,
+        ))),
+        Connection::Ip(SocketAddr::from(([127, 0, 0, 1], 8080))),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// The connections of [`connections_made`] in the project of `fixture`, as a record
+/// keeps them: sorted and without repeats.
+fn connections_recorded(fixture: &Fixture) -> Vec<StoredConnection> {
+    vec![
+        StoredConnection::Ipv4 {
+            address: [127, 0, 0, 1],
+            port: 8080,
+        },
+        StoredConnection::Ipv6 {
+            address: Ipv6Addr::LOCALHOST.octets(),
+            port: 443,
+            scope: 0,
+        },
+        StoredConnection::UnixPath {
+            path: fixture.path("run/s.sock"),
+        },
+        StoredConnection::UnixAbstract {
+            name: b"kizz\0".to_vec(),
+        },
+    ]
+}
+
+/// A run that made connections is cached: its record lists each connection once,
+/// sorted, and has no marker, and the engine keeps the run for the warning as
+/// cached. The next build finds the record a cache hit and keeps nothing for a
+/// warning, so a cache hit does not warn.
+#[test]
+fn a_run_with_connections_is_cached_and_warns_only_when_it_runs() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "connect")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+
+    let first = fixture.build(&tracer, &[&step])?;
+    assert!(!first.cached(0)?);
+    assert_eq!(first.not_cached, Vec::new());
+    assert_eq!(first.unknown, Vec::new());
+    assert_eq!(first.connections, [StepConnections {
+        key,
+        connections: connections_recorded(&fixture),
+        cached: true,
+    }]);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.not_cached, None);
+    assert_eq!(record.connections, connections_recorded(&fixture));
+
+    let second = fixture.build(&tracer, &[&step])?;
+    assert!(second.cached(0)?);
+    assert_eq!(second.connections, Vec::new());
+    assert_eq!(tracer.runs(), 1);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.connections, connections_recorded(&fixture));
+    Ok(())
+}
+
+/// A run that made connections and is also incompletely traced keeps that reason,
+/// and its marker still lists the connections; the engine keeps the run for the
+/// warning as not cached, and the next build runs it again and warns again.
+#[test]
+fn an_incomplete_run_with_connections_keeps_its_reason() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "incomplete-connect")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+    let why = not_cached_reason("incomplete-connect", &fixture.path("bin/tool"));
+
+    for build in 1..=2 {
+        let built = fixture.build(&tracer, &[&step])?;
+        assert!(!built.cached(0)?, "{build}");
+        assert_eq!(built.not_cached, [(key, why.clone())], "{build}");
+        assert_eq!(
+            built.connections,
+            [StepConnections {
+                key,
+                connections: connections_recorded(&fixture),
+                cached: false,
+            }],
+            "{build}"
+        );
+        let marker = fixture.record(&step)?.ok_or("no marker")?;
+        assert_eq!(marker.not_cached, Some(why.clone()), "{build}");
+        assert_eq!(
+            marker.connections,
+            connections_recorded(&fixture),
+            "{build}"
+        );
+    }
+    assert_eq!(tracer.runs(), 2);
     Ok(())
 }
 

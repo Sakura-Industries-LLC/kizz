@@ -32,6 +32,13 @@
 //! trace complete: the tracer reports its number in the result's unknown system
 //! calls. Either call then runs unchanged.
 //!
+//! The socket calls of [`TRACKED_SYSTEM_CALLS`] name socket addresses: a Unix socket
+//! path is recorded like any path, a write for `bind` and a probe for the others,
+//! and `connect`, and `sendto`, `sendmsg` and `sendmmsg` with a destination, also
+//! report it in the result's connections: each IPv4 or IPv6 address and port
+//! whatever the outcome of the call, and each Unix socket, by path or abstract name,
+//! unless its path was not found. Other socket families are not recorded.
+//!
 //! At the exit of a successful call that opens a regular file for reading or runs
 //! one, the tracer also notes the file's metadata as its first read, unless the
 //! tree wrote that path earlier or the call created or truncated the file: through
@@ -305,14 +312,15 @@ impl Tracer for LinuxTracer {
             .map_err(|error| tracer_error("could not follow the traced processes", error))?;
         let streams = supervised.streams?;
         supervised.fed?;
-        let (termination, accesses, incomplete, first_reads, unknown_system_calls) = outcome
-            .map_or_else(
+        let (termination, accesses, incomplete, first_reads, unknown_system_calls, connections) =
+            outcome.map_or_else(
                 || {
                     (
                         None,
                         Accesses::new(),
                         None,
                         FirstReads::new(),
+                        BTreeSet::new(),
                         BTreeSet::new(),
                     )
                 },
@@ -323,6 +331,7 @@ impl Tracer for LinuxTracer {
                         outcome.incomplete,
                         outcome.first_reads,
                         outcome.unknown_system_calls,
+                        outcome.connections,
                     )
                 },
             );
@@ -344,6 +353,7 @@ impl Tracer for LinuxTracer {
             incomplete,
             first_reads,
             unknown_system_calls,
+            connections,
         })
     }
 

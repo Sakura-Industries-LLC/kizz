@@ -57,6 +57,16 @@
 # The paths that the Linux section creates under out/linux/made-link, a symbolic link to out/linux/made, are
 # recorded under the link's name; the call that a group tests then works on the path under out/linux/made,
 # or on a descriptor that names it, so it is that path's only source.
+#
+# The connections that the step must record follow the paths, one on each line, and no others:
+#
+#     connection PLATFORM DESTINATION SOURCE
+#
+# DESTINATION is an IPv4 or IPv6 address and port, such as 127.0.0.1:47011 or [::1]:80; unix:PATH, a Unix
+# socket by its path relative to the task directory; or abstract:NAME, an abstract Unix socket by its name.
+# PLATFORM is as for the paths, without a mark, and SOURCE is ORIGIN:NAME, the call that made the connection:
+# connect, sendto, sendmsg or sendmmsg, through syscall() or the C library.
+# A destination is recorded once, however many calls connect or send to it.
 
 # The program, which kizz starts with execve, the portable core's child runs again with execv, and the kernel
 # runs as the interpreter of the script in/linux/interp/inner.
@@ -513,3 +523,40 @@ out/linux/made/fchmodat2-empty write file linux sys:fchmodat2:ok:write
 out/linux/fchmodat2-missing probe absent linux sys:fchmodat2:ENOENT:probe
 out/linux/made-link/fallocate write file linux sys:openat:ok:write
 out/linux/made/fallocate write file linux sys:fallocate:ok:write
+
+# Portable core: a Unix stream socket that bind creates and connect probes, through the C library, and a
+# missing Unix socket, which connect probes and fails on with ENOENT.
+out/core/stream.sock probe+write socket all libc:bind:ok:write libc:connect:ok:probe
+out/core/missing.sock probe absent all libc:connect:ENOENT:probe
+
+# bind and connect: a Unix stream socket that bind creates and connect probes, and missing paths, on which
+# each fails with ENOENT.
+out/linux/bound.sock probe+write socket linux sys:bind:ok:write sys:connect:ok:probe
+out/linux/no-dir/bind.sock probe absent linux sys:bind:ENOENT:probe
+out/linux/connect-missing.sock probe absent linux sys:connect:ENOENT:probe
+
+# sendto, sendmsg and sendmmsg: a datagram socket for each, which bind creates and the call probes when it
+# sends to it, and a missing path for each, on which the call fails with ENOENT.
+out/linux/sendto.sock probe+write socket linux sys:bind:ok:write sys:sendto:ok:probe
+out/linux/sendto-missing.sock probe absent linux sys:sendto:ENOENT:probe
+out/linux/sendmsg.sock probe+write socket linux sys:bind:ok:write sys:sendmsg:ok:probe
+out/linux/sendmsg-missing.sock probe absent linux sys:sendmsg:ENOENT:probe
+out/linux/sendmmsg.sock probe+write socket linux sys:bind:ok:write sys:sendmmsg:ok:probe
+out/linux/sendmmsg-missing.sock probe absent linux sys:sendmmsg:ENOENT:probe
+
+# The connections. The portable core connects to its Unix stream socket and, through UDP sockets, connects
+# and sends to 127.0.0.1 on two ports. The Linux section connects and sends to its Unix sockets, and through
+# UDP sockets connects, sends with sendto and with sendmsg to one loopback address each, and sends with
+# sendmmsg to two. The missing paths, and bind, record no connection.
+connection all unix:out/core/stream.sock libc:connect
+connection all 127.0.0.1:47011 libc:connect
+connection all 127.0.0.1:47012 libc:sendto
+connection linux unix:out/linux/bound.sock sys:connect
+connection linux unix:out/linux/sendto.sock sys:sendto
+connection linux unix:out/linux/sendmsg.sock sys:sendmsg
+connection linux unix:out/linux/sendmmsg.sock sys:sendmmsg
+connection linux 127.0.0.21:47021 sys:connect
+connection linux 127.0.0.22:47022 sys:sendto
+connection linux 127.0.0.23:47023 sys:sendmsg
+connection linux 127.0.0.24:47024 sys:sendmmsg
+connection linux 127.0.0.25:47025 sys:sendmmsg

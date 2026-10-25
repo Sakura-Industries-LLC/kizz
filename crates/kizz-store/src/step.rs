@@ -910,6 +910,110 @@ pub fn system_call_numbers(numbers: &[u32]) -> String {
     }
 }
 
+/// A connection that a command made to a service outside the trace: an IPv4 or
+/// IPv6 address and port, or a Unix socket by path or abstract name. What came back
+/// is an input that kizz cannot see, so it warns about the connection, and the
+/// result is still cached.
+///
+/// Connections are ordered by their kind, then by address or path, as a record
+/// keeps them: sorted and without repeats.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub enum Connection {
+    /// An IPv4 address and port.
+    #[n(0)]
+    Ipv4 {
+        /// The four bytes of the address, in network order.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        address: [u8; 4],
+        /// The port.
+        #[n(1)]
+        port: u16,
+    },
+    /// An IPv6 address and port, with the scope of the address, 0 for none.
+    #[n(1)]
+    Ipv6 {
+        /// The sixteen bytes of the address, in network order.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        address: [u8; 16],
+        /// The port.
+        #[n(1)]
+        port: u16,
+        /// The scope of the address, such as the index of a network interface.
+        #[n(2)]
+        scope: u32,
+    },
+    /// A Unix socket by its absolute path.
+    #[n(2)]
+    UnixPath {
+        /// The absolute path.
+        #[cbor(n(0), with = "path_bytes")]
+        path: PathBuf,
+    },
+    /// A Unix socket in the abstract namespace, by its name without the zero byte
+    /// that starts it.
+    #[n(3)]
+    UnixAbstract {
+        /// The name, which may hold more zero bytes.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        name: Vec<u8>,
+    },
+}
+
+impl Connection {
+    /// The connection as text, with a Unix socket's path shown by `path`: an
+    /// address with its port, such as `127.0.0.1:80` or `[fe80::1%2]:80`;
+    /// `Unix socket PATH`; or `abstract Unix socket @NAME`, with each byte of the
+    /// name that is not printable ASCII escaped, such as `\x00`.
+    #[must_use]
+    pub fn text(
+        &self,
+        path: impl Fn(&Path) -> String,
+    ) -> String {
+        match self {
+            Self::Ipv4 { address, port } => {
+                std::net::SocketAddrV4::new((*address).into(), *port).to_string()
+            },
+            Self::Ipv6 {
+                address,
+                port,
+                scope,
+            } => std::net::SocketAddrV6::new((*address).into(), *port, 0, *scope).to_string(),
+            Self::UnixPath { path: socket } => format!("Unix socket {}", path(socket.as_path())),
+            Self::UnixAbstract { name } => {
+                format!("abstract Unix socket @{}", name.escape_ascii())
+            },
+        }
+    }
+}
+
+impl fmt::Display for Connection {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.write_str(&self.text(|path| path.display().to_string()))
+    }
+}
+
+/// The connections `connections` as text, each shown by [`Connection::text`] with
+/// `path`, in the order given: `127.0.0.1:80`, `127.0.0.1:80 and Unix socket
+/// /run/s`, or `a, b and c` for several, and `no connection` for none.
+#[must_use]
+pub fn connections_text(
+    connections: &[Connection],
+    path: impl Fn(&Path) -> String,
+) -> String {
+    let shown: Vec<String> = connections
+        .iter()
+        .map(|connection| connection.text(&path))
+        .collect();
+    match shown.split_last() {
+        None => "no connection".to_owned(),
+        Some((only, [])) => only.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Why the result of a run was not cached.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum NotCachedReason {
@@ -1106,6 +1210,11 @@ pub struct StepRecord {
     /// another reason applies.
     #[n(13)]
     pub unknown_system_calls: Vec<u32>,
+    /// Every connection that the command made to an IPv4 or IPv6 address or to a
+    /// Unix socket, sorted and without repeats, whether the result was cached or
+    /// not. Connections never keep a result out of the cache.
+    #[n(14)]
+    pub connections: Vec<Connection>,
 }
 
 impl Record for StepRecord {
@@ -1298,6 +1407,7 @@ mod tests {
             ]
             .into(),
             unknown_system_calls: vec![400, 1_000_000],
+            connections: connections(),
         }
     }
 
@@ -1584,9 +1694,9 @@ mod tests {
     #[test]
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
-        // A definite-length array of fourteen fields, then the specification as a
+        // A definite-length array of fifteen fields, then the specification as a
         // definite-length array of thirteen.
-        assert_eq!(bytes.get(..2), Some(&[0x8E, 0x8D][..]));
+        assert_eq!(bytes.get(..2), Some(&[0x8F, 0x8D][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
@@ -1609,18 +1719,30 @@ mod tests {
             ("/a\u{e9}/kizz.md", 3),
             ("/b/kizz.md", 0)
         ]);
-        // The owners are the field before the unknown system calls, a
+        // The owners come before the unknown system calls and the connections, a
         // definite-length array of three task identities, each an array of the
         // file's bytes and the block index.
         let owners = minicbor::to_vec(&record.owners).unwrap();
         let numbers = minicbor::to_vec(&record.unknown_system_calls).unwrap();
-        assert!(bytes.ends_with(&[owners.as_slice(), numbers.as_slice()].concat()));
+        let connections = minicbor::to_vec(&record.connections).unwrap();
+        assert!(
+            bytes.ends_with(
+                &[
+                    owners.as_slice(),
+                    numbers.as_slice(),
+                    connections.as_slice()
+                ]
+                .concat()
+            )
+        );
         assert_eq!(owners.first(), Some(&0x83));
         // A record with no owner keeps an empty set.
         let mut unowned = record;
         unowned.owners.clear();
         let bytes = minicbor::to_vec(&unowned).unwrap();
-        assert!(bytes.ends_with(&[&[0x80_u8][..], numbers.as_slice()].concat()));
+        assert!(
+            bytes.ends_with(&[&[0x80_u8][..], numbers.as_slice(), connections.as_slice()].concat())
+        );
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), unowned);
     }
 
@@ -1883,12 +2005,13 @@ mod tests {
         ]);
         assert_eq!(minicbor::decode::<NotCachedReason>(&first).unwrap(), why);
         let numbers = minicbor::to_vec(vec![400_u32, 1_000_000]).unwrap();
+        let connections = minicbor::to_vec(connections()).unwrap();
         for not_cached in [Some(why), None] {
             let mut record = record();
             record.not_cached = not_cached;
             let bytes = minicbor::to_vec(&record).unwrap();
             assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
-            assert!(bytes.ends_with(&numbers));
+            assert!(bytes.ends_with(&[numbers.as_slice(), connections.as_slice()].concat()));
             let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
             assert_eq!(decoded, record);
             assert_eq!(decoded.unknown_system_calls, [400, 1_000_000]);
@@ -1897,6 +2020,110 @@ mod tests {
         none.unknown_system_calls = Vec::new();
         let bytes = minicbor::to_vec(&none).unwrap();
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), none);
+    }
+
+    /// One connection of each kind, sorted: an IPv4 address, an IPv6 address with a
+    /// scope, a Unix socket by path, and an abstract name with a zero byte.
+    fn connections() -> Vec<Connection> {
+        vec![
+            Connection::Ipv4 {
+                address: [127, 0, 0, 1],
+                port: 80,
+            },
+            Connection::Ipv6 {
+                address: [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                port: 443,
+                scope: 2,
+            },
+            Connection::UnixPath {
+                path: PathBuf::from("/run/s"),
+            },
+            Connection::UnixAbstract {
+                name: b"k\0x".to_vec(),
+            },
+        ]
+    }
+
+    /// Each connection encodes deterministically, as its variant index with a
+    /// definite-length array of its fields, addresses, paths and names as byte
+    /// strings, and round-trips; the connections of a record encode as its field
+    /// 14, after the unknown system calls, and round-trip with a marker and
+    /// without one, and with no connection at all.
+    #[test]
+    fn connections_encode_deterministically_and_round_trip() {
+        let [ipv4, ipv6, path, abstract_name] = connections().try_into().unwrap();
+        let expected: [(&Connection, Vec<u8>); 4] = [
+            (&ipv4, vec![
+                0x82, 0x00, 0x82, 0x44, 0x7F, 0x00, 0x00, 0x01, 0x18, 0x50,
+            ]),
+            (&ipv6, {
+                let mut bytes = vec![0x82, 0x01, 0x83, 0x50, 0xFE, 0x80];
+                bytes.extend([0; 13]);
+                bytes.extend([0x01, 0x19, 0x01, 0xBB, 0x02]);
+                bytes
+            }),
+            (&path, vec![
+                0x82, 0x02, 0x81, 0x46, b'/', b'r', b'u', b'n', b'/', b's',
+            ]),
+            (&abstract_name, vec![
+                0x82, 0x03, 0x81, 0x43, b'k', 0x00, b'x',
+            ]),
+        ];
+        for (connection, bytes) in expected {
+            let first = minicbor::to_vec(connection).unwrap();
+            assert_eq!(first, minicbor::to_vec(connection.clone()).unwrap());
+            assert_eq!(first, bytes, "{connection}");
+            assert_eq!(minicbor::decode::<Connection>(&first).unwrap(), *connection);
+        }
+        let listed = minicbor::to_vec(connections()).unwrap();
+        assert_eq!(listed.first(), Some(&0x84));
+        for not_cached in [Some(NotCachedReason::Signaled { signal: 9 }), None] {
+            let mut record = record();
+            record.not_cached = not_cached;
+            let bytes = minicbor::to_vec(&record).unwrap();
+            assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+            assert!(bytes.ends_with(&listed));
+            let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
+            assert_eq!(decoded, record);
+            assert_eq!(decoded.connections, connections());
+        }
+        let mut none = record();
+        none.connections = Vec::new();
+        let bytes = minicbor::to_vec(&none).unwrap();
+        assert_eq!(bytes.last(), Some(&0x80));
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), none);
+    }
+
+    /// Connections read as an address and port, or as a Unix socket by path or
+    /// abstract name with its unprintable bytes escaped, alone and in lists.
+    #[test]
+    fn connections_read_as_text() {
+        let shown: Vec<String> = connections().iter().map(ToString::to_string).collect();
+        assert_eq!(shown, [
+            "127.0.0.1:80",
+            "[fe80::1%2]:443",
+            "Unix socket /run/s",
+            "abstract Unix socket @k\\x00x",
+        ]);
+        let relative = |path: &Path| {
+            path.strip_prefix("/run")
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        assert_eq!(connections_text(&[], relative), "no connection");
+        assert_eq!(
+            connections_text(&connections()[2..3], relative),
+            "Unix socket s"
+        );
+        assert_eq!(
+            connections_text(&connections()[..2], relative),
+            "127.0.0.1:80 and [fe80::1%2]:443"
+        );
+        assert_eq!(
+            connections_text(&connections(), relative),
+            "127.0.0.1:80, [fe80::1%2]:443, Unix socket s and abstract Unix socket @k\\x00x"
+        );
     }
 
     /// The reason for files that changed after the command read them encodes

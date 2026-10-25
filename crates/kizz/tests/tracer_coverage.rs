@@ -29,6 +29,14 @@
 //! would record something else. The same holds for the kernel's implicit loads of
 //! [`IMPLICIT_LOADS`]. Unit tests cover the parser and the comparison.
 //!
+//! The expectation file also lists the connections that the run must record, on
+//! lines of their own: the portable core and the Linux section connect and send to
+//! Unix sockets under their output directories and, through UDP sockets, to
+//! loopback addresses on fixed ports, one for each call. The end-to-end test
+//! compares the record's connections with those for its platform exactly, and the
+//! build must warn about them once and repeat the warning in its summary. Each
+//! call that connects has a connection line of its own, made through `syscall()`.
+//!
 //! Another end-to-end test builds `coverage-changes` in its own copy, after
 //! `coverage-build` and a reset: each of its steps, [`CHANGES`], runs the program in
 //! a mode that reads or runs one committed file under `in/changes` through one way
@@ -90,8 +98,8 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, Attribute, Attributes, ChangedRead, NotCachedReason, PathState, RecordedOutput,
-    SpecialKind, StepExit, StepKey, StepRecord, Store, TaskId,
+    AccessBits, Attribute, Attributes, ChangedRead, Connection, NotCachedReason, PathState,
+    RecordedOutput, SpecialKind, StepExit, StepKey, StepRecord, Store, TaskId,
 };
 use kizz_trace_linux::{TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
 use libc::c_long;
@@ -224,6 +232,16 @@ const CHECKED_PATH: &CStr = c"/";
 /// The attribute name that the availability check passes to the `xattrat` calls
 /// that take one.
 const CHECKED_ATTRIBUTE: &CStr = c"user.kizz";
+
+/// The first field of a connection line of the expectation file.
+const CONNECTION_FIELD: &str = "connection";
+
+/// The calls that record a connection, which the connection lines name.
+const CONNECTING_CALLS: [&str; 4] = ["connect", "sendto", "sendmsg", "sendmmsg"];
+
+/// The number of system calls that the tracer tracks, as `architecture.md` lists
+/// them.
+const TRACKED_COUNT: usize = 76;
 
 /// An access kind, as "What is recorded" names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -805,14 +823,15 @@ fn parse_entry(
     })
 }
 
-/// Parse an expectation file: one entry per line, with blank lines and lines that
-/// start with `#` ignored. Returns every entry, or every error.
+/// Parse an expectation file: one entry per line, with blank lines, lines that
+/// start with `#`, and connection lines ignored. Returns every entry, or every
+/// error.
 fn parse_expectations(text: &str) -> Result<Vec<Entry>, Vec<String>> {
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     for (line, content) in (1_usize..).zip(text.lines()) {
         let content = content.trim();
-        if content.is_empty() || content.starts_with('#') {
+        if content.is_empty() || content.starts_with('#') || is_connection_line(content) {
             continue;
         }
         match parse_entry(line, content) {
@@ -825,6 +844,190 @@ fn parse_expectations(text: &str) -> Result<Vec<Entry>, Vec<String>> {
     } else {
         Err(errors)
     }
+}
+
+/// Whether `content`, a trimmed line of the expectation file, is a connection line:
+/// its first field is [`CONNECTION_FIELD`].
+fn is_connection_line(content: &str) -> bool {
+    content.split_whitespace().next() == Some(CONNECTION_FIELD)
+}
+
+/// One connection line of the expectation file: a connection that the run must
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedConnection {
+    /// The line, counting from one.
+    line: usize,
+    /// The platforms that expect the connection.
+    platform: Platform,
+    /// The destination, as [`connection_text`] writes a recorded one.
+    destination: String,
+    /// Where the call that made the connection comes from.
+    origin: Origin,
+    /// The call that made the connection, one of [`CONNECTING_CALLS`].
+    call: String,
+}
+
+/// Whether `text` is a destination as the expectation file writes it: an IPv4 or
+/// IPv6 address and port in the form that the standard library writes it,
+/// `unix:` and a normalized relative path, or `abstract:` and a name.
+fn is_destination(text: &str) -> bool {
+    if let Some(path) = text.strip_prefix("unix:") {
+        return is_normal_relative(path);
+    }
+    if let Some(name) = text.strip_prefix("abstract:") {
+        return !name.is_empty();
+    }
+    text.parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| address.to_string() == text)
+}
+
+/// Parse one connection line, the `line`-th of the file:
+/// `connection PLATFORM DESTINATION ORIGIN:CALL`.
+fn parse_connection(
+    line: usize,
+    text: &str,
+) -> Result<ExpectedConnection, String> {
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let [keyword, platform, destination, source] = fields.as_slice() else {
+        return Err(format!(
+            "line {line}: a connection is {CONNECTION_FIELD} PLATFORM DESTINATION ORIGIN:CALL"
+        ));
+    };
+    if *keyword != CONNECTION_FIELD {
+        return Err(format!("line {line}: `{text}` is not a connection line"));
+    }
+    let (platform, needs) =
+        parse_platform(platform).map_err(|error| format!("line {line}: {error}"))?;
+    if !needs.is_empty() {
+        return Err(format!("line {line}: a connection carries no mark"));
+    }
+    if !is_destination(destination) {
+        return Err(format!("line {line}: `{destination}` is not a destination"));
+    }
+    let origin = match source.split_once(':') {
+        Some(("sys", call)) if CONNECTING_CALLS.contains(&call) => (Origin::Sys, call),
+        Some(("libc", call)) if CONNECTING_CALLS.contains(&call) => (Origin::Libc, call),
+        _ => {
+            return Err(format!(
+                "line {line}: `{source}` is not sys or libc and a call that connects"
+            ));
+        },
+    };
+    Ok(ExpectedConnection {
+        line,
+        platform,
+        destination: (*destination).to_owned(),
+        origin: origin.0,
+        call: origin.1.to_owned(),
+    })
+}
+
+/// Parse the connection lines of an expectation file. Returns every connection,
+/// or every error.
+fn parse_connections(text: &str) -> Result<Vec<ExpectedConnection>, Vec<String>> {
+    let mut connections = Vec::new();
+    let mut errors = Vec::new();
+    for (line, content) in (1_usize..).zip(text.lines()) {
+        let content = content.trim();
+        if !is_connection_line(content) {
+            continue;
+        }
+        match parse_connection(line, content) {
+            Ok(connection) => connections.push(connection),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(connections)
+    } else {
+        Err(errors)
+    }
+}
+
+/// The problems of `connections` as a whole: a destination listed twice for a
+/// platform, and a call of [`CONNECTING_CALLS`] without a connection that it makes
+/// through `syscall()` on Linux.
+fn connection_problems(connections: &[ExpectedConnection]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, connection) in connections.iter().enumerate() {
+        for other in connections.iter().skip(index.saturating_add(1)) {
+            if connection.destination == other.destination
+                && connection.platform.overlaps(other.platform)
+            {
+                problems.push(format!(
+                    "lines {} and {}: {} is listed twice for a platform",
+                    connection.line, other.line, connection.destination
+                ));
+            }
+        }
+    }
+    for call in CONNECTING_CALLS {
+        let made = connections.iter().any(|connection| {
+            connection.origin == Origin::Sys
+                && connection.call == call
+                && connection.platform.overlaps(Platform::Linux)
+        });
+        if !made {
+            problems.push(format!(
+                "{call} has no connection that it makes through syscall() on Linux"
+            ));
+        }
+    }
+    problems
+}
+
+/// The connection `connection` of a record, as the expectation file writes it, with
+/// a Unix socket path relative to `dir`, or absolute when it is outside.
+fn connection_text(
+    connection: &Connection,
+    dir: &Path,
+) -> String {
+    match connection {
+        Connection::UnixPath { path } => {
+            format!("unix:{}", path.strip_prefix(dir).unwrap_or(path).display())
+        },
+        Connection::UnixAbstract { name } => format!("abstract:{}", name.escape_ascii()),
+        Connection::Ipv4 { .. } | Connection::Ipv6 { .. } => connection.to_string(),
+    }
+}
+
+/// The connections of `record`, as the expectation file writes them, relative to
+/// `dir`.
+fn recorded_connections(
+    record: &StepRecord,
+    dir: &Path,
+) -> BTreeSet<String> {
+    record
+        .connections
+        .iter()
+        .map(|connection| connection_text(connection, dir))
+        .collect()
+}
+
+/// The destinations of `connections` for the platform the test runs on.
+fn expected_connections_here(connections: &[ExpectedConnection]) -> BTreeSet<String> {
+    connections
+        .iter()
+        .filter(|connection| connection.platform.is_current())
+        .map(|connection| connection.destination.clone())
+        .collect()
+}
+
+/// Every difference between the `expected` and the `recorded` connections: each
+/// expected one that was not recorded, and each recorded one that was not
+/// expected.
+fn connection_differences(
+    expected: &BTreeSet<String>,
+    recorded: &BTreeSet<String>,
+) -> Vec<String> {
+    let missing = expected
+        .difference(recorded)
+        .map(|destination| format!("missing connection: {destination}"));
+    let unexpected = recorded
+        .difference(expected)
+        .map(|destination| format!("unexpected connection: {destination}"));
+    missing.chain(unexpected).collect()
 }
 
 /// The problems of `entries` as a whole, given the names of the tracked system
@@ -1164,6 +1367,12 @@ fn fixture_dir() -> PathBuf {
 fn fixture_entries() -> TestResult<Vec<Entry>> {
     let text = fs::read_to_string(fixture_dir().join(EXPECTATIONS))?;
     parse_expectations(&text).map_err(|errors| errors.join("\n").into())
+}
+
+/// The connections of the fixture's expectation file.
+fn fixture_connections() -> TestResult<Vec<ExpectedConnection>> {
+    let text = fs::read_to_string(fixture_dir().join(EXPECTATIONS))?;
+    parse_connections(&text).map_err(|errors| errors.join("\n").into())
 }
 
 /// The names of [`TRACKED_SYSTEM_CALLS`].
@@ -1518,9 +1727,11 @@ fn write_notice(
 /// Run the fixture's two builds and the reset in a copy of it, and compare the
 /// step that `coverage-test` recorded with the expectation file, leaving out the
 /// entries that name an unavailable gated call, as the test's own check and the
-/// program's report, which must agree, find. Every problem is reported at once,
-/// with the output of `kizz` and of the program, and a notice names each
-/// unavailable gated call.
+/// program's report, which must agree, find. The step's connections must be
+/// exactly those of the expectation file for the platform, and the build must warn
+/// about them once, naming them, and repeat the warning in its summary. Every
+/// problem is reported at once, with the output of `kizz` and of the program, and
+/// a notice names each unavailable gated call.
 #[test]
 fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     let (available, mut problems) = own_availability()?;
@@ -1529,6 +1740,7 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
         &available,
     )?;
     let entries = fixture_entries()?;
+    let connections = fixture_connections()?;
     let dir = tempfile::tempdir()?;
     let copy = dir.path().canonicalize()?.join(FIXTURE);
     copy_tree(&fixture_dir(), &copy)?;
@@ -1554,6 +1766,15 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     if run.status != Some(0) {
         problems.push("kizz build coverage-test failed".to_owned());
     }
+    problems.extend(warning_problems(&run, &[
+        "`./coverage`",
+        "connected to",
+        "127.0.0.1:47011",
+        "127.0.0.1:47012",
+        "Unix socket `out/core/stream.sock`",
+        "kizz cannot see what came back, and its result is still cached",
+        "`always = True` runs a command on every build",
+    ]));
     runs.push(run);
 
     let task = TaskId {
@@ -1571,6 +1792,10 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
         let differences = compare(&expected, &recorded_under(record, &copy));
         problems.extend(differences.iter().map(ToString::to_string));
         problems.extend(loader_problems(record, &copy));
+        problems.extend(connection_differences(
+            &expected_connections_here(&connections),
+            &recorded_connections(record, &copy),
+        ));
         writeln!(report, "program output:\n{}", output_of(record))?;
     }
     for run in &runs {
@@ -2456,7 +2681,7 @@ fn every_tracked_system_call_has_entries_that_only_it_explains() -> TestResult {
     let listed = spec_tracked_calls(&spec)?;
     let tracked = tracked_names();
     assert_eq!(listed, tracked);
-    assert_eq!(tracked.len(), 71);
+    assert_eq!(tracked.len(), TRACKED_COUNT);
     let entries = fixture_entries()?;
     let here: Vec<&Entry> = entries
         .iter()
@@ -2477,6 +2702,146 @@ fn the_expectation_file_is_consistent() -> TestResult {
     let problems = consistency_problems(&entries, &tracked_names());
     assert!(problems.is_empty(), "{}", problems.join("\n"));
     Ok(())
+}
+
+/// The connection lines of the expectation file are consistent: no destination is
+/// listed twice for a platform, each call that connects has a connection that it
+/// makes through `syscall()` on Linux, and each destination of a Unix socket path
+/// is under `out`, which the program creates.
+#[test]
+fn the_expected_connections_are_consistent() -> TestResult {
+    let connections = fixture_connections()?;
+    let problems = connection_problems(&connections);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    for connection in &connections {
+        if let Some(path) = connection.destination.strip_prefix("unix:") {
+            assert!(path.starts_with("out/"), "line {}: {path}", connection.line);
+        }
+    }
+    assert!(!expected_connections_here(&connections).is_empty());
+    Ok(())
+}
+
+/// The parser reads every field of a connection line, which the parser of entries
+/// skips, and rejects a malformed one with its line.
+#[test]
+fn the_parser_reads_connections() {
+    let text = "# A comment.\nin/a.txt read file+hash all libc:open:ok:read\nconnection all \
+                127.0.0.1:80 libc:connect\n  connection linux unix:out/s sys:sendmmsg\nconnection \
+                linux-x86_64 [::1]:443 sys:sendto\nconnection all abstract:kizz libc:sendmsg\n";
+    let connections = parse_connections(text).unwrap();
+    assert_eq!(connections, vec![
+        ExpectedConnection {
+            line: 3,
+            platform: Platform::All,
+            destination: "127.0.0.1:80".to_owned(),
+            origin: Origin::Libc,
+            call: "connect".to_owned(),
+        },
+        ExpectedConnection {
+            line: 4,
+            platform: Platform::Linux,
+            destination: "unix:out/s".to_owned(),
+            origin: Origin::Sys,
+            call: "sendmmsg".to_owned(),
+        },
+        ExpectedConnection {
+            line: 5,
+            platform: Platform::LinuxX86,
+            destination: "[::1]:443".to_owned(),
+            origin: Origin::Sys,
+            call: "sendto".to_owned(),
+        },
+        ExpectedConnection {
+            line: 6,
+            platform: Platform::All,
+            destination: "abstract:kizz".to_owned(),
+            origin: Origin::Libc,
+            call: "sendmsg".to_owned(),
+        },
+    ]);
+    assert_eq!(parse_expectations(text).unwrap().len(), 1);
+    for bad in [
+        "connection all 127.0.0.1:80",
+        "connection all 127.0.0.1 libc:connect",
+        "connection all 127.000.0.1:80 libc:connect",
+        "connection all unix:/abs sys:connect",
+        "connection all unix:./x sys:connect",
+        "connection all abstract: sys:connect",
+        "connection all 127.0.0.1:80 sys:bind",
+        "connection all 127.0.0.1:80 kizz:connect",
+        "connection all 127.0.0.1:80 connect",
+        "connection linux/getxattrat 127.0.0.1:80 sys:connect",
+        "connection nowhere 127.0.0.1:80 sys:connect",
+    ] {
+        let errors = parse_connections(bad).unwrap_err();
+        assert_eq!(errors.len(), 1, "{bad}");
+        assert!(errors[0].starts_with("line 1: "), "{bad}: {errors:?}");
+    }
+}
+
+/// The problems of connection lines name a destination listed twice for a platform
+/// and each call that connects without a connection through `syscall()` on Linux.
+#[test]
+fn connection_problems_name_repeats_and_missing_calls() {
+    let text = "connection all 127.0.0.1:1 sys:connect\nconnection linux 127.0.0.1:1 \
+                sys:sendto\nconnection macos 127.0.0.1:2 sys:sendmsg\nconnection linux \
+                127.0.0.1:3 libc:sendmmsg\n";
+    let connections = parse_connections(text).unwrap();
+    assert_eq!(connection_problems(&connections), vec![
+        "lines 1 and 2: 127.0.0.1:1 is listed twice for a platform".to_owned(),
+        "sendmsg has no connection that it makes through syscall() on Linux".to_owned(),
+        "sendmmsg has no connection that it makes through syscall() on Linux".to_owned(),
+    ]);
+}
+
+/// A record's connections read as the expectation file writes them, a Unix socket
+/// path relative to the task directory, or absolute outside it; the comparison
+/// names each missing and each unexpected connection.
+#[test]
+fn recorded_connections_are_compared_with_the_expected_ones() {
+    let dir = Path::new("/t");
+    let shown: Vec<String> = [
+        Connection::Ipv4 {
+            address: [127, 0, 0, 1],
+            port: 80,
+        },
+        Connection::Ipv6 {
+            address: std::net::Ipv6Addr::LOCALHOST.octets(),
+            port: 443,
+            scope: 0,
+        },
+        Connection::UnixPath {
+            path: PathBuf::from("/t/out/s"),
+        },
+        Connection::UnixPath {
+            path: PathBuf::from("/run/s"),
+        },
+        Connection::UnixAbstract {
+            name: b"k\0".to_vec(),
+        },
+    ]
+    .iter()
+    .map(|connection| connection_text(connection, dir))
+    .collect();
+    assert_eq!(shown, [
+        "127.0.0.1:80",
+        "[::1]:443",
+        "unix:out/s",
+        "unix:/run/s",
+        "abstract:k\\x00"
+    ]);
+    let set = |items: &[&str]| -> BTreeSet<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    };
+    assert_eq!(
+        connection_differences(&set(&["a", "b"]), &set(&["b", "c"])),
+        ["missing connection: a", "unexpected connection: c"]
+    );
+    assert_eq!(
+        connection_differences(&set(&["a"]), &set(&["a"])),
+        Vec::<String>::new()
+    );
 }
 
 /// Every path of the expectation file is in the fixture's committed inputs or under
@@ -2863,6 +3228,7 @@ fn incomplete_step(
         not_cached,
         owners: BTreeSet::new(),
         unknown_system_calls: unknown.to_vec(),
+        connections: Vec::new(),
     }
 }
 
@@ -3242,6 +3608,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         not_cached: None,
         owners: BTreeSet::new(),
         unknown_system_calls: Vec::new(),
+        connections: Vec::new(),
     };
     let recorded: Vec<String> = recorded_under(&record, Path::new("/t"))
         .into_iter()

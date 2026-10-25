@@ -54,7 +54,7 @@ These decisions came out of the review of the original outline.
 | Directory listings | Directory listings are dependencies, including the order in which the file system returns the entries. |
 | Explanations | Kizz says exactly why it ran each command and which things changed. |
 | Hermeticity | Not a goal. The goal is fast, cacheable, reliable builds without hand-written dependency lists, which nobody can maintain accurately. |
-| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. A system call that the tracer does not know makes the result not cached unless `kizz build --cache-unknown-syscalls` is given, and kizz warns about it either way. |
+| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. A system call that the tracer does not know makes the result not cached unless `kizz build --cache-unknown-syscalls` is given, and kizz warns about it either way. Connections to the network and to Unix sockets are detected and warned about, and the result is still cached. |
 | Tool awareness | None. Tool caches are tracked at file level like any other files. A tool that makes itself uncacheable is uncacheable, and kizz reports exactly why, for example that a command keeps writing a file and consuming it as an input. Users may ignore a file, glob, or regular expression, or a set of them; kizz never adds such exceptions itself. Users drive exceptions, not dependencies. |
 | Inputs | Anything read during the build is an input. To exclude a file, stop the tool from reading it, or add an exception. Kizz itself stays oblivious. |
 | Change detection | Different size: changed. Same size and same metadata: unchanged. Same size but different metadata: maybe changed, so compare hashes. A different type, permission bits or owner is always a change, whatever the content. A command run with `timestamps = True` also counts a different timestamp as a change. |
@@ -439,6 +439,7 @@ Tracked system calls, by x86_64 name:
   `utimensat`, `futimesat` and `file_setattr`
 * descriptor-based changes: `ftruncate`, `fchmod`, `fchown` and `fallocate`,
   resolved to the path behind the descriptor
+* sockets: `bind`, `connect`, `sendto`, `sendmsg` and `sendmmsg`
 
 Reading or listing extended attributes records the xattr kind, also when the call fails
 because the attribute does not exist (`ENODATA`), the buffer is too small (`ERANGE`) or the file system has none (`EOPNOTSUPP`):
@@ -447,6 +448,12 @@ Setting or removing an attribute is a write.
 `file_getattr` and `name_to_handle_at` record a probe, and so do `inotify_add_watch` and `fanotify_mark`, which watch a path.
 `file_setattr` is a write; the file attributes that `file_getattr` returns, such as the immutable flag, are not compared.
 `statfs` and `fstatfs` record a probe; the figures they return, such as free space, are not compared.
+Binding a Unix socket to a path writes the path, and connecting or sending to one probes it,
+so a missing socket is a dependency like a missing file.
+`connect`, and `sendto`, `sendmsg` and `sendmmsg` with a destination, also record the step's connections:
+each IPv4 or IPv6 address and port whatever the outcome of the call, and each Unix socket, by path or abstract name,
+unless its path was not found.
+Other socket families, such as netlink, which talks to the kernel, are not recorded.
 
 System calls that mark the run as incompletely traced, by x86_64 name:
 
@@ -539,6 +546,15 @@ they mark it with `always = True`.
 The command then runs on every build, and its dependencies are still recorded.
 If it does not change anything another step depends on, the cost is time, not correctness: dependent steps compare content hashes,
 find nothing changed, and stay cached.
+
+Kizz detects connections to the network and to Unix sockets, because what comes back is an input it cannot see.
+It warns loudly about each connection, naming the address or socket, and repeats the warning in the summary.
+The result is still cached, and `kizz why` lists the step's connections.
+Kizz warns when the command runs, not on a later cache hit.
+Kizz also assumes that a command has no effect outside the files it writes.
+A cache hit does not repeat an upload, a database update or a notification,
+so a command whose effect must happen on every build is marked `always` as well.
+Devices, FIFOs and sockets are compared by type only, never by what they deliver or by the service behind them.
 
 ### User exceptions
 
@@ -736,6 +752,7 @@ and the user can decide whether to add an ignore pattern.
 `kizz build` prints a one-line reason for each command it runs, and `--explain` prints the full reasons.
 `kizz why` prints the reasons stored by the most recent build.
 `kizz why` also lists each step's untracked `/proc` and `/sys` accesses, so the user can decide whether any should be tracked.
+It also lists each step's connections to the network and to Unix sockets.
 It also lists the system calls that a step made and that the tracer does not know, when there are any.
 
 ## Order of execution
@@ -1099,6 +1116,7 @@ Depends on phases 7 and 8.
   one for each way in which a command first reads a file, and in a mode that writes a file before it reads it.
 * A `coverage-incomplete` task runs the program once for each system call that marks a run as incompletely traced,
   and once for each of two numbers that the tracer does not know, 400 and 1,000,000.
+* `coverage.c` also binds, connects and sends to Unix sockets, and connects and sends to loopback addresses.
 
 Acceptance, end to end with the real tracer and a temporary cache:
 
@@ -1111,6 +1129,7 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * The step that writes its file before it reads it is cached.
 * Each step of `coverage-incomplete` is not cached, with a reason that names its system call or number.
 * With `kizz build --cache-unknown-syscalls`, the steps of the two numbers are cached and their records list them.
+* Each expected connection for the platform is recorded, and no other connection.
 
 ## Testing
 

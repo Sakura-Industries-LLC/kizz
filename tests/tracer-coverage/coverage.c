@@ -76,21 +76,38 @@
  *
  * The main program also calls unshare without CLONE_NEWNS and setns with another
  * namespace type, which leave the run completely traced.
+ *
+ * Both sections also bind, connect and send to Unix sockets under their output
+ * directories, the portable core through the C library and the Linux section
+ * through syscall(), and connect and send through UDP sockets to the loopback
+ * addresses on fixed ports, one for each call: the portable core to 127.0.0.1,
+ * the only loopback address that every platform has, and the Linux section to
+ * distinct addresses in 127.0.0.0/8. Connecting a UDP socket and sending a
+ * datagram succeed whether or not anything listens, so the results do not depend
+ * on the machine. Each Unix socket that a send call sends to is a datagram socket
+ * of its own, bound to its own path, so the path of each call has that call as its
+ * only probe.
  */
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -287,6 +304,74 @@ static const char *in_task(char *buffer, size_t size, const char *relative)
     return buffer;
 }
 
+/* The payload of every datagram that the program sends. */
+static char payload[] = "kizz";
+
+/* The address of the Unix socket `path`, with its length, its NUL byte included, in `length`. */
+static struct sockaddr_un unix_address(const char *path, socklen_t *length)
+{
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof address.sun_path, "%s", path);
+    *length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(address.sun_path) + 1);
+    return address;
+}
+
+/* The IPv4 address 127.0.0.`last`, a loopback address, with `port`. */
+static struct sockaddr_in loopback(unsigned last, unsigned short port)
+{
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof address);
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl((127u << 24) | last);
+    return address;
+}
+
+/* Open a socket of `domain` and `type`, for `what`, and check the result. */
+static int open_socket(const char *what, int domain, int type)
+{
+    return (int)EXPECT(0, "socket", what, socket(domain, type, 0));
+}
+
+/*
+ * The portable core's sockets, through the C library: a Unix stream socket bound to
+ * out/core/stream.sock that a second socket connects to, a connection to the missing
+ * out/core/missing.sock, and UDP sockets that connect to 127.0.0.1 port 47011 and send
+ * to 127.0.0.1 port 47012.
+ */
+static void core_sockets(void)
+{
+    socklen_t length;
+    struct sockaddr_un stream = unix_address("out/core/stream.sock", &length);
+    int listener = open_socket("out/core/stream.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "bind", "out/core/stream.sock", bind(listener, (struct sockaddr *)&stream, length));
+    EXPECT(0, "listen", "out/core/stream.sock", listen(listener, 1));
+    int client = open_socket("out/core/stream.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "connect", "out/core/stream.sock",
+           connect(client, (struct sockaddr *)&stream, length));
+    close_fd(client);
+    close_fd(listener);
+
+    struct sockaddr_un missing = unix_address("out/core/missing.sock", &length);
+    client = open_socket("out/core/missing.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(ENOENT, "connect", "out/core/missing.sock",
+           connect(client, (struct sockaddr *)&missing, length));
+    close_fd(client);
+
+    struct sockaddr_in connected = loopback(1, 47011);
+    int udp = open_socket("127.0.0.1:47011", AF_INET, SOCK_DGRAM);
+    EXPECT(0, "connect", "127.0.0.1:47011",
+           connect(udp, (struct sockaddr *)&connected, sizeof connected));
+    close_fd(udp);
+    struct sockaddr_in sent = loopback(1, 47012);
+    udp = open_socket("127.0.0.1:47012", AF_INET, SOCK_DGRAM);
+    EXPECT(0, "sendto", "127.0.0.1:47012",
+           sendto(udp, payload, sizeof payload - 1, 0, (struct sockaddr *)&sent, sizeof sent));
+    close_fd(udp);
+}
+
 /* The second thread of the portable core, which makes calls of its own. */
 static void *core_thread(void *argument)
 {
@@ -376,6 +461,9 @@ static void core(void)
            chown("out/core/owner-changed", geteuid(), getegid()));
     write_stream("out/core/touched");
     EXPECT(0, "utimes", "out/core/touched", utimes("out/core/touched", NULL));
+
+    /* Sockets. */
+    core_sockets();
 
     /* A second thread. */
     pthread_t thread;
@@ -1549,6 +1637,120 @@ static void linux_namespaces(void)
 }
 
 /*
+ * Send the payload from the socket `fd` to `address`, `length` bytes long, named `what`, with the
+ * system call `call`, sendto, sendmsg or sendmmsg with one message, through syscall(), and check
+ * the result against `expected`.
+ */
+static void send_with(const char *call, int fd, const void *address, socklen_t length,
+                      const char *what, int expected)
+{
+    struct iovec vector = {payload, sizeof payload - 1};
+    struct mmsghdr messages[1];
+    memset(messages, 0, sizeof messages);
+    messages[0].msg_hdr.msg_name = (void *)address;
+    messages[0].msg_hdr.msg_namelen = length;
+    messages[0].msg_hdr.msg_iov = &vector;
+    messages[0].msg_hdr.msg_iovlen = 1;
+    if (strcmp(call, "sendto") == 0) {
+        EXPECT(expected, call, what,
+               syscall(SYS_sendto, fd, payload, sizeof payload - 1, 0, address, length));
+    } else if (strcmp(call, "sendmsg") == 0) {
+        EXPECT(expected, call, what, syscall(SYS_sendmsg, fd, &messages[0].msg_hdr, 0));
+    } else {
+        EXPECT(expected, call, what, syscall(SYS_sendmmsg, fd, messages, 1, 0));
+    }
+}
+
+/*
+ * Bind a datagram socket to OUT/CALL.sock and send to it with `call`, then send to the missing
+ * OUT/CALL-missing.sock, which fails with ENOENT.
+ */
+static void unix_datagrams(const char *call)
+{
+    char path[64];
+    char missing_path[64];
+    snprintf(path, sizeof path, OUT "/%s.sock", call);
+    snprintf(missing_path, sizeof missing_path, OUT "/%s-missing.sock", call);
+    socklen_t length;
+    struct sockaddr_un address = unix_address(path, &length);
+    int receiver = open_socket(path, AF_UNIX, SOCK_DGRAM);
+    EXPECT(0, "bind", path, syscall(SYS_bind, receiver, &address, length));
+    int sender = open_socket(path, AF_UNIX, SOCK_DGRAM);
+    send_with(call, sender, &address, length, path, 0);
+    socklen_t missing_length;
+    struct sockaddr_un missing = unix_address(missing_path, &missing_length);
+    send_with(call, sender, &missing, missing_length, missing_path, ENOENT);
+    close_fd(sender);
+    close_fd(receiver);
+}
+
+/*
+ * Sockets: bind, connect, sendto, sendmsg and sendmmsg, each through syscall(), on Unix sockets
+ * under OUT, with a missing path for each, and through UDP sockets to 127.0.0.21 through
+ * 127.0.0.25, one address for each call and port 47021 through 47025.
+ */
+static void linux_sockets(void)
+{
+    socklen_t length;
+    struct sockaddr_un bound = unix_address(OUT "/bound.sock", &length);
+    int listener = open_socket(OUT "/bound.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "bind", OUT "/bound.sock", syscall(SYS_bind, listener, &bound, length));
+    EXPECT(0, "listen", OUT "/bound.sock", listen(listener, 1));
+    int client = open_socket(OUT "/bound.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "connect", OUT "/bound.sock", syscall(SYS_connect, client, &bound, length));
+    close_fd(client);
+    close_fd(listener);
+
+    client = open_socket(OUT "/no-dir/bind.sock", AF_UNIX, SOCK_STREAM);
+    struct sockaddr_un missing = unix_address(OUT "/no-dir/bind.sock", &length);
+    EXPECT(ENOENT, "bind", OUT "/no-dir/bind.sock", syscall(SYS_bind, client, &missing, length));
+    missing = unix_address(OUT "/connect-missing.sock", &length);
+    EXPECT(ENOENT, "connect", OUT "/connect-missing.sock",
+           syscall(SYS_connect, client, &missing, length));
+    close_fd(client);
+
+    unix_datagrams("sendto");
+    unix_datagrams("sendmsg");
+    unix_datagrams("sendmmsg");
+
+    struct sockaddr_in address = loopback(21, 47021);
+    int udp = open_socket("127.0.0.21:47021", AF_INET, SOCK_DGRAM);
+    EXPECT(0, "connect", "127.0.0.21:47021",
+           syscall(SYS_connect, udp, &address, sizeof address));
+    close_fd(udp);
+    address = loopback(22, 47022);
+    udp = open_socket("127.0.0.22:47022", AF_INET, SOCK_DGRAM);
+    send_with("sendto", udp, &address, sizeof address, "127.0.0.22:47022", 0);
+    close_fd(udp);
+    address = loopback(23, 47023);
+    udp = open_socket("127.0.0.23:47023", AF_INET, SOCK_DGRAM);
+    send_with("sendmsg", udp, &address, sizeof address, "127.0.0.23:47023", 0);
+    close_fd(udp);
+
+    /* sendmmsg sends two messages, to two addresses. */
+    struct sockaddr_in first = loopback(24, 47024);
+    struct sockaddr_in second = loopback(25, 47025);
+    struct iovec vector = {payload, sizeof payload - 1};
+    struct mmsghdr messages[2];
+    memset(messages, 0, sizeof messages);
+    messages[0].msg_hdr.msg_name = &first;
+    messages[0].msg_hdr.msg_namelen = sizeof first;
+    messages[1].msg_hdr.msg_name = &second;
+    messages[1].msg_hdr.msg_namelen = sizeof second;
+    for (int index = 0; index < 2; index++) {
+        messages[index].msg_hdr.msg_iov = &vector;
+        messages[index].msg_hdr.msg_iovlen = 1;
+    }
+    udp = open_socket("127.0.0.24:47024", AF_INET, SOCK_DGRAM);
+    long sent = EXPECT(0, "sendmmsg", "127.0.0.24:47024 and 127.0.0.25:47025",
+                       syscall(SYS_sendmmsg, udp, messages, 2, 0));
+    if (sent >= 0 && sent != 2) {
+        check("sendmmsg", "127.0.0.24:47024 and 127.0.0.25:47025", -1, 0, 0);
+    }
+    close_fd(udp);
+}
+
+/*
  * The Linux section: every tracked system call, made through syscall(), after the
  * check of the gated calls, whose groups it makes only where they are available.
  */
@@ -1574,6 +1776,7 @@ static void linux_section(void)
     linux_attribute_reads();
     linux_attribute_changes();
     linux_namespaces();
+    linux_sockets();
 
 #ifdef SYS_io_uring_setup
     /* io_uring would bypass the tracer, so it is not available. */

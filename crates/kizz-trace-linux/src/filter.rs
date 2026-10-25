@@ -18,7 +18,9 @@
 //!   make itself: `clone` and `unshare` only with `CLONE_NEWNS` in their flags, and
 //!   `setns` only when its namespace type is 0 or includes `CLONE_NEWNS`; `clone3` always
 //!   stops, and the tracer reads the flags in its `struct clone_args`;
-//! * each system call in [`TRACKED_SYSTEM_CALLS`] stops for the tracer;
+//! * each system call in [`TRACKED_SYSTEM_CALLS`] stops for the tracer, `sendto` only
+//!   with a destination address: a null address names none, so the call, which a
+//!   connected socket makes for every `send`, runs at full speed;
 //! * every other system call runs at full speed.
 
 use std::{num::TryFromIntError, ops::RangeInclusive};
@@ -73,7 +75,7 @@ pub(crate) mod numbers {
 /// Every system call the filter stops for, in the order of the spec's list:
 /// opening files, metadata and existence, file systems, watches, extended
 /// attributes, links, directory listings, programs, the working directory, changes,
-/// and changes through a descriptor.
+/// changes through a descriptor, and sockets.
 pub const TRACKED_SYSTEM_CALLS: &[TrackedSystemCall] = &[
     // Opening files.
     TrackedSystemCall::new("open", libc::SYS_open),
@@ -157,6 +159,12 @@ pub const TRACKED_SYSTEM_CALLS: &[TrackedSystemCall] = &[
     TrackedSystemCall::new("fchmod", libc::SYS_fchmod),
     TrackedSystemCall::new("fchown", libc::SYS_fchown),
     TrackedSystemCall::new("fallocate", libc::SYS_fallocate),
+    // Sockets.
+    TrackedSystemCall::new("bind", libc::SYS_bind),
+    TrackedSystemCall::new("connect", libc::SYS_connect),
+    TrackedSystemCall::new("sendto", libc::SYS_sendto),
+    TrackedSystemCall::new("sendmsg", libc::SYS_sendmsg),
+    TrackedSystemCall::new("sendmmsg", libc::SYS_sendmmsg),
 ];
 
 /// Every system call that marks a run as incompletely traced, in the order of the
@@ -235,6 +243,13 @@ const FIRST_ARGUMENT_OFFSET: u32 = 16;
 /// The offset of the low 32 bits of the second argument, `args[1]`, in
 /// `struct seccomp_data` on a little-endian machine.
 const SECOND_ARGUMENT_OFFSET: u32 = 24;
+/// The offset of the low 32 bits of the fifth argument, `args[4]`, in
+/// `struct seccomp_data` on a little-endian machine: the destination address of
+/// `sendto`.
+const FIFTH_ARGUMENT_OFFSET: u32 = 48;
+/// The offset of the high 32 bits of the fifth argument, `args[4]`, in
+/// `struct seccomp_data` on a little-endian machine.
+const FIFTH_ARGUMENT_HIGH_OFFSET: u32 = 52;
 
 /// The `CLONE_NEWNS` flag, which asks for a new mount namespace, as the filter
 /// compares it with the low 32 bits of an argument.
@@ -368,6 +383,34 @@ fn untraceable(call: &TrackedSystemCall) -> Result<Vec<sock_filter>, TryFromIntE
     })
 }
 
+/// The instructions for `call`, one of [`TRACKED_SYSTEM_CALLS`]: stop for the
+/// tracer. `sendto` stops only with a destination address, a fifth argument that
+/// is not null, which the filter compares in its two 32-bit halves; with a null
+/// one, it runs. The instructions that load an argument end in an action on every
+/// path, so the number that the instructions after them compare stays loaded.
+///
+/// # Errors
+///
+/// Returns an error only if the call's number does not fit the filter's 32-bit
+/// comparison.
+fn tracked(call: &TrackedSystemCall) -> Result<Vec<sock_filter>, TryFromIntError> {
+    let number = u32::try_from(call.number)?;
+    Ok(if call.number == libc::SYS_sendto {
+        vec![
+            jump(JUMP_IF_EQUAL, number, 0, 7),
+            load(FIFTH_ARGUMENT_OFFSET),
+            jump(JUMP_IF_EQUAL, 0, 1, 0),
+            trace(DATA_TRACKED),
+            load(FIFTH_ARGUMENT_HIGH_OFFSET),
+            jump(JUMP_IF_EQUAL, 0, 1, 0),
+            trace(DATA_TRACKED),
+            allow(),
+        ]
+    } else {
+        vec![unless_equal_skip(number), trace(DATA_TRACKED)]
+    })
+}
+
 /// Build the filter program.
 ///
 /// # Errors
@@ -400,8 +443,7 @@ pub(crate) fn program() -> Result<Vec<sock_filter>, TryFromIntError> {
         program.extend(untraceable(call)?);
     }
     for call in TRACKED_SYSTEM_CALLS {
-        program.push(unless_equal_skip(u32::try_from(call.number)?));
-        program.push(trace(DATA_TRACKED));
+        program.extend(tracked(call)?);
     }
     program.push(allow());
     Ok(program)
@@ -431,14 +473,35 @@ mod tests {
     }
 
     /// Run the filter program on one system call whose first two arguments have
-    /// the low 32 bits `arguments`, as the kernel does, and return the action it
-    /// chooses.
+    /// the low 32 bits `arguments`, and whose other arguments are 0, as the kernel
+    /// does, and return the action it chooses.
     fn evaluate_with(
         program: &[sock_filter],
         arch: u32,
         nr: u32,
         arguments: [u32; 2],
     ) -> u32 {
+        let [first, second] = arguments;
+        evaluate_all(program, arch, nr, [
+            u64::from(first),
+            u64::from(second),
+            0,
+            0,
+            0,
+            0,
+        ])
+    }
+
+    /// Run the filter program on one system call with the six arguments
+    /// `arguments`, as the kernel does, and return the action it chooses.
+    fn evaluate_all(
+        program: &[sock_filter],
+        arch: u32,
+        nr: u32,
+        arguments: [u64; 6],
+    ) -> u32 {
+        let low = |argument: u64| u32::try_from(argument & u64::from(u32::MAX)).unwrap();
+        let high = |argument: u64| u32::try_from(argument >> 32).unwrap();
         let mut pc = 0_usize;
         let mut accumulator = 0_u32;
         loop {
@@ -449,8 +512,10 @@ mod tests {
                     accumulator = match instruction.k {
                         NR_OFFSET => nr,
                         ARCH_OFFSET => arch,
-                        FIRST_ARGUMENT_OFFSET => arguments[0],
-                        SECOND_ARGUMENT_OFFSET => arguments[1],
+                        FIRST_ARGUMENT_OFFSET => low(arguments[0]),
+                        SECOND_ARGUMENT_OFFSET => low(arguments[1]),
+                        FIFTH_ARGUMENT_OFFSET => low(arguments[4]),
+                        FIFTH_ARGUMENT_HIGH_OFFSET => high(arguments[4]),
                         offset => panic!("unexpected load offset {offset}"),
                     };
                     next
@@ -480,7 +545,7 @@ mod tests {
         u32::try_from(nr).unwrap()
     }
 
-    /// The tracked calls are the spec's 71, in the order of its list.
+    /// The tracked calls are the spec's 76, in the order of its list.
     #[test]
     fn tracked_set_is_the_spec_list() {
         let names: Vec<&str> = TRACKED_SYSTEM_CALLS.iter().map(|call| call.name).collect();
@@ -556,8 +621,13 @@ mod tests {
             "fchmod",
             "fchown",
             "fallocate",
+            "bind",
+            "connect",
+            "sendto",
+            "sendmsg",
+            "sendmmsg",
         ]);
-        assert_eq!(names.len(), 71);
+        assert_eq!(names.len(), 76);
     }
 
     #[test]
@@ -595,6 +665,11 @@ mod tests {
             ("removexattrat", 466),
             ("file_getattr", 468),
             ("file_setattr", 469),
+            ("connect", 42),
+            ("sendto", 44),
+            ("sendmsg", 46),
+            ("bind", 49),
+            ("sendmmsg", 307),
         ];
         for (name, nr) in known {
             let call = TRACKED_SYSTEM_CALLS
@@ -644,6 +719,15 @@ mod tests {
             usize::try_from(SECOND_ARGUMENT_OFFSET).unwrap(),
             arguments.checked_add(mem::size_of::<u64>()).unwrap()
         );
+        // The fifth argument, `args[4]`, in its low and high halves.
+        let fifth = arguments
+            .checked_add(mem::size_of::<u64>().checked_mul(4).unwrap())
+            .unwrap();
+        assert_eq!(usize::try_from(FIFTH_ARGUMENT_OFFSET).unwrap(), fifth);
+        assert_eq!(
+            usize::try_from(FIFTH_ARGUMENT_HIGH_OFFSET).unwrap(),
+            fifth.checked_add(mem::size_of::<u32>()).unwrap()
+        );
         assert_eq!(NEW_MOUNT_NAMESPACE, 0x0002_0000);
     }
 
@@ -654,17 +738,67 @@ mod tests {
         assert!(u16::try_from(program.len()).is_ok());
     }
 
+    /// Every tracked call stops for the tracer, `sendto` with a destination address
+    /// in its fifth argument.
     #[test]
     fn tracked_calls_stop_for_the_tracer() {
         let program = program().unwrap();
         let stop = libc::SECCOMP_RET_TRACE | u32::from(DATA_TRACKED);
+        let destination = [0, 0, 0, 0, 0x7FFF_0000_1000, 16];
         for call in TRACKED_SYSTEM_CALLS {
             assert_eq!(
-                evaluate(&program, AUDIT_ARCH_X86_64, number(call.number)),
+                evaluate_all(
+                    &program,
+                    AUDIT_ARCH_X86_64,
+                    number(call.number),
+                    destination
+                ),
                 stop,
                 "{}",
                 call.name
             );
+        }
+    }
+
+    /// `sendto` stops for the tracer when its destination address is not null, in
+    /// either half of the register, and runs at full speed with a null one, as a
+    /// `send` on a connected socket makes it; the calls after it in the program are
+    /// still compared.
+    #[test]
+    fn sendto_stops_only_with_a_destination() {
+        let program = program().unwrap();
+        let stop = libc::SECCOMP_RET_TRACE | u32::from(DATA_TRACKED);
+        let sendto = number(libc::SYS_sendto);
+        for address in [
+            1,
+            0x1000,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x7FFF_0000_1000,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                evaluate_all(&program, AUDIT_ARCH_X86_64, sendto, [
+                    3, 0, 5, 0, address, 16
+                ]),
+                stop,
+                "{address:#x}"
+            );
+        }
+        for length in [0, 16] {
+            assert_eq!(
+                evaluate_all(&program, AUDIT_ARCH_X86_64, sendto, [3, 0, 5, 0, 0, length]),
+                libc::SECCOMP_RET_ALLOW,
+                "{length}"
+            );
+        }
+        for call in ["sendmsg", "sendmmsg"] {
+            let nr = TRACKED_SYSTEM_CALLS
+                .iter()
+                .find(|tracked| tracked.name == call)
+                .map(|tracked| number(tracked.number))
+                .unwrap();
+            assert_eq!(evaluate(&program, AUDIT_ARCH_X86_64, nr), stop, "{call}");
         }
     }
 
@@ -899,9 +1033,9 @@ mod tests {
 
     /// Every native number up to 1,000 gets exactly its stop: `io_uring_setup`
     /// fails, a tracked call and a call that marks the run stop for the tracer
-    /// (`clone` and `unshare` without arguments run, and `setns` with type 0
-    /// stops), every other known number runs, and every number outside the table
-    /// stops as unknown.
+    /// (`sendto` without a destination, and `clone` and `unshare` without
+    /// arguments, run, and `setns` with type 0 stops), every other known number
+    /// runs, and every number outside the table stops as unknown.
     #[test]
     fn every_native_number_gets_its_stop() {
         let program = program().unwrap();
@@ -911,6 +1045,8 @@ mod tests {
             let number = c_long::from(nr);
             let expected = if number == libc::SYS_io_uring_setup {
                 failure
+            } else if number == libc::SYS_sendto {
+                libc::SECCOMP_RET_ALLOW
             } else if TRACKED_SYSTEM_CALLS
                 .iter()
                 .any(|call| call.number == number)

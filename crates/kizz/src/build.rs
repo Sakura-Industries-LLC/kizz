@@ -22,10 +22,13 @@
 //! commands that ran and those that came from the cache, and gives the number of
 //! passes the build settled in. Among them: a command traced incompletely, which
 //! names the reason, such as a system call that kizz cannot trace; a command during
-//! whose run something else changed a file after the command read it; and a
-//! command that made system calls that the tracer does not know, once per step and
-//! build, which says whether its result was cached, and without
-//! `--cache-unknown-syscalls` that the command runs again on the next build. A
+//! whose run something else changed a file after the command read it; a command
+//! that made system calls that the tracer does not know, once per step and build,
+//! which says whether its result was cached, and without `--cache-unknown-syscalls`
+//! that the command runs again on the next build; and a command that connected to
+//! the network or to Unix sockets, once per step and build, which names each
+//! address or socket, says that kizz cannot see what came back and that the result
+//! is still cached, and that `always = True` runs a command on every build. A
 //! command that rewrote its own input gets no warning, because its reason says so,
 //! and a cache hit warns about nothing.
 //!
@@ -48,12 +51,12 @@ use std::{
 
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, LoadError, PrintSink,
-    ProgramWrite, Project, Render, StepDecision, TargetExpr, TaskInfo, TaskResult, UnknownCalls,
-    Warning, build, load, task_id, task_label,
+    ProgramWrite, Project, Render, StepConnections, StepDecision, TargetExpr, TaskInfo, TaskResult,
+    UnknownCalls, Warning, build, load, task_id, task_label,
 };
 use kizz_store::{
     CacheLock, LockDetails, NotCachedReason, StepKey, StepRecord, Store, TaskId, Verdict,
-    cache_dir_from_env, system_call_numbers,
+    cache_dir_from_env, connections_text, system_call_numbers,
 };
 use kizz_trace::{AbsolutePath, Cancellation, StdioEcho};
 use kizz_trace_linux::LinuxTracer;
@@ -232,6 +235,7 @@ fn build_selected(
         incomplete_shown: RefCell::new(BTreeSet::new()),
         changed_shown: RefCell::new(BTreeSet::new()),
         unknown_shown: RefCell::new(BTreeSet::new()),
+        connections_shown: RefCell::new(BTreeSet::new()),
         warnings: RefCell::new(warnings),
     };
     let status = match build(&engine, &tasks, &caller, &output, &output) {
@@ -378,6 +382,8 @@ struct Output<'a> {
     /// The steps already warned about because their command made system calls that
     /// the tracer does not know.
     unknown_shown: RefCell<BTreeSet<StepKey>>,
+    /// The steps already warned about because their command made connections.
+    connections_shown: RefCell<BTreeSet<StepKey>>,
     /// Every warning printed, for the final summary.
     warnings: RefCell<Vec<String>>,
 }
@@ -475,8 +481,9 @@ impl Output<'_> {
     /// Print, loudly, each warning the engine added since the last check: steps
     /// that re-ran in consecutive builds for the same self-inflicted reason, runs
     /// that were traced incompletely, runs in which something other than the
-    /// command changed a file after the command read it, and runs that made system
-    /// calls that the tracer does not know, each step once per build.
+    /// command changed a file after the command read it, runs that made system
+    /// calls that the tracer does not know, and runs that made connections, each
+    /// step once per build.
     fn check_warnings(&self) {
         let repeated = self.engine.warnings();
         for warning in repeated.iter().skip(self.repeated_shown.get()) {
@@ -512,6 +519,11 @@ impl Output<'_> {
         for calls in self.engine.unknown_system_calls() {
             if self.unknown_shown.borrow_mut().insert(calls.key) {
                 self.warn(self.unknown_calls(&calls));
+            }
+        }
+        for made in self.engine.connections() {
+            if self.connections_shown.borrow_mut().insert(made.key) {
+                self.warn(self.connected(&made));
             }
         }
     }
@@ -593,6 +605,29 @@ impl Output<'_> {
             "{} made {}, which the tracer does not know{outcome}",
             self.command(&calls.key),
             system_call_numbers(&calls.numbers)
+        )
+    }
+
+    /// The warning for the run `made`, which connected to the network or to Unix
+    /// sockets: the command and each address or socket, that kizz cannot see what
+    /// came back, whether its result is still cached, and that `always = True` runs
+    /// a command on every build.
+    fn connected(
+        &self,
+        made: &StepConnections,
+    ) -> String {
+        let outcome = if made.cached {
+            "and its result is still cached"
+        } else {
+            "and its result was not cached for another reason"
+        };
+        format!(
+            "{} connected to {}; kizz cannot see what came back, {outcome}; `always = True` \
+             runs a command on every build",
+            self.command(&made.key),
+            connections_text(&made.connections, |path| {
+                format!("`{}`", self.render.path(path))
+            })
         )
     }
 

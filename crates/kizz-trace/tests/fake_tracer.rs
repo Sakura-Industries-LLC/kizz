@@ -8,14 +8,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
 
 use kizz_trace::{
     AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
-    EchoSink, ExtendedAttributes, FirstReads, OutputStream, RunRequest, RunResult, Termination,
-    TraceError, Tracer,
+    Connection, EchoSink, ExtendedAttributes, FirstReads, OutputStream, RunRequest, RunResult,
+    Termination, TraceError, Tracer,
 };
 
 /// The signal number the fake reports for a cancelled request.
@@ -32,6 +33,8 @@ struct Script {
     termination: Termination,
     /// The system calls the program makes that the tracer does not know.
     unknown_system_calls: BTreeSet<u32>,
+    /// The connections the program makes.
+    connections: BTreeSet<Connection>,
 }
 
 /// A tracer that runs nothing and reports scripted behavior.
@@ -104,6 +107,7 @@ impl Tracer for FakeTracer {
                 incomplete: None,
                 first_reads,
                 unknown_system_calls: BTreeSet::new(),
+                connections: BTreeSet::new(),
             });
         }
 
@@ -144,6 +148,7 @@ impl Tracer for FakeTracer {
             incomplete: None,
             first_reads,
             unknown_system_calls: script.unknown_system_calls.clone(),
+            connections: script.connections.clone(),
         })
     }
 
@@ -210,6 +215,10 @@ fn tool_script() -> Result<Script, kizz_trace::NotAbsoluteError> {
         ],
         termination: Termination::Exited(3),
         unknown_system_calls: BTreeSet::from([1_000_000, 400]),
+        connections: BTreeSet::from([
+            Connection::UnixPath(path("/run/tool.sock")?),
+            Connection::Ip(SocketAddr::from(([127, 0, 0, 1], 8080))),
+        ]),
     })
 }
 
@@ -256,6 +265,14 @@ fn fake_tracer_reports_split_output_accesses_and_echo() {
             .copied()
             .collect::<Vec<_>>(),
         [400, 1_000_000]
+    );
+    assert_eq!(
+        result
+            .connections
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["127.0.0.1:8080", "Unix socket /run/tool.sock"]
     );
     assert_eq!(result.accesses.len(), 3);
     assert_eq!(
