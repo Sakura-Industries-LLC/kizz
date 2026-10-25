@@ -1,0 +1,48 @@
+# cargo-deny configuration for the kizz workspace.
+#
+# This file is consumed by `cargo deny check`, which the `check-ci` recipe
+# of the Justfile runs. The canonical CI command is:
+#
+#     just fix-ci
+#
+# Workspace license policy: every kizz crate is AGPL-3.0-only.
+#
+# Third-party dependencies must be in the `allow` list below.
+
+[advisories]
+# Inherit severity from the workspace settings where possible.
+unmaintained = "workspace"
+unsound = "workspace"
+unused-ignored-advisory = "warn"
+
+[bans]
+# Multiple versions of the same crate are tolerated but produce a warning
+# (so duplicate-version pressure surfaces during review without failing CI).
+multiple-versions = "warn"
+# Allow wildcards in dependency version requirements (e.g. `bpaf = "0.9"`).
+wildcards = "allow"
+
+[licenses]
+allow = [
+    # Permissive licenses used across the Rust ecosystem
+    "Apache-2.0",
+    "BSD-3-Clause",
+    # arrayref (through blake3) and Inflector (through debugserver-types), used by starlark
+    "BSD-2-Clause",
+    "MIT",
+    "BlueOak-1.0.0",
+    "Zlib",
+    # Boost Software License (xxhash-rust, used by surrealkv)
+    "BSL-1.0",
+    # Unicode data (used by ICU-based crates pulled in transitively)
+    "Unicode-3.0",
+    # First-party: every kizz crate
+    "AGPL-3.0-only",
+]
+# Permit dependencies that do not declare a license. Every dependency in
+# the current tree does declare one, so this is a safety valve rather than
+# a current need.
+private = { ignore = true }
+# Permit an allow-list entry to go unused, so that removing the last
+# dependency that needs a license does not require editing this file.
+unused-allowed-license = "allow"
