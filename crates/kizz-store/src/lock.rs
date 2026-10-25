@@ -377,8 +377,9 @@ fn user_name() -> String {
         .into_owned()
 }
 
-/// The host name of the machine, or `(unknown)` when it cannot be read.
-fn host_name() -> String {
+/// The host name of the machine, or `(unknown)` when it cannot be read; the lock
+/// file and the cache identity both name it.
+pub(crate) fn host_name() -> String {
     let mut buffer = [0_u8; 256];
     // SAFETY: the pointer and length describe `buffer`, which outlives the call.
     let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };

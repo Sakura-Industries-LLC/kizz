@@ -40,7 +40,7 @@ These decisions came out of the review of the original outline.
 | Shared code | Task programs call functions, so common build sequences are shared and parameterized. |
 | Files and data | Task programs read and write files, including structured JSON reads and writes, and those accesses are tracked. |
 | Cache location | One common cache in the user's standard cache directory (`~/.cache/kizz`), stored in a key-value database. An environment variable overrides the location. |
-| Cache scope | Builds started anywhere share the cache. Building deep in a tree and then several directories higher reuses the results already built below. |
+| Cache scope | Builds started anywhere share the cache. Building deep in a tree and then several directories higher reuses the results already built below. The cache belongs to one machine and user: it is not portable between builders. |
 | Database | SurrealKV. |
 | Record encoding | CBOR, which suits binary data such as hashes and captured output, encoded with the `minicbor` library. |
 | Lock file | Two builds cannot use the cache together: the first wins and the other waits. The waiting build is told who and what it is waiting for. The lock cleans itself up when a build stops, even if the build does not stop cleanly. |
@@ -578,6 +578,16 @@ Kizz never adds exceptions of its own.
   keys that survive a move need output restoration, which is a later extension.
 * The cache only grows during builds; `kizz cache` cleans it up, as described in [Cleaning up the cache](#cleaning-up-the-cache).
 
+### Cache identity
+
+The cache is not portable: it belongs to the machine and the user that created it.
+When kizz creates the database, it stamps it with the host name, the credentials
+(the effective user and group and the supplementary groups), the umask, the machine architecture and the CPU model.
+Every later command that uses the cache compares the stamp with the current values.
+If any of them differs, kizz refuses to use the cache, names each value that differs, and exits with status 2.
+`kizz cache reset --all` still wipes such a cache, and the next build stamps the new one; another cache, set with `KIZZ_CACHE_DIR`,
+avoids the conflict.
+
 ### Database
 
 The cache is a key-value store: SurrealKV, embedded, in the `db` directory of the cache.
@@ -592,6 +602,7 @@ The store holds these records:
 * last writers: for each path, the step or the task program that wrote it most recently
 * learned order: for each task, the tasks whose outputs it consumed
 * a schema version
+* the cache identity: the stamp of the machine and user that the cache belongs to
 
 The database is shared by concurrent threads within a build; SurrealKV provides concurrent transactions.
 
@@ -716,7 +727,7 @@ They change cache entries only, never project files.
   as are last-writer entries for paths that no longer exist.
   Dependencies on files that did not exist when they were recorded are kept, because they are still valid.
   It asks for no confirmation, because it removes only entries for files that are gone; the worst case is a rebuild.
-* `kizz cache reset --all` wipes the whole cache.
+* `kizz cache reset --all` wipes the whole cache, also one that kizz refuses to use because of its identity.
 * `kizz cache reset [path]` wipes every entry for tasks under the path, which defaults to the current directory:
   their step records, step positions, task records and learned order, and the last-writer entries for paths under it.
 * Both resets show what they will remove, such as the number of tasks and records, and ask for confirmation first.

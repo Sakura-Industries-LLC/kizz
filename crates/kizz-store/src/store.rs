@@ -13,10 +13,14 @@
 //! store hands the write-ahead log to the operating system, so a committed record
 //! survives a crash of the process.
 //!
-//! When the store creates the database it writes [`SCHEMA_VERSION`] into it, and it
-//! refuses to open a database with another version. It never wipes a cache by
-//! itself: `kizz cache reset --all` does, after asking, through [`Store::inventory`],
-//! which counts the entries of a cache of any schema version, and [`Store::wipe`].
+//! When the store creates the database it writes [`SCHEMA_VERSION`] and the current
+//! [`CacheIdentity`] into it. It refuses to open a database with another version,
+//! and then one whose identity differs from the current one or that has none,
+//! because the cache is not portable between machines and users. It never wipes a
+//! cache by itself:
+//! `kizz cache reset --all` does, after asking, through [`Store::inventory`], which
+//! counts the entries of a cache of any schema version and reads its identity, and
+//! [`Store::wipe`].
 
 use std::{
     collections::BTreeSet,
@@ -26,8 +30,11 @@ use std::{
 
 use surrealkv::{Durability, LSMIterator as _, Mode, ReadOptions, Transaction, Tree, TreeBuilder};
 
-use crate::records::{
-    Family, PositionKey, Record, RecordKey, SchemaKey, SchemaVersion, TaskId, database_key,
+use crate::{
+    identity::{CacheIdentity, IdentityDifference, IdentityKey, identity_differences_text},
+    records::{
+        Family, PositionKey, Record, RecordKey, SchemaKey, SchemaVersion, TaskId, database_key,
+    },
 };
 
 /// The name of the database directory in the cache directory.
@@ -76,8 +83,12 @@ const WIPED_DIR: &str = "db.wiped";
 /// not cached, marks a record that is never a cache hit. Version 15 adds the
 /// connections that a command made to IPv4 and IPv6 addresses and to Unix sockets,
 /// by path or abstract name, to every step record, whether or not its result was
-/// cached; they never keep a result out of the cache.
-pub const SCHEMA_VERSION: u32 = 15;
+/// cached; they never keep a result out of the cache. Version 16 adds the cache
+/// identity, in the `meta/` family: the host name, the effective user and group, the
+/// supplementary groups, the umask, the machine architecture, and the CPU model of
+/// the process that created the database, which every later open compares with the
+/// current values.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +149,35 @@ pub enum StoreError {
         /// The version this build uses, [`SCHEMA_VERSION`].
         expected: u32,
     },
+    /// The database was stamped with another cache identity: another machine or user
+    /// created it.
+    #[error(
+        "the cache database at `{}` belongs to another machine or user, so kizz refuses to \
+         use it: {}; the cache is not portable between machines and users; run `kizz cache \
+         reset --all` to wipe the cache, or set `KIZZ_CACHE_DIR` to use another cache",
+        path.display(),
+        identity_differences_text(differences)
+    )]
+    IdentityMismatch {
+        /// The database directory.
+        path: PathBuf,
+        /// Each value that differs, stored and current, in the order of the fields of
+        /// [`CacheIdentity`].
+        differences: Vec<IdentityDifference>,
+    },
+    /// The database has this schema version but no cache identity, so kizz cannot
+    /// tell which machine and user it belongs to.
+    #[error(
+        "the cache database at `{}` has no cache identity, so kizz cannot tell which machine \
+         and user it belongs to and refuses to use it; the cache is not portable between \
+         machines and users; run `kizz cache reset --all` to wipe the cache, or set \
+         `KIZZ_CACHE_DIR` to use another cache",
+        path.display()
+    )]
+    IdentityMissing {
+        /// The database directory.
+        path: PathBuf,
+    },
     /// The database directory could not be removed.
     #[error("cannot remove the cache database `{}`", path.display())]
     Wipe {
@@ -185,13 +225,17 @@ impl EntryCounts {
 }
 
 /// What a whole cache holds, as [`Store::inventory`] counts it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inventory {
-    /// The entries of every family but the schema version.
+    /// The entries of every family but the database facts: the schema version and the
+    /// cache identity.
     pub entries: EntryCounts,
     /// The schema version stored in the database, or `None` when there is no
     /// database or it holds no readable version.
     pub schema_version: Option<u32>,
+    /// The cache identity stored in the database, or `None` when there is no
+    /// database or it holds no readable identity.
+    pub identity: Option<CacheIdentity>,
 }
 
 /// The cache database, shared by the threads of one process.
@@ -219,21 +263,27 @@ impl std::fmt::Debug for Store {
 
 impl Store {
     /// Opens the database in the `db` directory of `cache_dir`, creating it, with the
-    /// current schema version, if it does not exist.
+    /// current schema version and the current [`CacheIdentity`], if it does not exist.
+    ///
+    /// An existing database's schema version is checked first, then its identity.
     ///
     /// # Errors
     ///
     /// [`StoreError::SchemaMismatch`] when the database has another schema version,
-    /// and another [`StoreError`] when the database cannot be created or opened.
+    /// [`StoreError::IdentityMismatch`] when it has another identity,
+    /// [`StoreError::IdentityMissing`] when it has this schema version but no
+    /// identity, and another [`StoreError`] when the database cannot be created or
+    /// opened.
     pub fn open(cache_dir: &Path) -> Result<Self, StoreError> {
         let store = Self::open_tree(cache_dir)?;
-        store.check_schema()?;
+        store.check_stamp(&CacheIdentity::current())?;
         Ok(store)
     }
 
     /// Counts the entries of the database in the `db` directory of `cache_dir`,
-    /// whatever its schema version, by their keys alone, without decoding a record
-    /// or changing anything. A cache without a database has no entries.
+    /// whatever its schema version, by their keys alone, and reads its schema version
+    /// and its identity when it can, without decoding another record or changing
+    /// anything. A cache without a database has no entries.
     ///
     /// # Errors
     ///
@@ -250,6 +300,10 @@ impl Store {
                 .get(database_key::<SchemaVersion>(&SchemaKey))?
                 .and_then(|bytes| decode::<SchemaVersion>(&bytes).ok())
                 .map(|schema| schema.version);
+            let identity = txn
+                .inner
+                .get(database_key::<CacheIdentity>(&IdentityKey))?
+                .and_then(|bytes| decode::<CacheIdentity>(&bytes).ok());
             let task_keys = txn.raw_keys(Family::Task)?;
             let position_keys = txn.raw_keys(Family::Position)?;
             let order_keys = txn.raw_keys(Family::Order)?;
@@ -275,6 +329,7 @@ impl Store {
                     writers: txn.raw_keys(Family::Writer)?.len(),
                 },
                 schema_version,
+                identity,
             }
         };
         store.close()?;
@@ -282,8 +337,9 @@ impl Store {
     }
 
     /// Wipes the whole cache database in the `db` directory of `cache_dir`, whatever
-    /// its schema version; the next [`Store::open`] creates an empty one. The caller
-    /// holds the cache lock, so no process has the database open.
+    /// its schema version and identity; the next [`Store::open`] creates an empty one,
+    /// stamped with the current identity. The caller holds the cache lock, so no
+    /// process has the database open.
     ///
     /// The directory is first renamed, in one step, so a crash during the removal
     /// leaves no partial database behind, only a directory that the next wipe
@@ -397,27 +453,50 @@ impl Store {
         Ok(())
     }
 
-    /// Writes the schema version into a new database, or checks the version of an
-    /// existing one.
-    fn check_schema(&self) -> Result<(), StoreError> {
+    /// Writes the schema version and `current`, the identity of this process, into a
+    /// new database, in one transaction, or checks the version of an existing one
+    /// first and then its identity against `current`.
+    ///
+    /// A database of this schema version always gets its identity in the transaction
+    /// that creates it, so one that has none is refused: kizz cannot tell whose
+    /// cache it is, and only `kizz cache reset --all` makes it usable again.
+    fn check_stamp(
+        &self,
+        current: &CacheIdentity,
+    ) -> Result<(), StoreError> {
         let mut txn = self.write()?;
         match txn.get::<SchemaVersion>(&SchemaKey)? {
             Some(SchemaVersion {
                 version: SCHEMA_VERSION,
-            }) => Ok(()),
+            }) => {},
             Some(SchemaVersion { version }) => {
-                Err(StoreError::SchemaMismatch {
+                return Err(StoreError::SchemaMismatch {
                     path: self.path.clone(),
                     found: version,
                     expected: SCHEMA_VERSION,
-                })
+                });
             },
             None => {
                 txn.put(&SchemaKey, &SchemaVersion {
                     version: SCHEMA_VERSION,
                 })?;
-                txn.commit()
+                txn.put(&IdentityKey, current)?;
+                return txn.commit();
             },
+        }
+        let Some(stored) = txn.get::<CacheIdentity>(&IdentityKey)? else {
+            return Err(StoreError::IdentityMissing {
+                path: self.path.clone(),
+            });
+        };
+        let differences = stored.differences(current);
+        if differences.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::IdentityMismatch {
+                path: self.path.clone(),
+                differences,
+            })
         }
     }
 }
@@ -633,11 +712,103 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 15 adds the connections of a run to step records, one more than
-    /// version 14, which added the unknown system calls of a run and the reason for
-    /// a run that made them.
+    /// The identity mismatch names each difference, stored and current, says that the
+    /// cache is not portable, and gives both ways on.
     #[test]
-    fn schema_version_15_records_connections() {
-        assert_eq!(SCHEMA_VERSION, 15);
+    fn identity_mismatch_names_each_difference_and_both_ways_on() {
+        let message = StoreError::IdentityMismatch {
+            path: PathBuf::from("/cache/db"),
+            differences: vec![
+                IdentityDifference {
+                    part: crate::IdentityPart::Host,
+                    stored: String::from(r#""old-host""#),
+                    current: String::from(r#""new-host""#),
+                },
+                IdentityDifference {
+                    part: crate::IdentityPart::Umask,
+                    stored: String::from("0022"),
+                    current: String::from("0077"),
+                },
+            ],
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "the cache database at `/cache/db` belongs to another machine or user, so kizz \
+             refuses to use it: host name: \"old-host\" in the cache, \"new-host\" now; umask: \
+             0022 in the cache, 0077 now; the cache is not portable between machines and users; \
+             run `kizz cache reset --all` to wipe the cache, or set `KIZZ_CACHE_DIR` to use \
+             another cache"
+        );
+    }
+
+    /// The missing-identity error says that the identity is missing, that the cache
+    /// is not portable, and gives both ways on.
+    #[test]
+    fn identity_missing_says_so_and_gives_both_ways_on() {
+        let message = StoreError::IdentityMissing {
+            path: PathBuf::from("/cache/db"),
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "the cache database at `/cache/db` has no cache identity, so kizz cannot tell \
+             which machine and user it belongs to and refuses to use it; the cache is not \
+             portable between machines and users; run `kizz cache reset --all` to wipe the \
+             cache, or set `KIZZ_CACHE_DIR` to use another cache"
+        );
+    }
+
+    /// The check that every open makes refuses a stored identity whose CPU models
+    /// differ from the current ones, also for the lists that the joined text of earlier
+    /// versions showed alike, naming the CPU model alone; its error text shows the
+    /// stored and the current list differently; and it accepts the stored models
+    /// themselves.
+    #[test]
+    fn the_open_check_refuses_and_tells_apart_cpu_models_that_once_showed_alike() {
+        let base = CacheIdentity::current();
+        for collision in crate::identity::colliding_cpu_models() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            let stored = CacheIdentity {
+                cpu_models: collision.stored,
+                ..base.clone()
+            };
+            let current = CacheIdentity {
+                cpu_models: collision.current,
+                ..base.clone()
+            };
+            let mut txn = store.write().unwrap();
+            txn.put(&IdentityKey, &stored).unwrap();
+            txn.commit().unwrap();
+            store.check_stamp(&stored).unwrap();
+            let error = store.check_stamp(&current).unwrap_err();
+            let message = error.to_string();
+            match error {
+                StoreError::IdentityMismatch { path, differences } => {
+                    assert_eq!(path, dir.path().join(DATABASE_DIR));
+                    assert_eq!(differences, vec![IdentityDifference {
+                        part: crate::IdentityPart::CpuModel,
+                        stored: String::from(collision.stored_text),
+                        current: String::from(collision.current_text),
+                    }]);
+                },
+                other => panic!("expected an identity mismatch, got {other:?}"),
+            }
+            assert_ne!(collision.stored_text, collision.current_text);
+            let shown = format!(
+                "refuses to use it: CPU model: {} in the cache, {} now; the cache is not",
+                collision.stored_text, collision.current_text
+            );
+            assert!(message.contains(&shown), "{message}");
+            store.close().unwrap();
+        }
+    }
+
+    /// Version 16 adds the cache identity, one more than version 15, which added the
+    /// connections of a run to step records.
+    #[test]
+    fn schema_version_16_stamps_the_cache_identity() {
+        assert_eq!(SCHEMA_VERSION, 16);
     }
 }

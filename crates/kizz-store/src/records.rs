@@ -11,6 +11,7 @@
 //! | Family | Prefix | Rest of the key | Record |
 //! | --- | --- | --- | --- |
 //! | schema version | `meta/` | `schema-version` | [`SchemaVersion`] |
+//! | cache identity | `meta/` | `identity` | [`CacheIdentity`](crate::identity::CacheIdentity) |
 //! | step records | `step/` | the 32 bytes of the [`StepKey`] | [`StepRecord`](crate::step::StepRecord) |
 //! | step positions | `position/` | the [`TaskId`], then the position | [`StepPosition`] |
 //! | task records | `task/` | the [`TaskId`] | [`TaskRecord`] |
@@ -49,7 +50,7 @@ use crate::{
 /// The record families of the cache database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Family {
-    /// Facts about the database itself: the schema version.
+    /// Facts about the database itself: the schema version and the cache identity.
     Meta,
     /// Step records, by step key.
     Step,
@@ -91,7 +92,7 @@ impl Family {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Meta => "schema version",
+            Self::Meta => "database fact",
             Self::Step => "step record",
             Self::Position => "step position",
             Self::Task => "task record",
@@ -301,7 +302,8 @@ impl RecordKey for PathKey {
     }
 }
 
-/// The key of the schema version, the only record of its family.
+/// The key of the schema version, one of the two records of its family with the
+/// cache identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaKey;
 

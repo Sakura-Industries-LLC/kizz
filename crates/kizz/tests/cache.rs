@@ -24,7 +24,7 @@ use std::{
     io::{self, BufRead as _, BufReader, Lines, Read as _, Write as _},
     os::{
         fd::{AsRawFd as _, FromRawFd as _},
-        unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _},
+        unix::{ffi::OsStrExt as _, fs::OpenOptionsExt as _, process::CommandExt as _},
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
@@ -35,8 +35,9 @@ use std::{
 };
 
 use kizz_store::{
-    LOCK_FILE_NAME, LastWriter, LearnedOrder, PathKey, PositionKey, SCHEMA_VERSION, SchemaKey,
-    SchemaVersion, StepKey, StepPosition, StepRecord, Store, StoreError, TaskId, TaskRecord,
+    CacheIdentity, DATABASE_DIR, IdentityKey, IdentityPart, LOCK_FILE_NAME, LastWriter,
+    LearnedOrder, PathKey, PositionKey, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepKey,
+    StepPosition, StepRecord, Store, StoreError, TaskId, TaskRecord, identity_differences_text,
 };
 use tempfile::TempDir;
 
@@ -989,6 +990,231 @@ fn reset_all_empties_a_cache_with_another_schema_version() -> TestResult {
         )
     );
     assert!(project.entries()?.is_empty());
+    Ok(())
+}
+
+/// A cache stamped with another identity is refused by `kizz build`, `kizz why`,
+/// `kizz cache clean` and `kizz cache reset PATH`, which exit with status 2, print
+/// the error, and change nothing; `kizz cache reset --all` then names what differs
+/// and wipes the cache, and the next build succeeds and stamps the current identity.
+#[test]
+fn a_cache_of_another_identity_is_refused_until_reset_all() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("sub", &[(
+        "Make",
+        "run(\"sh\", \"-c\", \"echo made > out.txt\")",
+    )])?;
+    project.build("sub")?;
+    let before = project.entries()?;
+    let current = CacheIdentity::current();
+    let mut other = current.clone();
+    other.host.push_str(".elsewhere");
+    other.machine = String::from("other-architecture");
+    {
+        let store = Store::open(project.cache.path())?;
+        let mut txn = store.write()?;
+        txn.put(&IdentityKey, &other)?;
+        txn.commit()?;
+        store.close()?;
+    }
+    let differences = other.differences(&current);
+    assert_eq!(
+        differences
+            .iter()
+            .map(|difference| difference.part)
+            .collect::<Vec<_>>(),
+        vec![IdentityPart::Host, IdentityPart::Machine]
+    );
+    let error = format!(
+        "error: the cache database at `{}` belongs to another machine or user, so kizz \
+         refuses to use it: {}; the cache is not portable between machines and users; run \
+         `kizz cache reset --all` to wipe the cache, or set `KIZZ_CACHE_DIR` to use another \
+         cache\n",
+        project.cache.path().join(DATABASE_DIR).display(),
+        identity_differences_text(&differences)
+    );
+    let inventory = Store::inventory(project.cache.path())?;
+    assert_eq!(inventory.identity.as_ref(), Some(&other));
+    let files = project.files()?;
+
+    for (dir, args) in [
+        ("sub", &["build", "ci"][..]),
+        ("sub", &["why"][..]),
+        ("", &["cache", "clean"][..]),
+        ("", &["cache", "reset", "sub", "--yes"][..]),
+    ] {
+        let run = project.run(dir, args)?;
+        assert_eq!(run.status, Some(2), "{args:?}: {run:?}");
+        assert!(run.stderr.contains(&error), "{args:?}: {run:?}");
+        assert!(
+            run.stderr
+                .contains("; machine architecture: \"other-architecture\" in the cache, \""),
+            "{args:?}: {run:?}"
+        );
+        assert_eq!(
+            Store::inventory(project.cache.path())?,
+            inventory,
+            "{args:?}"
+        );
+        assert_eq!(project.files()?, files, "{args:?}");
+    }
+
+    let run = project.run("", &["cache", "reset", "--all", "--yes"])?;
+    assert_eq!(run.status, Some(0), "{run:?}");
+    assert_eq!(
+        run.stdout,
+        format!(
+            "kizz cache reset --all wipes the whole cache at `{}`: {}\nthe cache belongs to \
+             another machine or user: {}\nwiped the whole cache: removed {}\n",
+            project.cache.path().display(),
+            before.description(),
+            identity_differences_text(&differences),
+            before.counts()
+        )
+    );
+    assert!(
+        run.stdout
+            .contains("; machine architecture: \"other-architecture\" in the cache, \""),
+        "{run:?}"
+    );
+    assert_eq!(
+        Store::inventory(project.cache.path())?,
+        kizz_store::Inventory::default()
+    );
+
+    project.build("sub")?;
+    assert_eq!(
+        Store::inventory(project.cache.path())?.identity,
+        Some(current)
+    );
+    assert!(!project.entries()?.is_empty());
+    Ok(())
+}
+
+/// A cache of this schema version whose identity was removed is refused like one of
+/// another identity, not adopted: `kizz build`, `kizz why`, `kizz cache clean` and
+/// `kizz cache reset PATH` exit with status 2, print the missing-identity error, and
+/// change nothing; `kizz cache reset --all` then says that the identity is missing
+/// and wipes the cache, and the next build succeeds and stamps the current identity.
+#[test]
+fn a_cache_without_an_identity_is_refused_until_reset_all() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("sub", &[(
+        "Make",
+        "run(\"sh\", \"-c\", \"echo made > out.txt\")",
+    )])?;
+    project.build("sub")?;
+    let before = project.entries()?;
+    assert!(!before.is_empty());
+    {
+        let store = Store::open(project.cache.path())?;
+        let mut txn = store.write()?;
+        txn.delete::<CacheIdentity>(&IdentityKey)?;
+        txn.commit()?;
+        store.close()?;
+    }
+    let error = format!(
+        "error: the cache database at `{}` has no cache identity, so kizz cannot tell which \
+         machine and user it belongs to and refuses to use it; the cache is not portable \
+         between machines and users; run `kizz cache reset --all` to wipe the cache, or set \
+         `KIZZ_CACHE_DIR` to use another cache\n",
+        project.cache.path().join(DATABASE_DIR).display()
+    );
+    let inventory = Store::inventory(project.cache.path())?;
+    assert_eq!(inventory.schema_version, Some(SCHEMA_VERSION));
+    assert_eq!(inventory.identity, None);
+    let files = project.files()?;
+
+    for (dir, args) in [
+        ("sub", &["build", "ci"][..]),
+        ("sub", &["why"][..]),
+        ("", &["cache", "clean"][..]),
+        ("", &["cache", "reset", "sub", "--yes"][..]),
+    ] {
+        let run = project.run(dir, args)?;
+        assert_eq!(run.status, Some(2), "{args:?}: {run:?}");
+        assert!(run.stderr.contains(&error), "{args:?}: {run:?}");
+        assert_eq!(
+            Store::inventory(project.cache.path())?,
+            inventory,
+            "{args:?}"
+        );
+        assert_eq!(project.files()?, files, "{args:?}");
+    }
+
+    let run = project.run("", &["cache", "reset", "--all", "--yes"])?;
+    assert_eq!(run.status, Some(0), "{run:?}");
+    assert_eq!(
+        run.stdout,
+        format!(
+            "kizz cache reset --all wipes the whole cache at `{}`: {}\nthe cache has no cache \
+             identity, so kizz cannot tell which machine and user it belongs to\nwiped the \
+             whole cache: removed {}\n",
+            project.cache.path().display(),
+            before.description(),
+            before.counts()
+        )
+    );
+    assert_eq!(
+        Store::inventory(project.cache.path())?,
+        kizz_store::Inventory::default()
+    );
+
+    project.build("sub")?;
+    assert_eq!(
+        Store::inventory(project.cache.path())?.identity,
+        Some(CacheIdentity::current())
+    );
+    assert!(!project.entries()?.is_empty());
+    Ok(())
+}
+
+/// A `kizz` started with another umask, which the test sets in the child before it
+/// runs, is refused a cache that a `kizz` with the default umask created, and the
+/// error names the umask, stored and current.
+#[test]
+fn a_kizz_with_another_umask_is_refused_the_cache() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[(
+        "Make",
+        "run(\"sh\", \"-c\", \"echo made > out.txt\")",
+    )])?;
+    project.build("")?;
+    let stored = Store::inventory(project.cache.path())?
+        .identity
+        .ok_or("the build stamped no identity")?;
+    assert_eq!(stored, CacheIdentity::current());
+    let umask: libc::mode_t = if stored.umask == Some(0o027) {
+        0o077
+    } else {
+        0o027
+    };
+
+    let mut command = project.command("", &["build", "ci"]);
+    // SAFETY: the closure runs in the child between `fork` and `exec`, and calls only
+    // `umask`, which is async-signal-safe and cannot fail.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    let output = command.output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "belongs to another machine or user, so kizz refuses to use it: umask: {} in \
+             the cache, {umask:04o} now; the cache is not portable between machines and \
+             users",
+            IdentityPart::Umask.value(&stored)
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        Store::inventory(project.cache.path())?.identity,
+        Some(stored)
+    );
     Ok(())
 }
 

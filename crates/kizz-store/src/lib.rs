@@ -10,6 +10,8 @@
 //!   other waits and says what it is waiting for.
 //! * [`store`]: the records live in `SurrealKV`, embedded, in the `db` directory of the
 //!   cache, as CBOR encoded with `minicbor`.
+//! * [`identity`]: the stamp of the machine and user that the cache belongs to, which the
+//!   store writes into a new database and compares on every later open.
 //! * [`records`]: the record families, their key layout, and their typed records.
 //! * [`step`]: the contents of step records: the step specification, the observations
 //!   with their path states, and how the step ended.
@@ -17,6 +19,7 @@
 //!   cached, as the step-position records keep them for `kizz why`.
 
 pub mod explanation;
+pub mod identity;
 pub mod location;
 pub mod lock;
 pub mod records;
@@ -26,6 +29,9 @@ pub mod store;
 pub use explanation::{
     BuildId, ChangedInput, EnvChange, Explanation, ModuleChange, ModuleChangeKind, Reason,
     SelfInflicted, TaskLabel, Verdict, Writer,
+};
+pub use identity::{
+    CacheIdentity, IdentityDifference, IdentityKey, IdentityPart, identity_differences_text,
 };
 pub use location::{LocationError, cache_dir, cache_dir_from_env};
 pub use lock::{CacheLock, LOCK_FILE_NAME, LockDetails, LockError, LockOptions};

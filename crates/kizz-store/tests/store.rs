@@ -3,27 +3,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The record store in temporary cache directories: persistence across closing,
-//! reopening, and crashes; transactions; prefix scans; the schema version; and
-//! sharing between threads.
+//! reopening, and crashes; transactions; prefix scans; the schema version; the cache
+//! identity; and sharing between threads.
 //!
-//! The crash test runs this test executable again in a helper mode:
-//! [`helper_process`] does nothing in a normal test run, and writes records into the
-//! cache that its explicit environment names when started with the helper variable
-//! set. It reports on its standard output, in lines that start with [`MARK`].
+//! The crash test and the umask test run this test executable again in a helper
+//! mode: [`helper_process`] does nothing in a normal test run, and opens the cache
+//! that its explicit environment names when started with the helper variable set. It
+//! reports on its standard output, in lines that start with [`MARK`].
 
 use std::{
+    collections::BTreeSet,
+    ffi::CStr,
+    fs,
     io::{BufRead as _, BufReader},
+    mem::MaybeUninit,
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
 };
 
 use kizz_store::{
-    AccessBits, Attribute, Attributes, BuildId, Capture, ContentHash, DATABASE_DIR, EntryCounts,
-    FileMeta, Inventory, LastWriter, LearnedOrder, Observation, Owner, PathKey, PathState,
-    PositionKey, ProgramPath, RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion,
-    StepExit, StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId,
-    TaskRecord, Times, Verdict, WrittenBy, path_prefix,
+    AccessBits, Attribute, Attributes, BuildId, CacheIdentity, Capture, ContentHash, DATABASE_DIR,
+    EntryCounts, FileMeta, IdentityDifference, IdentityKey, IdentityPart, Inventory, LastWriter,
+    LearnedOrder, Observation, Owner, PathKey, PathState, PositionKey, ProgramPath, RecordedOutput,
+    RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey, StepPosition,
+    StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Times, Verdict, WrittenBy,
+    path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -156,16 +162,22 @@ fn step_position(n: u8) -> StepPosition {
 /// The work of a helper mode, run by this test executable when a test starts it with
 /// [`HELPER_VARIABLE`] set. In a normal test run it does nothing.
 ///
-/// The only mode, `crash`, commits three step records, writes a fourth without
-/// committing it, reports `committed`, and then waits to be killed.
+/// The mode `crash` commits three step records, writes a fourth without committing
+/// it, reports `committed`, and then waits to be killed. The mode `stamp` opens the
+/// cache, which creates and stamps a new database, closes it, and reports `stamped`.
 #[test]
 fn helper_process() {
     let Some(mode) = std::env::var_os(HELPER_VARIABLE) else {
         return;
     };
-    assert_eq!(mode, "crash");
     let cache = PathBuf::from(std::env::var_os(CACHE_VARIABLE).unwrap());
     let store = Store::open(&cache).unwrap();
+    if mode == "stamp" {
+        store.close().unwrap();
+        println!("{MARK}stamped");
+        return;
+    }
+    assert_eq!(mode, "crash");
     let mut txn = store.write().unwrap();
     for n in 1..=3 {
         txn.put(&StepKey([n; 32]), &step_record(n)).unwrap();
@@ -558,6 +570,7 @@ fn the_inventory_counts_any_cache_and_a_wipe_empties_it() {
             writers: 1,
         },
         schema_version: Some(other),
+        identity: Some(CacheIdentity::current()),
     });
     assert!(!inventory.entries.is_empty());
     // Counting changed nothing: the cache is still refused.
@@ -583,6 +596,7 @@ fn the_inventory_counts_any_cache_and_a_wipe_empties_it() {
     assert_eq!(Store::inventory(dir.path()).unwrap(), Inventory {
         entries: EntryCounts::default(),
         schema_version: Some(SCHEMA_VERSION),
+        identity: Some(CacheIdentity::current()),
     });
 }
 
@@ -609,5 +623,334 @@ fn threads_of_one_process_share_the_store() {
     assert_eq!(records.len(), 100);
     for (key, record) in records {
         assert_eq!(record, step_record(key.0[1]));
+    }
+}
+
+/// The result of a test helper that can fail.
+type HelperResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// The identity of this process as the test reads it itself: the host name, the
+/// credentials, and the machine architecture through `libc`, the umask from the
+/// `Umask` line of `/proc/self/status`, and the CPU models from `/proc/cpuinfo`.
+fn identity_read_by_the_test() -> HelperResult<CacheIdentity> {
+    let mut host = [0_u8; 256];
+    // SAFETY: the pointer and length describe `host`, which outlives the call.
+    let status = unsafe { libc::gethostname(host.as_mut_ptr().cast(), host.len()) };
+    assert_eq!(status, 0);
+    let host = CStr::from_bytes_until_nul(&host)?
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: a size of zero only counts the groups and writes nothing.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups: Vec<libc::gid_t> = vec![0; usize::try_from(count)?];
+    // SAFETY: the buffer holds `count` group IDs, the size passed.
+    let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(filled)?);
+    let groups: BTreeSet<u32> = groups.into_iter().collect();
+    let mut names = MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: the pointer is valid for writing a `utsname`.
+    assert_eq!(unsafe { libc::uname(names.as_mut_ptr()) }, 0);
+    // SAFETY: `uname` succeeded, so it initialized `names`.
+    let names = unsafe { names.assume_init() };
+    // SAFETY: `uname` ends every field with a zero byte within the field.
+    let machine = unsafe { CStr::from_ptr(names.machine.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    let status = fs::read_to_string("/proc/self/status")?;
+    let umask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))
+        .map(|value| u32::from_str_radix(value.trim(), 8))
+        .transpose()?;
+    let cpu_models: BTreeSet<String> = fs::read_to_string("/proc/cpuinfo")?
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "model name").then(|| value.trim().to_owned())
+        })
+        .collect();
+    Ok(CacheIdentity {
+        host,
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        user: unsafe { libc::geteuid() },
+        // SAFETY: `getegid` has no preconditions and cannot fail.
+        group: unsafe { libc::getegid() },
+        groups: groups.into_iter().collect(),
+        umask,
+        machine,
+        cpu_models: cpu_models.into_iter().collect(),
+    })
+}
+
+/// `identity` with the value `part` changed, and every other value kept.
+fn with_another(
+    part: IdentityPart,
+    identity: &CacheIdentity,
+) -> CacheIdentity {
+    let mut other = identity.clone();
+    match part {
+        IdentityPart::Host => other.host.push_str(".elsewhere"),
+        IdentityPart::User => other.user ^= 1,
+        IdentityPart::Group => other.group ^= 1,
+        IdentityPart::Groups => {
+            if other.groups.is_empty() {
+                other.groups.push(4_000_000_000);
+            } else {
+                other.groups.clear();
+            }
+        },
+        IdentityPart::Umask => {
+            other.umask = Some(other.umask.map_or(0o022, |umask| umask ^ 0o007));
+        },
+        IdentityPart::Machine => other.machine = String::from("other-architecture"),
+        IdentityPart::CpuModel => other.cpu_models.push(String::from("Other CPU")),
+    }
+    other
+}
+
+/// Opens a new store in `cache`, which stamps it with the current identity, then
+/// replaces the stamp with `identity` and writes one step record.
+fn stamp_with(
+    cache: &Path,
+    identity: &CacheIdentity,
+) -> HelperResult {
+    let store = Store::open(cache)?;
+    let mut txn = store.write()?;
+    txn.put(&IdentityKey, identity)?;
+    txn.put(&StepKey([1; 32]), &step_record(1))?;
+    txn.commit()?;
+    store.close()?;
+    Ok(())
+}
+
+/// A new database holds the identity of the process that created it, which equals
+/// what the test reads itself, and the same process opens it again.
+#[test]
+fn a_new_database_holds_the_current_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected = identity_read_by_the_test().unwrap();
+    assert_eq!(CacheIdentity::current(), expected);
+
+    let store = Store::open(dir.path()).unwrap();
+    let txn = store.read().unwrap();
+    assert_eq!(
+        txn.get::<CacheIdentity>(&IdentityKey).unwrap(),
+        Some(expected.clone())
+    );
+    drop(txn);
+    store.close().unwrap();
+
+    Store::open(dir.path()).unwrap().close().unwrap();
+    assert_eq!(
+        Store::inventory(dir.path()).unwrap().identity,
+        Some(expected)
+    );
+}
+
+/// A stored identity that differs in any one value is refused with an error that
+/// names that value, stored and current, shown differently, says that the cache is not
+/// portable, and gives both ways on. The cache is kept: the next open refuses it
+/// again, and the inventory reports the stored identity and the entries.
+#[test]
+fn a_stored_identity_that_differs_in_any_value_is_refused() {
+    let current = CacheIdentity::current();
+    for part in IdentityPart::ALL {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = with_another(part, &current);
+        stamp_with(dir.path(), &stored).unwrap();
+        assert_ne!(part.value(&stored), part.value(&current), "{part}");
+        let expected = vec![IdentityDifference {
+            part,
+            stored: part.value(&stored),
+            current: part.value(&current),
+        }];
+        for _ in 0..2 {
+            match Store::open(dir.path()) {
+                Err(StoreError::IdentityMismatch { path, differences }) => {
+                    assert_eq!(path, dir.path().join(DATABASE_DIR), "{part}");
+                    assert_eq!(differences, expected, "{part}");
+                },
+                other => panic!("{part}: expected an identity mismatch, got {other:?}"),
+            }
+        }
+        let message = Store::open(dir.path()).unwrap_err().to_string();
+        for text in [
+            format!(
+                "{part}: {} in the cache, {} now",
+                part.value(&stored),
+                part.value(&current)
+            ),
+            String::from("the cache is not portable between machines and users"),
+            String::from("run `kizz cache reset --all` to wipe the cache"),
+            String::from("or set `KIZZ_CACHE_DIR` to use another cache"),
+        ] {
+            assert!(message.contains(&text), "{part}: {message}");
+        }
+        let inventory = Store::inventory(dir.path()).unwrap();
+        assert_eq!(inventory.identity, Some(stored), "{part}");
+        assert_eq!(inventory.entries.steps, 1, "{part}");
+    }
+}
+
+/// Opening checks the schema version first, then the identity: a cache whose schema
+/// version and identity both differ reports the schema mismatch.
+#[test]
+fn the_schema_version_is_checked_before_the_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = SCHEMA_VERSION.checked_add(1).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let mut txn = store.write().unwrap();
+    txn.put(
+        &IdentityKey,
+        &with_another(IdentityPart::Host, &CacheIdentity::current()),
+    )
+    .unwrap();
+    txn.put(&SchemaKey, &SchemaVersion { version: other })
+        .unwrap();
+    txn.commit().unwrap();
+    store.close().unwrap();
+    assert!(matches!(
+        Store::open(dir.path()),
+        Err(StoreError::SchemaMismatch { found, .. }) if found == other
+    ));
+}
+
+/// A wiped database opens again, stamped with the current identity.
+#[test]
+fn a_wiped_database_opens_again_with_the_current_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = CacheIdentity::current();
+    stamp_with(dir.path(), &with_another(IdentityPart::Machine, &current)).unwrap();
+    assert!(matches!(
+        Store::open(dir.path()),
+        Err(StoreError::IdentityMismatch { .. })
+    ));
+
+    Store::wipe(dir.path()).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let txn = store.read().unwrap();
+    assert_eq!(
+        txn.get::<CacheIdentity>(&IdentityKey).unwrap(),
+        Some(current.clone())
+    );
+    assert_eq!(txn.scan::<StepRecord>(b"").unwrap(), Vec::new());
+    drop(txn);
+    store.close().unwrap();
+    assert_eq!(
+        Store::inventory(dir.path()).unwrap().identity,
+        Some(current)
+    );
+}
+
+/// An existing database of this schema version whose identity was removed, and
+/// which still holds a step record, is refused with the missing-identity error
+/// rather than stamped with the current identity: the refusal changes nothing, so
+/// the next open refuses it again and the inventory still shows the record and no
+/// identity. A wipe, which `kizz cache reset --all` makes, lets it open again, empty
+/// and stamped with the current identity.
+#[test]
+fn a_database_without_an_identity_is_refused_until_it_is_wiped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let mut txn = store.write().unwrap();
+    txn.delete::<CacheIdentity>(&IdentityKey).unwrap();
+    txn.put(&StepKey([1; 32]), &step_record(1)).unwrap();
+    txn.commit().unwrap();
+    store.close().unwrap();
+
+    for _ in 0..2 {
+        match Store::open(dir.path()) {
+            Err(StoreError::IdentityMissing { path }) => {
+                assert_eq!(path, dir.path().join(DATABASE_DIR));
+            },
+            other => panic!("expected a missing identity, got {other:?}"),
+        }
+        let inventory = Store::inventory(dir.path()).unwrap();
+        assert_eq!(inventory.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(inventory.identity, None);
+        assert_eq!(inventory.entries.steps, 1);
+    }
+    let message = Store::open(dir.path()).unwrap_err().to_string();
+    assert!(
+        message.contains("has no cache identity, so kizz cannot tell which machine and user"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the cache is not portable between machines and users"),
+        "{message}"
+    );
+    assert!(message.contains("`kizz cache reset --all`"), "{message}");
+    assert!(message.contains("`KIZZ_CACHE_DIR`"), "{message}");
+
+    Store::wipe(dir.path()).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let txn = store.read().unwrap();
+    assert_eq!(
+        txn.get::<CacheIdentity>(&IdentityKey).unwrap(),
+        Some(CacheIdentity::current())
+    );
+    assert_eq!(txn.scan::<StepRecord>(b"").unwrap(), Vec::new());
+    drop(txn);
+    store.close().unwrap();
+}
+
+/// A process started with another umask, set in the child through `libc` before it
+/// runs, stamps a new cache with that umask, and this process is refused that cache
+/// for the umask alone.
+#[test]
+fn a_process_with_another_umask_stamps_it_and_is_refused_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let current = CacheIdentity::current();
+    let umask: libc::mode_t = if current.umask == Some(0o027) {
+        0o077
+    } else {
+        0o027
+    };
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "helper_process",
+            "--nocapture",
+            "--test-threads=1",
+            "--quiet",
+        ])
+        .env_clear()
+        .env(HELPER_VARIABLE, "stamp")
+        .env(CACHE_VARIABLE, &cache)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    // SAFETY: the closure runs in the child between `fork` and `exec`, and calls only
+    // `umask`, which is async-signal-safe and cannot fail.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line == format!("{MARK}stamped")),
+        "{stdout}"
+    );
+
+    let stored = Store::inventory(&cache).unwrap().identity.unwrap();
+    assert_eq!(stored, CacheIdentity {
+        umask: Some(umask),
+        ..current.clone()
+    });
+    match Store::open(&cache) {
+        Err(StoreError::IdentityMismatch { differences, .. }) => {
+            assert_eq!(differences, vec![IdentityDifference {
+                part: IdentityPart::Umask,
+                stored: format!("{umask:04o}"),
+                current: IdentityPart::Umask.value(&current),
+            }]);
+        },
+        other => panic!("expected an identity mismatch, got {other:?}"),
     }
 }

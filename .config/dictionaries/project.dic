@@ -84,9 +84,11 @@ ftruncate
 futimesat
 getattr
 getdents
+getegid
 geteuid
 GETEVENTMSG
 GETFMT
+getgroups
 gethostname
 getpgrp
 getpid
@@ -256,6 +258,7 @@ USRQUOTA
 utime
 utimensat
 utimes
+utsname
 vfork
 vforked
 vforks

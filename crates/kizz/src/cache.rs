@@ -24,7 +24,8 @@ use std::{
 
 use kizz_core::{clean as clean_cache, plan_reset};
 use kizz_store::{
-    CacheLock, EntryCounts, LockDetails, SCHEMA_VERSION, Store, StoreError, cache_dir_from_env,
+    CacheIdentity, CacheLock, EntryCounts, LockDetails, SCHEMA_VERSION, Store, StoreError,
+    cache_dir_from_env, identity_differences_text,
 };
 
 use crate::{cli::USAGE_ERROR, ui};
@@ -103,8 +104,9 @@ pub(crate) fn reset(
     }))
 }
 
-/// Wipe the whole cache in `cache`, whatever its schema version, after asking
-/// unless `yes` is set.
+/// Wipe the whole cache in `cache`, whatever its schema version and identity, after
+/// asking unless `yes` is set; a cache of another version or identity, or of this
+/// version without an identity, says so before the question.
 fn reset_all(
     cache: &Path,
     yes: bool,
@@ -113,7 +115,18 @@ fn reset_all(
     let other_version = inventory
         .schema_version
         .filter(|version| *version != SCHEMA_VERSION);
-    if inventory.entries.is_empty() && other_version.is_none() {
+    let differences = inventory
+        .identity
+        .as_ref()
+        .map(|stored| stored.differences(&CacheIdentity::current()))
+        .unwrap_or_default();
+    let missing_identity =
+        inventory.schema_version == Some(SCHEMA_VERSION) && inventory.identity.is_none();
+    if inventory.entries.is_empty()
+        && other_version.is_none()
+        && differences.is_empty()
+        && !missing_identity
+    {
         println!(
             "the cache at `{}` is empty; nothing to remove",
             cache.display()
@@ -129,6 +142,18 @@ fn reset_all(
         println!(
             "the cache has schema version {version}, and this kizz uses schema version \
              {SCHEMA_VERSION}"
+        );
+    }
+    if !differences.is_empty() {
+        println!(
+            "the cache belongs to another machine or user: {}",
+            identity_differences_text(&differences)
+        );
+    }
+    if missing_identity {
+        println!(
+            "the cache has no cache identity, so kizz cannot tell which machine and user it \
+             belongs to"
         );
     }
     if !confirm(yes)? {
