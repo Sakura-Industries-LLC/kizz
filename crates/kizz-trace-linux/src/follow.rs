@@ -72,6 +72,9 @@
 //! call runs, the loop decodes the call's paths from the thread, and resumes it
 //! with `PTRACE_SYSCALL`, so the thread stops again when the call returns. At that
 //! stop the loop reads the result and records the paths in the outcome's accesses.
+//! Before it records them, it notes the first-read metadata of each regular file
+//! that the call opened for reading or ran, unless the run wrote that path earlier
+//! or already noted it (see [`decode::Call::first_reads`]).
 //! A call that a signal interrupts reaches that stop too, with `EINTR` or one of the
 //! kernel's internal restart errors, and is recorded like a failed call, so a call
 //! that returns `EINTR` without restarting keeps its lookup; a call that restarts
@@ -89,7 +92,7 @@ use std::{
     },
 };
 
-use kizz_trace::{Accesses, IncompleteReason, Termination};
+use kizz_trace::{Accesses, FirstReads, IncompleteReason, Termination};
 use libc::{c_int, c_long, c_ulong, pid_t};
 
 use crate::{decode, filter, sys};
@@ -179,6 +182,9 @@ pub(crate) struct Outcome {
     pub accesses: Accesses,
     /// Why the trace is incomplete, if it is.
     pub incomplete: Option<IncompleteReason>,
+    /// The first-read metadata of the regular files the tree read or ran before it
+    /// wrote them.
+    pub first_reads: FirstReads,
 }
 
 /// What the loop knows about one traced thread.
@@ -323,6 +329,7 @@ impl<'a> Tree<'a> {
                 termination: None,
                 accesses: Accesses::new(),
                 incomplete: None,
+                first_reads: FirstReads::new(),
             },
         }
     }
@@ -368,13 +375,23 @@ impl<'a> Tree<'a> {
     /// Record the paths of a tracked call of the thread `pid` that returned
     /// `result`, or whose result was never seen, with what the kernel loaded to run
     /// the program of an `exec`.
+    ///
+    /// The first-read metadata of the files the call opened for reading or ran is
+    /// noted first, while the accesses hold only the calls that returned earlier,
+    /// so a write by the call itself does not count as an earlier write.
     fn finish(
         &mut self,
         pid: pid_t,
         mut call: decode::Call,
         result: Option<i64>,
     ) {
-        call.loaded(result, &sys::Thread(pid));
+        let thread = sys::Thread(pid);
+        call.loaded(result, &thread);
+        for (path, metadata) in call.first_reads(result, &thread) {
+            self.outcome
+                .first_reads
+                .note(&path, metadata, &self.outcome.accesses);
+        }
         if let Some(detail) = call.finish(result, &mut self.outcome.accesses) {
             self.incomplete(IncompleteReason::Other { detail });
         }

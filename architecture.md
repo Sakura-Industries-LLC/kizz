@@ -442,6 +442,14 @@ When the command finishes, kizz records the state of every touched path, concurr
 The next cache check compares the current state with that recorded state, so a file a step writes and then reads,
 or a temporary file it creates and removes, needs no special handling.
 
+The final state can differ from what the command consumed: a command may rewrite a file after it read it,
+or something else may change the file while the command runs.
+So the tracer also notes the metadata of each regular file when the command first opens it for reading or runs it,
+unless the command wrote that path earlier in the run, or the call that opened it created or truncated it.
+When the command finishes, a file whose state then differs from that metadata makes the result not cached
+(see [Results that are not cached](#results-that-are-not-cached)).
+Directory listings are compared by their final state only.
+
 ### Path states
 
 * Absent.
@@ -599,9 +607,12 @@ Hashing uses BLAKE3, multi-threaded for large files.
 
 * Commands killed by a signal, including interrupted commands.
 * Runs that the tracer reports as incompletely traced.
+* Runs in which a file changed after the command first read it or ran it.
+  The explanation names each such file and says whether the command itself wrote it.
 * Commands that could not start for a reason other than a missing or non-executable program.
 
 These run again on the next build, with that stated as the reason.
+A run in which something other than the command changed a file it read gets a loud warning.
 Within a build, kizz keeps the paths such a command touched in memory, so a later pass reruns it only if one of them changed.
 
 A command whose program is missing or not executable fails its task and is recorded like any other failure,
@@ -1027,6 +1038,8 @@ Depends on phases 7 and 8.
 * An end-to-end test copies the fixture to a temporary directory and runs `kizz build coverage-build` there.
   It then resets the copy's cache entries with `kizz cache reset` and runs `kizz build coverage-test`.
   It compares the step that `coverage-test` recorded with the expectation file.
+* A `coverage-changes` task runs the program in modes that read or run a file and then rewrite it,
+  one for each way in which a command first reads a file, and in a mode that writes a file before it reads it.
 
 Acceptance, end to end with the real tracer and a temporary cache:
 
@@ -1035,6 +1048,8 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * The loader that the program's `PT_INTERP` header names is recorded with the exec kind.
 * No other path under the task directory is recorded.
 * Each tracked system call has an expected entry that a tracer missing that call would record differently.
+* Each step of `coverage-changes` that rewrites a file it read is not cached, and the reason names the file.
+* The step that writes its file before it reads it is cached.
 
 ## Testing
 

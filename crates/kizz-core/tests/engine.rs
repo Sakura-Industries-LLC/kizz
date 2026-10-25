@@ -36,7 +36,7 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -96,7 +96,9 @@ impl Tracer for FakeTracer {
     }
 }
 
-/// A result that reports the program as run, then `accesses`, with no output.
+/// A result that reports the program as run, then `accesses`, with no output, and
+/// notes the metadata of each file read or run before it was written, as the Linux
+/// tracer does, now, when the script has done its file operations.
 ///
 /// # Errors
 ///
@@ -107,6 +109,8 @@ fn finished(
     termination: Termination,
 ) -> Result<RunResult, TraceError> {
     let mut reported = Accesses::new();
+    let mut first_reads = FirstReads::new();
+    first_reads.note_at(&request.program, &reported);
     reported.record(request.program.clone(), AccessKind::Exec);
     for (path, kind) in accesses {
         let path = AbsolutePath::new(path).map_err(|error| {
@@ -115,6 +119,9 @@ fn finished(
                 source: None,
             }
         })?;
+        if matches!(kind, AccessKind::Read | AccessKind::Exec) {
+            first_reads.note_at(&path, &reported);
+        }
         reported.record(path, *kind);
     }
     Ok(RunResult {
@@ -122,6 +129,7 @@ fn finished(
         output: CapturedOutput::empty(request.capture),
         accesses: reported,
         incomplete: None,
+        first_reads,
     })
 }
 

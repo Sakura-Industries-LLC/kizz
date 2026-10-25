@@ -21,6 +21,12 @@
 //! path with its combined access kinds. Successful and failed calls are recorded
 //! alike: a failed call, including a lookup that found nothing, is a probe.
 //!
+//! At the exit of a successful call that opens a regular file for reading or runs
+//! one, the tracer also notes the file's metadata as its first read, unless the
+//! tree wrote that path earlier or the call created or truncated the file: through
+//! the descriptor that an opening call returned, and through the path for the
+//! program of an `exec` and each interpreter and loader that the kernel loaded.
+//!
 //! When a request is cancelled, the tracer interrupts the tree: it sends `SIGINT`
 //! once to every live process. It follows the tree as before for
 //! [`CANCEL_GRACE_PERIOD`], and returns as soon as the whole tree has exited; when
@@ -50,7 +56,8 @@ use std::{
 
 pub use filter::{TRACKED_SYSTEM_CALLS, TrackedSystemCall};
 use kizz_trace::{
-    Accesses, Cancellation, EchoSink, OutputStream, RunRequest, RunResult, TraceError, Tracer,
+    Accesses, Cancellation, EchoSink, FirstReads, OutputStream, RunRequest, RunResult, TraceError,
+    Tracer,
 };
 
 use crate::{
@@ -279,9 +286,16 @@ impl Tracer for LinuxTracer {
             .map_err(|error| tracer_error("could not follow the traced processes", error))?;
         let streams = supervised.streams?;
         supervised.fed?;
-        let (termination, accesses, incomplete) = outcome.map_or_else(
-            || (None, Accesses::new(), None),
-            |outcome| (outcome.termination, outcome.accesses, outcome.incomplete),
+        let (termination, accesses, incomplete, first_reads) = outcome.map_or_else(
+            || (None, Accesses::new(), None, FirstReads::new()),
+            |outcome| {
+                (
+                    outcome.termination,
+                    outcome.accesses,
+                    outcome.incomplete,
+                    outcome.first_reads,
+                )
+            },
         );
         if let Some(failure) = spawn::read_failure(report_read)
             .map_err(|error| tracer_error("could not read the failure pipe", error))?
@@ -299,6 +313,7 @@ impl Tracer for LinuxTracer {
             output: capture::assemble(request.capture, streams),
             accesses,
             incomplete,
+            first_reads,
         })
     }
 }

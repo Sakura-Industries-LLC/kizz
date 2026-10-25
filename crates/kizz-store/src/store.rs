@@ -62,8 +62,11 @@ const WIPED_DIR: &str = "db.wiped";
 /// check finds. Version 11 keeps directory listings in the order the file system
 /// returned their entries, with a hash of that order and a hash of the same entries
 /// sorted, and adds the names of the entries that changed and the order change to
-/// what a cache check finds.
-pub const SCHEMA_VERSION: u32 = 11;
+/// what a cache check finds. Version 12 adds the reason for a run in which files
+/// changed after the command first read them or ran them, which lists each such
+/// file and whether the command wrote it, and, like the other reasons a run's
+/// result is not cached, marks a record that is never a cache hit.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -619,10 +622,11 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 11 stores directory listings in file-system order with a sorted hash,
-    /// one more than version 10, whose listings were sorted and had one hash.
+    /// Version 12 adds the reason for files that changed after the command read
+    /// them, one more than version 11, which stored directory listings in
+    /// file-system order with a sorted hash.
     #[test]
-    fn schema_version_11_has_ordered_listings() {
-        assert_eq!(SCHEMA_VERSION, 11);
+    fn schema_version_12_marks_files_that_changed_after_they_were_read() {
+        assert_eq!(SCHEMA_VERSION, 12);
     }
 }

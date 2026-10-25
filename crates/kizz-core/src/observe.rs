@@ -29,6 +29,10 @@
 //! retargeting, removing, or replacing one of them changes the step. A final link is
 //! recorded as [`PathState::Symlink`] with an untracked pointee, and every other link
 //! on the way is recorded as such a link too, as a probe.
+//!
+//! [`changed_after_read`] compares the first-read metadata that the tracer noted
+//! with the recorded states, to find the files that changed during the run after
+//! the command first read them or ran them.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -44,10 +48,10 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, ContentHash, DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
-    Owner, PathState, SpecialKind, Times,
+    AccessBits, ChangedRead, ContentHash, DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES,
+    Observation, Owner, PathState, SpecialKind, Times,
 };
-use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses};
+use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, FileMetadata, FirstReads};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use crate::{patterns::PathPatterns, states::FileStates};
@@ -529,8 +533,77 @@ fn listing_hash<'a>(entries: impl IntoIterator<Item = &'a DirEntry>) -> ContentH
     ContentHash(*hasher.finalize().as_bytes())
 }
 
-/// Unit tests for listing hashes and for recognizing paths that lead into `/proc`
-/// and `/sys`.
+/// The files that changed during a run after the command first read them or ran
+/// them, sorted by path: each path in `first_reads` whose recorded state in
+/// `observations`, following a final symbolic link, is not a regular file with the
+/// noted device, inode, size, modification and change times, mode, and owner.
+/// No file, another type, and an inaccessible path are changes too. Each says
+/// whether the command wrote the path, as its access kinds show.
+///
+/// A path that no observation holds, because an ignore pattern matched it, is not
+/// compared, and neither is a path under `/proc` or `/sys`, or one that symbolic
+/// links lead there, tracked or not.
+#[must_use]
+pub fn changed_after_read(
+    observations: &[Observation],
+    first_reads: &FirstReads,
+) -> Vec<ChangedRead> {
+    first_reads
+        .iter()
+        .filter_map(|(path, noted)| {
+            let path = path.as_path();
+            let index = observations
+                .binary_search_by(|observation| observation.path.as_path().cmp(path))
+                .ok()?;
+            let observation = observations.get(index)?;
+            if observation.tracked || is_kernel_path(path) {
+                return None;
+            }
+            let unchanged = same_file(&observation.state, noted)?;
+            (!unchanged).then(|| {
+                ChangedRead {
+                    path: path.to_path_buf(),
+                    written: observation.access.contains(AccessBits::WRITE),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Whether the recorded `state`, following a final symbolic link, is the regular
+/// file that `noted` describes, unchanged; `None` when the state is untracked, so
+/// it is not compared.
+fn same_file(
+    state: &PathState,
+    noted: &FileMetadata,
+) -> Option<bool> {
+    match state {
+        PathState::Untracked => None,
+        PathState::Symlink { pointee, .. } => same_file(pointee, noted),
+        PathState::File { meta, .. } => {
+            Some(
+                meta.device == noted.device
+                    && meta.inode == noted.inode
+                    && meta.size == noted.size
+                    && meta.mtime_nanos == noted.mtime_nanos
+                    && meta.ctime_nanos == noted.ctime_nanos
+                    && meta.mode == noted.mode
+                    && meta.owner
+                        == (Owner {
+                            uid: noted.uid,
+                            gid: noted.gid,
+                        }),
+            )
+        },
+        PathState::Absent
+        | PathState::Directory { .. }
+        | PathState::Special { .. }
+        | PathState::Inaccessible { .. } => Some(false),
+    }
+}
+
+/// Unit tests for listing hashes, for recognizing paths that lead into `/proc` and
+/// `/sys`, and for comparing first reads with recorded states.
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -543,6 +616,116 @@ mod tests {
             name: name.as_bytes().to_vec(),
             kind: EntryKind::File,
         }
+    }
+
+    /// The noted metadata of a regular file with `inode`.
+    fn noted(inode: u64) -> FileMetadata {
+        FileMetadata {
+            device: 1,
+            inode,
+            size: 2,
+            mtime_nanos: 3,
+            ctime_nanos: 4,
+            mode: 0o100_644,
+            uid: 5,
+            gid: 6,
+        }
+    }
+
+    /// The recorded state of the regular file that `noted(inode)` describes.
+    fn file(inode: u64) -> PathState {
+        PathState::File {
+            meta: FileMeta {
+                size: 2,
+                mtime_nanos: 3,
+                ctime_nanos: 4,
+                inode,
+                device: 1,
+                mode: 0o100_644,
+                owner: Owner { uid: 5, gid: 6 },
+            },
+            hash: None,
+        }
+    }
+
+    /// An observation of `path` with `access` and `state`.
+    fn observed(
+        path: &str,
+        access: u8,
+        tracked: bool,
+        state: PathState,
+    ) -> Observation {
+        Observation {
+            path: PathBuf::from(path),
+            access: AccessBits(access),
+            tracked,
+            state,
+        }
+    }
+
+    /// Each noted file is compared with its final state through a final link; any
+    /// differing field, another type, or no file is a change, with whether the
+    /// command wrote the path; ignored, untracked and tracked kernel paths are not
+    /// compared.
+    #[test]
+    fn first_reads_are_compared_with_the_recorded_states() {
+        let read = AccessBits::READ;
+        let written = AccessBits::READ | AccessBits::WRITE;
+        let link = |state| {
+            PathState::Symlink {
+                target: PathBuf::from("t"),
+                pointee: Box::new(state),
+            }
+        };
+        let mut moved = file(1);
+        if let PathState::File { meta, .. } = &mut moved {
+            meta.mode = 0o100_600;
+        }
+        let observations = vec![
+            observed("/p/absent", written, false, PathState::Absent),
+            observed("/p/dir", read, false, PathState::Directory {
+                mode: 0o040_755,
+                owner: Owner { uid: 5, gid: 6 },
+                listing: None,
+                times: Times {
+                    mtime_nanos: 3,
+                    ctime_nanos: 4,
+                },
+            }),
+            observed("/p/link-other", written, false, link(file(9))),
+            observed("/p/link-same", read, false, link(file(1))),
+            observed("/p/mode", read, false, moved),
+            observed("/p/same", read, false, file(1)),
+            observed("/proc/version", read, true, file(9)),
+            observed("/sys/kernel", read, false, PathState::Untracked),
+            observed("/x/untracked", read, false, link(PathState::Untracked)),
+        ];
+        let mut first_reads = FirstReads::new();
+        let accesses = Accesses::new();
+        for path in [
+            "/p/absent",
+            "/p/dir",
+            "/p/ignored",
+            "/p/link-other",
+            "/p/link-same",
+            "/p/mode",
+            "/p/same",
+            "/proc/version",
+            "/sys/kernel",
+            "/x/untracked",
+        ] {
+            first_reads.note(&AbsolutePath::new(path).unwrap(), noted(1), &accesses);
+        }
+        let changed: Vec<(String, bool)> = changed_after_read(&observations, &first_reads)
+            .into_iter()
+            .map(|file| (file.path.display().to_string(), file.written))
+            .collect();
+        assert_eq!(changed, [
+            ("/p/absent".to_owned(), true),
+            ("/p/dir".to_owned(), false),
+            ("/p/link-other".to_owned(), true),
+            ("/p/mode".to_owned(), false),
+        ]);
     }
 
     /// The same entries in two orders have different listing hashes and the same

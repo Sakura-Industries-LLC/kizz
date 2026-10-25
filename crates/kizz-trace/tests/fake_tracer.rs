@@ -13,7 +13,7 @@ use std::{
 
 use kizz_trace::{
     AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
-    EchoSink, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    EchoSink, FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 
 /// The signal number the fake reports for a cancelled request.
@@ -86,6 +86,8 @@ impl Tracer for FakeTracer {
         };
 
         let mut accesses = Accesses::new();
+        let mut first_reads = FirstReads::new();
+        first_reads.note_at(&request.program, &accesses);
         accesses.record(request.program.clone(), AccessKind::Exec);
         if cancel.is_cancelled() {
             return Ok(RunResult {
@@ -93,6 +95,7 @@ impl Tracer for FakeTracer {
                 output: CapturedOutput::empty(request.capture),
                 accesses,
                 incomplete: None,
+                first_reads,
             });
         }
 
@@ -118,6 +121,11 @@ impl Tracer for FakeTracer {
             }
         }
         for (path, kind) in &script.accesses {
+            // A read or a run notes the file's metadata first, as the Linux tracer
+            // does.
+            if matches!(kind, AccessKind::Read | AccessKind::Exec) {
+                first_reads.note_at(path, &accesses);
+            }
             accesses.record(path.clone(), *kind);
         }
 
@@ -126,6 +134,7 @@ impl Tracer for FakeTracer {
             output,
             accesses,
             incomplete: None,
+            first_reads,
         })
     }
 }

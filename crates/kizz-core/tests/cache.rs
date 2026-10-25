@@ -38,7 +38,8 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    IncompleteReason, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, IncompleteReason, OutputStream, RunRequest, RunResult, Termination, TraceError,
+    Tracer,
 };
 use tempfile::TempDir;
 
@@ -128,13 +129,33 @@ fn reported(
     request: &RunRequest,
     accesses: &[(PathBuf, AccessKind)],
 ) -> Result<Accesses, TraceError> {
+    traced(request, accesses).map(|(reported, _)| reported)
+}
+
+/// The accesses of a run of `request`, the program as run, then `accesses`, with
+/// the first reads of the run: the metadata of each file read or run before it was
+/// written, noted now, when the script has done its file operations, under the
+/// rules of the Linux tracer.
+///
+/// # Errors
+///
+/// A tracer failure when a path in `accesses` is not absolute.
+fn traced(
+    request: &RunRequest,
+    accesses: &[(PathBuf, AccessKind)],
+) -> Result<(Accesses, FirstReads), TraceError> {
     let mut reported = Accesses::new();
+    let mut first_reads = FirstReads::new();
+    first_reads.note_at(&request.program, &reported);
     reported.record(request.program.clone(), AccessKind::Exec);
     for (path, kind) in accesses {
         let path = AbsolutePath::new(path).map_err(|error| tracer_failure(&error))?;
+        if matches!(kind, AccessKind::Read | AccessKind::Exec) {
+            first_reads.note_at(&path, &reported);
+        }
         reported.record(path, *kind);
     }
-    Ok(reported)
+    Ok((reported, first_reads))
 }
 
 /// A result that reports the program as run, then `accesses`, with no output.
@@ -147,11 +168,13 @@ fn finished(
     accesses: &[(PathBuf, AccessKind)],
     termination: Termination,
 ) -> Result<RunResult, TraceError> {
+    let (accesses, first_reads) = traced(request, accesses)?;
     Ok(RunResult {
         termination,
         output: CapturedOutput::empty(request.capture),
-        accesses: reported(request, accesses)?,
+        accesses,
         incomplete: None,
+        first_reads,
     })
 }
 

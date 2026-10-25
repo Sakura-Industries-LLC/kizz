@@ -25,7 +25,9 @@
 //! * `signal` makes a signal kill the command;
 //!
 //! and any other argument does nothing. Relative paths are relative to the step's
-//! working directory.
+//! working directory. As the Linux tracer does, the fake notes the metadata of each
+//! file that a step reads or runs before it writes it, at the moment of the read,
+//! so `rw` and `bump` leave a result that is not cached.
 
 use std::{
     collections::BTreeMap,
@@ -49,7 +51,7 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -58,6 +60,11 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// The program hash of the tasks that run steps directly.
 const PROGRAM: [u8; 32] = [7; 32];
+
+/// The full reason line of a step whose previous run read `state.txt` and then
+/// rewrote it, so its result was not cached.
+const REWROTE_STATE: &str = "  the previous run could not be cached: a file changed after the \
+                             command read it: `state.txt` (the command wrote it)";
 
 /// A tracer failure from `error`.
 fn tracer_failure(error: &dyn Error) -> TraceError {
@@ -72,10 +79,15 @@ fn tracer_failure(error: &dyn Error) -> TraceError {
 fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
     let cwd = request.cwd.as_path();
     let mut accesses = Accesses::new();
+    let mut first_reads = FirstReads::new();
+    first_reads.note_at(&request.program, &accesses);
     accesses.record(request.program.clone(), AccessKind::Exec);
     let mut termination = Termination::Exited(0);
-    let mut record = |path: PathBuf, kind| -> Result<(), TraceError> {
+    let mut record = |path: PathBuf, kind: AccessKind| -> Result<(), TraceError> {
         let path = AbsolutePath::new(path).map_err(|error| tracer_failure(&error))?;
+        if matches!(kind, AccessKind::Read | AccessKind::Exec) {
+            first_reads.note_at(&path, &accesses);
+        }
         accesses.record(path, kind);
         Ok(())
     };
@@ -96,15 +108,15 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
             },
             "rw" => {
                 let _content: Vec<u8> = fs::read(&path).unwrap_or_default();
-                fs::write(&path, text).map_err(failed)?;
                 record(path.clone(), AccessKind::Read)?;
+                fs::write(&path, text).map_err(failed)?;
                 record(path, AccessKind::Write)?;
             },
             "bump" => {
                 let mut content = fs::read_to_string(&path).unwrap_or_default();
+                record(path.clone(), AccessKind::Read)?;
                 content.push('+');
                 fs::write(&path, content).map_err(failed)?;
-                record(path.clone(), AccessKind::Read)?;
                 record(path, AccessKind::Write)?;
             },
             "kernel" => record(path, AccessKind::Read)?,
@@ -119,6 +131,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
         output: CapturedOutput::empty(request.capture),
         accesses,
         incomplete: None,
+        first_reads,
     })
 }
 
@@ -1045,11 +1058,14 @@ fn consecutive_external_edits_of_a_file_a_step_writes_and_reads_are_not_self_inf
 
     fixture.write("state.txt", "xyz")?;
     let second = fixture.build(&tracer, &[(&task, &[&bump])])?;
+    // The step reads the file and then rewrites it, so its result is never cached,
+    // and each explanation starts with that reason.
     assert_eq!(
         fixture.full(second.verdict(0, 0)?, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 2 to 3 bytes; last written by something \
              outside kizz",
         ])
@@ -1064,14 +1080,17 @@ fn consecutive_external_edits_of_a_file_a_step_writes_and_reads_are_not_self_inf
         fixture.full(verdict, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 4 to 7 bytes; last written by something \
              outside kizz",
         ])
     );
     assert_eq!(
         fixture.render(false).one_line(verdict),
-        "`state.txt` changed (size changed from 4 to 7 bytes)"
+        "the previous run could not be cached: a file changed after the command read it: \
+         `state.txt` (the command wrote it); `state.txt` changed (size changed from 4 to 7 \
+         bytes)"
     );
     assert_eq!(self_inflicted(verdict)?, [None]);
     assert_eq!(third.warnings, Vec::<RepeatedWarning>::new());
@@ -1102,7 +1121,8 @@ fn another_writer_of_a_file_a_step_writes_and_reads_is_not_self_inflicted() -> T
         fixture.full(second.verdict(1, 0)?, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 2 to 4 bytes; last written by step 1 of \
              kizz.md:3 (Other) in this build",
         ])
@@ -1119,29 +1139,38 @@ fn another_writer_of_a_file_a_step_writes_and_reads_is_not_self_inflicted() -> T
         fixture.full(verdict, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 5 to 8 bytes; last written by step 1 of \
              kizz.md:3 (Other) in this build",
         ])
     );
     assert_eq!(
         fixture.render(false).one_line(verdict),
-        "`state.txt` changed (size changed from 5 to 8 bytes)"
+        "the previous run could not be cached: a file changed after the command read it: \
+         `state.txt` (the command wrote it); `state.txt` changed (size changed from 5 to 8 \
+         bytes)"
     );
     assert_eq!(self_inflicted(verdict)?, [None]);
     assert_eq!(third.warnings, Vec::<RepeatedWarning>::new());
 
-    // Rewritten in an earlier build, the file names that build's writer instead.
+    // With nothing changed since, the step runs again only because its previous
+    // run was not cached, and it rewrites the file once more.
     let fourth = fixture.build(&tracer, &[(&state, &[&bump])])?;
-    assert_eq!(fourth.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(
+        fixture.full(fourth.verdict(0, 0)?, false),
+        lines(&["ran because:", REWROTE_STATE])
+    );
+    // Rewritten in an earlier build, the file names that build's writer instead.
     fixture.build(&tracer, &[(&other, &[&write("dd")?])])?;
     let sixth = fixture.build(&tracer, &[(&state, &[&bump])])?;
     assert_eq!(
         fixture.full(sixth.verdict(0, 0)?, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
-            "    `state.txt`: size changed from 9 to 2 bytes; last written by step 1 of \
+            REWROTE_STATE,
+            "  1 input changed since:",
+            "    `state.txt`: size changed from 10 to 2 bytes; last written by step 1 of \
              kizz.md:3 (Other) in an earlier build",
         ])
     );

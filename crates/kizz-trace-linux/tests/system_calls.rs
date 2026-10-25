@@ -31,8 +31,8 @@ use std::{
 };
 
 use kizz_trace::{
-    AbsolutePath, AccessKind, AccessKinds, Cancellation, CaptureMode, CapturedOutput, RunRequest,
-    RunResult, StdioEcho, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, AccessKinds, Cancellation, CaptureMode, CapturedOutput, FileMetadata,
+    RunRequest, RunResult, StdioEcho, Termination, TraceError, Tracer,
 };
 use kizz_trace_linux::{LinuxTracer, TRACKED_SYSTEM_CALLS};
 use libc::{c_int, c_long};
@@ -1659,4 +1659,74 @@ fn openat2_in_root_records_directories_that_parent_components_leave() {
     for path in ["dir", "file"] {
         assert_eq!(workspace.kinds(&result, path).unwrap(), None, "{path}");
     }
+}
+
+/// The first-read metadata that `result` reports for `relative` in `workspace`.
+fn first_read(
+    workspace: &Workspace,
+    result: &RunResult,
+    relative: &str,
+) -> Outcome<Option<FileMetadata>> {
+    Ok(result
+        .first_reads
+        .get(&AbsolutePath::new(workspace.path(relative))?)
+        .copied())
+}
+
+/// The review's command reads `input` and then rewrites it: the first-read
+/// metadata of `input` is what the test read before the run, not its final state.
+#[test]
+fn a_file_read_and_then_rewritten_reports_its_metadata_before_the_rewrite() {
+    let workspace = Workspace::new().unwrap();
+    fs::write(workspace.path("input"), "the old input\n").unwrap();
+    let before = FileMetadata::at(&workspace.path("input")).unwrap();
+    let script = "cat input > output; printf \"new\\n\" > input";
+    let result = run_successfully(&shell(script, &workspace.root).unwrap()).unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.path("output")).unwrap(),
+        "the old input\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path("input")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        first_read(&workspace, &result, "input").unwrap(),
+        Some(before)
+    );
+    assert_ne!(FileMetadata::at(&workspace.path("input")), Some(before));
+    // `output` was created and truncated, and never read.
+    assert_eq!(first_read(&workspace, &result, "output").unwrap(), None);
+}
+
+/// A file that the command writes and then reads reports no first read.
+#[test]
+fn a_file_written_and_then_read_reports_no_first_read() {
+    let workspace = Workspace::new().unwrap();
+    let script = "printf 'one ' > made; cat made; printf two >> made; cat made";
+    let result = run_successfully(&shell(script, &workspace.root).unwrap()).unwrap();
+    assert_eq!(stdout(&result.output).unwrap(), "one one two");
+    let made = workspace.kinds(&result, "made").unwrap().unwrap();
+    assert!(made.contains(AccessKind::Read), "{made}");
+    assert_eq!(first_read(&workspace, &result, "made").unwrap(), None);
+}
+
+/// A script that runs reports its own first-read metadata, and so does its
+/// interpreter, which the kernel loaded.
+#[test]
+fn a_script_that_runs_reports_its_own_first_read() {
+    let workspace = Workspace::new().unwrap();
+    let script = write_executable(&workspace, "script", "#!/bin/sh\nexit 0\n").unwrap();
+    let before = FileMetadata::at(&script).unwrap();
+    let result = run_written(&request(&script, &["script"], &workspace.root).unwrap()).unwrap();
+    assert_eq!(result.termination, Termination::Exited(0));
+    assert_eq!(
+        first_read(&workspace, &result, "script").unwrap(),
+        Some(before)
+    );
+    let interpreter = AbsolutePath::new("/bin/sh").unwrap();
+    assert_eq!(
+        result.first_reads.get(&interpreter).copied(),
+        FileMetadata::at(Path::new("/bin/sh"))
+    );
 }

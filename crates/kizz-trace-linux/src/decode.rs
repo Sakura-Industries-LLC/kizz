@@ -48,6 +48,16 @@
 //! could not read it, or whose last file is neither a `#!` script nor an `x86_64`
 //! ELF executable, makes the trace incomplete, because a handler such as
 //! `binfmt_misc` may have run it with an interpreter that the tracer cannot see.
+//!
+//! A call that opens a regular file for reading or runs one is a read whose
+//! file the command may change later, so [`Call::first_reads`] gives the file's
+//! metadata at the call's exit, for the tracer to note when the run had not
+//! written the path before: an opening call with read access through the
+//! descriptor that it returned, unless it truncated the file, or created it, which
+//! an opening call with `O_CREAT` tells by whether a regular file was at the path
+//! at its entry; and `execve` and `execveat` through the path of the program and of
+//! each interpreter and loader that the kernel loaded. Reading a link opens no
+//! file, so `readlink` and `readlinkat` give nothing.
 
 use std::{
     ffi::OsStr,
@@ -56,7 +66,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses};
+use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, FileMetadata};
 use libc::{c_int, c_long};
 
 /// The six argument registers of a system call, in order.
@@ -239,6 +249,21 @@ pub(crate) trait Inspect {
         offset: u64,
         buffer: &mut [u8],
     ) -> io::Result<usize>;
+
+    /// The metadata of the regular file behind the thread's descriptor `fd`, which
+    /// `stat` reaches through the link in `/proc`, or `None` when the descriptor
+    /// names no regular file or its metadata cannot be read.
+    fn descriptor_file(
+        &self,
+        fd: c_int,
+    ) -> Option<FileMetadata>;
+
+    /// The metadata of the regular file at `path`, following symbolic links, or
+    /// `None` when `path` names no regular file or its metadata cannot be read.
+    fn path_file(
+        &self,
+        path: &Path,
+    ) -> Option<FileMetadata>;
 }
 
 /// When an empty or null path argument names the directory descriptor itself.
@@ -559,6 +584,24 @@ pub(crate) struct Call {
     /// Why the tracer could not follow the program that the call ran, which makes
     /// the trace incomplete.
     unfollowed: Option<String>,
+    /// What the call reads or runs first, whose metadata [`Call::first_reads`]
+    /// gives when the call succeeds.
+    first_read: FirstRead,
+}
+
+/// The files whose metadata a call gives when it succeeds, as reads or runs that
+/// may come before any write of their paths in the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRead {
+    /// None: the call opens nothing for reading and runs nothing, or it created or
+    /// truncated what it opened, which writes it first.
+    Nothing,
+    /// The regular file that an opening call opened for reading, at this index of
+    /// its operands, through the descriptor that the call returns.
+    Opened(usize),
+    /// The program that an `exec` ran, and each interpreter and loader that the
+    /// kernel loaded to run it, through their paths: every operand of the call.
+    Ran,
 }
 
 /// The working directory against which the kernel resolves a relative interpreter
@@ -690,6 +733,48 @@ impl Call {
             .extend(loads.into_iter().map(|path| (path, kinds)));
         if ran && let Some(detail) = failure {
             self.unfollowed = Some(format!("{} ran {program}, but {detail}", self.name));
+        }
+    }
+
+    /// The metadata of each regular file that the call, which returned `result`,
+    /// opened for reading or ran, with its path, in operand order: for an opening
+    /// call with read access that neither created nor truncated the file, the file
+    /// behind the descriptor it returned; for `execve` and `execveat`, after
+    /// [`Call::loaded`], the program and each interpreter and loader, through their
+    /// paths. A call that failed, or whose result was never seen, gives nothing,
+    /// and so does a path that names no regular file.
+    pub(crate) fn first_reads(
+        &self,
+        result: Option<i64>,
+        inspect: &(impl Inspect + ?Sized),
+    ) -> Vec<(AbsolutePath, FileMetadata)> {
+        let Some(result) = result.filter(|result| !(LOWEST_ERROR_RESULT..0).contains(result))
+        else {
+            return Vec::new();
+        };
+        match self.first_read {
+            FirstRead::Nothing => Vec::new(),
+            FirstRead::Opened(index) => {
+                let (Some((path, _)), Ok(fd)) = (self.operands.get(index), c_int::try_from(result))
+                else {
+                    return Vec::new();
+                };
+                inspect
+                    .descriptor_file(fd)
+                    .map(|metadata| (path.clone(), metadata))
+                    .into_iter()
+                    .collect()
+            },
+            FirstRead::Ran => {
+                self.operands
+                    .iter()
+                    .filter_map(|(path, _)| {
+                        inspect
+                            .path_file(path.as_path())
+                            .map(|metadata| (path.clone(), metadata))
+                    })
+                    .collect()
+            },
         }
     }
 
@@ -1282,6 +1367,8 @@ struct Decoder<'a, I: Inspect + ?Sized> {
     arguments: Arguments,
     /// The call decoded so far.
     call: Call,
+    /// The open flags of an opening call, once its rule is decoded.
+    open_flags: Option<u64>,
 }
 
 impl<I: Inspect + ?Sized> Decoder<'_, I> {
@@ -1516,6 +1603,7 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
             lookup,
             open_kinds(flags),
         );
+        self.open_flags = Some(flags);
         let tmpfile = flag(libc::O_TMPFILE);
         if flags & tmpfile == tmpfile {
             // The descriptor names a new unnamed file, not the directory the
@@ -1531,7 +1619,10 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
     ) {
         let kinds = match rule.kinds {
             Kinds::Fixed(kinds) => kinds,
-            Kinds::OpenFlags(index) => open_kinds(self.argument(index)),
+            Kinds::OpenFlags(index) => {
+                self.open_flags = Some(self.argument(index));
+                open_kinds(self.argument(index))
+            },
             Kinds::OpenHow => AccessKinds::EMPTY,
         };
         match rule.operand {
@@ -1542,6 +1633,38 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
             Operand::Descriptor(index) => self.descriptor(int(self.argument(index)), kinds),
             Operand::OpenHow => self.open_how(),
         }
+    }
+
+    /// What an opening call with `flags` reads first, now that its rule is decoded:
+    /// the operand it opens for reading, unless it truncates the file, or creates it,
+    /// which a call with `O_CREAT` does when no regular file is at the path now, at
+    /// its entry.
+    fn opened_for_reading(
+        &self,
+        flags: u64,
+    ) -> FirstRead {
+        if flags & flag(libc::O_TRUNC) != 0 {
+            return FirstRead::Nothing;
+        }
+        let Some(index) = self
+            .call
+            .operands
+            .iter()
+            .position(|(_, kinds)| kinds.contains(AccessKind::Read))
+        else {
+            return FirstRead::Nothing;
+        };
+        if flags & flag(libc::O_CREAT) != 0 {
+            let existed = self
+                .call
+                .operands
+                .get(index)
+                .is_some_and(|(path, _)| self.inspect.path_file(path.as_path()).is_some());
+            if !existed {
+                return FirstRead::Nothing;
+            }
+        }
+        FirstRead::Opened(index)
     }
 }
 
@@ -1571,12 +1694,18 @@ pub(crate) fn enter(
             reached: None,
             directory: None,
             unfollowed: None,
+            first_read: FirstRead::Nothing,
         },
+        open_flags: None,
     };
     for rule in system_call.rules {
         decoder.rule(*rule);
     }
+    if let Some(flags) = decoder.open_flags {
+        decoder.call.first_read = decoder.opened_for_reading(flags);
+    }
     if matches!(number, libc::SYS_execve | libc::SYS_execveat) {
+        decoder.call.first_read = FirstRead::Ran;
         decoder.call.directory = Some(match decoder.base(libc::AT_FDCWD) {
             Ok(Some(path)) => Directory::Path(path),
             Ok(None) => Directory::Removed,
@@ -1720,6 +1849,10 @@ mod tests {
         /// The content of each file that [`Inspect::read_file`] reads, by path, or
         /// `None` for a file that the tracer cannot read.
         contents: BTreeMap<String, Option<Vec<u8>>>,
+        /// The metadata of each regular file, by path, which
+        /// [`Inspect::path_file`] gives, and [`Inspect::descriptor_file`] for a
+        /// descriptor whose link names the path.
+        regular: BTreeMap<String, FileMetadata>,
     }
 
     /// The bytes of a `struct open_how` with `flags` and `resolve`.
@@ -1819,6 +1952,7 @@ mod tests {
                 directories,
                 locked: "/dir/locked",
                 contents: BTreeMap::new(),
+                regular: BTreeMap::new(),
             }
         }
 
@@ -1939,6 +2073,23 @@ mod tests {
             let count = available.len().min(buffer.len());
             buffer[..count].copy_from_slice(&available[..count]);
             Ok(count)
+        }
+
+        fn descriptor_file(
+            &self,
+            fd: c_int,
+        ) -> Option<FileMetadata> {
+            let (link, _) = self.link(fd).ok()?;
+            self.regular.get(link).copied()
+        }
+
+        fn path_file(
+            &self,
+            path: &Path,
+        ) -> Option<FileMetadata> {
+            path.to_str()
+                .and_then(|path| self.regular.get(path))
+                .copied()
         }
     }
 
@@ -3097,6 +3248,161 @@ mod tests {
         assert_eq!(
             exec_in(&fake, "open", &[REL, reg(libc::O_RDONLY)], Some(3)),
             (expect(&[("/work/rel", "read")]), None)
+        );
+    }
+
+    /// The metadata of a regular file whose inode number is `inode`.
+    fn regular(inode: u64) -> FileMetadata {
+        FileMetadata {
+            device: 1,
+            inode,
+            size: 4,
+            mtime_nanos: 5,
+            ctime_nanos: 6,
+            mode: 0o100_644,
+            uid: 7,
+            gid: 8,
+        }
+    }
+
+    /// The first reads of the call `name` with `arguments`, decoded at its entry in
+    /// `before` and returning `result` in `after`, as paths with inode numbers.
+    fn first_reads_across(
+        before: &Fake,
+        after: &Fake,
+        name: &str,
+        arguments: &[u64],
+        result: Option<i64>,
+    ) -> Vec<(String, u64)> {
+        let mut call = decode(before, name, arguments);
+        call.loaded(result, after);
+        call.first_reads(result, after)
+            .into_iter()
+            .map(|(path, metadata)| (path.to_string(), metadata.inode))
+            .collect()
+    }
+
+    /// The first reads of the call `name` with `arguments` in `fake` when it
+    /// returns `result`, as paths with inode numbers.
+    fn first_reads_in(
+        fake: &Fake,
+        name: &str,
+        arguments: &[u64],
+        result: Option<i64>,
+    ) -> Vec<(String, u64)> {
+        first_reads_across(fake, fake, name, arguments, result)
+    }
+
+    /// The expected first reads, from pairs of a path and its inode number.
+    fn noted(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        pairs
+            .iter()
+            .map(|(path, inode)| ((*path).to_owned(), *inode))
+            .collect()
+    }
+
+    /// A successful call that opens a regular file for reading gives the metadata
+    /// of the file behind the descriptor it returned, and a call that only writes,
+    /// truncates, only looks the path up, or fails gives nothing.
+    #[test]
+    fn opening_for_reading_gives_the_file_behind_the_returned_descriptor() {
+        let mut fake = Fake::new();
+        fake.regular.insert("/dir/rel".to_owned(), regular(11));
+        fake.regular.insert("/work/rel".to_owned(), regular(21));
+        fake.links.insert(12, ("/work/rel", object(21, 1, false)));
+        let opened = Some(returned(OPENED));
+        let openat = |flags: c_int, result: Option<i64>| {
+            first_reads_in(&fake, "openat", &[DIR, REL, reg(flags)], result)
+        };
+        let rel = noted(&[("/dir/rel", 11)]);
+        for flags in [
+            libc::O_RDONLY,
+            libc::O_RDWR,
+            libc::O_RDWR | libc::O_CREAT,
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+        ] {
+            assert_eq!(openat(flags, opened), rel, "{flags:#o}");
+        }
+        for flags in [
+            libc::O_WRONLY,
+            libc::O_RDWR | libc::O_TRUNC,
+            libc::O_RDONLY | libc::O_TRUNC,
+            libc::O_PATH,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            libc::O_TMPFILE | libc::O_RDWR,
+        ] {
+            assert_eq!(openat(flags, opened), noted(&[]), "{flags:#o}");
+        }
+        assert_eq!(openat(libc::O_RDONLY, failed(libc::ENOENT)), noted(&[]));
+        assert_eq!(openat(libc::O_RDONLY, None), noted(&[]));
+        // `open` and `openat2` too, and a descriptor that names no regular file
+        // gives nothing.
+        assert_eq!(
+            first_reads_in(&fake, "open", &[REL, reg(libc::O_RDONLY)], Some(12)),
+            noted(&[("/work/rel", 21)])
+        );
+        assert_eq!(
+            first_reads_in(&fake, "openat2", &[DIR, REL, HOW_PLAIN, 24], opened),
+            rel
+        );
+        assert_eq!(
+            first_reads_in(
+                &fake,
+                "open",
+                &[REL, reg(libc::O_RDONLY)],
+                Some(returned(PIPE))
+            ),
+            noted(&[])
+        );
+        // Reading a link opens no file.
+        assert_eq!(
+            first_reads_in(&fake, "readlink", &[REL], Some(4)),
+            noted(&[])
+        );
+    }
+
+    /// An opening call with `O_CREAT` reads first only a file that was at the path
+    /// at its entry; a file it created was written first.
+    #[test]
+    fn creating_a_file_gives_nothing() {
+        let created = Fake::new();
+        let mut existing = Fake::new();
+        existing.regular.insert("/dir/rel".to_owned(), regular(11));
+        let arguments = [DIR, REL, reg(libc::O_RDWR | libc::O_CREAT)];
+        let opened = Some(returned(OPENED));
+        assert_eq!(
+            first_reads_across(&created, &existing, "openat", &arguments, opened),
+            noted(&[])
+        );
+        assert_eq!(
+            first_reads_across(&existing, &existing, "openat", &arguments, opened),
+            noted(&[("/dir/rel", 11)])
+        );
+    }
+
+    /// A successful `exec` gives the metadata of the program and of each
+    /// interpreter and loader the kernel loaded, through their paths, in order; a
+    /// failed one gives nothing.
+    #[test]
+    fn running_gives_the_program_and_what_the_kernel_loaded() {
+        let mut fake = with_files("/p/outer", &[
+            ("/p/outer", text("#!/p/inner\n")),
+            ("/p/inner", dynamic("/lib64/ld.so")),
+        ]);
+        for (inode, path) in [(31, "/p/outer"), (32, "/p/inner"), (33, "/lib64/ld.so")] {
+            fake.regular.insert(path.to_owned(), regular(inode));
+        }
+        assert_eq!(
+            first_reads_in(&fake, "execve", &[PROGRAM, 0, 0], Some(0)),
+            noted(&[("/p/outer", 31), ("/p/inner", 32), ("/lib64/ld.so", 33)])
+        );
+        assert_eq!(
+            first_reads_in(&fake, "execve", &[PROGRAM, 0, 0], failed(libc::ENOENT)),
+            noted(&[])
+        );
+        assert_eq!(
+            first_reads_in(&fake, "execve", &[PROGRAM, 0, 0], None),
+            noted(&[])
         );
     }
 }

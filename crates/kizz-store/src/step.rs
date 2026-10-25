@@ -16,7 +16,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use minicbor::{Decode, Decoder, Encode, Encoder, bytes::ByteArray, decode, encode};
@@ -759,6 +759,51 @@ impl fmt::Display for Difference {
     }
 }
 
+/// A file that changed during a run after the command first read it or ran it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct ChangedRead {
+    /// The absolute path that the command read or ran.
+    #[cbor(n(0), with = "path_bytes")]
+    pub path: PathBuf,
+    /// Whether the command wrote the path, as its access kinds show; when it did
+    /// not, something else changed the file while the command ran.
+    #[n(1)]
+    pub written: bool,
+}
+
+impl ChangedRead {
+    /// Who changed the file, as explanations say it.
+    #[must_use]
+    pub const fn changed_by(&self) -> &'static str {
+        if self.written {
+            "the command wrote it"
+        } else {
+            "something else changed it while the command ran"
+        }
+    }
+}
+
+/// The reason for files that changed during a run after the command first read
+/// them, with each path shown by `path`: how many files changed, then each file
+/// with who changed it, such as `a file changed after the command read it: in.txt
+/// (the command wrote it)`.
+#[must_use]
+pub fn changed_reads_text(
+    files: &[ChangedRead],
+    path: impl Fn(&Path) -> String,
+) -> String {
+    let shown: Vec<String> = files
+        .iter()
+        .map(|file| format!("{} ({})", path(&file.path), file.changed_by()))
+        .collect();
+    let head = if files.len() == 1 {
+        "a file changed after the command read it".to_owned()
+    } else {
+        format!("{} files changed after the command read them", files.len())
+    };
+    format!("{head}: {}", shown.join(", "))
+}
+
 /// Why the result of a run was not cached.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum NotCachedReason {
@@ -799,6 +844,14 @@ pub enum NotCachedReason {
         #[n(0)]
         code: i32,
     },
+    /// Files changed during the run after the command first read them or ran them,
+    /// so the recorded states may not be what the command consumed.
+    #[n(5)]
+    ChangedAfterRead {
+        /// Each changed file, sorted by path.
+        #[n(0)]
+        files: Vec<ChangedRead>,
+    },
 }
 
 impl fmt::Display for NotCachedReason {
@@ -816,6 +869,11 @@ impl fmt::Display for NotCachedReason {
             },
             Self::Incomplete { detail } => write!(f, "incompletely traced: {detail}"),
             Self::StartFailed { message } => write!(f, "could not start: {message}"),
+            Self::ChangedAfterRead { files } => {
+                f.write_str(&changed_reads_text(files, |path| {
+                    path.display().to_string()
+                }))
+            },
         }
     }
 }
@@ -1161,6 +1219,7 @@ mod tests {
             NotCachedReason::StartFailed {
                 message: "out of memory".to_owned(),
             },
+            changed_after_read(),
         ];
         let mut reasons = vec![
             RunReason::NeverRun,
@@ -1207,6 +1266,7 @@ mod tests {
             Some(NotCachedReason::StartFailed {
                 message: "out of memory".to_owned(),
             }),
+            Some(changed_after_read()),
         ];
         for exit in exits {
             for not_cached in markers.clone() {
@@ -1316,6 +1376,13 @@ mod tests {
             NotCachedReason::StartFailed {
                 message: "out of memory".to_owned(),
             },
+            changed_after_read(),
+            NotCachedReason::ChangedAfterRead {
+                files: vec![ChangedRead {
+                    path: PathBuf::from("/p/in"),
+                    written: false,
+                }],
+            },
         ]
         .iter()
         .map(ToString::to_string)
@@ -1326,6 +1393,10 @@ mod tests {
             "interrupted, and exited with code 130",
             "incompletely traced: lost a process",
             "could not start: out of memory",
+            "2 files changed after the command read them: /p/a\u{e9} (the command wrote it), \
+             /p/b (something else changed it while the command ran)",
+            "a file changed after the command read it: /p/in (something else changed it while \
+             the command ran)",
         ]);
     }
 
@@ -1595,6 +1666,51 @@ mod tests {
             minicbor::to_vec(&listed).unwrap(),
             minicbor::to_vec(&reversed).unwrap()
         );
+    }
+
+    /// The reason of a run in which two files changed after the command read them:
+    /// one that the command wrote, with a path that is not ASCII, and one that
+    /// something else changed.
+    fn changed_after_read() -> NotCachedReason {
+        NotCachedReason::ChangedAfterRead {
+            files: vec![
+                ChangedRead {
+                    path: PathBuf::from("/p/a\u{e9}"),
+                    written: true,
+                },
+                ChangedRead {
+                    path: PathBuf::from("/p/b"),
+                    written: false,
+                },
+            ],
+        }
+    }
+
+    /// The reason for files that changed after the command read them encodes
+    /// deterministically, as variant 5 with a definite-length array of the files,
+    /// each a path as a byte string and whether the command wrote it, and
+    /// round-trips, alone and as a record's marker.
+    #[test]
+    fn changed_after_read_encodes_deterministically_and_round_trips() {
+        let why = changed_after_read();
+        let first = minicbor::to_vec(&why).unwrap();
+        assert_eq!(first, minicbor::to_vec(why.clone()).unwrap());
+        let file = minicbor::to_vec(ChangedRead {
+            path: PathBuf::from("/p/b"),
+            written: false,
+        })
+        .unwrap();
+        assert_eq!(file, b"\x82\x44/p/b\xf4");
+        // The variant index, then its one field: an array of two files.
+        assert_eq!(first.get(..3), Some(&[0x82, 0x05, 0x81][..]));
+        assert_eq!(first.get(3), Some(&0x82));
+        assert!(first.ends_with(&file));
+        assert_eq!(minicbor::decode::<NotCachedReason>(&first).unwrap(), why);
+        let mut record = record();
+        record.not_cached = Some(why);
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
     }
 
     #[test]

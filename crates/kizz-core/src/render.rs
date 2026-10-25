@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use kizz_store::{
     AccessBits, Capture, ChangedInput, EnvChange, Explanation, ModuleChange, ModuleChangeKind,
-    Reason, SelfInflicted, TaskLabel, Verdict, Writer,
+    NotCachedReason, Reason, SelfInflicted, TaskLabel, Verdict, Writer, changed_reads_text,
 };
 
 use crate::{explain::RepeatedWarning, warning::location};
@@ -129,6 +129,20 @@ impl Render {
         path: &Path,
     ) -> String {
         quoted(&self.path(path))
+    }
+
+    /// Why a run could not be cached, with the files that changed after the command
+    /// read them shown as other paths are, each with who changed it.
+    #[must_use]
+    pub fn not_cached(
+        &self,
+        why: &NotCachedReason,
+    ) -> String {
+        if let NotCachedReason::ChangedAfterRead { files } = why {
+            changed_reads_text(files, |path| self.quoted_path(path))
+        } else {
+            why.to_string()
+        }
     }
 
     /// A task as output names it: `path/kizz.md:LINE (Heading)`, or the path alone
@@ -422,6 +436,7 @@ impl Render {
             Reason::InputsChanged { inputs } => self.inputs_short(inputs),
             Reason::Always => "marked `always`".to_owned(),
             Reason::NotCached { why, inputs } => {
+                let why = self.not_cached(why);
                 if inputs.is_empty() {
                     format!("the previous run could not be cached: {why}")
                 } else {
@@ -469,7 +484,10 @@ impl Render {
                 lines
             },
             Reason::NotCached { why, inputs } => {
-                let mut lines = vec![format!("the previous run could not be cached: {why}")];
+                let mut lines = vec![format!(
+                    "the previous run could not be cached: {}",
+                    self.not_cached(why)
+                )];
                 if !inputs.is_empty() {
                     lines.push(format!("{} changed since:", count(inputs.len(), "input")));
                     lines.extend(self.inputs_full(inputs));

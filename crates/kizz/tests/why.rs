@@ -25,7 +25,7 @@ use kizz_core::{Engine, ProgramHash, ProgramParts, StepExecutor as _, StepSpec, 
 use kizz_store::{CacheLock, LockDetails, Store, TaskId};
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -65,7 +65,8 @@ fn tracer_failure(error: &dyn Error) -> TraceError {
 
 /// A tracer that runs nothing and reports, for each argument `read:PATH`,
 /// `kernel:PATH`, or `probe:PATH`, a read, a read, or a check of the path, relative
-/// to the working directory.
+/// to the working directory, noting the metadata of each file read as its first
+/// read, as the Linux tracer does.
 struct FakeTracer;
 
 impl Tracer for FakeTracer {
@@ -76,6 +77,8 @@ impl Tracer for FakeTracer {
         _cancel: &Cancellation,
     ) -> Result<RunResult, TraceError> {
         let mut accesses = Accesses::new();
+        let mut first_reads = FirstReads::new();
+        first_reads.note_at(&request.program, &accesses);
         accesses.record(request.program.clone(), AccessKind::Exec);
         for arg in request.args.iter().skip(1) {
             let arg = arg.to_str().unwrap_or_default();
@@ -89,6 +92,9 @@ impl Tracer for FakeTracer {
             };
             let path = AbsolutePath::new(request.cwd.as_path().join(path))
                 .map_err(|error| tracer_failure(&error))?;
+            if kind == AccessKind::Read {
+                first_reads.note_at(&path, &accesses);
+            }
             accesses.record(path, kind);
         }
         Ok(RunResult {
@@ -96,6 +102,7 @@ impl Tracer for FakeTracer {
             output: CapturedOutput::empty(request.capture),
             accesses,
             incomplete: None,
+            first_reads,
         })
     }
 }

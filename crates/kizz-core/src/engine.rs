@@ -37,15 +37,19 @@
 //! Results that are not cached ("Results that are not cached"): a command killed by
 //! a signal, every run that returns once cancellation has been requested, whether a
 //! signal ended it or it exited with a code after it handled the interrupt, a run
-//! that the tracer reports as incompletely traced, and a command that could not
-//! start for a reason other than a missing or non-executable program. Their record
-//! is marked with why, which makes it a record that is never a cache hit and
-//! replaces any older record of the step key, so no older result is replayed. The
-//! engine also keeps the paths such a command touched, with their states, in memory
-//! for the rest of the build: when the step comes up again, it runs again only if
-//! one of them changed, and otherwise its result is returned again without running.
-//! In a later build, the marked record makes the step run again, with that stated
-//! as the reason.
+//! that the tracer reports as incompletely traced, a run in which a file changed
+//! after the command first read it or ran it, and a command that could not start
+//! for a reason other than a missing or non-executable program. After it records
+//! the states, the engine compares the first-read metadata that the tracer noted
+//! with them (see [`changed_after_read`]); a change, when no other reason applies,
+//! is the reason, and lists each changed file with whether the command wrote it.
+//! Their record is marked with why, which makes it a record that is never a cache
+//! hit and replaces any older record of the step key, so no older result is
+//! replayed. The engine also keeps the paths such a command touched, with their
+//! states, in memory for the rest of the build: when the step comes up again, it
+//! runs again only if one of them changed, and otherwise its result is returned
+//! again without running. In a later build, the marked record makes the step run
+//! again, with that stated as the reason.
 //!
 //! A missing or non-executable program fails the task and is recorded like any
 //! other failure, with every path checked and the failure message, which a cache hit
@@ -81,7 +85,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap},
     ffi::OsString,
-    fmt,
+    fmt, mem,
     path::PathBuf,
     sync::{
         Mutex, MutexGuard, PoisonError,
@@ -98,7 +102,7 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 
 use crate::{
@@ -110,7 +114,7 @@ use crate::{
     files::FileChanges,
     key::Occurrences,
     lookup::{ProgramLookup, find_program},
-    observe::observe,
+    observe::{changed_after_read, observe},
     patterns::PathPatterns,
     runtime::ProgramHash,
     states::FileStates,
@@ -493,6 +497,9 @@ struct Finished {
     /// The failure message of a missing or non-executable program, or of a command
     /// that could not start.
     failure: Option<String>,
+    /// The first-read metadata the tracer noted, empty for a command that did not
+    /// run.
+    first_reads: FirstReads,
 }
 
 /// A step error from a store error.
@@ -1074,12 +1081,9 @@ impl TaskSteps<'_> {
                     duration,
                     ran_at,
                     failure: None,
+                    first_reads: result.first_reads,
                 };
-                if let Some(why) = why {
-                    self.remember(step, pending, finished, why, Ok(outcome.clone()))?;
-                } else {
-                    self.store(step, pending, finished)?;
-                }
+                self.finish_run(step, pending, finished, why, Ok(outcome.clone()))?;
                 Ok(outcome)
             },
             Err(error) if error.is_missing_program() => {
@@ -1104,6 +1108,7 @@ impl TaskSteps<'_> {
                     duration,
                     ran_at,
                     failure: Some(message.clone()),
+                    first_reads: FirstReads::new(),
                 })?;
                 Err(StepError::new(message))
             },
@@ -1122,9 +1127,10 @@ impl TaskSteps<'_> {
                     duration,
                     ran_at,
                     failure: Some(message.clone()),
+                    first_reads: FirstReads::new(),
                 };
                 let why = NotCachedReason::StartFailed { message };
-                self.remember(step, pending, finished, why, Err(failure.clone()))?;
+                self.finish_run(step, pending, finished, Some(why), Err(failure.clone()))?;
                 Err(failure)
             },
             Err(error) => Err(StepError::new(&error)),
@@ -1156,19 +1162,34 @@ impl TaskSteps<'_> {
         })
     }
 
-    /// Store the record of `step`, which ended as `finished` with a result that is
-    /// not cached for the reason `why`, in place of any older record of its key,
-    /// whose owners it keeps, so no older result is replayed; and keep the result in
-    /// memory for the rest of the build, with the states of the paths it touched.
-    fn remember(
+    /// Record the state of every path `finished` touched, and store the record of
+    /// `step`, whose result is `result`, with the owners of the record it replaces
+    /// and its task.
+    ///
+    /// The result is not cached for the reason `why`, or, when there is none, when
+    /// a file changed after the command first read it or ran it, as the comparison
+    /// of the first-read metadata with the recorded states finds. Such a record is
+    /// marked with the reason and replaces any older record of its key, so no older
+    /// result is replayed, and the result is kept in memory for the rest of the
+    /// build, with the states of the paths it touched.
+    fn finish_run(
         &self,
         step: &StepSpec,
         pending: &Pending,
-        finished: Finished,
-        why: NotCachedReason,
+        mut finished: Finished,
+        why: Option<NotCachedReason>,
         result: Result<StepOutcome, StepError>,
     ) -> Result<(), StepError> {
-        let mut record = self.record_of(step, pending, finished, Some(why.clone()));
+        let first_reads = mem::take(&mut finished.first_reads);
+        let mut record = self.record_of(step, pending, finished);
+        let why = why.or_else(|| {
+            let files = changed_after_read(&record.observations, &first_reads);
+            (!files.is_empty()).then_some(NotCachedReason::ChangedAfterRead { files })
+        });
+        let Some(why) = why else {
+            return self.put_run(pending, &mut record);
+        };
+        record.not_cached = Some(why.clone());
         self.put_run(pending, &mut record)?;
         let result = result.map(|outcome| {
             StepOutcome {
@@ -1186,14 +1207,15 @@ impl TaskSteps<'_> {
     }
 
     /// Record the state of every path `finished` touched and store the record of
-    /// `step`, with the owners of the record it replaces and its task.
+    /// `step`, a command that did not run, with the owners of the record it
+    /// replaces and its task.
     fn store(
         &self,
         step: &StepSpec,
         pending: &Pending,
         finished: Finished,
     ) -> Result<(), StepError> {
-        let mut record = self.record_of(step, pending, finished, None);
+        let mut record = self.record_of(step, pending, finished);
         self.put_run(pending, &mut record)
     }
 
@@ -1222,14 +1244,13 @@ impl TaskSteps<'_> {
     }
 
     /// The record of `step`, which ended as `finished`, with the state of every path
-    /// it touched; `not_cached` says why its result is not cached, if it is not. Its
+    /// it touched, as a cached result until [`TaskSteps::finish_run`] marks it. Its
     /// owners are empty until [`TaskSteps::put_run`] stores it.
     fn record_of(
         &self,
         step: &StepSpec,
         pending: &Pending,
         finished: Finished,
-        not_cached: Option<NotCachedReason>,
     ) -> StepRecord {
         let recorded_at_nanos = now_nanos();
         let observed = observe(
@@ -1252,7 +1273,7 @@ impl TaskSteps<'_> {
             reason: pending.reason.clone(),
             recorded_at_nanos,
             failure: finished.failure,
-            not_cached,
+            not_cached: None,
             owners: BTreeSet::new(),
         }
     }
@@ -1282,6 +1303,7 @@ impl TaskSteps<'_> {
             duration: Duration::ZERO,
             ran_at: SystemTime::now(),
             failure: Some(message.clone()),
+            first_reads: FirstReads::new(),
         })?;
         Err(StepError::new(message))
     }

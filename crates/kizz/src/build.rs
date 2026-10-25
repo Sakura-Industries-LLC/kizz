@@ -20,7 +20,10 @@
 //! task prints its error, the Starlark stack, and the failing command's captured
 //! output. Warnings are loud and repeated in the final summary, which counts the
 //! commands that ran and those that came from the cache, and gives the number of
-//! passes the build settled in.
+//! passes the build settled in. Among them: a command traced incompletely, and a
+//! command during whose run something else changed a file after the command read
+//! it; a command that rewrote its own input gets no warning, because its reason
+//! says so.
 //!
 //! Exit status: 0 on success, [`TASK_FAILED`] when a task fails or the build does not
 //! settle, [`USAGE_ERROR`] for usage and configuration errors and for a cache that
@@ -219,6 +222,7 @@ fn build_selected(
         pass_changed: Cell::new(false),
         repeated_shown: Cell::new(0),
         incomplete_shown: RefCell::new(BTreeSet::new()),
+        changed_shown: RefCell::new(BTreeSet::new()),
         warnings: RefCell::new(warnings),
     };
     let status = match build(&engine, &tasks, &caller, &output, &output) {
@@ -359,6 +363,9 @@ struct Output<'a> {
     repeated_shown: Cell<usize>,
     /// The incompletely traced steps already warned about.
     incomplete_shown: RefCell<BTreeSet<StepKey>>,
+    /// The steps already warned about because something other than the command
+    /// changed a file it read while it ran.
+    changed_shown: RefCell<BTreeSet<StepKey>>,
     /// Every warning printed, for the final summary.
     warnings: RefCell<Vec<String>>,
 }
@@ -454,8 +461,9 @@ impl Output<'_> {
     }
 
     /// Print, loudly, each warning the engine added since the last check: steps
-    /// that re-ran in consecutive builds for the same self-inflicted reason, and
-    /// runs that were traced incompletely.
+    /// that re-ran in consecutive builds for the same self-inflicted reason, runs
+    /// that were traced incompletely, and runs in which something other than the
+    /// command changed a file after the command read it.
     fn check_warnings(&self) {
         let repeated = self.engine.warnings();
         for warning in repeated.iter().skip(self.repeated_shown.get()) {
@@ -463,19 +471,37 @@ impl Output<'_> {
         }
         self.repeated_shown.set(repeated.len());
         for (key, why) in self.engine.not_cached() {
-            if let NotCachedReason::Incomplete { detail } = why
-                && self.incomplete_shown.borrow_mut().insert(key)
-            {
-                self.warn(self.incomplete(&key, &detail));
+            match why {
+                NotCachedReason::Incomplete { detail } => {
+                    if self.incomplete_shown.borrow_mut().insert(key) {
+                        self.warn(self.incomplete(&key, &detail));
+                    }
+                },
+                NotCachedReason::ChangedAfterRead { files } => {
+                    // A command that rewrote its own input gets no warning: its
+                    // build line and explanations give the reason.
+                    let outside: Vec<&Path> = files
+                        .iter()
+                        .filter(|file| !file.written)
+                        .map(|file| file.path.as_path())
+                        .collect();
+                    if !outside.is_empty() && self.changed_shown.borrow_mut().insert(key) {
+                        self.warn(self.changed_outside(&key, &outside));
+                    }
+                },
+                NotCachedReason::Signaled { .. }
+                | NotCachedReason::Interrupted { .. }
+                | NotCachedReason::InterruptedExited { .. }
+                | NotCachedReason::StartFailed { .. } => {},
             }
         }
     }
 
-    /// The warning for the incompletely traced step `key`.
-    fn incomplete(
+    /// The command of the step `key` as warnings name it: its arguments and its
+    /// working directory, or `a command` when its record cannot be read.
+    fn command(
         &self,
         key: &StepKey,
-        detail: &str,
     ) -> String {
         let record = self
             .store
@@ -483,7 +509,7 @@ impl Output<'_> {
             .and_then(|txn| txn.get::<StepRecord>(key))
             .ok()
             .flatten();
-        let command = record.map_or_else(
+        record.map_or_else(
             || "a command".to_owned(),
             |record| {
                 format!(
@@ -492,10 +518,39 @@ impl Output<'_> {
                     self.render.path(&record.spec.cwd)
                 )
             },
-        );
+        )
+    }
+
+    /// The warning for the incompletely traced step `key`.
+    fn incomplete(
+        &self,
+        key: &StepKey,
+        detail: &str,
+    ) -> String {
         format!(
-            "{command} was traced incompletely, so its result was not cached and it runs \
-             again on the next build: {detail}"
+            "{} was traced incompletely, so its result was not cached and it runs again on \
+             the next build: {detail}",
+            self.command(key)
+        )
+    }
+
+    /// The warning for the step `key`, in which something other than the command
+    /// changed the files `paths` while it ran, after the command read them.
+    fn changed_outside(
+        &self,
+        key: &StepKey,
+        paths: &[&Path],
+    ) -> String {
+        let shown: Vec<String> = paths
+            .iter()
+            .map(|path| format!("`{}`", self.render.path(path)))
+            .collect();
+        let it = if paths.len() == 1 { "it" } else { "them" };
+        format!(
+            "something else changed {} while {} ran, after the command read {it}, so its \
+             result was not cached and it runs again on the next build",
+            shown.join(", "),
+            self.command(key)
         )
     }
 

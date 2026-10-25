@@ -10,18 +10,28 @@
 //! content, the capture mode, and whether output is echoed live. A [`Tracer`] runs
 //! the command and returns a [`RunResult`]: how the command ended, its raw captured
 //! output, every path its process tree touched with the combined [`AccessKinds`]
-//! for each path, and a report when the trace is incomplete.
+//! for each path, the [`FirstReads`] of the run, and a report when the trace is
+//! incomplete.
+//!
+//! The first reads hold, for each path whose first read or run of a regular file
+//! came before any write of that path in the run, the file's [`FileMetadata`] at
+//! that moment. The engine compares them with the final state of each path, so a
+//! file that changed after the command read it, whether the command rewrote it or
+//! something else changed it while the command ran, keeps the result out of the
+//! cache.
 //!
 //! Version 1 has one tracer, for Linux, in `kizz_trace_linux`; tests of the engine
-//! implement [`Tracer`] with a fake. Nothing in the engine changes when the tracer
-//! does.
+//! implement [`Tracer`] with a fake, which notes first reads with
+//! [`FirstReads::note_at`] as it reads or runs files, as the Linux tracer does.
+//! Nothing in the engine changes when the tracer does.
 
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::OsString,
-    fmt,
+    fmt, fs,
     io::{self, Write},
     ops::{BitOr, BitOrAssign},
+    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -418,6 +428,176 @@ impl FromIterator<(AbsolutePath, AccessKind)> for Accesses {
     }
 }
 
+/// Nanoseconds in a second.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// A time in nanoseconds since the Unix epoch from its seconds and nanoseconds.
+const fn nanos(
+    seconds: i64,
+    nanoseconds: i64,
+) -> i64 {
+    seconds
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(nanoseconds)
+}
+
+/// The metadata of a regular file at one moment, as a tracer notes it when a
+/// command first reads or runs the file.
+///
+/// It holds what a change to the file changes: the device and inode that identify
+/// it, its size, its modification and change times, its mode, and its owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileMetadata {
+    /// The device that holds the file.
+    pub device: u64,
+    /// The file's inode number on its device.
+    pub inode: u64,
+    /// The size in bytes.
+    pub size: u64,
+    /// The modification time, in nanoseconds since the Unix epoch.
+    pub mtime_nanos: i64,
+    /// The change time, in nanoseconds since the Unix epoch.
+    pub ctime_nanos: i64,
+    /// The mode: the file type and the permission bits.
+    pub mode: u32,
+    /// The user number of the owner.
+    pub uid: u32,
+    /// The group number of the owner.
+    pub gid: u32,
+}
+
+impl FileMetadata {
+    /// The metadata that `metadata` describes, or `None` when it does not describe
+    /// a regular file.
+    #[must_use]
+    pub fn of(metadata: &fs::Metadata) -> Option<Self> {
+        metadata.file_type().is_file().then(|| {
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.size(),
+                mtime_nanos: nanos(metadata.mtime(), metadata.mtime_nsec()),
+                ctime_nanos: nanos(metadata.ctime(), metadata.ctime_nsec()),
+                mode: metadata.mode(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            }
+        })
+    }
+
+    /// The metadata of the regular file at `path` now, following symbolic links, or
+    /// `None` when `path` names no regular file or its metadata cannot be read.
+    #[must_use]
+    pub fn at(path: &Path) -> Option<Self> {
+        fs::metadata(path).ok().as_ref().and_then(Self::of)
+    }
+}
+
+/// The first reads of a run: for each path whose first read or run of a regular
+/// file came before any write of that path in the run, the file's
+/// [`FileMetadata`] at that moment, in sorted path order.
+///
+/// A tracer notes a file when the command opens it for reading or runs it, and the
+/// kernel's loads of interpreters and loaders count as runs. It notes nothing for
+/// a path that the command wrote earlier in the run, for a path it already noted,
+/// and for a call that created or truncated the file, which writes it first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FirstReads {
+    /// The first-read metadata of each noted path.
+    files: BTreeMap<AbsolutePath, FileMetadata>,
+}
+
+impl FirstReads {
+    /// No first reads.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a read or run of `path` now would be its first read: the path has
+    /// no note yet, and `accesses`, every access recorded earlier in the run, shows
+    /// no write of it.
+    #[must_use]
+    pub fn is_first(
+        &self,
+        path: &AbsolutePath,
+        accesses: &Accesses,
+    ) -> bool {
+        !self.files.contains_key(path)
+            && !accesses
+                .get(path)
+                .is_some_and(|kinds| kinds.contains(AccessKind::Write))
+    }
+
+    /// Note `metadata` as the first-read metadata of `path`, which the command is
+    /// reading or running now, when that is its first read by
+    /// [`FirstReads::is_first`]; return whether it was noted.
+    pub fn note(
+        &mut self,
+        path: &AbsolutePath,
+        metadata: FileMetadata,
+        accesses: &Accesses,
+    ) -> bool {
+        if !self.is_first(path, accesses) {
+            return false;
+        }
+        self.files.insert(path.clone(), metadata);
+        true
+    }
+
+    /// Note the metadata of the regular file at `path`, read now with
+    /// [`FileMetadata::at`], under the rules of [`FirstReads::note`]; nothing is
+    /// noted when `path` names no regular file. Return whether it was noted.
+    ///
+    /// A tracer calls it when the command reads or runs `path`, before it records
+    /// that access in `accesses`.
+    pub fn note_at(
+        &mut self,
+        path: &AbsolutePath,
+        accesses: &Accesses,
+    ) -> bool {
+        if !self.is_first(path, accesses) {
+            return false;
+        }
+        FileMetadata::at(path.as_path()).is_some_and(|metadata| self.note(path, metadata, accesses))
+    }
+
+    /// The first-read metadata of `path`, if it was noted.
+    #[must_use]
+    pub fn get(
+        &self,
+        path: &AbsolutePath,
+    ) -> Option<&FileMetadata> {
+        self.files.get(path)
+    }
+
+    /// The number of noted paths.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether no path was noted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// The noted paths with their first-read metadata, in sorted path order.
+    pub fn iter(&self) -> btree_map::Iter<'_, AbsolutePath, FileMetadata> {
+        self.files.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a FirstReads {
+    type IntoIter = btree_map::Iter<'a, AbsolutePath, FileMetadata>;
+    type Item = (&'a AbsolutePath, &'a FileMetadata);
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.files.iter()
+    }
+}
+
 /// How a command's standard output and standard error are captured.
 ///
 /// Output is always captured; the mode only decides how.
@@ -669,6 +849,9 @@ pub struct RunResult {
     pub accesses: Accesses,
     /// Why the trace is incomplete, or `None` when every access was observed.
     pub incomplete: Option<IncompleteReason>,
+    /// The first-read metadata of the regular files the process tree read or ran
+    /// before it wrote them, as [`FirstReads`] describes.
+    pub first_reads: FirstReads,
 }
 
 impl RunResult {
@@ -785,11 +968,12 @@ pub trait Tracer: Send + Sync {
 /// Unit tests for the logic of the tracer interface.
 #[cfg(test)]
 mod tests {
-    use std::{io, path::Path};
+    use std::{fs, io, path::Path};
 
     use super::{
         AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
-        IncompleteReason, NotAbsoluteError, RunResult, Termination, TraceError,
+        FileMetadata, FirstReads, IncompleteReason, NotAbsoluteError, RunResult, Termination,
+        TraceError,
     };
 
     /// Build an absolute path for a test.
@@ -956,6 +1140,81 @@ mod tests {
         assert_eq!(CaptureMode::default(), CaptureMode::Split);
     }
 
+    /// The metadata of a regular file holds what `stat` reports, and nothing else
+    /// has metadata.
+    #[test]
+    fn file_metadata_describes_only_regular_files() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let metadata = FileMetadata::at(&manifest).unwrap();
+        let stat = fs::metadata(&manifest).unwrap();
+        assert_eq!(FileMetadata::of(&stat), Some(metadata));
+        assert_eq!(metadata.size, stat.len());
+        assert!(metadata.mtime_nanos > 0 && metadata.ctime_nanos > 0);
+        assert_eq!(metadata.mode & 0o170_000, 0o100_000);
+        assert_eq!(
+            FileMetadata::at(Path::new(env!("CARGO_MANIFEST_DIR"))),
+            None
+        );
+        assert_eq!(
+            FileMetadata::at(&Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-file")),
+            None
+        );
+    }
+
+    /// A first read is noted once, and never after a write of the same path;
+    /// a write of another path does not matter.
+    #[test]
+    fn first_reads_are_noted_before_any_write() {
+        let metadata = |inode| {
+            FileMetadata {
+                device: 1,
+                inode,
+                size: 2,
+                mtime_nanos: 3,
+                ctime_nanos: 4,
+                mode: 0o100_644,
+                uid: 5,
+                gid: 6,
+            }
+        };
+        let mut accesses = Accesses::new();
+        let mut reads = FirstReads::new();
+        assert!(reads.is_empty());
+        accesses.record(path("/other"), AccessKind::Write);
+        assert!(reads.note(&path("/in"), metadata(1), &accesses));
+        accesses.record(path("/in"), AccessKind::Read);
+        // A later read keeps the first note, even after a write.
+        accesses.record(path("/in"), AccessKind::Write);
+        assert!(!reads.note(&path("/in"), metadata(2), &accesses));
+        assert_eq!(reads.get(&path("/in")), Some(&metadata(1)));
+        // A path written before its first read is never noted.
+        accesses.record(path("/out"), AccessKind::Write);
+        assert!(!reads.is_first(&path("/out"), &accesses));
+        assert!(!reads.note(&path("/out"), metadata(3), &accesses));
+        assert!(!reads.note_at(&path("/out"), &accesses));
+        assert_eq!(reads.len(), 1);
+        let noted: Vec<String> = reads.iter().map(|(path, _)| path.to_string()).collect();
+        assert_eq!(noted, ["/in"]);
+        assert_eq!((&reads).into_iter().count(), 1);
+    }
+
+    /// Noting a path reads its metadata now, following links, and notes nothing for
+    /// a path that names no regular file.
+    #[test]
+    fn first_reads_read_the_metadata_of_regular_files() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let file = AbsolutePath::new(&manifest).unwrap();
+        let directory = AbsolutePath::new(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let missing = directory.join("no-such-file");
+        let accesses = Accesses::new();
+        let mut reads = FirstReads::new();
+        assert!(reads.note_at(&file, &accesses));
+        assert!(!reads.note_at(&directory, &accesses));
+        assert!(!reads.note_at(&missing, &accesses));
+        assert_eq!(reads.get(&file).copied(), FileMetadata::at(&manifest));
+        assert_eq!(reads.len(), 1);
+    }
+
     /// A result is complete only without an incomplete-trace report.
     #[test]
     fn incomplete_results_are_reported() {
@@ -964,6 +1223,7 @@ mod tests {
             output: CapturedOutput::empty(CaptureMode::Merged),
             accesses: Accesses::new(),
             incomplete: None,
+            first_reads: FirstReads::new(),
         };
         assert!(result.is_complete());
         result.incomplete = Some(IncompleteReason::NonNativeSystemCall {

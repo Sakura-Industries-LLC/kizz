@@ -26,7 +26,9 @@ use std::{
     time::SystemTime,
 };
 
-use kizz_store::{Change, LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store, Times};
+use kizz_store::{
+    Change, ChangedRead, LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store, Times,
+};
 use tempfile::TempDir;
 
 /// The result of a test or a test helper.
@@ -1300,6 +1302,128 @@ fn retargeting_or_replacing_a_link_into_proc_runs_the_command_again() -> TestRes
             dir_link.display()
         ),
     )?;
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// The review's example: a command that reads `input` and then rewrites it. Its
+/// result is not cached, without a warning, because the command itself changed
+/// the file, and the next build runs it again with a reason that names `input` and
+/// says that the command wrote it.
+#[test]
+fn a_command_that_rewrites_a_file_it_read_runs_again_without_a_warning() -> TestResult {
+    let project = Project::new()?;
+    project.write("input", "the old input\n")?;
+    project.kizz_md("", &[(
+        "Rewrite",
+        "run(\"sh\", \"-c\", \"cat input > output; printf 'new\\\\n' > input\")",
+    )])?;
+    let command = "sh -c cat input > output; printf 'new\\n' > input";
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first.stdout.starts_with(&format!(
+            "{}\n",
+            ran(command, "kizz.md:3 (Rewrite)", NEVER_RUN)
+        )),
+        "{first:?}"
+    );
+    assert_eq!(first.stderr, "", "{first:?}");
+    assert_eq!(
+        fs::read_to_string(project.root.join("output"))?,
+        "the old input\n"
+    );
+    let records = project.step_records()?;
+    let record = records.first().ok_or("no record")?;
+    assert_eq!(
+        record.not_cached,
+        Some(NotCachedReason::ChangedAfterRead {
+            files: vec![ChangedRead {
+                path: project.root.join("input"),
+                written: true,
+            }],
+        }),
+        "{record:?}"
+    );
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert!(
+        second.stdout.starts_with(&format!(
+            "{}\n",
+            ran(
+                command,
+                "kizz.md:3 (Rewrite)",
+                "the previous run could not be cached: a file changed after the command read \
+                 it: `input` (the command wrote it)"
+            )
+        )),
+        "{second:?}"
+    );
+    assert_eq!(second.stderr, "", "{second:?}");
+    Ok(())
+}
+
+/// Make a FIFO at `path`.
+fn make_fifo(path: &Path) -> TestResult {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    // SAFETY: `path` is a NUL-terminated string.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// A command that reads a file and then waits on a FIFO, which the test opens only
+/// after it has rewritten that file, so the edit falls inside the run: the result
+/// is not cached, and a loud warning, repeated in the summary, names the command
+/// and the file and says that something else changed it while the command ran.
+#[test]
+fn a_file_changed_by_something_else_during_a_run_is_a_loud_warning() -> TestResult {
+    let project = Project::new()?;
+    project.write("input", "the old input\n")?;
+    make_fifo(&project.root.join("fifo"))?;
+    let script = "cat input > copy; echo started; cat fifo";
+    project.kizz_md("", &[(
+        "Wait",
+        &format!("run(\"sh\", \"-c\", \"{script}\", stream = True)"),
+    )])?;
+    let (child, lines) = project.start_build()?;
+    // The command has read `input`: edit it, then let the command finish.
+    project.write("input", "edited while the command ran\n")?;
+    {
+        let mut fifo = fs::OpenOptions::new()
+            .write(true)
+            .open(project.root.join("fifo"))?;
+        io::Write::write_all(&mut fifo, b"done\n")?;
+    }
+    let rest: Vec<String> = lines.collect::<Result<_, _>>()?;
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{rest:?} {stderr}");
+    let command = format!("sh -c {script}");
+    let message = format!(
+        "something else changed `input` while `{command}` in . ran, after the command read \
+         it, so its result was not cached and it runs again on the next build"
+    );
+    assert_eq!(
+        stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{rest:?}"
+    );
+    let records = project.step_records()?;
+    let record = records.first().ok_or("no record")?;
+    assert_eq!(
+        record.not_cached,
+        Some(NotCachedReason::ChangedAfterRead {
+            files: vec![ChangedRead {
+                path: project.root.join("input"),
+                written: false,
+            }],
+        }),
+        "{record:?}"
+    );
     assert!(!project.has_lock_file());
     Ok(())
 }

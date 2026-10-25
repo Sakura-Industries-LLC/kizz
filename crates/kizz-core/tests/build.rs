@@ -24,7 +24,10 @@
 //! * `interrupt` requests cancellation, as Ctrl-C does, and a signal kills the command;
 //!
 //! and any other argument does nothing. Relative paths are relative to the
-//! command's working directory, the task directory.
+//! command's working directory, the task directory. As the Linux tracer does, the
+//! fake notes the metadata of each file that a command reads or runs before it
+//! writes it, at the moment of the read, so a `bump` leaves a result that is not
+//! cached, because the file changed after the command read it.
 
 use std::{
     collections::BTreeMap,
@@ -44,8 +47,8 @@ use kizz_store::{
     BuildId, Change, LearnedOrder, Reason, Store, TaskId, TaskLabel, TaskRecord, Verdict, Writer,
 };
 use kizz_trace::{
-    AbsolutePath, AccessKind, Accesses, Cancellation, CapturedOutput, EchoSink, OutputStream,
-    RunRequest, RunResult, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Accesses, Cancellation, CapturedOutput, EchoSink, FirstReads,
+    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -68,10 +71,15 @@ fn script(
 ) -> Result<RunResult, TraceError> {
     let cwd = request.cwd.as_path();
     let mut accesses = Accesses::new();
+    let mut first_reads = FirstReads::new();
+    first_reads.note_at(&request.program, &accesses);
     accesses.record(request.program.clone(), AccessKind::Exec);
     let mut termination = Termination::Exited(0);
-    let mut record = |path: PathBuf, kind| -> Result<(), TraceError> {
+    let mut record = |path: PathBuf, kind: AccessKind| -> Result<(), TraceError> {
         let path = AbsolutePath::new(path).map_err(|error| tracer_failure(&error))?;
+        if matches!(kind, AccessKind::Read | AccessKind::Exec) {
+            first_reads.note_at(&path, &accesses);
+        }
         accesses.record(path, kind);
         Ok(())
     };
@@ -98,9 +106,9 @@ fn script(
             },
             "bump" => {
                 let mut content = fs::read_to_string(&path).unwrap_or_default();
+                record(path.clone(), AccessKind::Read)?;
                 content.push('+');
                 fs::write(&path, content).map_err(failed)?;
-                record(path.clone(), AccessKind::Read)?;
                 record(path, AccessKind::Write)?;
             },
             "exe" => {
@@ -126,6 +134,7 @@ fn script(
         output: CapturedOutput::empty(request.capture),
         accesses,
         incomplete: None,
+        first_reads,
     })
 }
 

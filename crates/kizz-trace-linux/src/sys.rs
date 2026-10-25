@@ -22,6 +22,7 @@ use std::{
     ptr,
 };
 
+use kizz_trace::FileMetadata;
 use libc::{c_int, c_long, c_uint, c_ulong, c_void, pid_t};
 
 use crate::decode;
@@ -235,6 +236,21 @@ impl decode::Inspect for Thread {
             filled = filled.saturating_add(read);
         }
         Ok(filled)
+    }
+
+    fn descriptor_file(
+        &self,
+        fd: c_int,
+    ) -> Option<FileMetadata> {
+        // `stat` follows the link in `/proc` to the file the descriptor holds open.
+        FileMetadata::at(Path::new(&self.link(fd)))
+    }
+
+    fn path_file(
+        &self,
+        path: &Path,
+    ) -> Option<FileMetadata> {
+        FileMetadata::at(path)
     }
 }
 

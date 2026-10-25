@@ -26,6 +26,13 @@
 //! path, one for its failure with `ENOENT`, on which a tracer that missed the call
 //! would record something else. The same holds for the kernel's implicit loads of
 //! [`IMPLICIT_LOADS`]. Unit tests cover the parser and the comparison.
+//!
+//! Another end-to-end test builds `coverage-changes` in its own copy, after
+//! `coverage-build` and a reset: each of its steps, [`CHANGES`], runs the program in
+//! a mode that reads or runs one committed file under `in/changes` through one way
+//! in which a command first reads a file, and then rewrites it, so its result is not
+//! cached and its reason names that file with the command as its writer; the
+//! `control` step writes its file before it reads it, so its result is cached.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -40,8 +47,8 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, PathState, RecordedOutput, SpecialKind, StepExit, StepKey, StepRecord, Store,
-    TaskId,
+    AccessBits, ChangedRead, NotCachedReason, PathState, RecordedOutput, SpecialKind, StepExit,
+    StepKey, StepRecord, Store, TaskId,
 };
 use kizz_trace_linux::TRACKED_SYSTEM_CALLS;
 
@@ -69,6 +76,24 @@ const SUCCESS_LINE: &str = "coverage: every call returned what it expected";
 
 /// The index of the `coverage-test` block in the fixture's `kizz.md`.
 const TEST_BLOCK: u32 = 1;
+
+/// The index of the `coverage-changes` block in the fixture's `kizz.md`.
+const CHANGES_BLOCK: u32 = 2;
+
+/// Each mode of the `coverage-changes` task, after its `change-` prefix, with the
+/// file under the task directory that it reads or runs and then rewrites, or
+/// `None` for the control, which writes its file before it reads it.
+const CHANGES: [(&str, Option<&str>); 9] = [
+    ("open", Some("in/changes/open.txt")),
+    ("openat", Some("in/changes/openat.txt")),
+    ("openat2", Some("in/changes/openat2.txt")),
+    ("fopen", Some("in/changes/fopen.txt")),
+    ("execve", Some("in/changes/execve")),
+    ("execveat", Some("in/changes/execveat")),
+    ("execv", Some("in/changes/execv")),
+    ("interpreter", Some("in/changes/interpreter")),
+    ("control", None),
+];
 
 /// The tracked system calls that take no path, only a descriptor, so they have no
 /// `ENOENT` entry.
@@ -1045,6 +1070,114 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
         problems.extend(loader_problems(record, &copy));
         writeln!(report, "program output:\n{}", output_of(record))?;
     }
+    for run in &runs {
+        writeln!(report, "{run}")?;
+    }
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{report}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// The problems of the step record of the `coverage-changes` step in `mode`, the
+/// task `task`, in `steps`: it must have ended with exit code 0 after the program
+/// printed its summary line, and, when `rewritten` names a file under `copy`, not
+/// be cached, for the one reason that the command wrote that file after it first
+/// read it; the control must be cached.
+fn change_problems(
+    steps: &[(StepKey, StepRecord)],
+    task: &TaskId,
+    copy: &Path,
+    mode: &str,
+    rewritten: Option<&str>,
+) -> Vec<String> {
+    let argv = ["./coverage".to_owned(), format!("change-{mode}")];
+    let Some((_, record)) = steps
+        .iter()
+        .find(|(_, record)| record.spec.argv == argv && record.owners.contains(task))
+    else {
+        return vec![format!("no step record of the {mode} step")];
+    };
+    let mut problems = Vec::new();
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!("the {mode} step ended with {:?}", record.exit));
+    }
+    if !output_of(record)
+        .lines()
+        .any(|line| line.starts_with(SUCCESS_LINE))
+    {
+        problems.push(format!(
+            "the {mode} step did not print its summary line: {}",
+            output_of(record)
+        ));
+    }
+    let expected = rewritten.map(|file| {
+        NotCachedReason::ChangedAfterRead {
+            files: vec![ChangedRead {
+                path: copy.join(file),
+                written: true,
+            }],
+        }
+    });
+    if record.not_cached != expected {
+        problems.push(format!(
+            "the {mode} step is marked {:?}, not {expected:?}",
+            record.not_cached
+        ));
+    }
+    problems
+}
+
+/// Build `coverage-changes` in a copy of the fixture, after `coverage-build` and a
+/// reset: each step that rewrites the file it first read or ran is not cached, with
+/// the reason that names that file and the command as its writer, without a
+/// warning, and the control, which writes its file before it reads it, is cached.
+#[test]
+fn each_way_of_first_reading_a_file_is_checked_for_a_rewrite() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let copy = dir.path().canonicalize()?.join(FIXTURE);
+    copy_tree(&fixture_dir(), &copy)?;
+    let cache = tempfile::tempdir()?;
+    let copy_text = copy.to_str().ok_or("the copy's path is not UTF-8")?;
+
+    let mut problems = Vec::new();
+    let mut runs = Vec::new();
+    for args in [
+        &["build", "coverage-build"][..],
+        &["cache", "reset", copy_text, "--yes"][..],
+        &["build", "coverage-changes"][..],
+    ] {
+        let run = run_kizz(&copy, cache.path(), args)?;
+        if run.status != Some(0) {
+            problems.push(format!("kizz {} failed", args.join(" ")));
+        }
+        runs.push(run);
+    }
+    if runs
+        .iter()
+        .any(|run| run.stderr.contains("something else changed"))
+    {
+        problems.push("a step that rewrote its own input was warned about".to_owned());
+    }
+    let steps = step_records(cache.path())?;
+    if steps.len() != CHANGES.len() {
+        problems.push(format!(
+            "the cache holds {} step records after building coverage-changes, not {}",
+            steps.len(),
+            CHANGES.len()
+        ));
+    }
+    let task = TaskId {
+        file: copy.join("kizz.md"),
+        index: CHANGES_BLOCK,
+    };
+    for (mode, rewritten) in CHANGES {
+        problems.extend(change_problems(&steps, &task, &copy, mode, rewritten));
+    }
+    let mut report = String::new();
     for run in &runs {
         writeln!(report, "{run}")?;
     }

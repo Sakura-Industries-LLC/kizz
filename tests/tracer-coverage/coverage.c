@@ -26,6 +26,14 @@
  * mode on paths of its own. Run as the interpreter of a fixture script, with the
  * argument `interpreted` first, it makes no call and exits with 0.
  *
+ * Run with one argument, a mode that starts with `change-`, the program is a step of
+ * the coverage-changes task: it first reads or runs one committed file under
+ * in/changes through the one call of that mode, then rewrites that file with
+ * content of another size, so the step's result is not cached. The `control` mode
+ * instead creates a file under out/changes, reads it and rewrites it, which stays
+ * cached. Each mode touches only its own paths; the modes through the C library,
+ * fopen and execv, are in the portable core, and the others are Linux calls.
+ *
  * Linux names some paths through out/linux/made-link, a symbolic link to
  * out/linux/made: a file created through the link is recorded under the link's
  * name, and a later call on out/linux/made, or on a descriptor that names it, is
@@ -63,6 +71,13 @@
  * makes no call and exits with 0.
  */
 #define INTERPRETED "interpreted"
+
+/* The start of each mode of the coverage-changes task. */
+#define CHANGE_PREFIX "change-"
+/* The committed inputs of the coverage-changes task. */
+#define CHANGES "in/changes"
+/* The output directory of the control mode of the coverage-changes task. */
+#define CHANGES_OUT "out/changes"
 
 /* Serializes the counters and the output of the threads. */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1064,7 +1079,128 @@ static void linux_section(void)
     close_fd(made_fd);
 }
 
+/* Run the fixture script `path` with execveat from the working directory in a child. */
+static void run_script_at(const char *path)
+{
+    char *arguments[] = {(char *)path, NULL};
+    char *environment[] = {NULL};
+    pid_t pid = start_child(path);
+    if (pid == 0) {
+#ifdef SYS_execveat
+        EXPECT(0, "execveat", path,
+               syscall(SYS_execveat, AT_FDCWD, path, arguments, environment, 0));
+#else
+        check("execveat", path, -1, ENOSYS, 0);
 #endif
+        _exit(1);
+    }
+    wait_child(path, pid);
+}
+
+/*
+ * The Linux modes of the coverage-changes task: each first reads or runs its
+ * committed file under in/changes through one Linux call, then rewrites the file
+ * that it read or ran. Return whether `mode` is one of them.
+ */
+static int linux_change(const char *mode)
+{
+    int fd;
+    if (strcmp(mode, "open") == 0) {
+#ifdef SYS_open
+        fd = (int)EXPECT(0, "open", CHANGES "/open.txt",
+                         syscall(SYS_open, CHANGES "/open.txt", O_RDONLY | O_CLOEXEC));
+        read_some(CHANGES "/open.txt", fd);
+        close_fd(fd);
+#else
+        check("open", CHANGES "/open.txt", -1, ENOSYS, 0);
+#endif
+        write_stream(CHANGES "/open.txt");
+        return 1;
+    }
+    if (strcmp(mode, "openat") == 0) {
+        read_at(AT_FDCWD, CHANGES "/openat.txt");
+        write_stream(CHANGES "/openat.txt");
+        return 1;
+    }
+    if (strcmp(mode, "openat2") == 0) {
+#ifdef SYS_openat2
+        struct open_how_argument how = {O_RDONLY | O_CLOEXEC, 0, 0};
+        fd = (int)EXPECT(0, "openat2", CHANGES "/openat2.txt",
+                         syscall(SYS_openat2, AT_FDCWD, CHANGES "/openat2.txt", &how, sizeof how));
+        read_some(CHANGES "/openat2.txt", fd);
+        close_fd(fd);
+#else
+        check("openat2", CHANGES "/openat2.txt", -1, ENOSYS, 0);
+#endif
+        write_stream(CHANGES "/openat2.txt");
+        return 1;
+    }
+    if (strcmp(mode, "execve") == 0) {
+        run_script(CHANGES "/execve", 0);
+        write_stream(CHANGES "/execve");
+        return 1;
+    }
+    if (strcmp(mode, "execveat") == 0) {
+        run_script_at(CHANGES "/execveat");
+        write_stream(CHANGES "/execveat");
+        return 1;
+    }
+    if (strcmp(mode, "interpreter") == 0) {
+        /* The kernel runs the script through in/changes/interpreter, a script itself. */
+        run_script(CHANGES "/through-interpreter", 0);
+        write_stream(CHANGES "/interpreter");
+        return 1;
+    }
+    return 0;
+}
+
+#endif
+
+/* Run the fixture script `path` with the C library's execv in a child, and wait for it. */
+static void run_execv(const char *path)
+{
+    char *arguments[] = {(char *)path, NULL};
+    pid_t pid = start_child(path);
+    if (pid == 0) {
+        EXPECT(0, "execv", path, execv(path, arguments));
+        _exit(1);
+    }
+    wait_child(path, pid);
+}
+
+/*
+ * A step of the coverage-changes task in `mode`, without its prefix: the portable
+ * modes, which read or run their committed file through the C library and then
+ * rewrite it, the control, which writes its file before it reads it, and on Linux
+ * the modes of linux_change.
+ */
+static void change(const char *mode)
+{
+    if (strcmp(mode, "fopen") == 0) {
+        read_stream(CHANGES "/fopen.txt");
+        write_stream(CHANGES "/fopen.txt");
+        return;
+    }
+    if (strcmp(mode, "execv") == 0) {
+        run_execv(CHANGES "/execv");
+        write_stream(CHANGES "/execv");
+        return;
+    }
+    if (strcmp(mode, "control") == 0) {
+        EXPECT(0, "mkdir", "out", mkdir("out", 0777));
+        EXPECT(0, "mkdir", CHANGES_OUT, mkdir(CHANGES_OUT, 0777));
+        write_stream(CHANGES_OUT "/control");
+        read_stream(CHANGES_OUT "/control");
+        write_stream(CHANGES_OUT "/control");
+        return;
+    }
+#ifdef __linux__
+    if (linux_change(mode)) {
+        return;
+    }
+#endif
+    check("change", mode, -1, EINVAL, 0);
+}
 
 /* The calls of a child in `mode`, which an exec started. */
 static void child(const char *mode)
@@ -1093,8 +1229,17 @@ int main(int argc, char **argv)
         child(argv[1]);
         return mismatches == 0 ? 0 : 1;
     }
+    if (argc == 2 && strncmp(argv[1], CHANGE_PREFIX, strlen(CHANGE_PREFIX)) == 0) {
+        change(argv[1] + strlen(CHANGE_PREFIX));
+        if (mismatches != 0) {
+            printf("coverage: %ld of %ld checks failed\n", mismatches, checks);
+            return 1;
+        }
+        printf(SUCCESS_LINE ", %ld checks\n", checks);
+        return 0;
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: coverage, or coverage MODE TASK-DIRECTORY\n");
+        fprintf(stderr, "usage: coverage [change-MODE | MODE TASK-DIRECTORY]\n");
         return 2;
     }
     if (getcwd(task_dir, sizeof task_dir) == NULL) {
