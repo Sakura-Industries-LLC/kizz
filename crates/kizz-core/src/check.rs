@@ -8,18 +8,22 @@
 //! path, concurrently, and lists every [`Difference`]. The step is a cache hit only
 //! when there is none. The rules of "Cache check":
 //!
+//! * A regular file or a directory whose type, permission bits, or owner differ has
+//!   changed, found without hashing, whatever its content: a command may check them. The
+//!   permission bits are the low twelve bits of the mode, the set-user-ID, set-group-ID,
+//!   and sticky bits included.
 //! * A regular file that was read has a hash. A different size is a change, found without
 //!   hashing. The same size and the same metadata (modification and change times, inode,
-//!   device, and mode) is unchanged. The same size with different metadata is hashed: an
-//!   equal hash means unchanged, and the check returns the new metadata so the record can
-//!   store it.
+//!   device, mode, and owner) is unchanged. The same size, mode, and owner with different
+//!   times, inode, or device is hashed: an equal hash means unchanged, and the check
+//!   returns the new metadata so the record can store it.
 //! * When the recorded modification time is within two seconds of when the record was
 //!   written, or later, metadata cannot prove the file unchanged, so it is hashed even
 //!   when the metadata matches, as git does for racily clean files.
-//! * A regular file that was not read has no hash: any difference in size or metadata is
-//!   a change.
-//! * A listed directory is listed again and compared by its listing hash; one that was
-//!   only opened or checked is compared by existence and type.
+//! * A regular file that was not read has no hash: any difference in size or metadata,
+//!   the owner included, is a change.
+//! * A directory's mode and owner are always compared. A listed directory is listed again
+//!   and compared by its listing hash.
 //! * A symbolic link is compared by its target, then by the state of what it points to.
 //! * Devices, FIFOs, and sockets are compared by type.
 //! * Untracked paths under `/proc` and `/sys` are never compared. Tracked ones are read
@@ -32,14 +36,17 @@
 
 use std::{
     fs::{self, Metadata},
+    os::unix::fs::MetadataExt as _,
     path::Path,
 };
 
-use kizz_store::{Change, ContentHash, Difference, FileMeta, Observation, PathState};
+use kizz_store::{
+    Change, ContentHash, Difference, FileMeta, Observation, Owner, PathState, permission_bits,
+};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use crate::{
-    observe::{failed, file_meta, list, special_kind},
+    observe::{self, failed, file_meta, list, special_kind},
     states::FileStates,
 };
 
@@ -172,7 +179,16 @@ fn compare(
         PathState::File { meta, hash } if file_type.is_file() => {
             compare_file(path, meta, hash.as_ref(), &metadata, tracked, context)
         },
-        PathState::Directory { listing } if file_type.is_dir() => {
+        PathState::Directory {
+            mode,
+            owner,
+            listing,
+        } if file_type.is_dir() => {
+            if let Some(change) =
+                access_change(*mode, *owner, metadata.mode(), observe::owner(&metadata))
+            {
+                return Compared::Changed(change);
+            }
             let Some(listing) = listing else {
                 return Compared::Same;
             };
@@ -235,8 +251,29 @@ fn compare_missing(
     }
 }
 
+/// The change between a recorded mode `old_mode` and owner `old_owner` of a regular
+/// file or a directory and its current mode `new_mode` and owner `new_owner`, when
+/// its type is the same: different permission bits, then a different owner, or
+/// `None` when both match.
+fn access_change(
+    old_mode: u32,
+    old_owner: Owner,
+    new_mode: u32,
+    new_owner: Owner,
+) -> Option<Change> {
+    let (old, new) = (permission_bits(old_mode), permission_bits(new_mode));
+    if old != new {
+        return Some(Change::Permissions { old, new });
+    }
+    (old_owner != new_owner).then_some(Change::Owner {
+        old: old_owner,
+        new: new_owner,
+    })
+}
+
 /// Compare a regular file at `path`, recorded with `meta` and, when it was read,
-/// `hash`, with its current `metadata`.
+/// `hash`, with its current `metadata`. Its permission bits and owner come first,
+/// so a refresh of its metadata never hides a change of either.
 fn compare_file(
     path: &Path,
     meta: &FileMeta,
@@ -246,6 +283,9 @@ fn compare_file(
     context: Context<'_>,
 ) -> Compared {
     let current = file_meta(metadata);
+    if let Some(change) = access_change(meta.mode, meta.owner, current.mode, current.owner) {
+        return Compared::Changed(change);
+    }
     if tracked {
         return match context.states.hash_uncached(path) {
             Ok(now) if Some(&now) == hash => Compared::Same,
@@ -463,15 +503,189 @@ mod tests {
     fn files_that_were_not_read_compare_by_metadata() {
         let dir = Dir::new();
         dir.write_old("checked", "content");
+        fs::set_permissions(dir.path("checked"), fs::Permissions::from_mode(0o644)).unwrap();
         let observations = vec![dir.observe("checked", AccessKind::Probe)];
-        fs::set_permissions(dir.path("checked"), fs::Permissions::from_mode(0o600)).unwrap();
+        set_modified(&dir.path("checked"), 7_200);
         let states = FileStates::new();
         let checked = check(&observations, now(), &states);
         assert_eq!(changes(&checked), [Change::Metadata]);
         fs::write(dir.path("checked"), "longer content").unwrap();
         let checked = check(&observations, now(), &states);
         assert_eq!(changes(&checked), [Change::Size { old: 7, new: 14 }]);
+        fs::set_permissions(dir.path("checked"), fs::Permissions::from_mode(0o600)).unwrap();
+        let checked = check(&observations, now(), &states);
+        assert_eq!(changes(&checked), [Change::Permissions {
+            old: 0o644,
+            new: 0o600,
+        }]);
         assert_eq!(states.files_hashed(), 0);
+    }
+
+    /// Set the modification time of `path` to `seconds` seconds ago.
+    fn set_modified(
+        path: &Path,
+        seconds: u64,
+    ) {
+        let then = SystemTime::now()
+            .checked_sub(Duration::from_secs(seconds))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(then))
+            .unwrap();
+    }
+
+    /// The owner every observation of `observations` records, replaced by one that
+    /// no file has: one more than the current user and group numbers.
+    fn other_owner(observations: &mut [Observation]) -> Owner {
+        let mut replaced = None;
+        for observation in observations {
+            let owner = match &mut observation.state {
+                PathState::File { meta, .. } => &mut meta.owner,
+                PathState::Directory { owner, .. } => owner,
+                other => panic!("no owner in {other:?}"),
+            };
+            *owner = Owner {
+                uid: owner.uid.wrapping_add(1),
+                gid: owner.gid.wrapping_add(1),
+            };
+            replaced = Some(*owner);
+        }
+        replaced.unwrap()
+    }
+
+    #[test]
+    fn permission_changes_are_found_without_hashing_whatever_the_content() {
+        let dir = Dir::new();
+        dir.write_old("read", "content");
+        fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir(dir.path("listed")).unwrap();
+        fs::set_permissions(dir.path("listed"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(dir.path("opened")).unwrap();
+        fs::set_permissions(dir.path("opened"), fs::Permissions::from_mode(0o755)).unwrap();
+        let observations = vec![
+            dir.observe("listed", AccessKind::List),
+            dir.observe("opened", AccessKind::Probe),
+            dir.observe("read", AccessKind::Read),
+        ];
+        for name in ["read", "listed", "opened"] {
+            fs::set_permissions(dir.path(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let states = FileStates::new();
+        let checked = check(&observations, now(), &states);
+        assert_eq!(changes(&checked), [
+            Change::Permissions {
+                old: 0o755,
+                new: 0o700,
+            },
+            Change::Permissions {
+                old: 0o755,
+                new: 0o700,
+            },
+            Change::Permissions {
+                old: 0o644,
+                new: 0o700,
+            },
+        ]);
+        assert!(!checked.refresh);
+        assert_eq!(states.files_hashed(), 0);
+    }
+
+    #[test]
+    fn a_file_whose_times_and_mode_changed_reports_the_mode_and_is_not_refreshed() {
+        let dir = Dir::new();
+        dir.write_old("read", "content");
+        fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o644)).unwrap();
+        let observations = vec![dir.observe("read", AccessKind::Read)];
+        set_modified(&dir.path("read"), 7_200);
+        fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o600)).unwrap();
+        let states = FileStates::new();
+        let checked = check(&observations, now(), &states);
+        assert_eq!(changes(&checked), [Change::Permissions {
+            old: 0o644,
+            new: 0o600,
+        }]);
+        assert!(!checked.refresh);
+        assert_eq!(checked.observations, observations);
+        assert_eq!(states.files_hashed(), 0);
+    }
+
+    #[test]
+    fn a_recorded_owner_that_differs_is_a_change_found_without_hashing() {
+        let dir = Dir::new();
+        dir.write_old("read", "content");
+        dir.write_old("checked", "content");
+        fs::create_dir(dir.path("listed")).unwrap();
+        fs::create_dir(dir.path("opened")).unwrap();
+        let mut observations = vec![
+            dir.observe("checked", AccessKind::Probe),
+            dir.observe("listed", AccessKind::List),
+            dir.observe("opened", AccessKind::Probe),
+            dir.observe("read", AccessKind::Read),
+        ];
+        let current = fs::metadata(dir.path("read")).unwrap();
+        let current = Owner {
+            uid: current.uid(),
+            gid: current.gid(),
+        };
+        let recorded = other_owner(&mut observations);
+        let states = FileStates::new();
+        let checked = check(&observations, now(), &states);
+        let owner = Change::Owner {
+            old: recorded,
+            new: current,
+        };
+        assert_eq!(changes(&checked), [
+            owner.clone(),
+            owner.clone(),
+            owner.clone(),
+            owner
+        ]);
+        assert_eq!(states.files_hashed(), 0);
+    }
+
+    #[test]
+    fn special_bits_count_as_permission_bits_and_the_type_does_not() {
+        let owner = Owner { uid: 1, gid: 2 };
+        for special in [0o4000, 0o2000, 0o1000] {
+            assert_eq!(
+                access_change(0o100_755, owner, 0o100_755 | special, owner),
+                Some(Change::Permissions {
+                    old: 0o755,
+                    new: 0o755 | special,
+                }),
+                "{special:o}"
+            );
+            assert_eq!(
+                access_change(0o040_755 | special, owner, 0o040_755, owner),
+                Some(Change::Permissions {
+                    old: 0o755 | special,
+                    new: 0o755,
+                }),
+                "{special:o}"
+            );
+        }
+        // The type bits are compared as the type, never as permissions.
+        assert_eq!(access_change(0o100_644, owner, 0o040_644, owner), None);
+        assert_eq!(access_change(0o100_644, owner, 0o100_644, owner), None);
+        // A permission change is reported before an owner change.
+        let root = Owner { uid: 0, gid: 0 };
+        assert_eq!(
+            access_change(0o100_644, owner, 0o100_600, root),
+            Some(Change::Permissions {
+                old: 0o644,
+                new: 0o600,
+            })
+        );
+        assert_eq!(
+            access_change(0o100_644, owner, 0o100_644, root),
+            Some(Change::Owner {
+                old: owner,
+                new: root,
+            })
+        );
     }
 
     #[test]

@@ -10,12 +10,11 @@
 //!
 //! * absent paths: [`PathState::Absent`];
 //! * regular files: size, modification and change times in nanoseconds, inode, device,
-//!   and mode, plus a BLAKE3 hash of the content only when the file was read or run,
-//!   hashed with several threads for large files, through the build's [`FileStates`], so
-//!   a file is hashed once per build;
-//! * directories: a hash of the sorted entry names and types when they were listed, plus
-//!   the entries when there are at most [`MAX_LISTED_NAMES`], and otherwise only
-//!   existence and type;
+//!   mode, and owner, plus a BLAKE3 hash of the content only when the file was read or
+//!   run, hashed with several threads for large files, through the build's
+//!   [`FileStates`], so a file is hashed once per build;
+//! * directories: mode and owner, and when they were listed, also a hash of the sorted
+//!   entry names and types, plus the entries when there are at most [`MAX_LISTED_NAMES`];
 //! * symbolic links: the target, plus the state of what the link points to;
 //! * devices, FIFOs, and sockets: type only.
 //!
@@ -44,7 +43,7 @@ use std::{
 
 use kizz_store::{
     AccessBits, ContentHash, DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
-    PathState, SpecialKind,
+    Owner, PathState, SpecialKind,
 };
 use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
@@ -390,7 +389,11 @@ fn state_of(
         } else {
             None
         };
-        PathState::Directory { listing }
+        PathState::Directory {
+            mode: metadata.mode(),
+            owner: owner(metadata),
+            listing,
+        }
     } else {
         PathState::Special {
             kind: special_kind(file_type),
@@ -432,6 +435,15 @@ pub(crate) fn file_meta(metadata: &Metadata) -> FileMeta {
         inode: metadata.ino(),
         device: metadata.dev(),
         mode: metadata.mode(),
+        owner: owner(metadata),
+    }
+}
+
+/// The owner of a file or directory whose metadata is `metadata`.
+pub(crate) fn owner(metadata: &Metadata) -> Owner {
+    Owner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
     }
 }
 

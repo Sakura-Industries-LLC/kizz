@@ -20,7 +20,7 @@ use std::{
 
 use kizz_store::{
     AccessBits, BuildId, Capture, ContentHash, DATABASE_DIR, EntryCounts, FileMeta, Inventory,
-    LastWriter, LearnedOrder, Observation, PathKey, PathState, PositionKey, ProgramPath,
+    LastWriter, LearnedOrder, Observation, Owner, PathKey, PathState, PositionKey, ProgramPath,
     RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey,
     StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Verdict,
     WrittenBy, path_prefix,
@@ -51,22 +51,41 @@ fn step_record(n: u8) -> StepRecord {
             occurrence: u32::from(n),
         },
         program: Some(ProgramPath(PathBuf::from("/bin/tool"))),
-        observations: vec![Observation {
-            path: PathBuf::from(format!("/w/{n}/input")),
-            access: AccessBits(AccessBits::READ),
-            tracked: false,
-            state: PathState::File {
-                meta: FileMeta {
-                    size: u64::from(n),
-                    mtime_nanos: i64::from(n),
-                    ctime_nanos: i64::from(n),
-                    inode: u64::from(n),
-                    device: 1,
-                    mode: 0o100_644,
+        observations: vec![
+            Observation {
+                path: PathBuf::from(format!("/w/{n}/input")),
+                access: AccessBits(AccessBits::READ),
+                tracked: false,
+                state: PathState::File {
+                    meta: FileMeta {
+                        size: u64::from(n),
+                        mtime_nanos: i64::from(n),
+                        ctime_nanos: i64::from(n),
+                        inode: u64::from(n),
+                        device: 1,
+                        mode: 0o100_644,
+                        owner: Owner {
+                            uid: u32::from(n),
+                            gid: 100,
+                        },
+                    },
+                    hash: Some(ContentHash([n; 32])),
                 },
-                hash: Some(ContentHash([n; 32])),
             },
-        }],
+            Observation {
+                path: PathBuf::from(format!("/w/{n}")),
+                access: AccessBits(AccessBits::PROBE),
+                tracked: false,
+                state: PathState::Directory {
+                    mode: 0o040_755,
+                    owner: Owner {
+                        uid: u32::from(n),
+                        gid: 100,
+                    },
+                    listing: None,
+                },
+            },
+        ],
         ignored: u64::from(n),
         exit: StepExit::Exited { code: i32::from(n) },
         output: RecordedOutput::Split {

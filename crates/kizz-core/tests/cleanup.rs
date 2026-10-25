@@ -22,8 +22,9 @@ use std::{
 use kizz_core::{clean, plan_reset};
 use kizz_store::{
     AccessBits, BuildId, Capture, ContentHash, EntryCounts, FileMeta, LastWriter, LearnedOrder,
-    Observation, PathKey, PathState, PositionKey, RecordedOutput, RunReason, StepExit, StepKey,
-    StepPosition, StepRecord, StepSpecRecord, Store, TaskId, TaskRecord, Verdict, WrittenBy,
+    Observation, Owner, PathKey, PathState, PositionKey, RecordedOutput, RunReason, StepExit,
+    StepKey, StepPosition, StepRecord, StepSpecRecord, Store, TaskId, TaskRecord, Verdict,
+    WrittenBy,
 };
 
 /// The result of a test.
@@ -52,6 +53,7 @@ fn file() -> PathState {
             inode: 1,
             device: 1,
             mode: 0o100_644,
+            owner: Owner { uid: 1, gid: 1 },
         },
         hash: Some(ContentHash([1; 32])),
     }

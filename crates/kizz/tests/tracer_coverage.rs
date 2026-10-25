@@ -221,7 +221,7 @@ impl State {
                     hash: hash.is_some(),
                 }
             },
-            PathState::Directory { listing } => {
+            PathState::Directory { listing, .. } => {
                 Self::Dir {
                     listing: listing.is_some(),
                 }
@@ -1206,8 +1206,11 @@ fn the_comparison_reports_every_difference_together() {
 /// with their kinds and the types of their states.
 #[test]
 fn recorded_observations_are_taken_relative_to_the_task_directory() {
-    use kizz_store::{Capture, ContentHash, FileMeta, Observation, RunReason, StepSpecRecord};
+    use kizz_store::{
+        Capture, ContentHash, FileMeta, Observation, Owner, RunReason, StepSpecRecord,
+    };
 
+    let owner = Owner { uid: 1, gid: 1 };
     let meta = FileMeta {
         size: 1,
         mtime_nanos: 0,
@@ -1215,6 +1218,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         inode: 1,
         device: 1,
         mode: 0o100_644,
+        owner,
     };
     let observation = |path: &str, access: u8, state: PathState| {
         Observation {
@@ -1246,6 +1250,8 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
                 hash: Some(ContentHash([1; 32])),
             }),
             observation("/t", AccessBits::PROBE, PathState::Directory {
+                mode: 0o040_755,
+                owner,
                 listing: None,
             }),
             observation(

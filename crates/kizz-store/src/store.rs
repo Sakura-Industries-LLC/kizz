@@ -54,8 +54,10 @@ const WIPED_DIR: &str = "db.wiped";
 /// resets and `kizz cache clean` use. Version 8 added task programs as last
 /// writers: each last writer names its task and either the step that wrote the path,
 /// with its position, or the task program, and explanations name a task program
-/// that last wrote a changed input.
-pub const SCHEMA_VERSION: u32 = 8;
+/// that last wrote a changed input. Version 9 added the owner, as user and group
+/// numbers, to every regular-file state, the mode and owner to every directory
+/// state, and the permission and owner changes that a cache check finds.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -611,10 +613,10 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 8 stores task programs as last writers, one more than version 7,
-    /// whose last writers named only steps.
+    /// Version 9 stores owners and directory modes, one more than version 8, whose
+    /// file states had no owner and whose directory states only a listing.
     #[test]
-    fn schema_version_8_has_program_last_writers() {
-        assert_eq!(SCHEMA_VERSION, 8);
+    fn schema_version_9_has_owners_and_directory_modes() {
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 }

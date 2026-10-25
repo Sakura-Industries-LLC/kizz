@@ -209,6 +209,36 @@ impl AccessBits {
     }
 }
 
+/// The permission bits of a mode: the low twelve bits, the set-user-ID,
+/// set-group-ID, and sticky bits included.
+pub const PERMISSION_BITS: u32 = 0o7777;
+
+/// The permission bits of `mode`, without its file type.
+#[must_use]
+pub const fn permission_bits(mode: u32) -> u32 {
+    mode & PERMISSION_BITS
+}
+
+/// The owner of a file or directory: its user and group numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Owner {
+    /// The user number.
+    #[n(0)]
+    pub uid: u32,
+    /// The group number.
+    #[n(1)]
+    pub gid: u32,
+}
+
+impl fmt::Display for Owner {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "{}:{}", self.uid, self.gid)
+    }
+}
+
 /// The metadata of a regular file that a cache check compares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct FileMeta {
@@ -230,6 +260,9 @@ pub struct FileMeta {
     /// The mode: the file type and permission bits.
     #[n(5)]
     pub mode: u32,
+    /// The owner.
+    #[n(6)]
+    pub owner: Owner,
 }
 
 /// The type of a directory entry, as the listing reports it, without following
@@ -345,12 +378,17 @@ pub enum PathState {
         #[n(1)]
         hash: Option<ContentHash>,
     },
-    /// A directory: its sorted entries when it was listed, otherwise only its
-    /// existence and type.
+    /// A directory: its mode and owner, and its sorted entries when it was listed.
     #[n(2)]
     Directory {
-        /// The listing, when the directory was listed.
+        /// The mode: the file type and permission bits.
         #[n(0)]
+        mode: u32,
+        /// The owner.
+        #[n(1)]
+        owner: Owner,
+        /// The listing, when the directory was listed.
+        #[n(2)]
         listing: Option<Listing>,
     },
     /// A symbolic link: its target, and the state of what it points to.
@@ -466,6 +504,27 @@ pub enum Change {
     /// can no longer be read.
     #[n(2)]
     Type,
+    /// A regular file's or a directory's permission bits changed, found without
+    /// hashing.
+    #[n(8)]
+    Permissions {
+        /// The recorded permission bits.
+        #[n(0)]
+        old: u32,
+        /// The current permission bits.
+        #[n(1)]
+        new: u32,
+    },
+    /// A regular file's or a directory's owner changed, found without hashing.
+    #[n(9)]
+    Owner {
+        /// The recorded owner.
+        #[n(0)]
+        old: Owner,
+        /// The current owner.
+        #[n(1)]
+        new: Owner,
+    },
     /// A regular file's size changed, found without hashing.
     #[n(3)]
     Size {
@@ -508,6 +567,10 @@ impl fmt::Display for Change {
             Self::Appeared => f.write_str("appeared"),
             Self::Disappeared => f.write_str("disappeared"),
             Self::Type => f.write_str("type changed"),
+            Self::Permissions { old, new } => {
+                write!(f, "permissions changed from {old:04o} to {new:04o}")
+            },
+            Self::Owner { old, new } => write!(f, "owner changed from {old} to {new}"),
             Self::Size { old, new } => write!(f, "size changed from {old} to {new} bytes"),
             Self::Content => f.write_str("content changed"),
             Self::Metadata => f.write_str("metadata changed"),
@@ -740,8 +803,8 @@ impl<'b, C> Decode<'b, C> for ProgramPath {
 mod tests {
     use super::*;
 
-    /// A step record with one observation of each state.
-    fn record() -> StepRecord {
+    /// One path state of each kind, with both kinds of directory state.
+    fn states() -> Vec<PathState> {
         let meta = FileMeta {
             size: 3,
             mtime_nanos: -1,
@@ -749,16 +812,29 @@ mod tests {
             inode: 4,
             device: 5,
             mode: 0o100_644,
+            owner: Owner {
+                uid: 1_000,
+                gid: 100,
+            },
         };
-        let states = vec![
+        vec![
             PathState::Absent,
             PathState::File {
                 meta,
                 hash: Some(ContentHash([1; 32])),
             },
             PathState::File { meta, hash: None },
-            PathState::Directory { listing: None },
             PathState::Directory {
+                mode: 0o041_777,
+                owner: Owner { uid: 0, gid: 0 },
+                listing: None,
+            },
+            PathState::Directory {
+                mode: 0o040_750,
+                owner: Owner {
+                    uid: 1_000,
+                    gid: 1_000,
+                },
                 listing: Some(Listing {
                     hash: ContentHash([2; 32]),
                     entries: Some(vec![DirEntry {
@@ -776,7 +852,12 @@ mod tests {
             },
             PathState::Untracked,
             PathState::Inaccessible { errno: 13 },
-        ];
+        ]
+    }
+
+    /// A step record with one observation of each state.
+    fn record() -> StepRecord {
+        let states = states();
         StepRecord {
             spec: StepSpecRecord {
                 program_hash: ContentHash([9; 32]),
@@ -845,6 +926,17 @@ mod tests {
             Change::Appeared,
             Change::Disappeared,
             Change::Type,
+            Change::Permissions {
+                old: 0o4755,
+                new: 0o644,
+            },
+            Change::Owner {
+                old: Owner {
+                    uid: 1_000,
+                    gid: 1_000,
+                },
+                new: Owner { uid: 0, gid: 0 },
+            },
             Change::Size { old: 1, new: 2 },
             Change::Content,
             Change::Metadata,
@@ -936,6 +1028,21 @@ mod tests {
             Change::Appeared,
             Change::Disappeared,
             Change::Type,
+            Change::Permissions {
+                old: 0o755,
+                new: 0o644,
+            },
+            Change::Permissions {
+                old: 0o7777,
+                new: 0,
+            },
+            Change::Owner {
+                old: Owner {
+                    uid: 1_000,
+                    gid: 1_000,
+                },
+                new: Owner { uid: 0, gid: 0 },
+            },
             Change::Size { old: 1, new: 2 },
             Change::Content,
             Change::Metadata,
@@ -952,6 +1059,9 @@ mod tests {
             "appeared",
             "disappeared",
             "type changed",
+            "permissions changed from 0755 to 0644",
+            "permissions changed from 7777 to 0000",
+            "owner changed from 1000:1000 to 0:0",
             "size changed from 1 to 2 bytes",
             "content changed",
             "metadata changed",
@@ -1043,6 +1153,71 @@ mod tests {
         assert!(bits.contains(AccessBits::EXEC));
         assert!(!bits.contains(AccessBits::PROBE));
         assert_eq!(minicbor::to_vec(bits).unwrap(), [0x11]);
+    }
+
+    /// File states carry the owner as the last field of their metadata, directory
+    /// states carry their mode and owner whether or not they were listed, and both
+    /// encode deterministically and round-trip.
+    #[test]
+    fn file_and_directory_states_carry_mode_and_owner() {
+        let owner = Owner {
+            uid: 1_000,
+            gid: 100,
+        };
+        let meta = FileMeta {
+            size: 3,
+            mtime_nanos: 1,
+            ctime_nanos: 2,
+            inode: 4,
+            device: 5,
+            mode: 0o104_755,
+            owner,
+        };
+        let owner_bytes = minicbor::to_vec(owner).unwrap();
+        assert_eq!(owner_bytes, [0x82, 0x19, 0x03, 0xE8, 0x18, 0x64]);
+        let meta_bytes = minicbor::to_vec(meta).unwrap();
+        // A definite-length array of seven fields, ending with the owner.
+        assert_eq!(meta_bytes.first(), Some(&0x87));
+        assert!(meta_bytes.ends_with(&owner_bytes));
+
+        let file = PathState::File {
+            meta,
+            hash: Some(ContentHash([1; 32])),
+        };
+        let checked = PathState::Directory {
+            mode: 0o041_777,
+            owner,
+            listing: None,
+        };
+        let listed = PathState::Directory {
+            mode: 0o040_755,
+            owner,
+            listing: Some(Listing {
+                hash: ContentHash([2; 32]),
+                entries: Some(Vec::new()),
+            }),
+        };
+        for state in [file, checked.clone(), listed] {
+            let first = minicbor::to_vec(&state).unwrap();
+            assert_eq!(first, minicbor::to_vec(&state).unwrap());
+            assert_eq!(minicbor::decode::<PathState>(&first).unwrap(), state);
+        }
+        // The mode and the owner each reach the bytes of a directory state.
+        let other_owner = PathState::Directory {
+            mode: 0o041_777,
+            owner: Owner { uid: 0, gid: 100 },
+            listing: None,
+        };
+        let other_mode = PathState::Directory {
+            mode: 0o040_777,
+            owner,
+            listing: None,
+        };
+        let checked = minicbor::to_vec(&checked).unwrap();
+        assert_ne!(checked, minicbor::to_vec(&other_owner).unwrap());
+        assert_ne!(checked, minicbor::to_vec(&other_mode).unwrap());
+        assert_eq!(permission_bits(meta.mode), 0o4755);
+        assert_eq!(PERMISSION_BITS, 0o7777);
     }
 
     #[test]

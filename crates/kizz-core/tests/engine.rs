@@ -31,8 +31,8 @@ use kizz_core::{
 };
 use kizz_store::{
     AccessBits, Capture, ContentHash, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
-    PathState, ProgramPath, RecordedOutput, RunReason, SpecialKind, StepExit, StepKey, StepRecord,
-    Store,
+    Owner, PathState, ProgramPath, RecordedOutput, RunReason, SpecialKind, StepExit, StepKey,
+    StepRecord, Store,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -297,6 +297,7 @@ fn listing(
     match &observation(record, path)?.state {
         PathState::Directory {
             listing: Some(listing),
+            ..
         } => Ok(listing.clone()),
         other => Err(format!("{} has no listing: {other:?}", path.display()).into()),
     }
@@ -329,12 +330,31 @@ fn file_state(
             inode: metadata.ino(),
             device: metadata.dev(),
             mode: metadata.mode(),
+            owner: owner(&metadata),
         },
         hash: if hashed {
             Some(content_hash(path)?)
         } else {
             None
         },
+    })
+}
+
+/// The owner of a file or directory whose metadata is `metadata`.
+fn owner(metadata: &fs::Metadata) -> Owner {
+    Owner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    }
+}
+
+/// The state that the directory at `path` should have when it was not listed.
+fn unlisted_dir_state(path: &Path) -> TestResult<PathState> {
+    let metadata = fs::metadata(path)?;
+    Ok(PathState::Directory {
+        mode: metadata.mode(),
+        owner: owner(&metadata),
+        listing: None,
     })
 }
 
@@ -500,7 +520,7 @@ fn program_lookup_records_every_checked_location() -> TestResult {
     let probe = AccessBits(AccessBits::PROBE);
     for (dir, state) in [
         ("first", file_state(&fixture.path("first/tool"), false)?),
-        ("second", PathState::Directory { listing: None }),
+        ("second", unlisted_dir_state(&fixture.path("second/tool"))?),
         ("missing", PathState::Absent),
     ] {
         let observed = observation(&stored, &fixture.path(&format!("{dir}/tool")))?;
@@ -703,7 +723,10 @@ fn each_path_state_is_recorded_as_specified() -> TestResult {
         file_state(&fixture.path("written.txt"), false)?
     );
     assert_eq!(state("missing.txt")?, PathState::Absent);
-    assert_eq!(state("opened")?, PathState::Directory { listing: None });
+    assert_eq!(
+        state("opened")?,
+        unlisted_dir_state(&fixture.path("opened"))?
+    );
     assert_eq!(state("link")?, PathState::Symlink {
         target: PathBuf::from("read.txt"),
         pointee: Box::new(file_state(&fixture.path("read.txt"), true)?),

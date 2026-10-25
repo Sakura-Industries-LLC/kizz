@@ -32,8 +32,8 @@ use kizz_core::{
     parse_tasks, step_key,
 };
 use kizz_store::{
-    AccessBits, Change, ContentHash, Difference, FileMeta, NotCachedReason, Observation, PathState,
-    RunReason, StepExit, StepKey, StepRecord, Store,
+    AccessBits, Change, ContentHash, Difference, FileMeta, NotCachedReason, Observation, Owner,
+    PathState, RunReason, StepExit, StepKey, StepRecord, Store,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -440,6 +440,10 @@ fn read_state(path: &Path) -> TestResult<PathState> {
             inode: metadata.ino(),
             device: metadata.dev(),
             mode: metadata.mode(),
+            owner: Owner {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            },
         },
         hash: Some(ContentHash(*blake3::hash(&fs::read(path)?).as_bytes())),
     })
@@ -765,11 +769,12 @@ fn always_steps_with_identical_output_leave_dependents_cached() -> TestResult {
 }
 
 /// A file that was only checked is never hashed, and a change to its metadata
-/// re-runs the step.
+/// re-runs the step; a change of its permission bits is named as such.
 #[test]
 fn a_checked_file_is_never_hashed_and_its_metadata_change_reruns() -> TestResult {
     let fixture = Fixture::new()?;
     let config = fixture.write_old("config.toml", "checked = true")?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644))?;
     let reported = config.clone();
     let tracer = FakeTracer::new(move |request| {
         finished(
@@ -785,7 +790,7 @@ fn a_checked_file_is_never_hashed_and_its_metadata_change_reruns() -> TestResult
     assert!(unchanged.cached(0)?);
     assert_eq!(unchanged.hashed, 0);
 
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    age(&config, 7_200)?;
     let changed = fixture.build(&tracer, &[&step])?;
     assert!(!changed.cached(0)?);
     assert_eq!(changed.hashed, 1);
@@ -798,6 +803,18 @@ fn a_checked_file_is_never_hashed_and_its_metadata_change_reruns() -> TestResult
         return Err("the checked file is not recorded as a file".into());
     };
     assert_eq!(*hash, None);
+
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    let changed = fixture.build(&tracer, &[&step])?;
+    assert!(!changed.cached(0)?);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(differences(&record), [difference(
+        config.clone(),
+        Change::Permissions {
+            old: 0o644,
+            new: 0o600,
+        }
+    )]);
     Ok(())
 }
 
@@ -1424,5 +1441,212 @@ fn a_shared_file_is_hashed_once_per_build_and_again_after_a_write() -> TestResul
     assert_eq!(checked.hashed, 1);
     assert_eq!(tracer.runs(), 5);
     assert_eq!(checked.not_cached, Vec::new());
+    Ok(())
+}
+
+/// A step that read a file is a cache hit until `chmod` changes the file's mode
+/// from 0644 to 0600 with identical bytes: the step runs again, and its reason
+/// names the permission change. When the times change with the mode, the mode is
+/// still what is reported, and nothing refreshes it away.
+#[test]
+fn a_permission_change_with_identical_bytes_runs_a_step_that_read_the_file() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "same bytes")?;
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o644))?;
+    let tracer = FakeTracer::reading(vec![input.clone()]);
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(input.clone(), Change::Permissions {
+            old: 0o644,
+            new: 0o600,
+        })]),
+    )?;
+
+    // A new modification time and a new mode: the mode is reported, not refreshed.
+    age(&input, 7_200)?;
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o640))?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(input.clone(), Change::Permissions {
+            old: 0o600,
+            new: 0o640,
+        })]),
+    )?;
+    assert_eq!(tracer.runs(), 3);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    Ok(())
+}
+
+/// A step that ran a program runs again after the program loses its execute bits,
+/// the review's first example: its reason names the permission change of the
+/// program, and the step fails because the program is not executable.
+#[test]
+fn a_program_that_loses_its_execute_bits_runs_its_step_again() -> TestResult {
+    let fixture = Fixture::new()?;
+    let tracer = FakeTracer::reading(Vec::new());
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+
+    let program = fixture.path("bin/tool");
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o644))?;
+    let built = fixture.build(&tracer, &[&step])?;
+    let Some(Err(error)) = built.results.first() else {
+        return Err("the step did not fail".into());
+    };
+    assert!(error.message.contains("not executable"), "{error:?}");
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.exit, StepExit::ProgramNotExecutable);
+    assert_eq!(differences(&record), [difference(
+        program,
+        Change::Permissions {
+            old: 0o755,
+            new: 0o644,
+        }
+    )]);
+    // The lookup found no executable program, so nothing was traced.
+    assert_eq!(tracer.runs(), 1);
+    Ok(())
+}
+
+/// Replace the owner that `state` records, a regular file's or a directory's, with
+/// `owner`.
+fn set_owner(
+    state: &mut PathState,
+    owner: Owner,
+) -> TestResult {
+    match state {
+        PathState::File { meta, .. } => meta.owner = owner,
+        PathState::Directory {
+            owner: recorded, ..
+        } => *recorded = owner,
+        other => return Err(format!("no owner in {other:?}").into()),
+    }
+    Ok(())
+}
+
+/// A recorded owner that differs from the file's or the directory's current one is
+/// a change, for a file that was read and for a directory that was only checked.
+/// Tests cannot change owners, so the test writes the other owner into the stored
+/// record.
+#[test]
+fn a_recorded_owner_that_differs_runs_the_step_again() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "content")?;
+    let dir = fixture.path("inputs");
+    fs::create_dir(&dir)?;
+    let (read, probed) = (input.clone(), dir.clone());
+    let tracer = FakeTracer::new(move |request| {
+        finished(
+            request,
+            &[
+                (read.clone(), AccessKind::Read),
+                (probed.clone(), AccessKind::Probe),
+            ],
+            Termination::Exited(0),
+        )
+    });
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+
+    let metadata = fs::metadata(&input)?;
+    let current = Owner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    };
+    let other = Owner {
+        uid: current.uid.wrapping_add(1),
+        gid: current.gid.wrapping_add(1),
+    };
+    let key = step_key(PROGRAM, &step, 0)?;
+    let mut record = fixture.record(&step)?.ok_or("no record")?;
+    for observation in &mut record.observations {
+        if observation.path == input || observation.path == dir {
+            set_owner(&mut observation.state, other)?;
+        }
+    }
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    txn.put(&key, &record)?;
+    txn.commit()?;
+    store.close()?;
+
+    let owner = Change::Owner {
+        old: other,
+        new: current,
+    };
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[
+            difference(input.clone(), owner.clone()),
+            difference(dir.clone(), owner),
+        ]),
+    )?;
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    let PathState::Directory { owner, mode, .. } = observation(&record, &dir)?.state else {
+        return Err("the directory is not recorded as a directory".into());
+    };
+    assert_eq!(owner, current);
+    assert_eq!(mode, fs::metadata(&dir)?.mode());
+    Ok(())
+}
+
+/// A listed directory and a directory that was only checked each run their step
+/// again after `chmod`, with the permission change as the reason.
+#[test]
+fn a_listed_or_checked_directory_runs_its_step_again_after_chmod() -> TestResult {
+    let fixture = Fixture::new()?;
+    let listed = fixture.path("listed");
+    let checked = fixture.path("checked");
+    for dir in [&listed, &checked] {
+        fs::create_dir(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    }
+    let (list, probe) = (listed.clone(), checked.clone());
+    let tracer = FakeTracer::new(move |request| {
+        let accesses = match verb(request) {
+            "list" => [(list.clone(), AccessKind::List)],
+            _ => [(probe.clone(), AccessKind::Probe)],
+        };
+        finished(request, &accesses, Termination::Exited(0))
+    });
+    let lists = fixture.step(&["tool", "list"])?;
+    let checks = fixture.step(&["tool", "check"])?;
+    fixture.build(&tracer, &[&lists, &checks])?;
+    let hit = fixture.build(&tracer, &[&lists, &checks])?;
+    assert!(hit.cached(0)? && hit.cached(1)?);
+
+    let change = Change::Permissions {
+        old: 0o755,
+        new: 0o700,
+    };
+    for (dir, step, other) in [(&listed, &lists, &checks), (&checked, &checks, &lists)] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        let built = fixture.build(&tracer, &[step, other])?;
+        assert!(!built.cached(0)?, "{}", dir.display());
+        assert!(built.cached(1)?, "{}", dir.display());
+        let record = fixture.record(step)?.ok_or("no record")?;
+        assert_eq!(differences(&record), [difference(
+            dir.clone(),
+            change.clone()
+        )]);
+        let again = fixture.build(&tracer, &[step, other])?;
+        assert!(again.cached(0)? && again.cached(1)?);
+    }
+    assert_eq!(tracer.runs(), 4);
     Ok(())
 }

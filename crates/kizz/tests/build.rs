@@ -752,6 +752,59 @@ fn a_task_that_keeps_failing_runs_once_then_fails_from_the_cache() -> TestResult
     Ok(())
 }
 
+/// A task that runs `./tool.sh`, an executable script, is cached until
+/// `chmod a-x tool.sh` leaves its bytes as they were: the next build runs the step
+/// again, its reason names the permission change, and the task fails because the
+/// program is not executable.
+#[test]
+fn a_script_that_loses_its_execute_bits_runs_again_and_fails() -> TestResult {
+    let project = Project::new()?;
+    project.write("tool.sh", "#!/bin/sh\necho tool\n")?;
+    let tool = project.root.join("tool.sh");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))?;
+    project.kizz_md("", &[("Tool", "run(\"./tool.sh\", expect = [0])")])?;
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        text(&[
+            &ran("./tool.sh", "kizz.md:3 (Tool)", NEVER_RUN),
+            &pass(2),
+            "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(
+        second.stdout,
+        text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"])
+    );
+
+    // `chmod a-x`: the mode loses every execute bit, and the bytes stay the same.
+    let mode = fs::metadata(&tool)?.permissions().mode();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(mode & !0o111))?;
+    let third = project.run("", &["build", "ci"])?;
+    assert_eq!(third.status, Some(1), "{third:?}");
+    assert_eq!(
+        third.stdout,
+        text(&[
+            &ran(
+                "./tool.sh",
+                "kizz.md:3 (Tool)",
+                "`tool.sh` changed (permissions changed from 0755 to 0644)"
+            ),
+            &pass(2),
+            "build failed: 1 task, 1 failed, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    for expected in ["error: kizz.md:3 (Tool) failed:\n", "is not executable"] {
+        assert!(third.stderr.contains(expected), "{expected:?}: {third:?}");
+    }
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
 /// `kizz build` without a target lists the available targets and exits with
 /// status 2, and says so when there is no task.
 #[test]

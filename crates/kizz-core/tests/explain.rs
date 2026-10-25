@@ -5,7 +5,7 @@
 //! Golden-output tests of explanations: every reason kind, every kind of last
 //! writer, environment values hidden without `--verbose` and shown with it, a step
 //! that writes a file and also reads it, the warning for consecutive builds, the
-//! one-line reasons, and the report of `kizz why`.
+//! one-line reasons, permission and owner changes, and the report of `kizz why`.
 //!
 //! Each test builds a project directory and a cache in temporary directories. A
 //! build is one [`Engine`] on a store opened in the cache, and each task runs through
@@ -28,7 +28,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fs, io,
-    os::unix::fs::PermissionsExt as _,
+    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
@@ -38,7 +38,8 @@ use kizz_core::{
     StepExecutor as _, StepSpec, TaskIdentity, TaskInfo, TaskProgram, TaskSteps, parse_tasks, why,
 };
 use kizz_store::{
-    Explanation, Reason, SelfInflicted, StepPosition, Store, TaskId, TaskRecord, Verdict, Writer,
+    Explanation, Owner, PathState, Reason, SelfInflicted, StepPosition, StepRecord, Store, TaskId,
+    TaskRecord, Verdict, Writer,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -662,6 +663,101 @@ fn changed_inputs_name_who_last_wrote_them() -> TestResult {
         .map(|input| &input.writer)
         .collect();
     assert_eq!(writers, [&Writer::Outside]);
+    Ok(())
+}
+
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// `tool read:mode.txt` once because `input` changed.
+fn why_for_one_changed_input(input: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool read:mode.txt`
+    ran because:
+      1 input changed:
+        {input}
+    untracked /proc and /sys accesses: none
+    ignored accesses: 0
+"
+    )
+}
+
+/// A permission change and an owner change name their old and new values in the
+/// full reasons, in the one-line reason of `kizz build`, and in `kizz why`. Tests
+/// cannot change owners, so the test writes another owner into the stored record.
+#[test]
+fn permission_and_owner_changes_name_their_old_and_new_values() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("mode.txt", "same")?;
+    let path = fixture.path("mode.txt");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let read = fixture.step(&["tool", "read:mode.txt"])?;
+    fixture.build(&tracer, &[(&task, &[&read])])?;
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let built = fixture.build(&tracer, &[(&task, &[&read])])?;
+    let input = "`mode.txt`: permissions changed from 0644 to 0600; last written by something \
+                 outside kizz";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        "`mode.txt` changed (permissions changed from 0644 to 0600)"
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_input(input));
+
+    let metadata = fs::metadata(&path)?;
+    let current = Owner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    };
+    let other = Owner {
+        uid: current.uid.wrapping_add(1),
+        gid: current.gid.wrapping_add(1),
+    };
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    for (key, mut record) in txn.scan::<StepRecord>(&[])? {
+        for observation in &mut record.observations {
+            if observation.path == path
+                && let PathState::File { meta, .. } = &mut observation.state
+            {
+                meta.owner = other;
+            }
+        }
+        txn.put(&key, &record)?;
+    }
+    txn.commit()?;
+    store.close()?;
+
+    let built = fixture.build(&tracer, &[(&task, &[&read])])?;
+    let input = format!(
+        "`mode.txt`: owner changed from {other} to {current}; last written by something \
+         outside kizz"
+    );
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        format!("`mode.txt` changed (owner changed from {other} to {current})")
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_input(&input));
+    assert_eq!(tracer.runs(), 3);
     Ok(())
 }
 
