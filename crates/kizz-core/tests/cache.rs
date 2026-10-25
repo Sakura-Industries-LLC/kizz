@@ -29,11 +29,12 @@ use std::{
 
 use kizz_core::{
     Engine, PrintSink, ProgramHash, StepExecutor, StepOutcome, StepSpec, TaskInfo, TaskProgram,
-    parse_tasks, step_key,
+    observe::listing, parse_tasks, step_key,
 };
 use kizz_store::{
-    AccessBits, Change, ContentHash, Difference, FileMeta, NotCachedReason, Observation, Owner,
-    PathState, RunReason, StepExit, StepKey, StepRecord, Store, Times,
+    AccessBits, Change, ContentHash, Difference, DirEntry, EntryKind, FileMeta, Listing,
+    NotCachedReason, Observation, Owner, PathState, RunReason, StepExit, StepKey, StepRecord,
+    Store, Times,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -602,7 +603,17 @@ fn a_new_entry_or_a_program_appearing_on_path_reruns_the_step() -> TestResult {
     fixture.write_old("src/b.c", "b")?;
     assert!(!fixture.build(&tracer, &[&step])?.cached(0)?);
     let record = fixture.record(&step)?.ok_or("no record")?;
-    assert_eq!(differences(&record), [difference(listed, Change::Entries)]);
+    assert_eq!(differences(&record), [difference(
+        listed,
+        Change::Entries {
+            appeared: vec![DirEntry {
+                name: b"b.c".to_vec(),
+                kind: EntryKind::File,
+            }],
+            disappeared: Vec::new(),
+            retyped: Vec::new(),
+        }
+    )]);
 
     fixture.write_old("first/tool", "#!/bin/sh\n")?;
     fs::set_permissions(
@@ -1603,6 +1614,111 @@ fn a_recorded_owner_that_differs_runs_the_step_again() -> TestResult {
     };
     assert_eq!(owner, current);
     assert_eq!(mode, fs::metadata(&dir)?.mode());
+    Ok(())
+}
+
+/// Replace the listing that `state`, a listed directory, records with `new`.
+fn set_listing(
+    state: &mut PathState,
+    new: Listing,
+) -> TestResult {
+    match state {
+        PathState::Directory {
+            listing: Some(recorded),
+            ..
+        } => {
+            *recorded = new;
+            Ok(())
+        },
+        other => Err(format!("no listing in {other:?}").into()),
+    }
+}
+
+/// Replace the listing of `dir` in the stored record of `step` with the listing of
+/// `entries`, in their order, with the hashes of that order.
+fn store_listing(
+    fixture: &Fixture,
+    step: &StepSpec,
+    dir: &Path,
+    entries: &[DirEntry],
+) -> TestResult {
+    let key = step_key(PROGRAM, step, 0)?;
+    let mut record = fixture.record(step)?.ok_or("no record")?;
+    for observation in &mut record.observations {
+        if observation.path == dir {
+            set_listing(&mut observation.state, listing(entries.to_vec()))?;
+        }
+    }
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    txn.put(&key, &record)?;
+    txn.commit()?;
+    store.close()?;
+    Ok(())
+}
+
+/// A recorded listing with the directory's current entries in reverse order runs
+/// the step with an order change, and one that lacks a current entry runs it with
+/// an entries change that names the entry. The test writes each listing, with the
+/// hashes of its order, into the stored record.
+#[test]
+fn a_listing_in_another_order_or_without_an_entry_runs_the_step_again() -> TestResult {
+    let fixture = Fixture::new()?;
+    let listed = fixture.path("listed");
+    for name in ["one", "two", "three", "four"] {
+        fixture.write_old(&format!("listed/{name}"), name)?;
+    }
+    let reported = listed.clone();
+    let tracer = FakeTracer::new(move |request| {
+        finished(
+            request,
+            &[(reported.clone(), AccessKind::List)],
+            Termination::Exited(0),
+        )
+    });
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    let PathState::Directory {
+        listing: Some(recorded),
+        ..
+    } = &observation(&record, &listed)?.state
+    else {
+        return Err("the directory is not recorded as listed".into());
+    };
+    let current = recorded.entries.clone().ok_or("no entries")?;
+    assert_eq!(current.len(), 4);
+
+    let reversed: Vec<DirEntry> = current.iter().rev().cloned().collect();
+    store_listing(&fixture, &step, &listed, &reversed)?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(listed.clone(), Change::Order)]),
+    )?;
+
+    let without_two: Vec<DirEntry> = current
+        .iter()
+        .filter(|entry| entry.name != b"two")
+        .cloned()
+        .collect();
+    store_listing(&fixture, &step, &listed, &without_two)?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(listed, Change::Entries {
+            appeared: vec![DirEntry {
+                name: b"two".to_vec(),
+                kind: EntryKind::File,
+            }],
+            disappeared: Vec::new(),
+            retyped: Vec::new(),
+        })]),
+    )?;
+    assert_eq!(tracer.runs(), 3);
     Ok(())
 }
 

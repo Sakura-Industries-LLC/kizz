@@ -59,8 +59,11 @@ const WIPED_DIR: &str = "db.wiped";
 /// state, and the permission and owner changes that a cache check finds. Version 10
 /// added the `timestamps` option to the step specification, the modification and
 /// change times to every directory state, and the timestamp change that a cache
-/// check finds.
-pub const SCHEMA_VERSION: u32 = 10;
+/// check finds. Version 11 keeps directory listings in the order the file system
+/// returned their entries, with a hash of that order and a hash of the same entries
+/// sorted, and adds the names of the entries that changed and the order change to
+/// what a cache check finds.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -616,11 +619,10 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 10 stores the `timestamps` option and directory times, one more than
-    /// version 9, whose specifications had no `timestamps` and whose directory
-    /// states only a mode, an owner, and a listing.
+    /// Version 11 stores directory listings in file-system order with a sorted hash,
+    /// one more than version 10, whose listings were sorted and had one hash.
     #[test]
-    fn schema_version_10_has_timestamps_and_directory_times() {
-        assert_eq!(SCHEMA_VERSION, 10);
+    fn schema_version_11_has_ordered_listings() {
+        assert_eq!(SCHEMA_VERSION, 11);
     }
 }

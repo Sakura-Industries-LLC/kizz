@@ -14,8 +14,9 @@
 //!   run, hashed with several threads for large files, through the build's
 //!   [`FileStates`], so a file is hashed once per build;
 //! * directories: mode, owner, and modification and change times, and when they were
-//!   listed, also a hash of the sorted entry names and types, plus the entries when there
-//!   are at most [`MAX_LISTED_NAMES`];
+//!   listed, also a hash of the entry names and types in the order the file system
+//!   returned them, a hash of the same entries sorted, and the entries in that order when
+//!   there are at most [`MAX_LISTED_NAMES`]; entry inode numbers are not recorded;
 //! * symbolic links: the target, plus the state of what the link points to;
 //! * devices, FIFOs, and sockets: type only.
 //!
@@ -51,8 +52,10 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use crate::{patterns::PathPatterns, states::FileStates};
 
-/// The context string from which directory listing hashes are derived.
-const LISTING_CONTEXT: &str = "kizz directory listing, version 1";
+/// The context string from which directory listing hashes are derived, both the
+/// hash of the entries in the order the file system returned them and the hash of
+/// the same entries sorted.
+const LISTING_CONTEXT: &str = "kizz directory listing, version 2";
 
 /// The kernel interfaces whose paths are recorded but not compared unless tracked.
 const KERNEL_ROOTS: [&str; 2] = ["/proc", "/sys"];
@@ -483,8 +486,8 @@ fn entry_kind(file_type: FileType) -> EntryKind {
     }
 }
 
-/// The listing of the directory at `path`: the hash of its sorted entry names and
-/// types, and the entries when there are at most [`MAX_LISTED_NAMES`].
+/// The listing of the directory at `path`, with its entries in the order the file
+/// system returns them (see [`listing`]).
 pub(crate) fn list(path: &Path) -> io::Result<Listing> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(path)? {
@@ -495,26 +498,111 @@ pub(crate) fn list(path: &Path) -> io::Result<Listing> {
             kind,
         });
     }
-    entries.sort();
+    Ok(listing(entries))
+}
+
+/// The listing of `entries`, in the order given: the hash of their names and types
+/// in that order, the hash of the same entries sorted by name and type, and the
+/// entries in that order when there are at most [`MAX_LISTED_NAMES`].
+#[must_use]
+pub fn listing(entries: Vec<DirEntry>) -> Listing {
+    let mut sorted: Vec<&DirEntry> = entries.iter().collect();
+    sorted.sort();
+    let sorted_hash = listing_hash(sorted);
+    Listing {
+        hash: listing_hash(&entries),
+        sorted_hash,
+        entries: (entries.len() <= MAX_LISTED_NAMES).then_some(entries),
+    }
+}
+
+/// The hash of `entries`, in the order given: for each entry, the length of its
+/// name as eight little-endian bytes, the name, and the code of its type.
+fn listing_hash<'a>(entries: impl IntoIterator<Item = &'a DirEntry>) -> ContentHash {
     let mut hasher = blake3::Hasher::new_derive_key(LISTING_CONTEXT);
-    for entry in &entries {
+    for entry in entries {
         let length = u64::try_from(entry.name.len()).unwrap_or(u64::MAX);
         hasher.update(&length.to_le_bytes());
         hasher.update(&entry.name);
         hasher.update(&[entry.kind.code()]);
     }
-    Ok(Listing {
-        hash: ContentHash(*hasher.finalize().as_bytes()),
-        entries: (entries.len() <= MAX_LISTED_NAMES).then_some(entries),
-    })
+    ContentHash(*hasher.finalize().as_bytes())
 }
 
-/// Unit tests for recognizing paths that lead into `/proc` and `/sys`.
+/// Unit tests for listing hashes and for recognizing paths that lead into `/proc`
+/// and `/sys`.
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    /// A regular-file entry named `name`.
+    fn entry(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.as_bytes().to_vec(),
+            kind: EntryKind::File,
+        }
+    }
+
+    /// The same entries in two orders have different listing hashes and the same
+    /// sorted hash, and the same entries in the same order have the same hashes.
+    #[test]
+    fn order_changes_the_listing_hash_and_not_the_sorted_hash() {
+        let forward = listing(vec![entry("a"), entry("b"), entry("c")]);
+        let backward = listing(vec![entry("c"), entry("b"), entry("a")]);
+        assert_ne!(forward.hash, backward.hash);
+        assert_eq!(forward.sorted_hash, backward.sorted_hash);
+        let again = listing(vec![entry("a"), entry("b"), entry("c")]);
+        assert_eq!(again, forward);
+        // Sorted entries hash the same both ways; other entries hash differently.
+        assert_eq!(forward.hash, forward.sorted_hash);
+        let other = listing(vec![entry("a"), entry("b")]);
+        assert_ne!(other.sorted_hash, forward.sorted_hash);
+        // A type is part of an entry.
+        let retyped = listing(vec![entry("a"), entry("b"), DirEntry {
+            name: b"c".to_vec(),
+            kind: EntryKind::Directory,
+        }]);
+        assert_ne!(retyped.sorted_hash, forward.sorted_hash);
+        assert_eq!(
+            backward.entries,
+            Some(vec![entry("c"), entry("b"), entry("a")])
+        );
+    }
+
+    /// A listing keeps the entries in the order the file system returns them, and
+    /// keeps them only up to the limit, while both hashes cover every entry.
+    #[test]
+    fn listings_keep_the_file_system_order_up_to_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["m", "a", "z", "k"] {
+            fs::write(dir.path().join(name), "").unwrap();
+        }
+        fs::create_dir(dir.path().join("d")).unwrap();
+        let returned: Vec<DirEntry> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                DirEntry {
+                    name: entry.file_name().into_vec(),
+                    kind: entry_kind(entry.file_type().unwrap()),
+                }
+            })
+            .collect();
+        let listed = list(dir.path()).unwrap();
+        assert_eq!(listed, listing(returned.clone()));
+        assert_eq!(listed.entries, Some(returned));
+
+        let many: Vec<DirEntry> = (0..=MAX_LISTED_NAMES)
+            .map(|index| entry(&index.to_string()))
+            .collect();
+        let large = listing(many.clone());
+        assert_eq!(large.entries, None);
+        let fewer = listing(many.iter().skip(1).cloned().collect());
+        assert_ne!(large.hash, fewer.hash);
+        assert_ne!(large.sorted_hash, fewer.sorted_hash);
+    }
 
     /// Paths under `/proc` and `/sys`, and the standard links into them, reach a
     /// kernel interface.

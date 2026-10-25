@@ -23,7 +23,10 @@
 //! * A regular file that was not read has no hash: any difference in size or metadata,
 //!   the owner included, is a change.
 //! * A directory's mode and owner are always compared. A listed directory is listed again
-//!   and compared by its listing hash.
+//!   and compared by its entries, in the order the file system returns them: an equal
+//!   listing hash is unchanged; otherwise an equal hash of the sorted entries means only
+//!   the order changed, and a different one that the entries changed, naming those that
+//!   appeared, disappeared, or changed type when both listings kept their entries.
 //! * For a step run with `timestamps`, a regular file that was read or run, or a
 //!   directory that was read, listed, or checked, whose modification or change time
 //!   differs has changed, found without hashing, after its permission bits and owner and,
@@ -43,14 +46,15 @@
 //! file is hashed once per build.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, Metadata},
     os::unix::fs::MetadataExt as _,
     path::Path,
 };
 
 use kizz_store::{
-    AccessBits, Change, ContentHash, Difference, FileMeta, Observation, Owner, PathState, Times,
-    permission_bits,
+    AccessBits, Change, ContentHash, Difference, DirEntry, EntryKind, FileMeta, Listing,
+    Observation, Owner, PathState, Times, permission_bits,
 };
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
@@ -230,8 +234,9 @@ fn compare(
                 return Compared::Same;
             };
             match list(path) {
-                Ok(current) if current.hash == listing.hash => Compared::Same,
-                Ok(_) => Compared::Changed(Change::Entries),
+                Ok(current) => {
+                    listing_change(listing, &current).map_or(Compared::Same, Compared::Changed)
+                },
                 Err(_) => Compared::Changed(Change::Type),
             }
         },
@@ -306,6 +311,72 @@ fn access_change(
         old: old_owner,
         new: new_owner,
     })
+}
+
+/// The change from the recorded listing `old` of a directory to its `current`
+/// listing, or `None` when the entries and their order match: an equal listing hash
+/// is unchanged; otherwise an equal sorted hash is an order change, and a different
+/// one is an entries change.
+fn listing_change(
+    old: &Listing,
+    current: &Listing,
+) -> Option<Change> {
+    if current.hash == old.hash {
+        None
+    } else if current.sorted_hash == old.sorted_hash {
+        Some(Change::Order)
+    } else {
+        Some(entries_change(
+            old.entries.as_deref(),
+            current.entries.as_deref(),
+        ))
+    }
+}
+
+/// The entries change from the recorded entries `old` to the `current` ones: the
+/// entries that appeared, that disappeared, and whose type changed, each sorted by
+/// name, or none of them when either listing kept no entries.
+fn entries_change(
+    old: Option<&[DirEntry]>,
+    current: Option<&[DirEntry]>,
+) -> Change {
+    let mut appeared = Vec::new();
+    let mut disappeared = Vec::new();
+    let mut retyped = Vec::new();
+    if let (Some(old), Some(current)) = (old, current) {
+        let kinds = |entries: &[DirEntry]| -> BTreeMap<Vec<u8>, EntryKind> {
+            entries
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.kind))
+                .collect()
+        };
+        let old = kinds(old);
+        let current = kinds(current);
+        for (name, &kind) in &current {
+            let entry = DirEntry {
+                name: name.clone(),
+                kind,
+            };
+            match old.get(name) {
+                None => appeared.push(entry),
+                Some(&recorded) if recorded != kind => retyped.push(entry),
+                Some(_) => {},
+            }
+        }
+        for (name, &kind) in &old {
+            if !current.contains_key(name) {
+                disappeared.push(DirEntry {
+                    name: name.clone(),
+                    kind,
+                });
+            }
+        }
+    }
+    Change::Entries {
+        appeared,
+        disappeared,
+        retyped,
+    }
 }
 
 /// Compare a regular file at `path`, recorded with `meta` and, when it was read,
@@ -385,7 +456,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use kizz_store::{AccessBits, SpecialKind};
+    use kizz_store::{AccessBits, MAX_LISTED_NAMES, SpecialKind};
     use kizz_trace::{AccessKind, AccessKinds};
 
     use super::*;
@@ -873,7 +944,14 @@ mod tests {
             Change::Appeared,
             Change::Disappeared,
             Change::Disappeared,
-            Change::Entries,
+            Change::Entries {
+                appeared: vec![DirEntry {
+                    name: b"entry".to_vec(),
+                    kind: EntryKind::File,
+                }],
+                disappeared: Vec::new(),
+                retyped: Vec::new(),
+            },
             Change::Type,
         ]);
 
@@ -883,6 +961,140 @@ mod tests {
         assert_eq!(changes(&checked), [Change::LinkTarget {
             old: PathBuf::from("gone"),
             new: PathBuf::from("appears"),
+        }]);
+    }
+
+    /// The recorded listing of `observation`, a listed directory.
+    fn recorded_listing(observation: &Observation) -> &Listing {
+        match &observation.state {
+            PathState::Directory {
+                listing: Some(listing),
+                ..
+            } => listing,
+            other => panic!("no listing in {other:?}"),
+        }
+    }
+
+    /// `observation`, a listed directory, recorded with `listing` instead.
+    fn with_listing(
+        observation: &Observation,
+        listing: Listing,
+    ) -> Observation {
+        let mut observation = observation.clone();
+        if let PathState::Directory {
+            listing: recorded, ..
+        } = &mut observation.state
+        {
+            *recorded = Some(listing);
+        }
+        observation
+    }
+
+    /// A regular-file entry named `name`.
+    fn file_entry(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.as_bytes().to_vec(),
+            kind: EntryKind::File,
+        }
+    }
+
+    #[test]
+    fn an_order_change_is_told_apart_from_an_entries_change() {
+        let dir = Dir::new();
+        fs::create_dir(dir.path("listed")).unwrap();
+        for name in ["a", "b", "c"] {
+            fs::write(dir.path(&format!("listed/{name}")), "").unwrap();
+        }
+        let observed = dir.observe("listed", AccessKind::List);
+        let current = recorded_listing(&observed).entries.clone().unwrap();
+        let check_with = |entries: Vec<DirEntry>, keep: bool| {
+            let mut listing = observe::listing(entries);
+            if !keep {
+                listing.entries = None;
+            }
+            changes(&check(
+                &[with_listing(&observed, listing)],
+                now(),
+                false,
+                &FileStates::new(),
+            ))
+        };
+        assert_eq!(check_with(current.clone(), true), []);
+
+        // The current entries recorded in reverse order: only the order changed.
+        let reversed: Vec<DirEntry> = current.iter().rev().cloned().collect();
+        assert_eq!(check_with(reversed, true), [Change::Order]);
+
+        // A recorded listing that lacks `b`, and has a `gone` directory and a `c`
+        // directory, names what appeared, disappeared, and changed type.
+        let mut other: Vec<DirEntry> = current
+            .iter()
+            .filter(|entry| entry.name != b"b")
+            .cloned()
+            .collect();
+        for entry in &mut other {
+            if entry.name == b"c" {
+                entry.kind = EntryKind::Directory;
+            }
+        }
+        other.push(DirEntry {
+            name: b"gone".to_vec(),
+            kind: EntryKind::Directory,
+        });
+        assert_eq!(check_with(other.clone(), true), [Change::Entries {
+            appeared: vec![file_entry("b")],
+            disappeared: vec![DirEntry {
+                name: b"gone".to_vec(),
+                kind: EntryKind::Directory,
+            }],
+            retyped: vec![file_entry("c")],
+        }]);
+
+        // Without recorded entries, an entries change names none.
+        assert_eq!(check_with(other, false), [Change::Entries {
+            appeared: Vec::new(),
+            disappeared: Vec::new(),
+            retyped: Vec::new(),
+        }]);
+    }
+
+    #[test]
+    fn above_the_limit_a_matching_sorted_hash_is_an_order_change() {
+        let dir = Dir::new();
+        fs::create_dir(dir.path("listed")).unwrap();
+        for index in 0..=MAX_LISTED_NAMES {
+            fs::write(dir.path(&format!("listed/{index}")), "").unwrap();
+        }
+        let observed = dir.observe("listed", AccessKind::List);
+        let listing = recorded_listing(&observed).clone();
+        assert_eq!(listing.entries, None);
+        let check_with = |listing: Listing| {
+            changes(&check(
+                &[with_listing(&observed, listing)],
+                now(),
+                false,
+                &FileStates::new(),
+            ))
+        };
+        assert_eq!(check_with(listing.clone()), []);
+
+        // An ordered hash that differs with a sorted hash that matches.
+        let reordered = Listing {
+            hash: ContentHash([0; 32]),
+            ..listing.clone()
+        };
+        assert_eq!(check_with(reordered), [Change::Order]);
+
+        // Both hashes differ: the entries changed, and no names are known.
+        let different = Listing {
+            hash: ContentHash([0; 32]),
+            sorted_hash: ContentHash([0; 32]),
+            entries: None,
+        };
+        assert_eq!(check_with(different), [Change::Entries {
+            appeared: Vec::new(),
+            disappeared: Vec::new(),
+            retyped: Vec::new(),
         }]);
     }
 

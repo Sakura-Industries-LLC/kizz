@@ -6,7 +6,8 @@
 //! writer, environment values hidden without `--verbose` and shown with it, a step
 //! that writes a file and also reads it, the warning for consecutive builds, the
 //! one-line reasons, permission and owner changes, timestamp changes and the
-//! `timestamps` option, and the report of `kizz why`.
+//! `timestamps` option, order and entries changes of listed directories, and the
+//! report of `kizz why`.
 //!
 //! Each test builds a project directory and a cache in temporary directories. A
 //! build is one [`Engine`] on a store opened in the cache, and each task runs through
@@ -20,6 +21,7 @@
 //! * `bump:PATH` reads a file and writes it back with one more `+`;
 //! * `kernel:PATH` reads an absolute path, such as one under `/proc`;
 //! * `probe:PATH` checks an absolute path;
+//! * `list:PATH` lists a directory;
 //! * `signal` makes a signal kill the command;
 //!
 //! and any other argument does nothing. Relative paths are relative to the step's
@@ -38,7 +40,8 @@ use std::{
 
 use kizz_core::{
     Engine, PrintSink, ProgramHash, ProgramParts, Render, RepeatedWarning, StepDecision,
-    StepExecutor as _, StepSpec, TaskIdentity, TaskInfo, TaskProgram, TaskSteps, parse_tasks, why,
+    StepExecutor as _, StepSpec, TaskIdentity, TaskInfo, TaskProgram, TaskSteps, observe,
+    parse_tasks, why,
 };
 use kizz_store::{
     Explanation, Owner, PathState, Reason, SelfInflicted, StepPosition, StepRecord, Store, TaskId,
@@ -106,6 +109,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
             },
             "kernel" => record(path, AccessKind::Read)?,
             "probe" => record(path, AccessKind::Probe)?,
+            "list" => record(path, AccessKind::List)?,
             "signal" => termination = Termination::Signaled(9),
             _ => {},
         }
@@ -870,6 +874,100 @@ kizz.md:3 (Build) [ci]
     // Switching back finds the record of the step key with the option, which
     // nothing changed since.
     let built = fixture.build(&tracer, &[(&task, &[&stamped])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// `tool list:listed` once because `input` changed.
+fn why_for_one_changed_listing(input: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool list:listed`
+    ran because:
+      1 input changed:
+        {input}
+    untracked /proc and /sys accesses: none
+    ignored accesses: 0
+"
+    )
+}
+
+/// A listed directory whose recorded entries are its current entries in reverse
+/// order runs its step with an order change, and one with a new entry runs it with
+/// an entries change that names the entry, in the full reasons, in the one-line
+/// reason of `kizz build`, and in `kizz why`. The test writes the reversed listing,
+/// with the hashes of its order, into the stored record.
+#[test]
+fn order_and_entries_changes_of_a_listed_directory_are_explained() -> TestResult {
+    let fixture = Fixture::new()?;
+    for name in ["a", "b", "c"] {
+        fixture.write(&format!("listed/{name}"), name)?;
+    }
+    let path = fixture.path("listed");
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let list = fixture.step(&["tool", "list:listed"])?;
+    fixture.build(&tracer, &[(&task, &[&list])])?;
+
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    for (key, mut record) in txn.scan::<StepRecord>(&[])? {
+        for observation in &mut record.observations {
+            if observation.path == path
+                && let PathState::Directory {
+                    listing: Some(listing),
+                    ..
+                } = &mut observation.state
+            {
+                let entries = listing.entries.clone().ok_or("no entries")?;
+                *listing = observe::listing(entries.into_iter().rev().collect());
+            }
+        }
+        txn.put(&key, &record)?;
+    }
+    txn.commit()?;
+    store.close()?;
+
+    let built = fixture.build(&tracer, &[(&task, &[&list])])?;
+    let input = "`listed`: the order of its entries changed; last written by something outside \
+                 kizz";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        "`listed` changed (the order of its entries changed)"
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_listing(input));
+
+    fixture.write("listed/d", "d")?;
+    let built = fixture.build(&tracer, &[(&task, &[&list])])?;
+    let input = "`listed`: directory entries changed: `d` appeared; last written by something \
+                 outside kizz";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        "`listed` changed (directory entries changed: `d` appeared)"
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_listing(input));
+
+    let built = fixture.build(&tracer, &[(&task, &[&list])])?;
     assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
     assert_eq!(tracer.runs(), 3);
     Ok(())

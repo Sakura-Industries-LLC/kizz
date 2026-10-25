@@ -51,7 +51,7 @@ These decisions came out of the review of the original outline.
 | Task program in the key | The task's Starlark source is part of every step key, because it decides which commands run and in what order. Editing it re-runs the task's commands. |
 | No sandbox | Task programs do I/O and run any command. Paths such as `../../../../common-file.txt` are allowed and are never treated as security violations. Users who want isolation run kizz in a container. |
 | Missing files | A lookup that finds nothing (`ENOENT`) is a dependency, both so builds stay correct and so unexpected configuration-file lookups are visible. |
-| Directory listings | Directory listings are dependencies. |
+| Directory listings | Directory listings are dependencies, including the order in which the file system returns the entries. |
 | Explanations | Kizz says exactly why it ran each command and which things changed. |
 | Hermeticity | Not a goal. The goal is fast, cacheable, reliable builds without hand-written dependency lists, which nobody can maintain accurately. |
 | Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. |
@@ -443,8 +443,10 @@ or a temporary file it creates and removes, needs no special handling.
 * Any other regular file, such as one that was only checked or only written: that the command touched it, and the same metadata.
   Kizz never hashes it.
 * Directory: its mode, owner, and modification and change times.
-  When listed, also a hash of its sorted entry names and types, plus the names themselves when there are not too many
-  (up to 1,000), so explanations can name what appeared or disappeared.
+  When listed, also a hash of its entry names and types in the order the file system returned them,
+  plus the entries themselves when there are not too many
+  (up to 1,000), so explanations can name what appeared or disappeared, or say that only the order changed.
+  Entry inode numbers are not recorded.
 * Symbolic link: the link target, plus the state of what it points to.
 * Device, FIFO or socket: type only.
 * Anything under `/proc` or `/sys`: recorded so explanations and `kizz why` show the access,
@@ -568,7 +570,7 @@ A regular file that was read is compared like this:
 A regular file that was not read has no hash, so its metadata is the whole dependency:
 any difference in size or metadata is a change.
 A directory's mode and owner are always compared.
-A listed directory is listed again and compared by its entries.
+A listed directory is listed again and compared by its entries, in the order the file system returns them.
 Untracked paths under `/proc` and `/sys` are never compared.
 
 Programs cannot set the change time, so a tool that restores modification times
@@ -646,8 +648,8 @@ These are the reasons:
   with values shown only with `--verbose`, because values can be secrets
 * the working directory, `stdin`, capture mode, ignore patterns, `track` patterns or `timestamps` changed
 * inputs changed: every changed path, what changed about it
-  (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, directory entries
-  or link target changed),
+  (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, directory entries,
+  entry order or link target changed),
   and who last wrote it: this command on its previous run, another task's command or program in this build,
   a command or task program of an earlier build, or something outside kizz
 * the command is marked `always`

@@ -764,13 +764,7 @@ fn each_path_state_is_recorded_as_specified() -> TestResult {
         }
     );
 
-    let entries: Vec<(Vec<u8>, EntryKind)> = listing(&stored, &fixture.path("listed"))?
-        .entries
-        .ok_or("the listed directory has no names")?
-        .into_iter()
-        .map(|entry| (entry.name, entry.kind))
-        .collect();
-    assert_eq!(entries, [
+    assert_eq!(sorted_entries(&stored, &fixture.path("listed"))?, [
         (b"a-dir".to_vec(), EntryKind::Directory),
         (b"b.txt".to_vec(), EntryKind::File),
         (b"c-link".to_vec(), EntryKind::Symlink),
@@ -949,10 +943,41 @@ fn directory_entry_names_are_kept_up_to_the_limit() -> TestResult {
         .entries
         .ok_or("the names at the limit were left out")?;
     assert_eq!(names.len(), MAX_LISTED_NAMES);
-    assert_eq!(names[0].name, b"0000");
+    let kept: Vec<Vec<u8>> = names.into_iter().map(|entry| entry.name).collect();
+    assert_eq!(kept, returned_names(&fixture.path("at-limit"))?);
     assert_eq!(over_limit.entries, None);
     assert_ne!(at_limit.hash, over_limit.hash);
+    assert_ne!(at_limit.sorted_hash, over_limit.sorted_hash);
     Ok(())
+}
+
+/// The names of the entries of the directory at `dir`, in the order the file
+/// system returns them.
+fn returned_names(dir: &Path) -> TestResult<Vec<Vec<u8>>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        names.push(entry?.file_name().into_encoded_bytes());
+    }
+    Ok(names)
+}
+
+/// The entries recorded for the listed directory at `dir` in `record`, as names
+/// and types, sorted, after checking that the record keeps them in the order the
+/// file system returns them.
+fn sorted_entries(
+    record: &StepRecord,
+    dir: &Path,
+) -> TestResult<Vec<(Vec<u8>, EntryKind)>> {
+    let mut entries: Vec<(Vec<u8>, EntryKind)> = listing(record, dir)?
+        .entries
+        .ok_or("the listed directory has no names")?
+        .into_iter()
+        .map(|entry| (entry.name, entry.kind))
+        .collect();
+    let names: Vec<Vec<u8>> = entries.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(names, returned_names(dir)?);
+    entries.sort();
+    Ok(entries)
 }
 
 /// Every access under `/proc` or `/sys` is recorded; an untracked one has no state,

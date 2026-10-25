@@ -88,8 +88,8 @@ pub(crate) mod path_list {
     }
 }
 
-/// A BLAKE3 hash: of a file's content, of a directory's sorted entries, or of a
-/// task program.
+/// A BLAKE3 hash: of a file's content, of a directory's entries, or of a task
+/// program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentHash(pub [u8; 32]);
 
@@ -366,16 +366,22 @@ pub struct DirEntry {
     pub kind: EntryKind,
 }
 
-/// The recorded contents of a listed directory.
+/// The recorded contents of a listed directory, in the order the file system
+/// returned its entries when kizz read it. Entry inode numbers are not recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Listing {
-    /// The hash of the sorted entry names and types.
+    /// The hash of the entry names and types, in the order the file system
+    /// returned them.
     #[n(0)]
     pub hash: ContentHash,
-    /// The entries, sorted by name, when there are at most
-    /// [`MAX_LISTED_NAMES`]; `None` above that.
+    /// The entries, in the order the file system returned them, when there are at
+    /// most [`MAX_LISTED_NAMES`]; `None` above that.
     #[n(1)]
     pub entries: Option<Vec<DirEntry>>,
+    /// The hash of the same entries sorted by name and type, which tells a change
+    /// of order alone from a change of entries, in a directory of any size.
+    #[n(2)]
+    pub sorted_hash: ContentHash,
 }
 
 /// The most entries a listed directory may have for its names to be kept.
@@ -420,8 +426,8 @@ pub enum PathState {
         #[n(1)]
         hash: Option<ContentHash>,
     },
-    /// A directory: its mode, owner, and times, and its sorted entries when it was
-    /// listed.
+    /// A directory: its mode, owner, and times, and its listing, in the order the
+    /// file system returned its entries, when it was listed.
     #[n(2)]
     Directory {
         /// The mode: the file type and permission bits.
@@ -600,9 +606,24 @@ pub enum Change {
     /// different metadata.
     #[n(5)]
     Metadata,
-    /// The entries of a listed directory changed.
+    /// The entries of a listed directory changed. The entries that appeared,
+    /// disappeared, or changed type are named when both listings kept their
+    /// entries; otherwise all three lists are empty.
     #[n(6)]
-    Entries,
+    Entries {
+        /// The entries that appeared, sorted by name.
+        #[n(0)]
+        appeared: Vec<DirEntry>,
+        /// The entries that disappeared, as recorded, sorted by name.
+        #[n(1)]
+        disappeared: Vec<DirEntry>,
+        /// The entries whose type changed, with their current type, sorted by name.
+        #[n(2)]
+        retyped: Vec<DirEntry>,
+    },
+    /// A listed directory has the same entries in a different order.
+    #[n(11)]
+    Order,
     /// A symbolic link points somewhere else.
     #[n(7)]
     LinkTarget {
@@ -632,7 +653,12 @@ impl fmt::Display for Change {
             Self::Size { old, new } => write!(f, "size changed from {old} to {new} bytes"),
             Self::Content => f.write_str("content changed"),
             Self::Metadata => f.write_str("metadata changed"),
-            Self::Entries => f.write_str("directory entries changed"),
+            Self::Entries {
+                appeared,
+                disappeared,
+                retyped,
+            } => write_entries(f, appeared, disappeared, retyped),
+            Self::Order => f.write_str("the order of its entries changed"),
             Self::LinkTarget { old, new } => {
                 write!(
                     f,
@@ -643,6 +669,46 @@ impl fmt::Display for Change {
             },
         }
     }
+}
+
+/// The most entry names an entries change shows for each of appeared,
+/// disappeared, and changed type; the rest are counted.
+const SHOWN_ENTRY_NAMES: usize = 10;
+
+/// Write an entries change: the entries that appeared, disappeared, and changed
+/// type, each group when it is not empty, with at most [`SHOWN_ENTRY_NAMES`] names
+/// each.
+fn write_entries(
+    f: &mut fmt::Formatter<'_>,
+    appeared: &[DirEntry],
+    disappeared: &[DirEntry],
+    retyped: &[DirEntry],
+) -> fmt::Result {
+    f.write_str("directory entries changed")?;
+    let mut separator = ": ";
+    for (entries, what) in [
+        (appeared, "appeared"),
+        (disappeared, "disappeared"),
+        (retyped, "changed type"),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        f.write_str(separator)?;
+        separator = "; ";
+        for (index, entry) in entries.iter().take(SHOWN_ENTRY_NAMES).enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "`{}`", String::from_utf8_lossy(&entry.name))?;
+        }
+        let more = entries.len().saturating_sub(SHOWN_ENTRY_NAMES);
+        if more > 0 {
+            write!(f, " and {more} more")?;
+        }
+        write!(f, " {what}")?;
+    }
+    Ok(())
 }
 
 /// Write a timestamp change: each time that differs, old and new, or both times
@@ -927,10 +993,17 @@ mod tests {
                 },
                 listing: Some(Listing {
                     hash: ContentHash([2; 32]),
-                    entries: Some(vec![DirEntry {
-                        name: b"a\xff".to_vec(),
-                        kind: EntryKind::Symlink,
-                    }]),
+                    entries: Some(vec![
+                        DirEntry {
+                            name: b"a\xff".to_vec(),
+                            kind: EntryKind::Symlink,
+                        },
+                        DirEntry {
+                            name: b"0".to_vec(),
+                            kind: EntryKind::File,
+                        },
+                    ]),
+                    sorted_hash: ContentHash([3; 32]),
                 }),
                 times: Times {
                     mtime_nanos: 5,
@@ -1045,7 +1118,26 @@ mod tests {
             Change::Size { old: 1, new: 2 },
             Change::Content,
             Change::Metadata,
-            Change::Entries,
+            Change::Entries {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                retyped: Vec::new(),
+            },
+            Change::Entries {
+                appeared: vec![DirEntry {
+                    name: b"new\xff".to_vec(),
+                    kind: EntryKind::Directory,
+                }],
+                disappeared: vec![DirEntry {
+                    name: b"old".to_vec(),
+                    kind: EntryKind::File,
+                }],
+                retyped: vec![DirEntry {
+                    name: b"kind".to_vec(),
+                    kind: EntryKind::Symlink,
+                }],
+            },
+            Change::Order,
             Change::LinkTarget {
                 old: PathBuf::from("a"),
                 new: PathBuf::from("b\u{e9}"),
@@ -1181,7 +1273,12 @@ mod tests {
             Change::Size { old: 1, new: 2 },
             Change::Content,
             Change::Metadata,
-            Change::Entries,
+            Change::Entries {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                retyped: Vec::new(),
+            },
+            Change::Order,
             Change::LinkTarget {
                 old: PathBuf::from("a"),
                 new: PathBuf::from("b"),
@@ -1201,6 +1298,7 @@ mod tests {
             "content changed",
             "metadata changed",
             "directory entries changed",
+            "the order of its entries changed",
             "link target changed from a to b",
         ]);
         let difference = Difference {
@@ -1339,6 +1437,7 @@ mod tests {
             listing: Some(Listing {
                 hash: ContentHash([2; 32]),
                 entries: Some(Vec::new()),
+                sorted_hash: ContentHash([2; 32]),
             }),
             times,
         };
@@ -1400,6 +1499,102 @@ mod tests {
             assert_eq!(first.last(), Some(if timestamps { &0xF5 } else { &0xF4 }));
             assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
         }
+    }
+
+    /// An entries change names what appeared, disappeared, and changed type, each
+    /// group only when it is not empty and with at most ten names, and an order
+    /// change says that only the order changed.
+    #[test]
+    fn entries_and_order_changes_display() {
+        let entry = |name: &str| {
+            DirEntry {
+                name: name.as_bytes().to_vec(),
+                kind: EntryKind::File,
+            }
+        };
+        let many: Vec<DirEntry> = (0..12)
+            .map(|index| entry(&format!("f{index:02}")))
+            .collect();
+        let shown: Vec<String> = [
+            Change::Entries {
+                appeared: vec![entry("b.txt")],
+                disappeared: vec![entry("a.txt"), entry("c.txt")],
+                retyped: vec![entry("d")],
+            },
+            Change::Entries {
+                appeared: Vec::new(),
+                disappeared: vec![entry("gone")],
+                retyped: Vec::new(),
+            },
+            Change::Entries {
+                appeared: many,
+                disappeared: Vec::new(),
+                retyped: vec![DirEntry {
+                    name: b"x\xff".to_vec(),
+                    kind: EntryKind::Directory,
+                }],
+            },
+            Change::Order,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let many_and_invalid = format!(
+            "directory entries changed: `f00`, `f01`, `f02`, `f03`, `f04`, `f05`, `f06`, `f07`, \
+             `f08`, `f09` and 2 more appeared; `x{}` changed type",
+            char::REPLACEMENT_CHARACTER
+        );
+        assert_eq!(shown, [
+            "directory entries changed: `b.txt` appeared; `a.txt`, `c.txt` disappeared; `d` \
+             changed type",
+            "directory entries changed: `gone` disappeared",
+            many_and_invalid.as_str(),
+            "the order of its entries changed",
+        ]);
+    }
+
+    /// A listing keeps its entries in the order given, encodes deterministically as
+    /// a definite-length array of the ordered hash, the entries, and the sorted
+    /// hash, and round-trips, with or without its entries.
+    #[test]
+    fn listings_keep_their_order_encode_deterministically_and_round_trip() {
+        let entries = vec![
+            DirEntry {
+                name: b"z".to_vec(),
+                kind: EntryKind::File,
+            },
+            DirEntry {
+                name: b"a".to_vec(),
+                kind: EntryKind::Directory,
+            },
+        ];
+        let listed = Listing {
+            hash: ContentHash([4; 32]),
+            entries: Some(entries.clone()),
+            sorted_hash: ContentHash([5; 32]),
+        };
+        let large = Listing {
+            entries: None,
+            ..listed.clone()
+        };
+        for listing in [&listed, &large] {
+            let first = minicbor::to_vec(listing).unwrap();
+            assert_eq!(first, minicbor::to_vec(listing).unwrap());
+            assert_eq!(first.first(), Some(&0x83));
+            assert!(first.ends_with(&minicbor::to_vec(ContentHash([5; 32])).unwrap()));
+            assert_eq!(&minicbor::decode::<Listing>(&first).unwrap(), listing);
+        }
+        let decoded = minicbor::decode::<Listing>(&minicbor::to_vec(&listed).unwrap()).unwrap();
+        assert_eq!(decoded.entries, Some(entries.clone()));
+        // The same entries in another order encode differently.
+        let reversed = Listing {
+            entries: Some(entries.into_iter().rev().collect()),
+            ..listed.clone()
+        };
+        assert_ne!(
+            minicbor::to_vec(&listed).unwrap(),
+            minicbor::to_vec(&reversed).unwrap()
+        );
     }
 
     #[test]
