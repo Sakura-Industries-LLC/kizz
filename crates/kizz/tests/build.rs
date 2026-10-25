@@ -1688,3 +1688,249 @@ fn the_machine_state_is_recorded_and_shown_by_why() -> TestResult {
     }
     Ok(())
 }
+
+/// The warning `kizz build` prints for the step `run("false")` of the task `task`,
+/// as warnings name it, which its program left unchecked; `cached` says that the
+/// result came from the cache, and `fail` that `--fail-unchecked` was given.
+fn unchecked_false(
+    task: &str,
+    cached: bool,
+    fail: bool,
+) -> String {
+    format!(
+        "{task} left `false` in . unchecked: exit code 1, but its `run()` has no `expect` and \
+         the task program never read the result's `rc` or `signal`{}; {}",
+        if cached {
+            "; the result came from the cache"
+        } else {
+            ""
+        },
+        if fail {
+            "the task fails because `kizz build --fail-unchecked` was given"
+        } else {
+            "`kizz build --fail-unchecked` makes this fail the task"
+        }
+    )
+}
+
+/// The warning `kizz build` prints for the step `run("false")` of the task on line
+/// 3 of the root `kizz.md`, headed `Ignore`, which its program left unchecked;
+/// `cached` says that the result came from the cache, and `fail` that
+/// `--fail-unchecked` was given.
+fn false_unchecked(
+    cached: bool,
+    fail: bool,
+) -> String {
+    unchecked_false("kizz.md:3 (Ignore)", cached, fail)
+}
+
+/// Only the results that stand when the build settles warn: `Use` runs `cat
+/// out.txt` before `Make` writes `out.txt`, so `cat` fails unchecked in pass 1 and
+/// succeeds in pass 2, and `Ignore` ignores `run("false")`. The build settles in two
+/// passes, and its standard error is exactly the warning for `false`, without the
+/// cache note, then the summary with it; the next build prints the same warning
+/// with the cache note.
+#[test]
+fn only_the_unchecked_exits_that_stand_warn() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[
+        ("Use", "run(\"cat\", \"out.txt\")"),
+        ("Make", "run(\"sh\", \"-c\", \"echo made > out.txt\")"),
+        ("Ignore", "run(\"false\")"),
+    ])?;
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first
+            .stdout
+            .ends_with("build succeeded: 3 tasks, settled in 2 passes; 4 commands ran, 0 cached\n"),
+        "{first:?}"
+    );
+    let message = unchecked_false("kizz.md:17 (Ignore)", false, false);
+    assert_eq!(
+        first.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{first:?}"
+    );
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    let message = unchecked_false("kizz.md:17 (Ignore)", true, false);
+    assert_eq!(
+        second.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{second:?}"
+    );
+    Ok(())
+}
+
+/// When a task that ignores `run("false")` runs before a task that calls `fail()`,
+/// standard error holds the later task's failure, then the warning for `false`,
+/// which comes after the last pass, then the `failed:` line, then the summary of
+/// warnings, in that order.
+#[test]
+fn the_unchecked_warning_comes_after_the_last_pass() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[
+        ("Ignore", "run(\"false\")"),
+        ("Stop", "fail(\"stopped on purpose\")"),
+    ])?;
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    let message = false_unchecked(false, false);
+    let warning = format!("warning: {message}\n");
+    let summary = format!("1 warning:\n  {message}\n");
+    let parts = [
+        "error: kizz.md:10 (Stop) failed:",
+        warning.as_str(),
+        "failed: kizz.md:10 (Stop)\n",
+        summary.as_str(),
+    ];
+    let mut from = 0_usize;
+    for part in parts {
+        let found = run
+            .stderr
+            .get(from..)
+            .and_then(|rest| rest.find(part))
+            .ok_or_else(|| format!("{part:?} after byte {from} in {run:?}"))?;
+        from = from.saturating_add(found).saturating_add(part.len());
+    }
+    assert!(run.stderr.ends_with(&summary), "{run:?}");
+    assert_eq!(
+        run.stderr.matches(&warning).count(),
+        1,
+        "the warning is printed once, then repeated in the summary: {run:?}"
+    );
+    Ok(())
+}
+
+/// A task that runs `false` and ignores the result builds with exit status 0, with
+/// one loud warning that names the task, the command and how it ended, repeated in
+/// the summary; the next build, whose result comes from the cache, warns again. The
+/// same build with `--fail-unchecked` exits with status 1 and prints the command,
+/// its exit status and its captured output, and so does a fresh build with it.
+#[test]
+fn an_unchecked_false_warns_and_fails_with_fail_unchecked() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[("Ignore", "run(\"false\")")])?;
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    let message = false_unchecked(false, false);
+    assert_eq!(
+        first.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{first:?}"
+    );
+    assert!(
+        first
+            .stdout
+            .ends_with("build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached\n"),
+        "{first:?}"
+    );
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    let message = false_unchecked(true, false);
+    assert_eq!(
+        second.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{second:?}"
+    );
+
+    let failing = project.run("", &["build", "--fail-unchecked", "ci"])?;
+    assert_eq!(failing.status, Some(1), "{failing:?}");
+    let fresh = Project::new()?;
+    fresh.kizz_md("", &[("Ignore", "run(\"false\")")])?;
+    let fresh_run = fresh.run("", &["build", "--fail-unchecked", "ci"])?;
+    assert_eq!(fresh_run.status, Some(1), "{fresh_run:?}");
+    for (run, cached) in [(&failing, true), (&fresh_run, false)] {
+        let message = false_unchecked(cached, true);
+        for part in [
+            "error: kizz.md:3 (Ignore) failed:\n  the task program left a non-zero exit \
+             unchecked, and `kizz build --fail-unchecked` makes that fail the task\n  command \
+             `false`: exit code 1, which the task program never checked: its `run()` has no \
+             `expect`, and the program never read the result's `rc` or `signal`\n  --- stdout \
+             ---\n  --- stderr ---\n"
+                .to_owned(),
+            format!("warning: {message}\n"),
+            "failed: kizz.md:3 (Ignore)\n".to_owned(),
+            format!("1 warning:\n  {message}\n"),
+        ] {
+            assert!(run.stderr.contains(&part), "{part:?} in {run:?}");
+        }
+        assert!(
+            run.stdout
+                .contains("build failed: 1 task, 1 failed, settled in 1 pass; "),
+            "{run:?}"
+        );
+    }
+    Ok(())
+}
+
+/// With `--fail-unchecked`, the failure of a task that leaves a command's non-zero
+/// exit unchecked prints the command's captured output.
+#[test]
+fn fail_unchecked_prints_the_captured_output() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[(
+        "Noisy",
+        "run(\"sh\", \"-c\", \"echo printed; echo complained >&2; exit 3\")",
+    )])?;
+    let run = project.run("", &["build", "--fail-unchecked", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    assert!(
+        run.stderr.contains(
+            "  command `sh -c echo printed; echo complained >&2; exit 3`: exit code 3, which the \
+             task program never checked"
+        ),
+        "{run:?}"
+    );
+    assert!(
+        run.stderr
+            .contains("  --- stdout ---\n  printed\n  --- stderr ---\n  complained\n"),
+        "{run:?}"
+    );
+    Ok(())
+}
+
+/// `run("false", expect = [1])` accepts the exit, a task that reads `rc` checks
+/// it, and a task that writes `json.encode(result)` with `fs.write`, or the result
+/// with `fs.write_json`, encodes it, which checks it: none warns, and
+/// `--fail-unchecked` fails none. The files hold the result's attributes.
+#[test]
+fn checked_exits_warn_about_nothing() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[
+        ("Expect", "run(\"false\", expect = [1])"),
+        (
+            "Read",
+            "if run(\"false\", \"read\").rc != 1:\n    fail(\"unexpected\")",
+        ),
+        (
+            "Encode",
+            "fs.write(\"encoded.json\", json.encode(run(\"false\", \"encode\")))",
+        ),
+        (
+            "Write",
+            "fs.write_json(\"written.json\", run(\"false\", \"write\"))",
+        ),
+    ])?;
+    for args in [
+        &["build", "ci"][..],
+        &["build", "--fail-unchecked", "ci"][..],
+    ] {
+        let run = project.run("", args)?;
+        assert_eq!(run.status, Some(0), "{args:?}: {run:?}");
+        assert_eq!(run.stderr, "", "{args:?}: {run:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(project.root.join("encoded.json"))?,
+        r#"{"rc":1,"signal":null,"stdout":"","stderr":"","cached":true}"#
+    );
+    let written = fs::read_to_string(project.root.join("written.json"))?;
+    assert!(written.contains("\"rc\": 1"), "{written}");
+    assert!(written.contains("\"signal\": null"), "{written}");
+    Ok(())
+}

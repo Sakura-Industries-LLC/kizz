@@ -70,6 +70,11 @@
 //! and the engine keeps each run that made any for the build's warnings (see
 //! [`Engine::connections`]). A cache hit runs nothing, so it adds no warning.
 //!
+//! Unchecked steps ("Exit codes and failure"): with [`Engine::with_fail_unchecked`],
+//! a task run that leaves a non-zero exit unchecked fails when its program ends.
+//! Which unchecked steps warn is the build's to say, from the results that stand
+//! when it settles (see [`BuildReport::unchecked`](crate::BuildReport::unchecked)).
+//!
 //! A missing or non-executable program fails the task and is recorded like any
 //! other failure, with every path checked and the failure message, which a cache hit
 //! fails with again. A bare program name without `PATH` in the step's environment,
@@ -233,6 +238,9 @@ pub struct Engine<'a> {
     unknown_calls: Mutex<Vec<UnknownCalls>>,
     /// The runs of the build that made connections, in the order they ended.
     connections: Mutex<Vec<StepConnections>>,
+    /// Whether a task run that leaves a step unchecked fails when its program
+    /// ends, as `kizz build --fail-unchecked` asks.
+    fail_unchecked: bool,
     /// The step keys whose recorded machine state the build already compared, or
     /// whose step ran in the build. The machine state is compared at most once per
     /// step key and build, so a step that names a part that changes all the time,
@@ -259,6 +267,7 @@ impl fmt::Debug for Engine<'_> {
             )
             .field("unknown_calls", &self.unknown_calls)
             .field("connections", &self.connections)
+            .field("fail_unchecked", &self.fail_unchecked)
             .field("machine_compared", &self.machine_compared)
             .finish_non_exhaustive()
     }
@@ -295,6 +304,7 @@ impl<'a> Engine<'a> {
             cache_unknown_system_calls: false,
             unknown_calls: Mutex::new(Vec::new()),
             connections: Mutex::new(Vec::new()),
+            fail_unchecked: false,
             machine_compared: Mutex::new(HashSet::new()),
         }
     }
@@ -333,6 +343,25 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn connections(&self) -> Vec<StepConnections> {
         lock(&self.connections).clone()
+    }
+
+    /// The engine, which makes a task run that leaves a step unchecked fail when
+    /// its program ends, when `fail` is set, as `kizz build --fail-unchecked` asks.
+    /// Without it, an unchecked step only warns. The option is in no step key or
+    /// record.
+    #[must_use]
+    pub const fn with_fail_unchecked(
+        mut self,
+        fail: bool,
+    ) -> Self {
+        self.fail_unchecked = fail;
+        self
+    }
+
+    /// Whether a task run that leaves a step unchecked fails.
+    #[must_use]
+    pub const fn fails_unchecked(&self) -> bool {
+        self.fail_unchecked
     }
 
     /// The identity of the build.

@@ -1,4 +1,5 @@
 ACCMODE
+allocative
 arrayref
 bavail
 binfmt
@@ -165,6 +166,7 @@ openat
 opendir
 openpt
 osrelease
+pagable
 phentsize
 phnum
 phoff
@@ -241,6 +243,7 @@ SIGTRAP
 SIGUSR
 sockaddr
 Starlark
+startswith
 statfs
 statvfs
 statx

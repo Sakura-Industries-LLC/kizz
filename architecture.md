@@ -33,7 +33,7 @@ These decisions came out of the review of the original outline.
 | Build daemons | Not supported. Their work cannot be traced; builds that need them should use another tool. |
 | Unknown inputs | A step with no record has never run, so it runs. |
 | Task programs | Tasks are small Starlark programs. Kizz does not run plain lists of commands. |
-| Exit codes | A task program decides whether an exit code fails its task and under which conditions. A non-zero code never fails anything by itself; sometimes a negative result is the one you want, and sometimes the code does not matter. |
+| Exit codes | A task program decides whether an exit code fails its task and under which conditions. A non-zero code never fails anything by itself; sometimes a negative result is the one you want, and sometimes the code does not matter. A non-zero code that the task program neither expects nor checks gets a loud warning, and `kizz build --fail-unchecked` makes it fail the task. |
 | Captured output | Output can be captured as separate standard output and standard error, or interleaved. Output that is captured and then passed to another step (not piped) becomes a dependency of that step. |
 | Cached results | The exit status and captured output of each step are cached and replayed to the task program on a hit. |
 | Environment | Each task starts with an empty environment. Task programs read the caller environment and named `.env` files with defaults, inject variables into the environment of later commands, and clear it. The environment is a tracked input, and tasks are explicit about every variable their commands see. |
@@ -165,6 +165,8 @@ Version 1 implements these commands:
   Without a target, `kizz build` exits with an error that lists the available targets.
   A build tries every task, even after a failure, and `--explain` prints the full reason for every command, cached ones included.
   `--sequential`, the default, runs one task at a time; `--parallel` exits with an error until parallel execution exists.
+  `--fail-unchecked` fails a task whose command exited with a non-zero code that the task never checked
+  (see [Exit codes and failure](#exit-codes-and-failure)).
   `--cache-unknown-syscalls` caches the results of commands that made a system call that the tracer does not know,
   which are not cached by default; kizz warns about them either way (see [The Linux tracer](#the-linux-tracer)).
 * `kizz why [path]` prints why each command ran or was cached in the most recent build,
@@ -277,6 +279,20 @@ The task program decides whether an exit code matters, which codes are acceptabl
 * With `expect = [0, 1]`, the task fails when the exit code is not in the list or a signal killed the process.
   Kizz then prints the command, its exit status and its captured output.
 * `fail()` fails the task explicitly.
+* A command's non-zero exit or signal is unchecked when its `run()` has no `expect` and the program never checks the result.
+  The program checks a result by reading its `rc` or `signal`, as an attribute or with `getattr`, or by encoding it.
+  Reading only the result's output or `cached` does not check it.
+  `json.encode` and `fs.write_json` encode a result as an object of its attributes and their values.
+  Encoding a result checks it: its exit status then leaves the program on purpose, for example in a file for a later step.
+* Once the build settles, kizz warns loudly about each unchecked command in the results that stand.
+  The results that stand are those of each task's latest run or replay in the build.
+  A task that runs again in a later pass replaces its earlier results, so a superseded result never warns.
+  Each warning names the task, the command and how it ended, and the summary repeats it.
+  A result replayed from the cache of an earlier build warns again, and the warning says that it came from the cache.
+  A build that does not settle, or that is interrupted, warns about no unchecked command.
+* `kizz build --fail-unchecked` turns that warning into a task failure when the task program ends.
+  Kizz then prints the command, its exit status and its captured output, as for an unexpected exit.
+  As for any failed task, a failure that a later pass replaced does not fail the build.
 
 ### Captured output is cached and becomes a dependency
 
@@ -825,6 +841,7 @@ This is the first version of the rule, to be refined later.
 
 * A task fails when its program calls `fail()`, raises an error, calls `run()` with `expect` and gets an unexpected exit,
   or runs a command whose program cannot be found or started.
+  With `--fail-unchecked`, a task also fails when it leaves a non-zero exit unchecked.
   Kizz prints the error, the Starlark stack and the captured output of the failing command.
 * A failed task does not stop the build:
   the pass continues with every other task, including tasks that may consume its outputs.

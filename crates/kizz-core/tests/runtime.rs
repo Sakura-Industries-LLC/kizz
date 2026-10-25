@@ -18,7 +18,7 @@ use std::{
 
 use kizz_core::{
     PrintSink, ProgramHash, StepError, StepExecutor, StepOutcome, StepSpec, TaskFailure, TaskInfo,
-    TaskProgram, parse_tasks,
+    TaskProgram, TaskRun, UncheckedExit, parse_tasks,
 };
 use kizz_trace::{AbsolutePath, AccessKind, Accesses, CaptureMode, CapturedOutput, Termination};
 use tempfile::TempDir;
@@ -745,5 +745,336 @@ fn run_while_a_module_loads_is_an_error() -> TestResult {
         AbsolutePath::new(fixture.path().join("out"))?,
         "cwd resolves against the task directory, not the module's"
     );
+    Ok(())
+}
+
+/// An executor whose steps end by their program: `fails` exits with code 3,
+/// `killed` is killed by signal 9, `cached` exits with code 2 from the cache, and
+/// every other program exits with code 0. Each step writes `out` to standard
+/// output and `err` to standard error.
+fn exits() -> FakeExecutor {
+    FakeExecutor::scripted(|step| {
+        let program = step.argv.first().map_or("", String::as_str);
+        let termination = match program {
+            "fails" => Termination::Exited(3),
+            "killed" => Termination::Signaled(9),
+            "cached" => Termination::Exited(2),
+            _ => Termination::Exited(0),
+        };
+        let mut outcome = outcome(termination, step.capture, b"out\n", b"err\n");
+        outcome.cached = program == "cached";
+        Ok(outcome)
+    })
+}
+
+/// Load and run the program of `task`, which must load, returning the whole run
+/// and the printed lines.
+fn run_whole(
+    task: TaskInfo,
+    executor: &FakeExecutor,
+) -> TestResult<(TaskRun, Vec<String>)> {
+    let printed = Printed::default();
+    let program = TaskProgram::load(task, &printed).program?;
+    let run = program.run(&BTreeMap::new(), executor, &printed);
+    Ok((run, printed.lines()))
+}
+
+/// The position, command, and termination of each unchecked step of `run`.
+fn unchecked(run: &TaskRun) -> Vec<(u32, String, Termination)> {
+    run.unchecked
+        .iter()
+        .map(|exit| (exit.position, exit.command(), exit.termination))
+        .collect()
+}
+
+/// A non-zero exit whose result the program ignores is unchecked, and so is a
+/// command killed by a signal; a zero exit never is. Each unchecked step keeps its
+/// position, command, termination, and raw output, and the run still succeeds.
+#[test]
+fn ignored_non_zero_exits_and_signals_are_unchecked() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block(
+        "a = run(\"fails\", \"one\")\nb = run(\"killed\", capture = \"merged\")\nc = \
+         run(\"ok\")\n",
+    )?;
+    let (run, _) = run_whole(task, &exits())?;
+    run.result?;
+    assert_eq!(run.unchecked, [
+        UncheckedExit {
+            position: 0,
+            argv: vec!["fails".to_owned(), "one".to_owned()],
+            termination: Termination::Exited(3),
+            output: CapturedOutput::Split {
+                stdout: b"out\n".to_vec(),
+                stderr: b"err\n".to_vec(),
+            },
+            cached: false,
+        },
+        UncheckedExit {
+            position: 1,
+            argv: vec!["killed".to_owned()],
+            termination: Termination::Signaled(9),
+            output: CapturedOutput::Merged {
+                output: b"out\nerr\n".to_vec(),
+            },
+            cached: false,
+        },
+    ]);
+    Ok(())
+}
+
+/// Reading `rc`, `signal`, `getattr(result, "rc")` or `getattr(result, "signal")`
+/// checks a result; reading only `stdout`, `stderr`, `output` or `cached`, asking
+/// `hasattr`, listing `dir()`, or printing the result does not.
+#[test]
+fn reading_rc_or_signal_checks_and_reading_output_does_not() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block(
+        "a = run(\"fails\", \"rc\")\nb = run(\"killed\", \"signal\")\nc = run(\"fails\", \
+         \"getattr\")\nd = run(\"killed\", \"getattr-signal\")\nread = [a.rc, b.signal, \
+         getattr(c, \"rc\"), getattr(d, \"signal\")]\nprint(read)\ne = run(\"fails\", \
+         \"stdout\")\nprint(e.stdout.strip(), e.stderr.strip(), e.cached, hasattr(e, \"rc\"), \
+         hasattr(e, \"signal\"), dir(e))\nprint(str(e).startswith(\"run_result(\"))\nf = \
+         run(\"fails\", \"merged\", capture = \"merged\")\nprint(f.output.strip())\n",
+    )?;
+    let (run, printed) = run_whole(task, &exits())?;
+    run.result.clone()?;
+    assert_eq!(printed, [
+        "Build it: [3, 9, 3, 9]",
+        "Build it: out err False True True [\"cached\", \"rc\", \"signal\", \"stderr\", \
+         \"stdout\"]",
+        "Build it: True",
+        "Build it: out",
+        "Build it: err",
+    ]);
+    assert_eq!(unchecked(&run), [
+        (4, "fails stdout".to_owned(), Termination::Exited(3)),
+        (5, "fails merged".to_owned(), Termination::Exited(3)),
+    ]);
+    Ok(())
+}
+
+/// With `expect = [0, 1]`, nothing is unchecked, whatever the exit: an accepted
+/// code returns, and any other code or a signal fails the task as an unexpected
+/// exit, never as an unchecked one.
+#[test]
+fn expect_leaves_nothing_unchecked() -> TestResult {
+    let fixture = Fixture::new()?;
+    let executor = FakeExecutor::scripted(|step| {
+        let termination = match first_argument(step) {
+            "one" => Termination::Exited(1),
+            "three" => Termination::Exited(3),
+            "killed" => Termination::Signaled(15),
+            _ => Termination::Exited(0),
+        };
+        Ok(outcome(termination, step.capture, b"", b""))
+    });
+    let accepted = fixture.block(
+        "run(\"tool\", \"zero\", expect = [0, 1])\nrun(\"tool\", \"one\", expect = [0, 1])\n",
+    )?;
+    let (run, _) = run_whole(accepted, &executor)?;
+    run.result?;
+    assert!(run.unchecked.is_empty(), "{:?}", run.unchecked);
+    for argument in ["three", "killed"] {
+        let task = fixture.block(&format!("run(\"tool\", \"{argument}\", expect = [0, 1])\n"))?;
+        let (run, _) = run_whole(task, &executor)?;
+        assert!(
+            matches!(run.result, Err(TaskFailure::UnexpectedExit { .. })),
+            "{argument}: {:?}",
+            run.result
+        );
+        assert!(run.unchecked.is_empty(), "{argument}: {:?}", run.unchecked);
+    }
+    Ok(())
+}
+
+/// A module function that returns a result to its caller, which reads `rc`,
+/// checks it; the same function whose caller reads only the output leaves it
+/// unchecked.
+#[test]
+fn a_result_returned_by_a_module_function_is_checked_where_it_is_read() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write(
+        "lib/tools.star",
+        "def tool(name):\n    return run(\"fails\", name)\n",
+    )?;
+    let task = fixture.block(
+        "load(\"lib/tools.star\", \"tool\")\nif tool(\"checked\").rc != 3:\n    fail(\"rc\")\nprint(tool(\"ignored\").stdout.strip())\n",
+    )?;
+    let (run, printed) = run_whole(task, &exits())?;
+    run.result.clone()?;
+    assert_eq!(printed, ["Build it: out"]);
+    assert_eq!(unchecked(&run), [(
+        1,
+        "fails ignored".to_owned(),
+        Termination::Exited(3)
+    )]);
+    Ok(())
+}
+
+/// A result from the cache counts like any other, and a program that fails still
+/// reports what it left unchecked before it failed.
+#[test]
+fn cached_results_and_failed_programs_report_unchecked_steps() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block("a = run(\"cached\")\nfail(\"stop\")\n")?;
+    let (run, _) = run_whole(task, &exits())?;
+    let message = program_message(run.result.clone())?;
+    assert!(message.contains("stop"), "{message}");
+    assert_eq!(run.unchecked.len(), 1, "{:?}", run.unchecked);
+    let exit = &run.unchecked[0];
+    assert_eq!(exit.termination, Termination::Exited(2));
+    assert!(exit.cached);
+    Ok(())
+}
+
+/// An unchecked step and the failure of `kizz build --fail-unchecked` show each
+/// command, its exit status, and its captured output, as an unexpected exit does.
+#[test]
+fn unchecked_failures_show_each_command_status_and_output() {
+    let exits = vec![
+        UncheckedExit {
+            position: 0,
+            argv: vec!["false".to_owned()],
+            termination: Termination::Exited(1),
+            output: CapturedOutput::Split {
+                stdout: b"out".to_vec(),
+                stderr: Vec::new(),
+            },
+            cached: false,
+        },
+        UncheckedExit {
+            position: 2,
+            argv: vec!["sleep".to_owned(), "9".to_owned()],
+            termination: Termination::Signaled(9),
+            output: CapturedOutput::Merged {
+                output: b"partial\n".to_vec(),
+            },
+            cached: true,
+        },
+    ];
+    let shown = TaskFailure::Unchecked { exits }.to_string();
+    assert_eq!(
+        shown,
+        "the task program left 2 non-zero exits unchecked, and `kizz build --fail-unchecked` \
+         makes that fail the task\ncommand `false`: exit code 1, which the task program never \
+         checked: its `run()` has no `expect`, and the program never read the result's `rc` or \
+         `signal`\n--- stdout ---\nout\n--- stderr ---\ncommand `sleep 9`: killed by signal 9, \
+         which the task program never checked: its `run()` has no `expect`, and the program \
+         never read the result's `rc` or `signal`\n--- output ---\npartial\n"
+    );
+}
+
+/// An executor for the encoding tests, by the step's first argument: `one` exits
+/// with code 1 and writes `out` to standard output, `killed` is killed by signal 9
+/// after writing `out` and `err`, and `hit` exits with code 0 from the cache after
+/// writing `hit` and `warn`.
+fn encoded() -> FakeExecutor {
+    FakeExecutor::scripted(|step| {
+        let (termination, stdout, stderr): (Termination, &[u8], &[u8]) = match first_argument(step)
+        {
+            "one" => (Termination::Exited(1), b"out\n", b""),
+            "killed" => (Termination::Signaled(9), b"out\n", b"err\n"),
+            _ => (Termination::Exited(0), b"hit\n", b"warn\n"),
+        };
+        let mut outcome = outcome(termination, step.capture, stdout, stderr);
+        outcome.cached = first_argument(step) == "hit";
+        Ok(outcome)
+    })
+}
+
+/// The encoding rule's first regression: `json.encode` of a result is exactly the
+/// text that the struct `run()` returned before encoded to for the same values,
+/// an object of `rc`, `signal`, `stdout` and `stderr` or `output`, and `cached`, in
+/// that order, for both capture modes, an exit code and a signal, and a run and a
+/// cache hit; `fs.write_json` writes the same members with the same values.
+#[test]
+fn json_encode_gives_the_text_of_the_former_struct() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block(
+        "a = run(\"tool\", \"one\")\nb = run(\"tool\", \"killed\", capture = \"merged\")\nc = \
+         run(\"tool\", \"hit\")\nd = run(\"tool\", \"killed\")\nfor r in [a, b, c, d]:\n    \
+         print(json.encode(r))\nfs.write_json(\"a.json\", a)\nfs.write_json(\"b.json\", \
+         b)\nfs.write_json(\"c.json\", c)\n",
+    )?;
+    let (run, printed) = run_whole(task, &encoded())?;
+    run.result.clone()?;
+    assert_eq!(printed, [
+        r#"Build it: {"rc":1,"signal":null,"stdout":"out\n","stderr":"","cached":false}"#,
+        r#"Build it: {"rc":null,"signal":9,"output":"out\nerr\n","cached":false}"#,
+        r#"Build it: {"rc":0,"signal":null,"stdout":"hit\n","stderr":"warn\n","cached":true}"#,
+        r#"Build it: {"rc":null,"signal":9,"stdout":"out\n","stderr":"err\n","cached":false}"#,
+    ]);
+    let written = |name: &str| -> TestResult<serde_json::Value> {
+        Ok(serde_json::from_str(&fs::read_to_string(
+            fixture.path().join(name),
+        )?)?)
+    };
+    assert_eq!(
+        written("a.json")?,
+        serde_json::json!({
+            "rc": 1,
+            "signal": null,
+            "stdout": "out\n",
+            "stderr": "",
+            "cached": false
+        })
+    );
+    assert_eq!(
+        written("b.json")?,
+        serde_json::json!({
+            "rc": null,
+            "signal": 9,
+            "output": "out\nerr\n",
+            "cached": false
+        })
+    );
+    assert_eq!(
+        written("c.json")?,
+        serde_json::json!({
+            "rc": 0,
+            "signal": null,
+            "stdout": "hit\n",
+            "stderr": "warn\n",
+            "cached": true
+        })
+    );
+    assert!(run.unchecked.is_empty(), "{:?}", run.unchecked);
+    Ok(())
+}
+
+/// The encoding rule's second regression: a non-zero exit, and a signal, whose
+/// result the program only encodes, with `json.encode`, also inside a list or a
+/// dict, or with `fs.write_json`, also inside a dict, is checked, while the same
+/// program without the encoding leaves it unchecked.
+#[test]
+fn encoding_a_result_checks_it() -> TestResult {
+    let fixture = Fixture::new()?;
+    let encodings = [
+        "json.encode(r)",
+        "json.encode([r])",
+        "json.encode({\"result\": r})",
+        "fs.write_json(\"r.json\", r)",
+        "fs.write_json(\"r.json\", {\"all\": [r]})",
+    ];
+    for program in ["fails", "killed"] {
+        for encoding in encodings {
+            let task = fixture.block(&format!("r = run(\"{program}\")\n{encoding}\n"))?;
+            let (run, _) = run_whole(task, &exits())?;
+            run.result?;
+            assert!(
+                run.unchecked.is_empty(),
+                "{program}, {encoding}: {:?}",
+                run.unchecked
+            );
+        }
+        let task = fixture.block(&format!(
+            "r = run(\"{program}\")\nkept = [r]\nprint(len(kept), r.stdout.strip())\n"
+        ))?;
+        let (run, printed) = run_whole(task, &exits())?;
+        run.result?;
+        assert_eq!(printed, ["Build it: 1 out"]);
+        assert_eq!(run.unchecked.len(), 1, "{program}: {:?}", run.unchecked);
+    }
     Ok(())
 }

@@ -44,7 +44,7 @@ use std::{
 
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, INTERRUPTED, Pass, PrintSink,
-    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, build, load, task_id,
+    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, UncheckedStep, build, load, task_id,
 };
 use kizz_store::{
     BuildId, Change, LearnedOrder, MachineChange, Reason, Store, TaskId, TaskLabel, TaskRecord,
@@ -498,6 +498,31 @@ impl Fixture {
         let record = store.read()?.get::<TaskRecord>(task)?;
         store.close()?;
         Ok(record.ok_or("no task record")?)
+    }
+
+    /// Run one build of the tasks of target `ci` with `tracer`, failing task runs
+    /// that leave a step unchecked when `fail` is set, as `kizz build
+    /// --fail-unchecked` does; return the report, whose standing unchecked exits
+    /// ([`BuildReport::unchecked`]) are the build's warnings.
+    fn build_unchecked(
+        &self,
+        tracer: &FakeTracer,
+        fail: bool,
+    ) -> TestResult<BuildReport> {
+        let tasks = self.tasks()?;
+        let caller: BTreeMap<String, String> = [(
+            "PATH".to_owned(),
+            self.path("bin").to_string_lossy().into_owned(),
+        )]
+        .into();
+        let store = self.store()?;
+        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None)
+            .with_fail_unchecked(fail);
+        assert_eq!(engine.fails_unchecked(), fail);
+        let report = build(&engine, &tasks, &caller, &NoPrint, &Events::default())?;
+        drop(engine);
+        store.close()?;
+        Ok(report)
     }
 }
 
@@ -1477,5 +1502,282 @@ fn a_program_that_keeps_changing_a_file_stops_at_the_pass_limit() -> TestResult 
     assert_eq!(write.writer.task, fixture.id("", 0));
     let worked: Vec<Option<&str>> = worked.iter().map(|task| task.name.as_deref()).collect();
     assert_eq!(worked, vec![Some("Count")]);
+    Ok(())
+}
+
+/// An unchecked step as the tests compare it: the heading of its task, its
+/// command, how it ended, whether the build ran a command under its step key, and
+/// whether its result came from the cache.
+type Unchecked = (Option<String>, String, Termination, bool, bool);
+
+/// The unchecked steps `steps`, as the tests compare them.
+fn unchecked_steps(steps: &[UncheckedStep]) -> Vec<Unchecked> {
+    steps
+        .iter()
+        .map(|step| {
+            (
+                step.task.heading.clone(),
+                step.exit.command(),
+                step.exit.termination,
+                step.ran,
+                step.exit.cached,
+            )
+        })
+        .collect()
+}
+
+/// The number of unchecked steps of each task run of `report`, pass by pass.
+fn unchecked_per_run(report: &BuildReport) -> Vec<Vec<usize>> {
+    report
+        .passes
+        .iter()
+        .map(|pass| {
+            pass.tasks
+                .iter()
+                .map(|result| result.unchecked.len())
+                .collect()
+        })
+        .collect()
+}
+
+/// A superseded result never warns (the final-state rule): `Use`, earlier in the
+/// default order, fails unchecked in pass 1, because `Make` has not yet written
+/// its input, and succeeds in pass 2; `Switch` fails unchecked in pass 1, and its
+/// run in pass 2 no longer makes that command. Neither leaves a standing unchecked
+/// exit, with or without `--fail-unchecked`; with the option their pass-1 runs
+/// fail, and the build still succeeds, because its final pass decides.
+#[test]
+fn a_superseded_unchecked_exit_never_stands() -> TestResult {
+    for fail in [false, true] {
+        let fixture = Fixture::new()?;
+        fixture.kizz("", &[
+            ("Use", "run(\"tool\", \"need:out.txt\")"),
+            (
+                "Switch",
+                "if fs.exists(\"flag.txt\"):\n    run(\"tool\", \"ok\")\nelse:\n    \
+                 run(\"tool\", \"need:flag.txt\")",
+            ),
+            (
+                "Make",
+                "run(\"tool\", \"write:out.txt=made\")\nfs.write(\"flag.txt\", \"set\\n\")",
+            ),
+        ])?;
+        let tracer = FakeTracer::default();
+        let report = fixture.build_unchecked(&tracer, fail)?;
+        let first = if fail { "failed" } else { "ok" };
+        let use_line = format!("Use ran {first}");
+        let switch_line = format!("Switch ran {first}");
+        assert_eq!(passes(&report), [
+            lines(&[use_line.as_str(), switch_line.as_str(), "Make ran ok"]),
+            lines(&["Use ran ok", "Switch ran ok", "Make cached ok"]),
+            lines(&["Use cached ok", "Switch cached ok", "Make cached ok"]),
+        ]);
+        assert_eq!(unchecked_per_run(&report), [
+            vec![1, 1, 0],
+            vec![0, 0, 0],
+            vec![0, 0, 0]
+        ]);
+        assert_eq!(report.outcome, BuildOutcome::Succeeded, "fail: {fail}");
+        let standing = report.unchecked();
+        assert!(standing.is_empty(), "fail: {fail}: {standing:?}");
+    }
+    Ok(())
+}
+
+/// Exactly once, and again from the cache: `Ignore`, whose final result is
+/// unchecked, in a first build that takes three passes, the final one included,
+/// and reaches the step in each, gives exactly one standing unchecked exit, which
+/// says that the build ran the command; the next build, which replays every step
+/// from the cache, gives the same standing unchecked exit, which says that its
+/// result came from the cache. `Check`, which reads `rc`, gives none.
+#[test]
+fn a_standing_unchecked_exit_stands_once_and_again_from_the_cache() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.kizz("", &[
+        (
+            "Ignore",
+            "run(\"tool\", \"need:absent.txt\")\nrun(\"tool\", \"read:in.txt\")",
+        ),
+        (
+            "Check",
+            "result = run(\"tool\", \"need:absent.txt\", \"checked\")\nif result.rc != 1:\n    \
+             fail(\"unexpected\")",
+        ),
+        ("Make", "fs.write(\"in.txt\", \"in\\n\")"),
+    ])?;
+    let tracer = FakeTracer::default();
+
+    let first = fixture.build_unchecked(&tracer, false)?;
+    assert_eq!(first.outcome, BuildOutcome::Succeeded);
+    assert_eq!(passes(&first), [
+        lines(&["Ignore ran ok", "Check ran ok", "Make cached ok"]),
+        lines(&["Ignore ran ok", "Check cached ok", "Make cached ok"]),
+        lines(&["Ignore cached ok", "Check cached ok", "Make cached ok"]),
+    ]);
+    assert_eq!(
+        unchecked_per_run(&first),
+        [vec![1, 0, 0], vec![1, 0, 0], vec![1, 0, 0]],
+        "every pass reaches the unchecked step"
+    );
+    let standing = first.unchecked();
+    assert_eq!(unchecked_steps(&standing), [(
+        Some("Ignore".to_owned()),
+        "tool need:absent.txt".to_owned(),
+        Termination::Exited(1),
+        true,
+        true,
+    )]);
+    let [step] = standing.as_slice() else {
+        return Err(format!("unexpected steps {standing:?}").into());
+    };
+    assert_eq!(step.task.task, fixture.id("", 0));
+    assert_eq!(step.exit.position, 0);
+    let ran = tracer.runs().len();
+
+    // The build learned that `Ignore` reads the file that `Make` writes, so `Make`
+    // now runs first.
+    let second = fixture.build_unchecked(&tracer, false)?;
+    assert_eq!(second.outcome, BuildOutcome::Succeeded);
+    assert_eq!(passes(&second), [lines(&[
+        "Make cached ok",
+        "Ignore cached ok",
+        "Check cached ok"
+    ])]);
+    assert_eq!(unchecked_steps(&second.unchecked()), [(
+        Some("Ignore".to_owned()),
+        "tool need:absent.txt".to_owned(),
+        Termination::Exited(1),
+        false,
+        true,
+    )]);
+    assert_eq!(tracer.runs().len(), ran, "the second build ran nothing");
+    Ok(())
+}
+
+/// A build that does not settle, and one that is interrupted, give no standing
+/// unchecked exit, although their task runs left steps unchecked; the same report
+/// with a settled outcome, built by hand, would give the final pass's.
+#[test]
+fn unsettled_and_interrupted_builds_have_no_standing_unchecked_exit() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("count.txt", "")?;
+    fixture.kizz("", &[(
+        "Count",
+        "run(\"tool\", \"need:absent.txt\")\nfs.write(\"count.txt\", fs.read(\"count.txt\") + \
+         \"+\")",
+    )])?;
+    let report = fixture.build_unchecked(&FakeTracer::default(), false)?;
+    assert!(
+        matches!(report.outcome, BuildOutcome::NotSettled { .. }),
+        "{:?}",
+        report.outcome
+    );
+    assert_eq!(unchecked_per_run(&report), [vec![1], vec![1]]);
+    assert!(report.unchecked().is_empty(), "{:?}", report.unchecked());
+    let settled = BuildReport {
+        outcome: BuildOutcome::Succeeded,
+        ..report.clone()
+    };
+    assert_eq!(settled.unchecked().len(), 1);
+    let failed = BuildReport {
+        outcome: BuildOutcome::Failed {
+            failures: Vec::new(),
+        },
+        ..report.clone()
+    };
+    assert_eq!(failed.unchecked().len(), 1);
+    let interrupted = BuildReport {
+        outcome: BuildOutcome::Interrupted,
+        ..report
+    };
+    assert!(
+        interrupted.unchecked().is_empty(),
+        "{:?}",
+        interrupted.unchecked()
+    );
+
+    // A build that the last command of its first task interrupts.
+    let fixture = Fixture::new()?;
+    fixture.kizz("", &[
+        (
+            "Stop",
+            "run(\"tool\", \"need:absent.txt\")\nrun(\"tool\", \"interrupt\")",
+        ),
+        ("After", "run(\"tool\", \"need:absent.txt\", \"after\")"),
+    ])?;
+    let report = fixture.build_unchecked(&FakeTracer::default(), false)?;
+    assert_eq!(report.outcome, BuildOutcome::Interrupted);
+    assert_eq!(passes(&report), [lines(&["Stop ran ok"])]);
+    assert_eq!(unchecked_per_run(&report), [vec![2]]);
+    assert!(report.unchecked().is_empty(), "{:?}", report.unchecked());
+    Ok(())
+}
+
+/// With `--fail-unchecked`, a task whose final run leaves a non-zero exit
+/// unchecked fails when its program ends, with a failure that names the command,
+/// and the build fails; a task that reads `rc` does not. In the first build the
+/// command runs in pass 1 and its result comes from the cache in pass 2, which
+/// ends the build; in the second build it comes from the cache and fails the same
+/// way. Without the option, the same project builds, with the same standing
+/// unchecked exit.
+#[test]
+fn fail_unchecked_fails_a_standing_unchecked_exit_and_the_build() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.kizz("", &[
+        ("Ignore", "run(\"tool\", \"need:absent.txt\")"),
+        (
+            "Check",
+            "result = run(\"tool\", \"need:absent.txt\", \"checked\")\nif result.rc != 1:\n    \
+             fail(\"unexpected\")",
+        ),
+    ])?;
+    let tracer = FakeTracer::default();
+    let expected_passes = [
+        vec![
+            lines(&["Ignore ran failed", "Check ran ok"]),
+            lines(&["Ignore cached failed", "Check cached ok"]),
+        ],
+        vec![lines(&["Ignore cached failed", "Check cached ok"])],
+    ];
+    for expected in expected_passes {
+        let report = fixture.build_unchecked(&tracer, true)?;
+        assert_eq!(passes(&report), expected);
+        let BuildOutcome::Failed { failures } = &report.outcome else {
+            return Err(format!("unexpected outcome {:?}", report.outcome).into());
+        };
+        let [failed] = failures.as_slice() else {
+            return Err(format!("unexpected failures {failures:?}").into());
+        };
+        assert_eq!(failed.task.name.as_deref(), Some("Ignore"));
+        let TaskFailure::Unchecked { exits } = &failed.failure else {
+            return Err(format!("unexpected failure {:?}", failed.failure).into());
+        };
+        let commands: Vec<(String, Termination, bool)> = exits
+            .iter()
+            .map(|exit| (exit.command(), exit.termination, exit.cached))
+            .collect();
+        assert_eq!(commands, [(
+            "tool need:absent.txt".to_owned(),
+            Termination::Exited(1),
+            true
+        )]);
+        let message = failed.failure.to_string();
+        assert!(
+            message.contains("command `tool need:absent.txt`: exit code 1"),
+            "{message}"
+        );
+        let standing = report.unchecked();
+        assert_eq!(standing.len(), 1, "{standing:?}");
+        assert!(
+            !fixture.task_record(&fixture.id("", 0))?.succeeded,
+            "the task record says that the run failed"
+        );
+        assert!(fixture.task_record(&fixture.id("", 1))?.succeeded);
+    }
+    assert_eq!(tracer.runs().len(), 2, "only the first build ran commands");
+    let report = fixture.build_unchecked(&tracer, false)?;
+    assert_eq!(report.outcome, BuildOutcome::Succeeded);
+    let standing = report.unchecked();
+    assert_eq!(standing.len(), 1, "{standing:?}");
     Ok(())
 }

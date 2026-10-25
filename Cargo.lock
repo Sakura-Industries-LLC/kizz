@@ -1392,6 +1392,7 @@ dependencies = [
 name = "kizz-core"
 version = "0.0.1"
 dependencies = [
+ "allocative",
  "blake3",
  "dashmap",
  "globset",
@@ -1402,6 +1403,7 @@ dependencies = [
  "pulldown-cmark",
  "rayon",
  "regex",
+ "serde",
  "serde_json",
  "starlark",
  "tempfile",

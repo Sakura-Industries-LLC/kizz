@@ -79,12 +79,16 @@ impl Cli {
                 targets,
                 explain,
                 cache_unknown_syscalls,
+                fail_unchecked,
                 ..
             } => {
                 crate::build::run(targets.as_deref(), crate::build::Options {
                     explain,
                     verbose: self.verbose,
-                    cache_unknown_syscalls,
+                    engine: crate::build::EngineOptions {
+                        cache_unknown_syscalls,
+                        fail_unchecked,
+                    },
                 })
             },
             Command::Why { path } => crate::why::run(path.as_deref(), self.verbose),
@@ -154,6 +158,11 @@ pub enum Command {
         /// Cache commands that made system calls the tracer does not know.
         #[bpaf(long)]
         cache_unknown_syscalls: bool,
+
+        /// Fail a task that leaves a non-zero exit unchecked: no `expect`, and no
+        /// read of `rc` or `signal`.
+        #[bpaf(long)]
+        fail_unchecked: bool,
 
         /// How tasks are scheduled.
         #[bpaf(external(execution), fallback(Execution::Sequential))]
@@ -321,17 +330,19 @@ mod tests {
         );
     }
 
-    /// `kizz build` parses its targets and options, and is sequential by default.
+    /// `kizz build` parses its targets and options, and is sequential by default;
+    /// `--fail-unchecked` is off unless given.
     #[test]
     fn parses_build() {
         match parse(&["build", "ci+check"]).command {
             Command::Build {
                 explain,
                 cache_unknown_syscalls,
+                fail_unchecked,
                 execution,
                 targets,
             } => {
-                assert!(!explain && !cache_unknown_syscalls);
+                assert!(!explain && !cache_unknown_syscalls && !fail_unchecked);
                 assert_eq!(execution, Execution::Sequential);
                 assert_eq!(targets.as_deref(), Some("ci+check"));
             },
@@ -341,10 +352,11 @@ mod tests {
             Command::Build {
                 explain,
                 cache_unknown_syscalls,
+                fail_unchecked,
                 execution,
                 targets,
             } => {
-                assert!(explain && !cache_unknown_syscalls);
+                assert!(explain && !cache_unknown_syscalls && !fail_unchecked);
                 assert_eq!(execution, Execution::Parallel);
                 assert_eq!(targets, None);
             },
@@ -354,10 +366,11 @@ mod tests {
             Command::Build {
                 explain,
                 cache_unknown_syscalls,
+                fail_unchecked,
                 execution,
                 targets,
             } => {
-                assert!(!explain && cache_unknown_syscalls);
+                assert!(!explain && cache_unknown_syscalls && !fail_unchecked);
                 assert_eq!(execution, Execution::Sequential);
                 assert_eq!(targets.as_deref(), Some("TARGET"));
             },
@@ -370,6 +383,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `kizz build --fail-unchecked TARGET` parses, with the option set and every
+    /// other option at its default.
+    #[test]
+    fn parses_build_fail_unchecked() {
+        match parse(&["build", "--fail-unchecked", "TARGET"]).command {
+            Command::Build {
+                explain,
+                cache_unknown_syscalls,
+                fail_unchecked,
+                execution,
+                targets,
+            } => {
+                assert!(fail_unchecked && !explain && !cache_unknown_syscalls);
+                assert_eq!(execution, Execution::Sequential);
+                assert_eq!(targets.as_deref(), Some("TARGET"));
+            },
+            other => panic!("expected build, got {other:?}"),
+        }
     }
 
     /// `kizz why`, `kizz list`, and the stubs parse.

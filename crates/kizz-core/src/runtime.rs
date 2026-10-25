@@ -25,15 +25,29 @@
 //! like `run()`. The `fs` functions and `env.read` work there too, and every file
 //! access they make, like each module read, is recorded against the task, as is
 //! every file that `fs.write` or `fs.write_json` changes.
+//!
+//! `run()` returns a value of the runtime's own Starlark type, `run_result`, with
+//! the attributes `rc`, `signal`, `stdout` and `stderr` or `output`, and `cached`.
+//! The value notes when the program reads `rc` or `signal`, or encodes the value
+//! with `json.encode` or `fs.write_json`, which encode it as an object of its
+//! attributes, as they encoded the struct that `run()` returned before. So when the
+//! program ends, [`TaskRun::unchecked`] lists every step that exited with a
+//! non-zero code or was killed by a signal, whose `run()` had no `expect`, and
+//! whose result the program never checked ("Exit codes and failure").
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},
     fmt, fs,
     io::ErrorKind,
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
+use allocative::Allocative;
 use kizz_store::MachinePart;
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, CaptureMode, CapturedOutput, NotAbsoluteError, Termination,
@@ -43,13 +57,18 @@ use starlark::{
     any::ProvidesStaticType,
     environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module},
     eval::{Evaluator, FileLoader},
+    pagable::{
+        StarlarkDeserialize, StarlarkDeserializeContext, StarlarkSerialize,
+        StarlarkSerializeContext,
+    },
     starlark_module,
     syntax::{AstModule, Dialect},
     values::{
-        Heap, Value,
+        AllocValue, Heap, StarlarkValue, Value, ValueLike,
         dict::{AllocDict, UnpackDictEntries},
         list_or_tuple::UnpackListOrTuple,
         none::{NoneOr, NoneType},
+        starlark_value,
         structs::AllocStruct,
         tuple::UnpackTuple,
     },
@@ -195,14 +214,84 @@ impl fmt::Display for UnexpectedExit {
                 expected.join(" or ")
             },
         )?;
-        match &self.output {
-            CapturedOutput::Split { stdout, stderr } => {
-                write_output(f, "stdout", stdout)?;
-                write_output(f, "stderr", stderr)
-            },
-            CapturedOutput::Merged { output } => write_output(f, "output", output),
-        }
+        write_captured(f, &self.output)
     }
+}
+
+/// Write the captured output `output` under a header for each stream.
+fn write_captured(
+    f: &mut fmt::Formatter<'_>,
+    output: &CapturedOutput,
+) -> fmt::Result {
+    match output {
+        CapturedOutput::Split { stdout, stderr } => {
+            write_output(f, "stdout", stdout)?;
+            write_output(f, "stderr", stderr)
+        },
+        CapturedOutput::Merged { output } => write_output(f, "output", output),
+    }
+}
+
+/// A step whose command exited with a non-zero code or was killed by a signal,
+/// whose `run()` had no `expect`, and whose result the task program never checked:
+/// it never read the result's `rc` or `signal` and never encoded the result
+/// ("Exit codes and failure"). A result from the cache counts like any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncheckedExit {
+    /// The position of the step in the task's run, counting from zero: the number
+    /// of `run()` calls that reached the executor before it.
+    pub position: u32,
+    /// The step's argument vector.
+    pub argv: Vec<String>,
+    /// How the command ended: never with exit code 0.
+    pub termination: Termination,
+    /// The command's raw captured output.
+    pub output: CapturedOutput,
+    /// Whether the result came from the cache.
+    pub cached: bool,
+}
+
+impl UncheckedExit {
+    /// The command as messages name it: its arguments joined with spaces.
+    #[must_use]
+    pub fn command(&self) -> String {
+        self.argv.join(" ")
+    }
+}
+
+impl fmt::Display for UncheckedExit {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        writeln!(
+            f,
+            "command `{}`: {}, which the task program never checked: its `run()` has no \
+             `expect`, and the program never read the result's `rc` or `signal`",
+            self.command(),
+            self.termination,
+        )?;
+        write_captured(f, &self.output)
+    }
+}
+
+/// The message of a task that `kizz build --fail-unchecked` fails because its
+/// program left the steps `exits` unchecked: a line that says so, then each
+/// command with its exit status and its captured output.
+fn unchecked_message(exits: &[UncheckedExit]) -> String {
+    let mut message = format!(
+        "the task program left {} unchecked, and `kizz build --fail-unchecked` makes that fail \
+         the task\n",
+        if exits.len() == 1 {
+            "a non-zero exit".to_owned()
+        } else {
+            format!("{} non-zero exits", exits.len())
+        }
+    );
+    for exit in exits {
+        message.push_str(&exit.to_string());
+    }
+    message
 }
 
 /// Write one captured stream under a header, decoded as UTF-8 with invalid bytes
@@ -239,6 +328,14 @@ pub enum TaskFailure {
         exit: Box<UnexpectedExit>,
         /// The Starlark error message with the stack of the `run()` call.
         message: String,
+    },
+    /// The program ended, and left steps unchecked, which fails the task with
+    /// `kizz build --fail-unchecked` ("Exit codes and failure").
+    #[error("{}", unchecked_message(.exits))]
+    Unchecked {
+        /// Each unchecked step, in the order the program ran them, with its command,
+        /// its exit status, and its captured output.
+        exits: Vec<UncheckedExit>,
     },
 }
 
@@ -327,6 +424,10 @@ enum RunError {
     /// A JSON number has no Starlark value.
     #[error("fs.read_json(): the number {0} is out of range")]
     NumberRange(String),
+    /// A `run()` result was to be stored as a frozen value, which never happens,
+    /// because a result exists only while its task runs.
+    #[error("a run() result exists only while its task runs, so it cannot be stored")]
+    NotStored,
 }
 
 /// The state of the task whose program is being evaluated, reached by `run()`
@@ -347,6 +448,23 @@ struct TaskState<'a> {
     changes: RefCell<FileChanges>,
     /// The step whose exit status `expect` did not accept, if any.
     unexpected: RefCell<Option<UnexpectedExit>>,
+    /// The number of `run()` calls that reached the executor so far, which is the
+    /// position of the next step in the task's run.
+    started: Cell<u32>,
+    /// The steps that exited with a non-zero code or were killed by a signal and
+    /// had no `expect`, in the order they ran, each with whether the program
+    /// checked its result.
+    watched: RefCell<Vec<Watched>>,
+}
+
+/// A step that is unchecked unless the program checks its result before it ends:
+/// reads its `rc` or `signal`, or encodes it.
+struct Watched {
+    /// The step, as it is reported when it stays unchecked.
+    exit: UncheckedExit,
+    /// Set when the program reads the result's `rc` or `signal`, or encodes the
+    /// result; shared with the [`RunResult`] that `run()` returned for the step.
+    checked: Arc<AtomicBool>,
 }
 
 /// Marks an evaluator that loads a module, outside any task.
@@ -531,7 +649,9 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
     ///
     /// The positional arguments are the program, then its arguments. With
     /// `expect = None`, `run()` always returns; with a list of exit codes, the task
-    /// fails when the exit code is not in it or a signal killed the command.
+    /// fails when the exit code is not in it or a signal killed the command. A
+    /// non-zero exit or a signal without `expect` is unchecked unless the program
+    /// reads the result's `rc` or `signal`, or encodes the result, before it ends.
     #[expect(
         clippy::too_many_arguments,
         reason = "run() takes every parameter that \"Running commands\" lists, as Starlark \
@@ -615,6 +735,8 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             machine,
             expect: expect.into_option().map(|codes| codes.items),
         };
+        let position = state.started.get();
+        state.started.set(position.saturating_add(1));
         let outcome = state
             .executor
             .execute(&step)
@@ -634,32 +756,243 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             });
             return Err(starlark::Error::new_other(error));
         }
-        Ok(result_value(eval.heap(), &outcome))
+        let result = RunResult::new(&outcome);
+        if step.expect.is_none() && outcome.termination != Termination::Exited(0) {
+            state.watched.borrow_mut().push(Watched {
+                exit: UncheckedExit {
+                    position,
+                    argv: step.argv,
+                    termination: outcome.termination,
+                    output: outcome.output,
+                    cached: outcome.cached,
+                },
+                checked: Arc::clone(&result.checked),
+            });
+        }
+        Ok(eval.heap().alloc(result))
     }
 }
 
-/// The value `run()` returns: `rc`, `signal`, `stdout` and `stderr` or `output`
-/// for the capture mode, and `cached`.
-fn result_value<'v>(
-    heap: Heap<'v>,
-    outcome: &StepOutcome,
-) -> Value<'v> {
-    let int_or_none =
-        |value: Option<i32>| value.map_or_else(Value::new_none, |value| heap.alloc(value));
-    let text = |bytes: &[u8]| heap.alloc(String::from_utf8_lossy(bytes).as_ref());
-    let mut fields: Vec<(&str, Value<'v>)> = vec![
-        ("rc", int_or_none(outcome.termination.code())),
-        ("signal", int_or_none(outcome.termination.signal())),
-    ];
-    match &outcome.output {
-        CapturedOutput::Split { stdout, stderr } => {
-            fields.push(("stdout", text(stdout)));
-            fields.push(("stderr", text(stderr)));
-        },
-        CapturedOutput::Merged { output } => fields.push(("output", text(output))),
+/// The output of a `run()` result in the shape of its capture mode, decoded as
+/// UTF-8 with invalid bytes replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+enum ResultOutput {
+    /// With `capture = "split"`: standard output and standard error apart.
+    Split {
+        /// Standard output.
+        stdout: String,
+        /// Standard error.
+        stderr: String,
+    },
+    /// With `capture = "merged"`: both streams in the order they were written.
+    Merged {
+        /// Both streams.
+        output: String,
+    },
+}
+
+/// The value `run()` returns, of the Starlark type `run_result`: the attributes
+/// `rc`, `signal`, `stdout` and `stderr` or `output` for the capture mode, and
+/// `cached`, with the values a struct of them had, so `dir()`, `hasattr` and
+/// `getattr` work as for that struct.
+///
+/// The value notes when the program checks it: reads `rc` or `signal`, as an
+/// attribute or with `getattr`, or encodes the value with `json.encode` or
+/// `fs.write_json`, also inside an encoded list or dict ("Exit codes and
+/// failure"); `hasattr`, `dir()`, printing the value, and reading the output or
+/// `cached` do not.
+#[derive(Debug, ProvidesStaticType, Allocative)]
+struct RunResult {
+    /// The exit code, or `None` when a signal killed the command.
+    rc: Option<i32>,
+    /// The signal that killed the command, or `None` when it exited.
+    signal: Option<i32>,
+    /// The captured output.
+    output: ResultOutput,
+    /// Whether the result came from the cache.
+    cached: bool,
+    /// Set once the program reads `rc` or `signal` or encodes the value; shared with
+    /// the runtime's [`Watched`] entry of the step, when it has one.
+    checked: Arc<AtomicBool>,
+}
+
+impl RunResult {
+    /// The result of a step that ended as `outcome`, not checked yet.
+    fn new(outcome: &StepOutcome) -> Self {
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        Self {
+            rc: outcome.termination.code(),
+            signal: outcome.termination.signal(),
+            output: match &outcome.output {
+                CapturedOutput::Split { stdout, stderr } => {
+                    ResultOutput::Split {
+                        stdout: text(stdout),
+                        stderr: text(stderr),
+                    }
+                },
+                CapturedOutput::Merged { output } => {
+                    ResultOutput::Merged {
+                        output: text(output),
+                    }
+                },
+            },
+            cached: outcome.cached,
+            checked: Arc::new(AtomicBool::new(false)),
+        }
     }
-    fields.push(("cached", Value::new_bool(outcome.cached)));
-    heap.alloc(AllocStruct(fields))
+
+    /// The names of the attributes, in the order the struct had them.
+    const fn attributes(&self) -> &'static [&'static str] {
+        match self.output {
+            ResultOutput::Split { .. } => &["rc", "signal", "stdout", "stderr", "cached"],
+            ResultOutput::Merged { .. } => &["rc", "signal", "output", "cached"],
+        }
+    }
+
+    /// Whether `other` has the same exit status, output and `cached`, whether or
+    /// not either was checked.
+    fn same_values(
+        &self,
+        other: &Self,
+    ) -> bool {
+        self.rc == other.rc
+            && self.signal == other.signal
+            && self.output == other.output
+            && self.cached == other.cached
+    }
+}
+
+impl fmt::Display for RunResult {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        /// An optional integer as Starlark shows it.
+        fn int(value: Option<i32>) -> String {
+            value.map_or_else(|| "None".to_owned(), |value| value.to_string())
+        }
+        write!(
+            f,
+            "run_result(rc={}, signal={}, ",
+            int(self.rc),
+            int(self.signal)
+        )?;
+        match &self.output {
+            ResultOutput::Split { stdout, stderr } => {
+                write!(f, "stdout={stdout:?}, stderr={stderr:?}, ")?;
+            },
+            ResultOutput::Merged { output } => write!(f, "output={output:?}, ")?,
+        }
+        write!(f, "cached={})", if self.cached { "True" } else { "False" })
+    }
+}
+
+impl<'v> AllocValue<'v> for RunResult {
+    fn alloc_value(
+        self,
+        heap: Heap<'v>,
+    ) -> Value<'v> {
+        heap.alloc_simple(self)
+    }
+}
+
+/// The JSON encoding of `json.encode` and `fs.write_json`: an object of the
+/// attributes in the order the struct had them, `rc`, `signal`, `stdout` and
+/// `stderr` or `output`, and `cached`, with the same values, as the struct that
+/// `run()` returned before encoded. Encoding the value checks it, because its exit
+/// status then leaves the program on purpose ("Exit codes and failure").
+impl serde::Serialize for RunResult {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+
+        self.checked.store(true, Ordering::Relaxed);
+        let mut map = serializer.serialize_map(Some(self.attributes().len()))?;
+        map.serialize_entry("rc", &self.rc)?;
+        map.serialize_entry("signal", &self.signal)?;
+        match &self.output {
+            ResultOutput::Split { stdout, stderr } => {
+                map.serialize_entry("stdout", stdout)?;
+                map.serialize_entry("stderr", stderr)?;
+            },
+            ResultOutput::Merged { output } => map.serialize_entry("output", output)?,
+        }
+        map.serialize_entry("cached", &self.cached)?;
+        map.end()
+    }
+}
+
+/// A `run()` result exists only while its task runs and is never stored as a
+/// frozen value, so this storage, which is not JSON, refuses it.
+impl StarlarkSerialize for RunResult {
+    fn starlark_serialize(
+        &self,
+        _ctx: &mut dyn StarlarkSerializeContext,
+    ) -> starlark::Result<()> {
+        Err(starlark::Error::new_other(RunError::NotStored))
+    }
+}
+
+/// A `run()` result is never stored, so it is never read back from storage either.
+impl StarlarkDeserialize for RunResult {
+    fn starlark_deserialize(
+        _ctx: &mut dyn StarlarkDeserializeContext<'_>
+    ) -> starlark::Result<Self> {
+        Err(starlark::Error::new_other(RunError::NotStored))
+    }
+}
+
+#[starlark_value(type = "run_result")]
+impl<'v> StarlarkValue<'v> for RunResult {
+    fn get_attr(
+        &self,
+        attribute: &str,
+        heap: Heap<'v>,
+    ) -> Option<Value<'v>> {
+        let int_or_none =
+            |value: Option<i32>| value.map_or_else(Value::new_none, |value| heap.alloc(value));
+        match (attribute, &self.output) {
+            ("rc", _) => {
+                self.checked.store(true, Ordering::Relaxed);
+                Some(int_or_none(self.rc))
+            },
+            ("signal", _) => {
+                self.checked.store(true, Ordering::Relaxed);
+                Some(int_or_none(self.signal))
+            },
+            ("stdout", ResultOutput::Split { stdout, .. }) => Some(heap.alloc(stdout.as_str())),
+            ("stderr", ResultOutput::Split { stderr, .. }) => Some(heap.alloc(stderr.as_str())),
+            ("output", ResultOutput::Merged { output }) => Some(heap.alloc(output.as_str())),
+            ("cached", _) => Some(Value::new_bool(self.cached)),
+            _ => None,
+        }
+    }
+
+    fn has_attr(
+        &self,
+        attribute: &str,
+        _heap: Heap<'v>,
+    ) -> bool {
+        self.attributes().contains(&attribute)
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        self.attributes()
+            .iter()
+            .map(|&name| name.to_owned())
+            .collect()
+    }
+
+    fn equals(
+        &self,
+        other: Value<'v>,
+    ) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<Self>()
+            .is_some_and(|other| self.same_values(other)))
+    }
 }
 
 /// The `env` functions, which read the caller environment and dotenv files and
@@ -1324,7 +1657,10 @@ impl TaskProgram {
     /// The task environment starts empty. `caller` is the caller environment, the
     /// only one that `env.caller` and `env.inherit` read. The result holds every
     /// file access the program made while it ran, and every file it changed,
-    /// whether or not it failed.
+    /// whether or not it failed, and every step it left unchecked: when the
+    /// program ends, whether it succeeded or failed, each step that exited with a
+    /// non-zero code or was killed by a signal, whose `run()` had no `expect`, and
+    /// whose result's `rc` and `signal` the program never read.
     #[must_use]
     pub fn run(
         self,
@@ -1348,6 +1684,8 @@ impl TaskProgram {
             accesses: RefCell::new(Accesses::new()),
             changes: RefCell::new(FileChanges::new()),
             unexpected: RefCell::new(None),
+            started: Cell::new(0),
+            watched: RefCell::new(Vec::new()),
         };
         let result = Module::with_temp_heap(|module| {
             set_task_value(&module, &task);
@@ -1369,10 +1707,18 @@ impl TaskProgram {
                 None => TaskFailure::Program { message },
             }
         });
+        let unchecked = state
+            .watched
+            .take()
+            .into_iter()
+            .filter(|watched| !watched.checked.load(Ordering::Relaxed))
+            .map(|watched| watched.exit)
+            .collect();
         TaskRun {
             accesses: state.accesses.into_inner(),
             changes: state.changes.into_inner(),
             result,
+            unchecked,
         }
     }
 }
@@ -1387,8 +1733,12 @@ pub struct TaskRun {
     /// Every file the program changed through `fs.write` and `fs.write_json` while
     /// it ran, in the order it first changed each, without repeats.
     pub changes: FileChanges,
-    /// Whether the program succeeded, or why it failed.
+    /// Whether the program succeeded, or why it failed. Unchecked steps never fail
+    /// the run here; `kizz build --fail-unchecked` turns them into a failure.
     pub result: Result<(), TaskFailure>,
+    /// Every step the program left unchecked, in the order they ran, with its
+    /// command, how it ended, and its output; results from the cache included.
+    pub unchecked: Vec<UncheckedExit>,
 }
 
 /// Unit tests for the runtime's own logic.

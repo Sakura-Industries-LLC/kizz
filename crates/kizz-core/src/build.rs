@@ -35,6 +35,25 @@
 //! passes reuse its result, and one first reached in a later pass, or with a new step
 //! key, runs once in that pass.
 //!
+//! When a task program ends, whether it succeeded or failed, each step it left
+//! unchecked, which exited with a non-zero code or was killed by a signal, had no
+//! `expect`, and whose result the program never checked, by reading its `rc` or
+//! `signal` or by encoding it, is in [`TaskResult::unchecked`], with its step key
+//! and whether the build ran a command under that key; a result from the cache
+//! counts like any other ("Exit codes and failure"). Only the unchecked steps that
+//! stand when the build settles warn, the final-state rule
+//! ([`BuildReport::unchecked`]): those of each task's latest run in the build,
+//! which in a settled build is its run in the final pass, because every pass tries
+//! every selected task. A task that runs again in a later pass replaces its
+//! earlier results, so a superseded unchecked step never warns, and a build that
+//! does not settle or is interrupted warns about none. With
+//! [`Engine::with_fail_unchecked`] (`kizz build --fail-unchecked`), a run whose
+//! program succeeded but left a step unchecked fails with
+//! [`TaskFailure::Unchecked`], which names every unchecked step; as for every
+//! failure, the final pass decides whether the build fails, and a program that
+//! failed keeps its own failure. Without the option, an unchecked step fails
+//! nothing.
+//!
 //! Once cancellation is requested, the build starts nothing new: no further task or
 //! command starts, the outcome is [`BuildOutcome::Interrupted`], and no learned
 //! order is stored.
@@ -50,6 +69,7 @@
 //! the program hash and a summary of the run.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     path::PathBuf,
@@ -64,7 +84,7 @@ use kizz_trace::{AbsolutePath, AccessKind, Accesses};
 use crate::{
     engine::{Engine, TaskSteps},
     explain::{StepDecision, TaskIdentity},
-    runtime::{PrintSink, TaskFailure, TaskInfo, TaskProgram},
+    runtime::{PrintSink, TaskFailure, TaskInfo, TaskProgram, UncheckedExit},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
 };
 
@@ -135,6 +155,10 @@ pub struct TaskResult {
     /// in the run, its modules' top-level code included, in the order it first
     /// changed each, without repeats.
     pub changed: Vec<AbsolutePath>,
+    /// The steps the run left unchecked, in the order they ran: each exited with a
+    /// non-zero code or was killed by a signal, had no `expect`, and the program
+    /// never read its result's `rc` or `signal` and never encoded the result.
+    pub unchecked: Vec<UncheckedStep>,
 }
 
 impl TaskResult {
@@ -163,6 +187,23 @@ impl TaskResult {
     pub const fn failed(&self) -> bool {
         self.result.is_err()
     }
+}
+
+/// A step that a task run left unchecked ("Exit codes and failure"): its task,
+/// its step key, the step itself, and whether the build ran a command under the
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncheckedStep {
+    /// The task whose program left it unchecked.
+    pub task: TaskLabel,
+    /// The step key.
+    pub key: StepKey,
+    /// The step, with its command, how it ended, and its output.
+    pub exit: UncheckedExit,
+    /// Whether the build ran a command under the step key, in this run or in an
+    /// earlier run of the build; when it did not, every result under the key in
+    /// the build came from the cache of an earlier build.
+    pub ran: bool,
 }
 
 /// One pass of a build.
@@ -290,6 +331,32 @@ impl BuildReport {
     pub const fn succeeded(&self) -> bool {
         matches!(self.outcome, BuildOutcome::Succeeded)
     }
+
+    /// The unchecked steps that stand when the build settles, which warn (the
+    /// final-state rule, "Exit codes and failure"): those of each task's latest run
+    /// in the build. Every pass tries every selected task, so in a settled build
+    /// these are the runs of the final pass, in the order it ran the tasks and each
+    /// task its steps, each step once. A task that ran again in a later pass
+    /// replaced its earlier results, so an unchecked step of an earlier pass stands
+    /// only when the final pass still has it. A build that did not settle or was
+    /// interrupted has no settled state, so it has none.
+    #[must_use]
+    pub fn unchecked(&self) -> Vec<UncheckedStep> {
+        match self.outcome {
+            BuildOutcome::Succeeded | BuildOutcome::Failed { .. } => {
+                self.passes
+                    .last()
+                    .map(|pass| {
+                        pass.tasks
+                            .iter()
+                            .flat_map(|result| result.unchecked.iter().cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+            BuildOutcome::NotSettled { .. } | BuildOutcome::Interrupted => Vec::new(),
+        }
+    }
 }
 
 /// What one run of a task touched, for the learned order.
@@ -330,11 +397,18 @@ struct Builder<'b> {
     caller: &'b BTreeMap<String, String>,
     /// Where the lines that task programs print go.
     print: &'b dyn PrintSink,
+    /// The step keys under which the build ran a command so far.
+    ran: RefCell<BTreeSet<StepKey>>,
 }
 
 impl Builder<'_> {
     /// Run the task `task` once: load its program, run it, and finish the run,
     /// storing its program as the last writer of every file it changed.
+    ///
+    /// Each step the run left unchecked is in its result, with its step key and
+    /// whether the build ran a command under that key so far; when the engine
+    /// fails unchecked steps and the program succeeded, the run fails with every
+    /// unchecked step instead, before its task record is stored.
     fn run_task(
         &self,
         task: &TaskInfo,
@@ -342,8 +416,8 @@ impl Builder<'_> {
         let load = TaskProgram::load(task.clone(), self.print);
         let mut accesses = load.accesses;
         let mut changes = load.changes;
-        let (result, decisions, keys) = match load.program {
-            Err(failure) => (Err(failure), Vec::new(), Vec::new()),
+        let (result, decisions, keys, exits) = match load.program {
+            Err(failure) => (Err(failure), Vec::new(), Vec::new(), Vec::new()),
             Ok(program) => {
                 let steps = self.engine.task_for(TaskIdentity::of(&program));
                 let executor = CancelGuard {
@@ -353,10 +427,45 @@ impl Builder<'_> {
                 let run = program.run(self.caller, &executor, self.print);
                 accesses.merge(run.accesses);
                 changes.merge(run.changes);
-                steps.finish(run.result.is_ok())?;
-                (run.result, steps.decisions(), steps.keys())
+                let result = match run.result {
+                    Ok(()) if self.engine.fails_unchecked() && !run.unchecked.is_empty() => {
+                        Err(TaskFailure::Unchecked {
+                            exits: run.unchecked.clone(),
+                        })
+                    },
+                    other => other,
+                };
+                steps.finish(result.is_ok())?;
+                (result, steps.decisions(), steps.keys(), run.unchecked)
             },
         };
+        let position_key = |position: u32| {
+            usize::try_from(position)
+                .ok()
+                .and_then(|position| keys.get(position))
+                .copied()
+        };
+        let mut ran = self.ran.borrow_mut();
+        for decision in &decisions {
+            if matches!(decision.verdict, Verdict::Ran(_))
+                && let Some(key) = position_key(decision.position)
+            {
+                ran.insert(key);
+            }
+        }
+        let unchecked: Vec<UncheckedStep> = exits
+            .into_iter()
+            .filter_map(|exit| {
+                let key = position_key(exit.position)?;
+                Some(UncheckedStep {
+                    task: task_label(task),
+                    key,
+                    ran: ran.contains(&key),
+                    exit,
+                })
+            })
+            .collect();
+        drop(ran);
         self.engine.program_wrote(&task_id(task), &changes)?;
         let missing = if result.is_err() {
             missing_paths(self.engine.store(), &keys, &accesses)?
@@ -370,6 +479,7 @@ impl Builder<'_> {
                 result,
                 missing,
                 changed: changes.paths(),
+                unchecked,
             },
             TaskTrace { keys, accesses },
         ))
@@ -426,6 +536,7 @@ pub fn build(
         engine,
         caller,
         print,
+        ran: RefCell::new(BTreeSet::new()),
     };
     let limit = pass_limit(ordered.len());
     let mut passes: Vec<Pass> = Vec::new();

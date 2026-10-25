@@ -57,7 +57,8 @@ const STUBS: [(&[&str], &str); 3] = [
 ];
 
 /// `kizz --help` lists every command and exits with status 0, and the help of the
-/// commands with options lists them.
+/// commands with options lists and describes them, `kizz build --fail-unchecked`
+/// included.
 #[test]
 fn help_lists_every_subcommand() {
     let run = kizz(&["--help"]).unwrap();
@@ -95,6 +96,7 @@ fn help_lists_every_subcommand() {
     for option in [
         "--explain",
         "--cache-unknown-syscalls",
+        "--fail-unchecked",
         "--sequential",
         "--parallel",
         "TARGETS",
@@ -107,6 +109,10 @@ fn help_lists_every_subcommand() {
     assert!(
         build.stdout.contains("does not know"),
         "build --help does not describe --cache-unknown-syscalls: {build:?}"
+    );
+    assert!(
+        build.stdout.contains("leaves a non-zero exit unchecked"),
+        "build --help does not describe --fail-unchecked: {build:?}"
     );
 
     let reset = kizz(&["cache", "reset", "--help"]).unwrap();

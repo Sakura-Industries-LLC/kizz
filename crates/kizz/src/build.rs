@@ -30,7 +30,21 @@
 //! address or socket, says that kizz cannot see what came back and that the result
 //! is still cached, and that `always = True` runs a command on every build. A
 //! command that rewrote its own input gets no warning, because its reason says so,
-//! and a cache hit warns about nothing.
+//! and a cache hit warns about none of these.
+//!
+//! Once the build settles, a step whose non-zero exit or signal its task program
+//! left unchecked, with no `expect` and without reading `rc` or `signal` or
+//! encoding the result, gets a loud warning, which names the task, the command and
+//! how it ended ("Exit codes and failure"). Only the results that stand warn, each
+//! task's latest run in the build ([`BuildReport::unchecked`]), so a result that a
+//! later pass replaced never warns; the warnings come after the last pass, before
+//! the lines that say how the build ended, each step once, and the summary repeats
+//! them. A warning says that the result came from the cache only when the build ran
+//! no command under the step's key, so a result replayed from the cache of an
+//! earlier build warns again with that note. A build that does not settle, or that
+//! is interrupted, warns about no unchecked exit. With `--fail-unchecked`, such a
+//! task fails when its program ends, and its failure prints each unchecked command,
+//! its exit status and its captured output, as for an unexpected exit.
 //!
 //! Exit status: 0 on success, [`TASK_FAILED`] when a task fails or the build does not
 //! settle, [`USAGE_ERROR`] for usage and configuration errors and for a cache that
@@ -52,7 +66,7 @@ use std::{
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, LoadError, PrintSink,
     ProgramWrite, Project, Render, StepConnections, StepDecision, TargetExpr, TaskInfo, TaskResult,
-    UnknownCalls, Warning, build, load, task_id, task_label,
+    UncheckedStep, UnknownCalls, Warning, build, load, task_id, task_label,
 };
 use kizz_store::{
     CacheLock, LockDetails, NotCachedReason, StepKey, StepRecord, Store, TaskId, Verdict,
@@ -74,9 +88,20 @@ pub(crate) struct Options {
     pub explain: bool,
     /// List the cached commands, and show environment values in reasons.
     pub verbose: bool,
+    /// What the engine does beyond the defaults.
+    pub engine: EngineOptions,
+}
+
+/// The `kizz build` options that change what the engine does: neither is in any
+/// step key or record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EngineOptions {
     /// Cache the results of commands that made system calls that the tracer does
     /// not know, `--cache-unknown-syscalls`.
     pub cache_unknown_syscalls: bool,
+    /// Fail a task whose program leaves a non-zero exit unchecked,
+    /// `--fail-unchecked`.
+    pub fail_unchecked: bool,
 }
 
 /// Build the tasks that `targets` selects under the current directory, and return
@@ -218,7 +243,8 @@ fn build_selected(
         home.as_deref()
             .and_then(|home| AbsolutePath::new(home).ok()),
     )
-    .with_cache_unknown_system_calls(options.cache_unknown_syscalls);
+    .with_cache_unknown_system_calls(options.engine.cache_unknown_syscalls)
+    .with_fail_unchecked(options.engine.fail_unchecked);
     let output = Output {
         render: Render {
             base: cwd.to_path_buf(),
@@ -483,7 +509,8 @@ impl Output<'_> {
     /// that were traced incompletely, runs in which something other than the
     /// command changed a file after the command read it, runs that made system
     /// calls that the tracer does not know, and runs that made connections, each
-    /// step once per build.
+    /// step once per build. Unchecked exits warn only once the build settles, in
+    /// [`Output::finish`].
     fn check_warnings(&self) {
         let repeated = self.engine.warnings();
         for warning in repeated.iter().skip(self.repeated_shown.get()) {
@@ -631,6 +658,35 @@ impl Output<'_> {
         )
     }
 
+    /// The warning for the step `step`, whose non-zero exit or signal its task
+    /// program left unchecked in a result that stands when the build settles: the
+    /// task, the command and how it ended, that the program has no `expect` and
+    /// never read `rc` or `signal`, and, when the build ran no command under the
+    /// step's key, that the result came from the cache; then either that the task
+    /// fails, with `--fail-unchecked`, or that the option would fail it.
+    fn unchecked(
+        &self,
+        step: &UncheckedStep,
+    ) -> String {
+        let cached = if step.ran {
+            ""
+        } else {
+            "; the result came from the cache"
+        };
+        let outcome = if self.engine.fails_unchecked() {
+            "the task fails because `kizz build --fail-unchecked` was given"
+        } else {
+            "`kizz build --fail-unchecked` makes this fail the task"
+        };
+        format!(
+            "{} left {} unchecked: {}, but its `run()` has no `expect` and the task program never \
+             read the result's `rc` or `signal`{cached}; {outcome}",
+            self.render.task(&step.task),
+            self.command(&step.key),
+            step.exit.termination,
+        )
+    }
+
     /// Print `message` as a loud warning and keep it for the final summary.
     fn warn(
         &self,
@@ -640,11 +696,15 @@ impl Output<'_> {
         self.warnings.borrow_mut().push(message);
     }
 
-    /// Print how the build ended and its summary; return the exit status.
+    /// Print the unchecked exits that stand, then how the build ended and its
+    /// summary; return the exit status.
     fn finish(
         &self,
         report: &BuildReport,
     ) -> u8 {
+        for step in report.unchecked() {
+            self.warn(self.unchecked(&step));
+        }
         let (verdict, failed, status) = match &report.outcome {
             BuildOutcome::Succeeded => ("build succeeded", 0, 0),
             BuildOutcome::Failed { failures } => {
@@ -813,6 +873,7 @@ mod tests {
             result: Ok(()),
             missing: Vec::new(),
             changed: Vec::new(),
+            unchecked: Vec::new(),
         }
     }
 

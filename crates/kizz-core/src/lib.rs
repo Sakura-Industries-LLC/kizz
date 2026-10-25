@@ -67,7 +67,7 @@ pub mod why;
 
 pub use build::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, FailedTask, INTERRUPTED, NoEvents, Pass,
-    ProgramWrite, TaskResult, build, learned_order, pass_limit, task_id, task_label,
+    ProgramWrite, TaskResult, UncheckedStep, build, learned_order, pass_limit, task_id, task_label,
 };
 pub use check::{Checked, RACY_WINDOW_NANOS, check};
 pub use cleanup::{Cleaned, ResetPlan, clean, plan_reset};
@@ -90,7 +90,7 @@ pub use project::{ConfigError, LoadError, Project, load};
 pub use render::{CACHED, Render, access_kinds};
 pub use runtime::{
     PrintSink, ProgramHash, ProgramLoad, ProgramParts, TaskFailure, TaskInfo, TaskProgram, TaskRun,
-    UnexpectedExit,
+    UncheckedExit, UnexpectedExit,
 };
 pub use states::FileStates;
 pub use step::{StepError, StepExecutor, StepOutcome, StepSpec};
