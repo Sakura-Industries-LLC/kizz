@@ -15,8 +15,8 @@ use std::{
 
 use kizz_trace::{
     AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
-    Connection, EchoSink, ExtendedAttributes, FirstReads, OutputStream, RunRequest, RunResult,
-    Termination, TraceError, Tracer,
+    Connection, Disk, EchoSink, ExtendedAttributes, FileSystem, FirstReads, Kernel, MachineState,
+    Memory, OutputStream, ResourceLimit, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 
 /// The signal number the fake reports for a cancelled request.
@@ -47,6 +47,10 @@ struct FakeTracer {
     /// The extended attributes of each path, by the path and whether a final link
     /// is followed, which the attribute query answers.
     attributes: BTreeMap<(PathBuf, bool), ExtendedAttributes>,
+    /// The machine state that the machine query answers.
+    machine: MachineState,
+    /// Every working directory the machine query was asked about, in order.
+    machine_queries: Mutex<Vec<PathBuf>>,
 }
 
 impl FakeTracer {
@@ -161,6 +165,17 @@ impl Tracer for FakeTracer {
             .get(&(path.to_path_buf(), follow))
             .cloned()
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    fn machine_state(
+        &self,
+        cwd: &Path,
+    ) -> MachineState {
+        self.machine_queries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(cwd.to_path_buf());
+        self.machine.clone()
     }
 }
 
@@ -379,4 +394,48 @@ fn fake_tracer_answers_the_attribute_query() {
         .extended_attributes(Path::new("/work/missing"), true)
         .unwrap_err();
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+}
+
+/// The machine query answers through the trait object with the state the test
+/// scripted, and the fake notes the working directory of each query.
+#[test]
+fn fake_tracer_answers_the_machine_query() {
+    let state = MachineState {
+        kernel: Some(Kernel {
+            release: "6.12.0".to_owned(),
+            version: "#1 SMP".to_owned(),
+        }),
+        limits: Some(vec![ResourceLimit {
+            resource: "nofile".to_owned(),
+            soft: Some(1_024),
+            hard: None,
+        }]),
+        affinity: Some(vec![0, 1]),
+        memory: Some(Memory {
+            total: 8_589_934_592,
+            available: 4_294_967_296,
+        }),
+        filesystem: Some(FileSystem {
+            kind: 0xEF53,
+            flags: 0x1020,
+        }),
+        disk: Some(Disk {
+            size: 107_374_182_400,
+            free: 42_949_672_960,
+        }),
+    };
+    let fake = FakeTracer {
+        machine: state.clone(),
+        ..FakeTracer::default()
+    };
+    let tracer: &dyn Tracer = &fake;
+    assert_eq!(tracer.machine_state(Path::new("/work")), state);
+    assert_eq!(MachineState::default().kernel, None);
+    assert_eq!(
+        *fake
+            .machine_queries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        [PathBuf::from("/work")]
+    );
 }

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use kizz_store::{
     AccessBits, Capture, ChangedInput, EnvChange, Explanation, ModuleChange, ModuleChangeKind,
     NotCachedReason, Reason, SelfInflicted, TaskLabel, Verdict, Writer, changed_reads_text,
+    machine_changes_text,
 };
 
 use crate::{explain::RepeatedWarning, warning::location};
@@ -434,7 +435,20 @@ impl Render {
                     starlark_bool(*new)
                 )
             },
+            Reason::MachineNamesChanged { old, new } => {
+                format!(
+                    "the `machine` names changed from {} to {}",
+                    patterns(old),
+                    patterns(new)
+                )
+            },
             Reason::InputsChanged { inputs } => self.inputs_short(inputs),
+            Reason::MachineChanged { changes } => {
+                format!(
+                    "the machine state changed: {}",
+                    machine_changes_text(changes)
+                )
+            },
             Reason::Always => "marked `always`".to_owned(),
             Reason::NotCached { why, inputs } => {
                 let why = self.not_cached(why);
@@ -484,6 +498,11 @@ impl Render {
                 lines.extend(self.inputs_full(inputs));
                 lines
             },
+            Reason::MachineChanged { changes } => {
+                let mut lines = vec!["the machine state changed:".to_owned()];
+                lines.extend(changes.iter().map(|change| format!("  {change}")));
+                lines
+            },
             Reason::NotCached { why, inputs } => {
                 let mut lines = vec![format!(
                     "the previous run could not be cached: {}",
@@ -503,6 +522,7 @@ impl Render {
             | Reason::IgnoreChanged { .. }
             | Reason::TrackChanged { .. }
             | Reason::TimestampsChanged { .. }
+            | Reason::MachineNamesChanged { .. }
             | Reason::Always => vec![self.reason_line(reason)],
         }
     }

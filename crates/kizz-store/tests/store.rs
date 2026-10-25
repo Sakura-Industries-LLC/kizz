@@ -25,11 +25,11 @@ use std::{
 
 use kizz_store::{
     AccessBits, Attribute, Attributes, BuildId, CacheIdentity, Capture, ContentHash, DATABASE_DIR,
-    EntryCounts, FileMeta, IdentityDifference, IdentityKey, IdentityPart, Inventory, LastWriter,
-    LearnedOrder, Observation, Owner, PathKey, PathState, PositionKey, ProgramPath, RecordedOutput,
-    RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey, StepPosition,
-    StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Times, Verdict, WrittenBy,
-    path_prefix,
+    EntryCounts, FileMeta, IdentityDifference, IdentityKey, IdentityPart, Inventory, KernelRecord,
+    LastWriter, LearnedOrder, MachineStateRecord, MemoryRecord, Observation, Owner, PathKey,
+    PathState, PositionKey, ProgramPath, RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey,
+    SchemaVersion, StepExit, StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError,
+    TaskId, TaskRecord, Times, Verdict, WrittenBy, path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -56,6 +56,11 @@ fn step_record(n: u8) -> StepRecord {
             timestamps: n % 2 == 1,
             expect: None,
             occurrence: u32::from(n),
+            machine: if n % 2 == 1 {
+                vec!["kernel".to_owned()]
+            } else {
+                Vec::new()
+            },
         },
         program: Some(ProgramPath(PathBuf::from("/bin/tool"))),
         observations: vec![
@@ -120,6 +125,17 @@ fn step_record(n: u8) -> StepRecord {
         owners: [task(&format!("/w/{n}"), u32::from(n)), task("/w/shared", 0)].into(),
         unknown_system_calls: Vec::new(),
         connections: Vec::new(),
+        machine: MachineStateRecord {
+            kernel: Some(KernelRecord {
+                release: format!("6.{n}.0"),
+                version: "#1".to_owned(),
+            }),
+            memory: Some(MemoryRecord {
+                total: u64::from(n),
+                available: u64::from(n),
+            }),
+            ..MachineStateRecord::default()
+        },
     }
 }
 

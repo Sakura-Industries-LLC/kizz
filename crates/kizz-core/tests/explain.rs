@@ -200,6 +200,14 @@ impl Tracer for FakeTracer {
     ) -> std::io::Result<kizz_trace::ExtendedAttributes> {
         Ok(kizz_trace::ExtendedAttributes::new())
     }
+
+    /// These tests name no machine state, so the fake knows no part.
+    fn machine_state(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> kizz_trace::MachineState {
+        kizz_trace::MachineState::default()
+    }
 }
 
 /// Echoes nothing.
@@ -314,6 +322,7 @@ impl Fixture {
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,
+            machine: Vec::new(),
             expect: None,
         })
     }

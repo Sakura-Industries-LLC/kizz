@@ -534,15 +534,16 @@ mod tests {
 
     use kizz_store::{AccessBits, MAX_LISTED_NAMES, SpecialKind};
     use kizz_trace::{
-        AccessKind, AccessKinds, Cancellation, EchoSink, ExtendedAttributes, RunRequest, RunResult,
-        TraceError,
+        AccessKind, AccessKinds, Cancellation, EchoSink, ExtendedAttributes, MachineState,
+        RunRequest, RunResult, TraceError,
     };
 
     use super::*;
     use crate::observe::{access_bits, path_state};
 
-    /// A fake tracer that runs nothing, and whose attribute query finds no
-    /// attributes anywhere, for the tests that record none.
+    /// A fake tracer that runs nothing, whose attribute query finds no attributes
+    /// anywhere, for the tests that record none, and whose machine query knows no
+    /// part, because the cache check reads no machine state.
     struct NoAttributes;
 
     impl Tracer for NoAttributes {
@@ -564,6 +565,13 @@ mod tests {
             _follow: bool,
         ) -> io::Result<ExtendedAttributes> {
             Ok(ExtendedAttributes::new())
+        }
+
+        fn machine_state(
+            &self,
+            _cwd: &Path,
+        ) -> MachineState {
+            MachineState::default()
         }
     }
 
@@ -618,6 +626,13 @@ mod tests {
                 .get(&(path.to_path_buf(), follow))
                 .cloned()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+
+        fn machine_state(
+            &self,
+            cwd: &Path,
+        ) -> MachineState {
+            NoAttributes.machine_state(cwd)
         }
     }
 

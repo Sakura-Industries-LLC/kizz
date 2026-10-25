@@ -103,6 +103,15 @@ impl Tracer for FakeTracer {
     ) -> std::io::Result<kizz_trace::ExtendedAttributes> {
         Ok(kizz_trace::ExtendedAttributes::new())
     }
+
+    /// These tests compare no machine state that changes, so the fake knows no
+    /// part.
+    fn machine_state(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> kizz_trace::MachineState {
+        kizz_trace::MachineState::default()
+    }
 }
 
 /// A result that reports the program as run, then `accesses`, with no output, and
@@ -273,6 +282,7 @@ impl Fixture {
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,
+            machine: Vec::new(),
             expect: None,
         }
     }
@@ -393,8 +403,8 @@ fn unlisted_dir_state(path: &Path) -> TestResult<PathState> {
 }
 
 /// The same specification always gives the same key, each value that "Step keys"
-/// lists changes it, `timestamps` included, and `always`, `stream`, and `expect` do
-/// not.
+/// lists changes it, `timestamps` and the `machine` names included, and `always`,
+/// `stream`, and `expect` do not.
 #[test]
 fn step_keys_cover_exactly_the_listed_values() -> TestResult {
     let fixture = Fixture::new()?;
@@ -442,6 +452,9 @@ fn step_keys_cover_exactly_the_listed_values() -> TestResult {
     let mut variant = base.clone();
     variant.timestamps = true;
     changed.insert("timestamps", key(PROGRAM, &variant, 0));
+    let mut variant = base.clone();
+    variant.machine = vec!["kernel".to_owned()];
+    changed.insert("machine", key(PROGRAM, &variant, 0));
     changed.insert("occurrence", key(PROGRAM, &base, 1));
 
     let distinct: BTreeSet<StepKey> = changed.values().copied().collect();
@@ -1230,6 +1243,7 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
     step.ignore.push("*.tmp".to_owned());
     step.track.push("/proc/cpuinfo".to_owned());
     step.timestamps = true;
+    step.machine = vec!["kernel".to_owned()];
 
     let before = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let key = {
@@ -1263,6 +1277,7 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
     assert_eq!(spec.ignore, ["*.tmp"]);
     assert_eq!(spec.track, ["/proc/cpuinfo"]);
     assert!(spec.timestamps);
+    assert_eq!(spec.machine, ["kernel"]);
     assert_eq!(spec.expect, Some(vec![0, 3]));
     assert_eq!(spec.occurrence, 0);
     assert_eq!(stored.program, Some(ProgramPath(fixture.path("bin/tool"))));

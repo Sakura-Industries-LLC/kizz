@@ -36,7 +36,10 @@ use std::{
     fs, io,
     os::unix::fs::PermissionsExt as _,
     path::PathBuf,
-    sync::{Mutex, PoisonError},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use kizz_core::{
@@ -44,11 +47,12 @@ use kizz_core::{
     Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, build, load, task_id,
 };
 use kizz_store::{
-    BuildId, Change, LearnedOrder, Reason, Store, TaskId, TaskLabel, TaskRecord, Verdict, Writer,
+    BuildId, Change, LearnedOrder, MachineChange, Reason, Store, TaskId, TaskLabel, TaskRecord,
+    Verdict, Writer,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CapturedOutput, EchoSink, FirstReads,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    MachineState, Memory, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -141,11 +145,14 @@ fn script(
 }
 
 /// A tracer that runs nothing, follows [`script`], and keeps every command it was
-/// asked to run.
+/// asked to run; its machine query reports one more byte of available memory at
+/// each query, and knows no other part.
 #[derive(Default)]
 struct FakeTracer {
     /// The argument vector of every run so far, joined with spaces.
     runs: Mutex<Vec<String>>,
+    /// The number of machine queries so far.
+    machine_queries: AtomicU64,
 }
 
 impl FakeTracer {
@@ -184,6 +191,25 @@ impl Tracer for FakeTracer {
         _follow: bool,
     ) -> io::Result<kizz_trace::ExtendedAttributes> {
         Ok(kizz_trace::ExtendedAttributes::new())
+    }
+
+    /// The available memory is the number of queries so far, this one included,
+    /// so it differs at every query.
+    fn machine_state(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> MachineState {
+        let queries = self
+            .machine_queries
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        MachineState {
+            memory: Some(Memory {
+                total: 1_000,
+                available: queries,
+            }),
+            ..MachineState::default()
+        }
     }
 }
 
@@ -899,6 +925,60 @@ fn an_always_command_reached_in_the_first_pass_runs_once_per_build() -> TestResu
     );
     assert_eq!(fs::read_to_string(fixture.path("count.txt"))?, "++");
     assert_eq!(tracer.runs().len(), 5);
+    Ok(())
+}
+
+/// A step that names `memory`, whose available memory differs at every query, runs
+/// at most once per build: a later pass of the build that ran it compares no
+/// machine state again, so the build settles, and the next build compares it once,
+/// finds it changed, and runs the step with a reason that names the value. A step
+/// that names no part is queried only when it runs.
+#[test]
+fn a_step_that_names_changing_memory_runs_once_per_build_and_settles() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.kizz("", &[
+        (
+            "Use",
+            "run(\"tool\", \"read:out.txt\", machine = [\"memory\"])",
+        ),
+        ("Make", "run(\"tool\", \"write:out.txt=made\")"),
+    ])?;
+    let tracer = FakeTracer::default();
+    let first = fixture.build(&tracer)?.report;
+    assert_eq!(first.outcome, BuildOutcome::Succeeded);
+    assert_eq!(passes(&first), vec![
+        lines(&["Use ran ok", "Make ran ok"]),
+        lines(&["Use ran ok", "Make cached ok"]),
+        lines(&["Use cached ok", "Make cached ok"]),
+    ]);
+    // One query before each of the three runs, and none for a cache check.
+    assert_eq!(tracer.machine_queries.load(Ordering::SeqCst), 3);
+
+    let second = fixture.build(&tracer)?.report;
+    assert_eq!(second.outcome, BuildOutcome::Succeeded);
+    assert_eq!(passes(&second), vec![
+        lines(&["Make cached ok", "Use ran ok"]),
+        lines(&["Make cached ok", "Use cached ok"]),
+    ]);
+    // One query to compare, and one before the run.
+    assert_eq!(tracer.machine_queries.load(Ordering::SeqCst), 5);
+    let ran = task_in(&second, 1, "Use")?;
+    let [decision] = ran.decisions.as_slice() else {
+        return Err(format!("unexpected decisions {:?}", ran.decisions).into());
+    };
+    assert_eq!(
+        decision.verdict,
+        Verdict::Ran(kizz_store::Explanation {
+            reasons: vec![Reason::MachineChanged {
+                changes: vec![MachineChange {
+                    value: "available memory".to_owned(),
+                    old: "3 bytes".to_owned(),
+                    new: "4 bytes".to_owned(),
+                }],
+            }],
+            repeated: Vec::new(),
+        })
+    );
     Ok(())
 }
 

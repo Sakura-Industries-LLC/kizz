@@ -54,7 +54,7 @@ These decisions came out of the review of the original outline.
 | Directory listings | Directory listings are dependencies, including the order in which the file system returns the entries. |
 | Explanations | Kizz says exactly why it ran each command and which things changed. |
 | Hermeticity | Not a goal. The goal is fast, cacheable, reliable builds without hand-written dependency lists, which nobody can maintain accurately. |
-| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. A system call that the tracer does not know makes the result not cached unless `kizz build --cache-unknown-syscalls` is given, and kizz warns about it either way. Connections to the network and to Unix sockets are detected and warned about, and the result is still cached. |
+| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. A system call that the tracer does not know makes the result not cached unless `kizz build --cache-unknown-syscalls` is given, and kizz warns about it either way. Connections to the network and to Unix sockets are detected and warned about, and the result is still cached. Machine and process state is recorded with each step and counts as an input only for a step that names it. |
 | Tool awareness | None. Tool caches are tracked at file level like any other files. A tool that makes itself uncacheable is uncacheable, and kizz reports exactly why, for example that a command keeps writing a file and consuming it as an input. Users may ignore a file, glob, or regular expression, or a set of them; kizz never adds such exceptions itself. Users drive exceptions, not dependencies. |
 | Inputs | Anything read during the build is an input. To exclude a file, stop the tool from reading it, or add an exception. Kizz itself stays oblivious. |
 | Change detection | Different size: changed. Same size and same metadata: unchanged. Same size but different metadata: maybe changed, so compare hashes. A different type, permission bits or owner is always a change, whatever the content. A command run with `timestamps = True` also counts a different timestamp as a change. |
@@ -249,6 +249,7 @@ result = run(
     ignore = [],        # user exceptions: paths not recorded as dependencies of this step
     track = [],         # /proc and /sys files whose content counts as an input of this step
     timestamps = False, # also compare the timestamps of what the step read, ran, listed or checked
+    machine = [],       # machine and process state that counts as an input; see Machine state
     expect = None,      # None: never fail the task on exit status; or a list of acceptable exit codes
 )
 ```
@@ -388,7 +389,8 @@ def go_build(package, output, version):
 The core never starts a process itself and knows nothing about system calls.
 It asks a tracer to run one command with an exact program, arguments, environment, working directory and `stdin`.
 The tracer returns the exit status, the captured output, and every path the process tree touched, with how it touched it.
-Through the same interface, the core reads what the standard library cannot: the extended attributes of a path.
+Through the same interface, the core reads what the standard library cannot: the extended attributes of a path,
+and the machine and process state that a command starts with.
 Version 1 has one tracer, for Linux, and tests use a fake one.
 Nothing in the core changes when the tracer does.
 
@@ -537,6 +539,27 @@ Per-process paths such as `/proc/self` describe kizz when it checks the cache ra
 so tracking them is rarely meaningful.
 `track` patterns are part of the step's cache key.
 
+### Machine state
+
+The state of the machine, and the process state that a command inherits, can change what the command does.
+Kizz never compares it by itself: it observes it when a command starts and records it with the step,
+and `kizz why` shows the parts that a step names, and every part with `--verbose`.
+`run(..., machine = [...])` names the parts that count as an input of the step:
+
+* `kernel`: the kernel release and version
+* `limits`: every resource limit, soft and hard
+* `affinity`: the CPUs the command may run on
+* `memory`: the total and the available memory
+* `filesystem`: the type and mount flags of the file system that holds the working directory
+* `disk`: the size and free space of that file system
+
+A step runs again when a value of a part it names differs from the recorded one,
+and the explanation names each changed value with its old and new value.
+Available memory and free space change on almost every build, so a step that names `memory` or `disk` runs on almost every build.
+The names are part of the step's cache key, and an unknown name fails the task.
+The host name, the credentials, the umask, the machine architecture and the CPU model are not per step:
+they are the [cache identity](#cache-identity).
+
 ### Behavior kizz cannot see
 
 Kizz assumes a command does nothing it cannot observe: no dependence on time, randomness, the network, process IDs,
@@ -587,6 +610,7 @@ Every later command that uses the cache compares the stamp with the current valu
 If any of them differs, kizz refuses to use the cache, names each value that differs, and exits with status 2.
 `kizz cache reset --all` still wipes such a cache, and the next build stamps the new one; another cache, set with `KIZZ_CACHE_DIR`,
 avoids the conflict.
+The kernel, resource limits, memory and the rest of the machine state are per step; see [Machine state](#machine-state).
 
 ### Database
 
@@ -633,6 +657,7 @@ A step's key is a BLAKE3 hash, derived with a versioned context string, of a CBO
 * the ignore patterns
 * the `track` patterns
 * whether `timestamps` is set
+* the `machine` names
 * the occurrence number, which counts identical commands earlier in the same task run,
   so a command repeated in a task gets one cache entry per repetition
 
@@ -746,12 +771,13 @@ These are the reasons:
 * the arguments changed: old and new, word by word
 * the environment changed: which variables were added, removed or changed,
   with values shown only with `--verbose`, because values can be secrets
-* the working directory, `stdin`, capture mode, ignore patterns, `track` patterns or `timestamps` changed
+* the working directory, `stdin`, capture mode, ignore patterns, `track` patterns, `timestamps` or `machine` changed
 * inputs changed: every changed path, what changed about it
   (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, extended attributes,
   directory entries, entry order or link target changed),
   and who last wrote it: this command on its previous run, another task's command or program in this build,
   a command or task program of an earlier build, or something outside kizz
+* the machine state that the step names changed: each changed value, old and new
 * the command is marked `always`
 * the previous run could not be cached, and why
 
@@ -826,7 +852,7 @@ crates/
                      cache checks, explanations and ordering
   kizz-store/        the cache location, the lock file, and the SurrealKV store of typed records
   kizz-trace/        the tracer interface: the run request, the result, access kinds, the tracer trait
-                     and the platform queries of the core, such as extended attributes
+                     and the platform queries of the core: extended attributes and machine state
   kizz-trace-linux/  the ptrace and seccomp-bpf tracer
 ```
 
@@ -1141,6 +1167,7 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * Each step of `coverage-incomplete` is not cached, with a reason that names its system call or number.
 * With `kizz build --cache-unknown-syscalls`, the steps of the two numbers are cached and their records list them.
 * Each expected connection for the platform is recorded, and no other connection.
+* The step's record holds every part of the machine state, with the kernel release that the test reads itself.
 
 ## Testing
 

@@ -20,7 +20,9 @@
 //! `KIZZ_CACHE_DIR` and `PATH`. Paths outside the copy, such as those of the dynamic
 //! loader and the C library, are not compared with the expectation file, but the
 //! loader that the program's `PT_INTERP` header names must be recorded with the exec
-//! kind.
+//! kind. The record must also hold every part of the machine state that the program
+//! started with, with the kernel release that the test reads itself through `uname`,
+//! a non-empty affinity, and a non-zero total memory and file-system size.
 //!
 //! The other tests check `expected.txt` itself: that it is consistent, and that each
 //! tracked system call that `architecture.md` lists, the same list as
@@ -91,6 +93,7 @@ use std::{
     fmt::{self, Write as _},
     fs,
     io::{self, Write as _},
+    mem::MaybeUninit,
     os::unix::{ffi::OsStrExt as _, fs::symlink},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -98,8 +101,9 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, Attribute, Attributes, ChangedRead, Connection, NotCachedReason, PathState,
-    RecordedOutput, SpecialKind, StepExit, StepKey, StepRecord, Store, TaskId,
+    AccessBits, Attribute, Attributes, ChangedRead, Connection, KernelRecord, MachineStateRecord,
+    NotCachedReason, PathState, RecordedOutput, SpecialKind, StepExit, StepKey, StepRecord, Store,
+    TaskId,
 };
 use kizz_trace_linux::{TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
 use libc::c_long;
@@ -1532,6 +1536,58 @@ fn record_problems(
     (problems, Some(record.clone()))
 }
 
+/// The kernel release that `uname` reports, which the test reads itself.
+fn uname_release() -> TestResult<String> {
+    let mut names = MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: the pointer is valid for writing a `utsname`.
+    if unsafe { libc::uname(names.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: `uname` succeeded, so it initialized `names`.
+    let names = unsafe { names.assume_init() };
+    // SAFETY: `uname` ends every field with a zero byte within the field.
+    Ok(unsafe { CStr::from_ptr(names.release.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// The problems of the machine state `machine` of the `coverage-test` record: it
+/// must hold every part, with the kernel release `release`, a non-empty affinity,
+/// and a non-zero total memory and file-system size.
+fn machine_problems(
+    machine: &MachineStateRecord,
+    release: &str,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    match &machine.kernel {
+        Some(kernel) if kernel.release == release => {},
+        other => {
+            problems.push(format!(
+                "the recorded kernel is {other:?}, not release {release}"
+            ));
+        },
+    }
+    if machine.limits.as_ref().is_none_or(Vec::is_empty) {
+        problems.push(format!(
+            "the recorded resource limits are {:?}",
+            machine.limits
+        ));
+    }
+    if machine.affinity.as_ref().is_none_or(Vec::is_empty) {
+        problems.push(format!("the recorded affinity is {:?}", machine.affinity));
+    }
+    if machine.memory.is_none_or(|memory| memory.total == 0) {
+        problems.push(format!("the recorded memory is {:?}", machine.memory));
+    }
+    if machine.filesystem.is_none() {
+        problems.push("the record holds no file system".to_owned());
+    }
+    if machine.disk.is_none_or(|disk| disk.size == 0) {
+        problems.push(format!("the recorded disk is {:?}", machine.disk));
+    }
+    problems
+}
+
 /// Whether each gated call is available, by name: unavailable when its check
 /// returned `ENOSYS`.
 type Availability = BTreeMap<String, bool>;
@@ -1792,6 +1848,7 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
         let differences = compare(&expected, &recorded_under(record, &copy));
         problems.extend(differences.iter().map(ToString::to_string));
         problems.extend(loader_problems(record, &copy));
+        problems.extend(machine_problems(&record.machine, &uname_release()?));
         problems.extend(connection_differences(
             &expected_connections_here(&connections),
             &recorded_connections(record, &copy),
@@ -3212,6 +3269,7 @@ fn incomplete_step(
             timestamps: false,
             expect: None,
             occurrence: 0,
+            machine: Vec::new(),
         },
         program: None,
         observations: Vec::new(),
@@ -3229,6 +3287,7 @@ fn incomplete_step(
         owners: BTreeSet::new(),
         unknown_system_calls: unknown.to_vec(),
         connections: Vec::new(),
+        machine: MachineStateRecord::default(),
     }
 }
 
@@ -3572,6 +3631,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
             timestamps: false,
             expect: None,
             occurrence: 0,
+            machine: Vec::new(),
         },
         program: None,
         observations: vec![
@@ -3609,6 +3669,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         owners: BTreeSet::new(),
         unknown_system_calls: Vec::new(),
         connections: Vec::new(),
+        machine: MachineStateRecord::default(),
     };
     let recorded: Vec<String> = recorded_under(&record, Path::new("/t"))
         .into_iter()
@@ -3620,4 +3681,48 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         "l write symlink:x:absent",
         "x xattr file@user.a",
     ]);
+}
+
+/// The machine-state check of the conformance test accepts a state with every part
+/// and the expected kernel release, and names each part that is missing, empty, or
+/// zero, and a kernel release that differs.
+#[test]
+fn the_machine_state_check_names_each_missing_part() {
+    use kizz_store::{DiskRecord, FileSystemRecord, LimitRecord, MemoryRecord};
+
+    let complete = MachineStateRecord {
+        kernel: Some(KernelRecord {
+            release: "6.12.0".to_owned(),
+            version: "#1".to_owned(),
+        }),
+        limits: Some(vec![LimitRecord {
+            resource: "nofile".to_owned(),
+            soft: Some(1),
+            hard: None,
+        }]),
+        affinity: Some(vec![0]),
+        memory: Some(MemoryRecord {
+            total: 1,
+            available: 0,
+        }),
+        filesystem: Some(FileSystemRecord { kind: 1, flags: 0 }),
+        disk: Some(DiskRecord { size: 1, free: 0 }),
+    };
+    assert_eq!(machine_problems(&complete, "6.12.0"), Vec::<String>::new());
+    assert_eq!(machine_problems(&complete, "6.13.0").len(), 1);
+    let empty = MachineStateRecord {
+        limits: Some(Vec::new()),
+        affinity: Some(Vec::new()),
+        memory: Some(MemoryRecord {
+            total: 0,
+            available: 0,
+        }),
+        disk: Some(DiskRecord { size: 0, free: 0 }),
+        ..MachineStateRecord::default()
+    };
+    assert_eq!(machine_problems(&empty, "6.12.0").len(), 6);
+    assert_eq!(
+        machine_problems(&MachineStateRecord::default(), "6.12.0").len(),
+        6
+    );
 }

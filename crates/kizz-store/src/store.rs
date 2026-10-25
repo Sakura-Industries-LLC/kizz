@@ -87,8 +87,11 @@ const WIPED_DIR: &str = "db.wiped";
 /// identity, in the `meta/` family: the host name, the effective user and group, the
 /// supplementary groups, the umask, the machine architecture, and the CPU model of
 /// the process that created the database, which every later open compares with the
-/// current values.
-pub const SCHEMA_VERSION: u32 = 16;
+/// current values. Version 17 adds the machine state that a command started with to
+/// every step record, the `machine` names to the step specification, the machine
+/// state values that a cache check finds changed, and the reasons that name a change
+/// of the `machine` names or of the machine state.
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -805,10 +808,10 @@ mod tests {
         }
     }
 
-    /// Version 16 adds the cache identity, one more than version 15, which added the
-    /// connections of a run to step records.
+    /// Version 17 adds the machine state of step records, one more than version 16,
+    /// which added the cache identity.
     #[test]
-    fn schema_version_16_stamps_the_cache_identity() {
-        assert_eq!(SCHEMA_VERSION, 16);
+    fn schema_version_17_records_machine_state() {
+        assert_eq!(SCHEMA_VERSION, 17);
     }
 }

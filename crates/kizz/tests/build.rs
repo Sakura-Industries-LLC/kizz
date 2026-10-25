@@ -1599,3 +1599,92 @@ fn a_command_that_connects_warns_and_is_still_cached() -> TestResult {
     drop(listener);
     Ok(())
 }
+
+/// With the real tracer, a step records every part of the machine state, with the
+/// kernel release that the kernel reports; a step that names `kernel` is a cache hit
+/// in the next build, since the kernel stayed the same; `kizz why` shows the part
+/// that it names, and `kizz --verbose why` shows every part, one line for each.
+#[test]
+fn the_machine_state_is_recorded_and_shown_by_why() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[(
+        "Kernel",
+        "run(\"true\", machine = [\"kernel\"], expect = [0])",
+    )])?;
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease")?
+        .trim_end()
+        .to_owned();
+    let records = project.step_records()?;
+    let [record] = records.as_slice() else {
+        return Err(format!("expected one record, found {records:?}").into());
+    };
+    assert_eq!(record.spec.machine, ["kernel"]);
+    let machine = &record.machine;
+    assert_eq!(
+        machine
+            .kernel
+            .as_ref()
+            .map(|kernel| kernel.release.as_str()),
+        Some(release.as_str())
+    );
+    assert!(
+        machine
+            .limits
+            .as_ref()
+            .is_some_and(|limits| !limits.is_empty())
+    );
+    assert!(
+        machine
+            .affinity
+            .as_ref()
+            .is_some_and(|cpus| !cpus.is_empty())
+    );
+    assert!(machine.memory.is_some_and(|memory| memory.total > 0));
+    assert!(machine.filesystem.is_some());
+    assert!(machine.disk.is_some_and(|disk| disk.size > 0));
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert!(!second.stdout.contains("ran `"), "{second:?}");
+    assert!(second.stdout.contains(", 1 cached"), "{second:?}");
+
+    let machine_lines = |stdout: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("    machine "))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    let why = project.run("", &["why"])?;
+    assert_eq!(why.status, Some(0), "{why:?}");
+    let shown = machine_lines(&why.stdout);
+    let [kernel] = shown.as_slice() else {
+        return Err(format!("expected one machine line, found {shown:?}").into());
+    };
+    assert!(
+        kernel.starts_with(&format!(
+            "    machine kernel: kernel release {release}, kernel version "
+        )),
+        "{why:?}"
+    );
+
+    let verbose = project.run("", &["--verbose", "why"])?;
+    assert_eq!(verbose.status, Some(0), "{verbose:?}");
+    let shown = machine_lines(&verbose.stdout);
+    let starts = [
+        format!("    machine kernel (checked): kernel release {release}, kernel version "),
+        "    machine limits: soft limit of cpu ".to_owned(),
+        "    machine affinity: CPUs ".to_owned(),
+        "    machine memory: total memory ".to_owned(),
+        "    machine filesystem: file system type 0x".to_owned(),
+        "    machine disk: file system size ".to_owned(),
+    ];
+    assert_eq!(shown.len(), starts.len(), "{verbose:?}");
+    for (line, start) in shown.iter().zip(&starts) {
+        assert!(line.starts_with(start.as_str()), "{start:?} in {verbose:?}");
+        assert!(!line.contains("unknown"), "{verbose:?}");
+    }
+    Ok(())
+}

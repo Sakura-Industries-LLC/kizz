@@ -21,7 +21,10 @@ use std::{
 
 use minicbor::{Decode, Decoder, Encode, Encoder, bytes::ByteArray, decode, encode};
 
-use crate::records::{Family, Record, StepKey, TaskId};
+use crate::{
+    machine::{MachineChange, MachineStateRecord},
+    records::{Family, Record, StepKey, TaskId},
+};
 
 /// Encodes and decodes a path as a CBOR byte string of its bytes.
 pub(crate) mod path_bytes {
@@ -181,6 +184,10 @@ pub struct StepSpecRecord {
     /// the step read, ran, listed, or checked is a change.
     #[n(12)]
     pub timestamps: bool,
+    /// The names of the parts of the machine state that count as an input of the
+    /// step, as `run(..., machine = [...])` gave them, sorted and without repeats.
+    #[n(13)]
+    pub machine: Vec<String>,
 }
 
 /// The combined kinds of access a step made to one path, one bit per kind.
@@ -1117,12 +1124,18 @@ pub enum RunReason {
     /// The step is marked `always`, and this was its one run in the build.
     #[n(1)]
     Always,
-    /// A record existed, and the cache check found these recorded paths changed.
+    /// A record existed, and the cache check found these recorded paths changed,
+    /// or these values of the machine state that the step names.
     #[n(2)]
     InputsChanged {
         /// Every difference, sorted by path.
         #[n(0)]
         differences: Vec<Difference>,
+        /// Every value of the machine state that the step names and that changed, in
+        /// the order of the step's names; empty when the check compared none, or
+        /// none changed.
+        #[n(1)]
+        machine: Vec<MachineChange>,
     },
     /// The step's previous run could not be cached, and the cache check found these
     /// paths it touched changed since. In the build of that run, the check compares
@@ -1215,6 +1228,11 @@ pub struct StepRecord {
     /// not. Connections never keep a result out of the cache.
     #[n(14)]
     pub connections: Vec<Connection>,
+    /// The machine and process state that the command started with, which the
+    /// engine queries right before it looks the program up and runs it, whether or
+    /// not the step names any part of it.
+    #[n(15)]
+    pub machine: MachineStateRecord,
 }
 
 impl Record for StepRecord {
@@ -1250,6 +1268,7 @@ impl<'b, C> Decode<'b, C> for ProgramPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::{DiskRecord, FileSystemRecord, KernelRecord, LimitRecord, MemoryRecord};
 
     /// One path state of each kind, with both kinds of directory state.
     fn states() -> Vec<PathState> {
@@ -1362,6 +1381,7 @@ mod tests {
                 timestamps: true,
                 expect: Some(vec![0, 1]),
                 occurrence: 2,
+                machine: vec!["kernel".to_owned(), "memory".to_owned()],
             },
             program: Some(ProgramPath(PathBuf::from("/usr/bin/cc"))),
             observations: states
@@ -1408,6 +1428,44 @@ mod tests {
             .into(),
             unknown_system_calls: vec![400, 1_000_000],
             connections: connections(),
+            machine: machine_state(),
+        }
+    }
+
+    /// A machine state with every part.
+    fn machine_state() -> MachineStateRecord {
+        MachineStateRecord {
+            kernel: Some(KernelRecord {
+                release: "6.12.0".to_owned(),
+                version: "#1 SMP".to_owned(),
+            }),
+            limits: Some(vec![LimitRecord {
+                resource: "nofile".to_owned(),
+                soft: Some(1_024),
+                hard: None,
+            }]),
+            affinity: Some(vec![0, 1]),
+            memory: Some(MemoryRecord {
+                total: 8_000,
+                available: 4_000,
+            }),
+            filesystem: Some(FileSystemRecord {
+                kind: 0xEF53,
+                flags: 0x1020,
+            }),
+            disk: Some(DiskRecord {
+                size: 100_000,
+                free: 40_000,
+            }),
+        }
+    }
+
+    /// A change of the kernel release.
+    fn kernel_change() -> MachineChange {
+        MachineChange {
+            value: "kernel release".to_owned(),
+            old: "6.12.0".to_owned(),
+            new: "6.13.0".to_owned(),
         }
     }
 
@@ -1498,6 +1556,11 @@ mod tests {
             RunReason::Always,
             RunReason::InputsChanged {
                 differences: differences.clone(),
+                machine: vec![kernel_change()],
+            },
+            RunReason::InputsChanged {
+                differences: differences.clone(),
+                machine: Vec::new(),
             },
         ];
         reasons.extend(whys.into_iter().map(|why| {
@@ -1694,9 +1757,9 @@ mod tests {
     #[test]
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
-        // A definite-length array of fifteen fields, then the specification as a
-        // definite-length array of thirteen.
-        assert_eq!(bytes.get(..2), Some(&[0x8F, 0x8D][..]));
+        // A definite-length array of sixteen fields, then the specification as a
+        // definite-length array of fourteen.
+        assert_eq!(bytes.get(..2), Some(&[0x90, 0x8E][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
@@ -1719,18 +1782,20 @@ mod tests {
             ("/a\u{e9}/kizz.md", 3),
             ("/b/kizz.md", 0)
         ]);
-        // The owners come before the unknown system calls and the connections, a
-        // definite-length array of three task identities, each an array of the
-        // file's bytes and the block index.
+        // The owners come before the unknown system calls, the connections and the
+        // machine state, a definite-length array of three task identities, each an
+        // array of the file's bytes and the block index.
         let owners = minicbor::to_vec(&record.owners).unwrap();
         let numbers = minicbor::to_vec(&record.unknown_system_calls).unwrap();
         let connections = minicbor::to_vec(&record.connections).unwrap();
+        let machine = minicbor::to_vec(&record.machine).unwrap();
         assert!(
             bytes.ends_with(
                 &[
                     owners.as_slice(),
                     numbers.as_slice(),
-                    connections.as_slice()
+                    connections.as_slice(),
+                    machine.as_slice()
                 ]
                 .concat()
             )
@@ -1741,7 +1806,15 @@ mod tests {
         unowned.owners.clear();
         let bytes = minicbor::to_vec(&unowned).unwrap();
         assert!(
-            bytes.ends_with(&[&[0x80_u8][..], numbers.as_slice(), connections.as_slice()].concat())
+            bytes.ends_with(
+                &[
+                    &[0x80_u8][..],
+                    numbers.as_slice(),
+                    connections.as_slice(),
+                    machine.as_slice()
+                ]
+                .concat()
+            )
         );
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), unowned);
     }
@@ -1854,18 +1927,49 @@ mod tests {
         assert_eq!(PERMISSION_BITS, 0o7777);
     }
 
-    /// The `timestamps` option is the last field of the specification's encoding,
-    /// and both values round-trip.
+    /// The `timestamps` option comes right before the `machine` names, the last
+    /// field of the specification's encoding, and both values round-trip.
     #[test]
     fn the_timestamps_option_encodes_deterministically_and_round_trips() {
         for timestamps in [false, true] {
             let mut spec = record().spec;
             spec.timestamps = timestamps;
+            spec.machine = Vec::new();
             let first = minicbor::to_vec(&spec).unwrap();
             assert_eq!(first, minicbor::to_vec(&spec).unwrap());
-            assert_eq!(first.last(), Some(if timestamps { &0xF5 } else { &0xF4 }));
+            let expected = [if timestamps { 0xF5 } else { 0xF4 }, 0x80];
+            assert_eq!(
+                first.get(first.len().saturating_sub(2)..),
+                Some(&expected[..])
+            );
             assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
         }
+    }
+
+    /// The `machine` names are the last field of the specification's encoding, an
+    /// array of text strings; and the machine state is the last field of the
+    /// record. Both encode deterministically and round-trip, a state whose parts
+    /// could not be read included.
+    #[test]
+    fn machine_names_and_state_encode_deterministically_and_round_trip() {
+        let mut spec = record().spec;
+        let first = minicbor::to_vec(&spec).unwrap();
+        assert_eq!(first, minicbor::to_vec(&spec).unwrap());
+        assert!(first.ends_with(b"\x82\x66kernel\x66memory"), "{first:x?}");
+        assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
+        spec.machine = vec!["disk".to_owned()];
+        let other = minicbor::to_vec(&spec).unwrap();
+        assert!(other.ends_with(b"\x81\x64disk"), "{other:x?}");
+
+        let state = minicbor::to_vec(machine_state()).unwrap();
+        let mut record = record();
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert!(bytes.ends_with(&state));
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+        record.machine = MachineStateRecord::default();
+        let unknown = minicbor::to_vec(&record).unwrap();
+        assert_eq!(unknown, minicbor::to_vec(&record).unwrap());
+        assert_eq!(minicbor::decode::<StepRecord>(&unknown).unwrap(), record);
     }
 
     /// An entries change names what appeared, disappeared, and changed type, each
@@ -2006,12 +2110,22 @@ mod tests {
         assert_eq!(minicbor::decode::<NotCachedReason>(&first).unwrap(), why);
         let numbers = minicbor::to_vec(vec![400_u32, 1_000_000]).unwrap();
         let connections = minicbor::to_vec(connections()).unwrap();
+        let machine = minicbor::to_vec(machine_state()).unwrap();
         for not_cached in [Some(why), None] {
             let mut record = record();
             record.not_cached = not_cached;
             let bytes = minicbor::to_vec(&record).unwrap();
             assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
-            assert!(bytes.ends_with(&[numbers.as_slice(), connections.as_slice()].concat()));
+            assert!(
+                bytes.ends_with(
+                    &[
+                        numbers.as_slice(),
+                        connections.as_slice(),
+                        machine.as_slice()
+                    ]
+                    .concat()
+                )
+            );
             let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
             assert_eq!(decoded, record);
             assert_eq!(decoded.unknown_system_calls, [400, 1_000_000]);
@@ -2077,12 +2191,13 @@ mod tests {
         }
         let listed = minicbor::to_vec(connections()).unwrap();
         assert_eq!(listed.first(), Some(&0x84));
+        let machine = minicbor::to_vec(machine_state()).unwrap();
         for not_cached in [Some(NotCachedReason::Signaled { signal: 9 }), None] {
             let mut record = record();
             record.not_cached = not_cached;
             let bytes = minicbor::to_vec(&record).unwrap();
             assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
-            assert!(bytes.ends_with(&listed));
+            assert!(bytes.ends_with(&[listed.as_slice(), machine.as_slice()].concat()));
             let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
             assert_eq!(decoded, record);
             assert_eq!(decoded.connections, connections());
@@ -2090,7 +2205,7 @@ mod tests {
         let mut none = record();
         none.connections = Vec::new();
         let bytes = minicbor::to_vec(&none).unwrap();
-        assert_eq!(bytes.last(), Some(&0x80));
+        assert!(bytes.ends_with(&[&[0x80][..], machine.as_slice()].concat()));
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), none);
     }
 

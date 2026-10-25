@@ -1,5 +1,6 @@
 ACCMODE
 arrayref
+bavail
 binfmt
 binprm
 bpaf
@@ -10,6 +11,7 @@ chdir
 CLOEXEC
 cmark
 cowextsize
+cpus
 creat
 dashmap
 datagram
@@ -72,16 +74,20 @@ flistxattr
 fopen
 fprog
 fremovexattr
+frsize
 fsconfig
 fsetxattr
+fsize
 fsmount
 fsopen
 fspick
 fstat
 fstatat
 fstatfs
+fstatvfs
 ftruncate
 futimesat
+getaffinity
 getattr
 getdents
 getegid
@@ -94,6 +100,7 @@ getpgrp
 getpid
 getpwuid
 GETREGS
+getrlimit
 GETSIGINFO
 gettid
 getxattr
@@ -113,6 +120,7 @@ inotify
 interp
 iovec
 JSET
+kibibytes
 kizz
 lchown
 ldflags
@@ -128,6 +136,7 @@ lsetxattr
 MAXINSNS
 MAXIOV
 MAXSYMLINKS
+memlock
 minicbor
 mkdirat
 mkfifo
@@ -137,6 +146,7 @@ mmap
 MMSG
 mmsghdr
 msghdr
+msgqueue
 namelen
 netlink
 newfstatat
@@ -147,12 +157,14 @@ nlink
 nocapture
 NOCTTY
 nodata
+nofile
 NONBLOCK
 NOTIF
 nsec
 openat
 opendir
 openpt
+osrelease
 phentsize
 phnum
 phoff
@@ -162,6 +174,7 @@ pipefail
 pointee
 prctl
 PRIVS
+prlimit
 projid
 pthread
 ptrace
@@ -184,13 +197,18 @@ retarget
 retargeted
 rgignore
 Riker
+rlim
+rlimit
 rseq
 rsplit
+rtprio
+rttime
 rumdl
 RUSTDOCFLAGS
 Ryzen
 Sakura
 sccache
+sched
 seccomp
 SEGV
 sendmmsg
@@ -213,6 +231,7 @@ SIGHAND
 sighandler
 siginfo
 sigmask
+sigpending
 SIGPIPE
 sigprocmask
 SIGSEGV
@@ -223,6 +242,7 @@ SIGUSR
 sockaddr
 Starlark
 statfs
+statvfs
 statx
 SurrealKV
 swapoff
@@ -234,6 +254,7 @@ Tgid
 tgkill
 thiserror
 timeformat
+totalram
 TRACECLONE
 tracee
 tracees

@@ -14,9 +14,10 @@
 //! * the arguments changed: old and new, word by word;
 //! * the environment changed: the variables added, removed, or changed, with their
 //!   values, which only `--verbose` shows;
-//! * the working directory, `stdin`, capture mode, ignore patterns, `track` patterns, or
-//!   `timestamps` changed;
+//! * the working directory, `stdin`, capture mode, ignore patterns, `track` patterns,
+//!   `timestamps`, or `machine` changed;
 //! * inputs changed: every changed path, what changed about it, and who last wrote it;
+//! * the machine state that the step names changed: each changed value, old and new;
 //! * the command is marked `always`;
 //! * the previous run could not be cached, and why.
 //!
@@ -28,6 +29,7 @@ use std::path::PathBuf;
 use minicbor::{Decode, Encode};
 
 use crate::{
+    machine::MachineChange,
     records::TaskId,
     step::{Capture, Change, NotCachedReason, path_bytes, path_list},
 };
@@ -277,12 +279,29 @@ pub enum Reason {
         #[n(1)]
         new: bool,
     },
+    /// The `machine` names changed.
+    #[n(13)]
+    MachineNamesChanged {
+        /// The old names.
+        #[n(0)]
+        old: Vec<String>,
+        /// The new names.
+        #[n(1)]
+        new: Vec<String>,
+    },
     /// Recorded inputs changed.
     #[n(9)]
     InputsChanged {
         /// Every changed input, sorted by path.
         #[n(0)]
         inputs: Vec<ChangedInput>,
+    },
+    /// Values of the machine state that the step names changed.
+    #[n(14)]
+    MachineChanged {
+        /// Each changed value, old and new, in the order of the step's names.
+        #[n(0)]
+        changes: Vec<MachineChange>,
     },
     /// The command is marked `always`.
     #[n(10)]
@@ -437,6 +456,10 @@ mod tests {
                 old: false,
                 new: true,
             },
+            Reason::MachineNamesChanged {
+                old: Vec::new(),
+                new: vec!["kernel".to_owned()],
+            },
             Reason::InputsChanged {
                 inputs: vec![
                     input(Writer::ThisCommand, Some(SelfInflicted::WritesAndReads)),
@@ -461,6 +484,13 @@ mod tests {
                     input(Writer::ProgramThisBuild { task: label() }, None),
                     input(Writer::ProgramEarlierBuild { task: label() }, None),
                 ],
+            },
+            Reason::MachineChanged {
+                changes: vec![MachineChange {
+                    value: "kernel release".to_owned(),
+                    old: "6.12.0".to_owned(),
+                    new: "6.13.0".to_owned(),
+                }],
             },
             Reason::Always,
             Reason::NotCached {

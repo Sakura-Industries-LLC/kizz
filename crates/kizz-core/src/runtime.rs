@@ -34,6 +34,7 @@ use std::{
     path::PathBuf,
 };
 
+use kizz_store::MachinePart;
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, CaptureMode, CapturedOutput, NotAbsoluteError, Termination,
 };
@@ -269,6 +270,12 @@ enum RunError {
     /// `capture` was neither `"split"` nor `"merged"`.
     #[error("run(): capture must be \"split\" or \"merged\", not \"{0}\"")]
     Capture(String),
+    /// `machine` named a part that the machine state does not have.
+    #[error(
+        "run(): machine has no part \"{0}\"; the parts are {parts}",
+        parts = MachinePart::names_text()
+    )]
+    MachinePart(String),
     /// The executor could not run the step.
     #[error("run(): {0}")]
     Step(#[from] StepError),
@@ -545,6 +552,8 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = UnpackListOrTuple::default())]
         track: UnpackListOrTuple<String>,
         #[starlark(require = named, default = false)] timestamps: bool,
+        #[starlark(require = named, default = UnpackListOrTuple::default())]
+        machine: UnpackListOrTuple<String>,
         #[starlark(require = named, default = NoneOr::None)] expect: NoneOr<UnpackListOrTuple<i32>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
@@ -566,6 +575,17 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
                 )));
             },
         };
+        let mut machine = machine.items;
+        if let Some(unknown) = machine
+            .iter()
+            .find(|name| MachinePart::from_name(name).is_none())
+        {
+            return Err(starlark::Error::new_other(RunError::MachinePart(
+                unknown.clone(),
+            )));
+        }
+        machine.sort();
+        machine.dedup();
         let mut step_env = state.env.borrow().clone();
         if let NoneOr::Other(entries) = env {
             for (name, value) in entries.entries {
@@ -592,6 +612,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             ignore: ignore.items,
             track: track.items,
             timestamps,
+            machine,
             expect: expect.into_option().map(|codes| codes.items),
         };
         let outcome = state

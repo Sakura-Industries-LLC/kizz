@@ -11,10 +11,13 @@
 //!   task used another key at the same position last time, the reasons compare that key's
 //!   specification with this one. The task program, the arguments, the environment, the
 //!   working directory, `stdin`, the capture mode, the ignore patterns, the `track`
-//!   patterns, and the `timestamps` option each give their own reason; a changed program
-//!   names its block or each loaded module that changed, from the part hashes of the task
-//!   record. Without an earlier specification, or when only the occurrence number
-//!   differs, the step never ran.
+//!   patterns, the `timestamps` option, and the `machine` names each give their own
+//!   reason; a changed program names its block or each loaded module that changed, from
+//!   the part hashes of the task record. Without an earlier specification, or when only
+//!   the occurrence number differs, the step never ran.
+//! * A step whose record names parts of the machine state, and whose cache check found
+//!   values of them changed, gives a reason of its own that names each changed value, old
+//!   and new, after the changed inputs.
 //! * Each changed input names who last wrote it, from the last-writer records: this
 //!   command on its previous run, another step in this build, a step of an earlier build,
 //!   the program of a task, through `fs.write` or `fs.write_json`, in this build or an
@@ -263,6 +266,12 @@ pub fn spec_reasons(
         reasons.push(Reason::TimestampsChanged {
             old: old.timestamps,
             new: new.timestamps,
+        });
+    }
+    if old.machine != new.machine {
+        reasons.push(Reason::MachineNamesChanged {
+            old: old.machine.clone(),
+            new: new.machine.clone(),
         });
     }
     reasons
@@ -527,6 +536,7 @@ mod tests {
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,
+            machine: Vec::new(),
             expect: None,
             occurrence: 0,
         }
@@ -587,6 +597,7 @@ mod tests {
         new.ignore = vec!["*.o".to_owned()];
         new.track = vec!["/proc/cpuinfo".to_owned()];
         new.timestamps = true;
+        new.machine = vec!["kernel".to_owned()];
         let parts = ProgramParts {
             block: [7; 32],
             modules: vec![
@@ -656,6 +667,10 @@ mod tests {
             Reason::TimestampsChanged {
                 old: false,
                 new: true,
+            },
+            Reason::MachineNamesChanged {
+                old: Vec::new(),
+                new: vec!["kernel".to_owned()],
             },
         ]);
     }

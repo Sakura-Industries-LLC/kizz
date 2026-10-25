@@ -347,9 +347,9 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
     let task = fixture.block(
         "run(\"prog\")\nrun(\"prog\", \"a b\", \"c\", stdin = \"input\", env = {\"A\": \"1\", \
          \"B\": None}, cwd = \"sub/dir\", capture = \"merged\", stream = True, always = True, \
-         ignore = [\"*.log\", \"tmp/**\"], track = [\"/proc/cpuinfo\"], timestamps = True, expect = \
-         [0, 2])\nrun(\"prog\", \
-         cwd = \"/elsewhere\")\n",
+         ignore = [\"*.log\", \"tmp/**\"], track = [\"/proc/cpuinfo\"], timestamps = True, machine \
+         = [\"memory\", \"kernel\", \"memory\"], expect = [0, 2])\nrun(\"prog\", cwd = \
+         \"/elsewhere\")\n",
     )?;
     let dir = AbsolutePath::new(fixture.path())?;
     let (result, _) = run(task, &executor)?;
@@ -366,6 +366,7 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             ignore: vec![],
             track: vec![],
             timestamps: false,
+            machine: vec![],
             expect: None,
         },
         StepSpec {
@@ -379,6 +380,7 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             ignore: vec!["*.log".to_owned(), "tmp/**".to_owned()],
             track: vec!["/proc/cpuinfo".to_owned()],
             timestamps: true,
+            machine: vec!["kernel".to_owned(), "memory".to_owned()],
             expect: Some(vec![0, 2]),
         },
         StepSpec {
@@ -392,6 +394,7 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             ignore: vec![],
             track: vec![],
             timestamps: false,
+            machine: vec![],
             expect: None,
         },
     ]);
@@ -399,8 +402,8 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
 }
 
 /// Invalid `run()` calls fail the task: no program, an unknown capture mode, an
-/// unknown parameter, a `timestamps` value that is not a boolean, and a step the
-/// executor cannot run.
+/// unknown parameter, a `timestamps` value that is not a boolean, an unknown
+/// `machine` part, and a step the executor cannot run.
 #[test]
 fn invalid_run_calls_fail_the_task() -> TestResult {
     let fixture = Fixture::new()?;
@@ -414,6 +417,11 @@ fn invalid_run_calls_fail_the_task() -> TestResult {
         (
             "run(\"p\", timestamps = \"yes\")\n",
             "Type of parameter `timestamps` doesn't match, expected `bool`",
+        ),
+        (
+            "run(\"p\", machine = [\"kernel\", \"cpu\"])\n",
+            "run(): machine has no part \"cpu\"; the parts are kernel, limits, affinity, \
+             memory, filesystem and disk",
         ),
         ("run(\"missing\")\n", "run(): no such program: missing"),
     ] {
@@ -442,6 +450,30 @@ fn a_timestamps_value_that_is_not_a_boolean_fails_the_task() -> TestResult {
         "{message}"
     );
     assert_eq!(executor.steps(), []);
+    Ok(())
+}
+
+/// An unknown `machine` part fails the task with an error that lists every part,
+/// before any step runs, and so does a value that is not a list of strings.
+#[test]
+fn an_unknown_machine_part_fails_the_task() -> TestResult {
+    let fixture = Fixture::new()?;
+    for (source, expected) in [
+        (
+            "run(\"p\", machine = [\"Kernel\"])\n",
+            "run(): machine has no part \"Kernel\"; the parts are kernel, limits, affinity, \
+             memory, filesystem and disk",
+        ),
+        (
+            "run(\"p\", machine = \"kernel\")\n",
+            "Type of parameter `machine` doesn't match",
+        ),
+    ] {
+        let executor = FakeExecutor::new();
+        let message = program_message(run(fixture.block(source)?, &executor)?.0)?;
+        assert!(message.contains(expected), "{expected:?} in {message}");
+        assert_eq!(executor.steps(), []);
+    }
     Ok(())
 }
 

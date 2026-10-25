@@ -80,6 +80,7 @@ fn step(
             timestamps: false,
             expect: None,
             occurrence: 0,
+            machine: Vec::new(),
         },
         program: None,
         observations,
@@ -98,6 +99,7 @@ fn step(
         owners: BTreeSet::new(),
         unknown_system_calls: Vec::new(),
         connections: Vec::new(),
+        machine: kizz_store::MachineStateRecord::default(),
     }
 }
 

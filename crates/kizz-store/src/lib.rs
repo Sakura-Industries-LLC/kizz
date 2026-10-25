@@ -15,6 +15,8 @@
 //! * [`records`]: the record families, their key layout, and their typed records.
 //! * [`step`]: the contents of step records: the step specification, the observations
 //!   with their path states, and how the step ended.
+//! * [`machine`]: the machine state that each step record keeps, and how the parts that a
+//!   step names are compared and shown.
 //! * [`explanation`]: the contents of explanations: why a step ran, or that it was
 //!   cached, as the step-position records keep them for `kizz why`.
 
@@ -22,6 +24,7 @@ pub mod explanation;
 pub mod identity;
 pub mod location;
 pub mod lock;
+pub mod machine;
 pub mod records;
 pub mod step;
 pub mod store;
@@ -35,6 +38,10 @@ pub use identity::{
 };
 pub use location::{LocationError, cache_dir, cache_dir_from_env};
 pub use lock::{CacheLock, LOCK_FILE_NAME, LockDetails, LockError, LockOptions};
+pub use machine::{
+    DiskRecord, FileSystemRecord, KernelRecord, LimitRecord, MachineChange, MachinePart,
+    MachineStateRecord, MemoryRecord, machine_changes, machine_changes_text,
+};
 pub use records::{
     Family, LastWriter, LearnedOrder, ModuleHash, PathKey, PositionKey, Record, RecordKey,
     SchemaKey, SchemaVersion, StepKey, StepPosition, TaskId, TaskRecord, WrittenBy, database_key,

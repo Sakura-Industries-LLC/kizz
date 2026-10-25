@@ -16,17 +16,27 @@
 //! 3. on a cache hit, returns the recorded exit status and raw output, with `cached` set,
 //!    storing new metadata the check found;
 //! 4. otherwise looks the program up through the `PATH` of the step's environment,
-//!    recording every location checked, and runs the command through the tracer;
+//!    recording every location checked, queries the machine state that the command starts
+//!    with, through the tracer's machine query, and runs the command through the tracer;
 //! 5. drops the cached hash of every path the step wrote, and records the state of every
 //!    touched path, concurrently, applying the step's ignore and `track` patterns; and
-//! 6. stores the step record under the step key; a result that is not cached replaces any
-//!    older record with a record marked as not cached.
+//! 6. stores the step record, with the machine state, under the step key; a result that
+//!    is not cached replaces any older record with a record marked as not cached.
 //!
 //! The cache check ("Cache check"): with no record for the key, the step runs, and
 //! the reason is that it never ran. With a record, every recorded observation is
 //! compared with the file system by [`check`]; the step is a
 //! hit only when nothing changed, and otherwise it runs, with every difference as
 //! the reason.
+//!
+//! Machine state ("Machine state"): a cache hit queries no machine state to record.
+//! When the record names parts of the machine state, with `run(..., machine =
+//! [...])`, the check queries the current state for the record's working directory
+//! and compares each value of those parts with the recorded one; a difference makes
+//! the step run, and the reason names each changed value, old and new. Each step key
+//! is compared at most once per build, and not after its step ran in the build, so a
+//! step that names a part that changes all the time, such as `memory`, runs at most
+//! once per build and the build still settles.
 //!
 //! A step marked `always` runs at most once per build, when a pass first reaches it:
 //! the first time its key comes up in the build, normally in the first pass, and it
@@ -92,7 +102,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fmt, mem,
     net::SocketAddr,
@@ -105,14 +115,16 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, BuildId, Capture, Connection, ContentHash, Explanation, LastWriter,
-    NotCachedReason, Observation, PathKey, PositionKey, ProgramPath, Reason, RecordedOutput,
-    RunReason, StepExit, StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError,
-    TaskId, TaskRecord, Txn, Verdict, WrittenBy,
+    AccessBits, BuildId, Capture, Connection, ContentHash, DiskRecord, Explanation,
+    FileSystemRecord, KernelRecord, LastWriter, LimitRecord, MachineChange, MachinePart,
+    MachineStateRecord, MemoryRecord, NotCachedReason, Observation, PathKey, PositionKey,
+    ProgramPath, Reason, RecordedOutput, RunReason, StepExit, StepKey, StepPosition, StepRecord,
+    StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Txn, Verdict, WrittenBy,
+    machine_changes,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    FirstReads, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, MachineState, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 
 use crate::{
@@ -221,6 +233,11 @@ pub struct Engine<'a> {
     unknown_calls: Mutex<Vec<UnknownCalls>>,
     /// The runs of the build that made connections, in the order they ended.
     connections: Mutex<Vec<StepConnections>>,
+    /// The step keys whose recorded machine state the build already compared, or
+    /// whose step ran in the build. The machine state is compared at most once per
+    /// step key and build, so a step that names a part that changes all the time,
+    /// such as `memory`, runs at most once per build, and the build still settles.
+    machine_compared: Mutex<HashSet<StepKey>>,
 }
 
 impl fmt::Debug for Engine<'_> {
@@ -242,6 +259,7 @@ impl fmt::Debug for Engine<'_> {
             )
             .field("unknown_calls", &self.unknown_calls)
             .field("connections", &self.connections)
+            .field("machine_compared", &self.machine_compared)
             .finish_non_exhaustive()
     }
 }
@@ -277,6 +295,7 @@ impl<'a> Engine<'a> {
             cache_unknown_system_calls: false,
             unknown_calls: Mutex::new(Vec::new()),
             connections: Mutex::new(Vec::new()),
+            machine_compared: Mutex::new(HashSet::new()),
         }
     }
 
@@ -596,6 +615,52 @@ struct Finished {
     /// The connections that the command made, sorted and without repeats; empty
     /// for a command that did not run.
     connections: Vec<Connection>,
+    /// The machine state that the command started with, queried right before the
+    /// lookup of its program.
+    machine: MachineStateRecord,
+}
+
+/// The machine state `state` that the tracer reported, as a record keeps it.
+fn machine_record(state: &MachineState) -> MachineStateRecord {
+    MachineStateRecord {
+        kernel: state.kernel.as_ref().map(|kernel| {
+            KernelRecord {
+                release: kernel.release.clone(),
+                version: kernel.version.clone(),
+            }
+        }),
+        limits: state.limits.as_ref().map(|limits| {
+            limits
+                .iter()
+                .map(|limit| {
+                    LimitRecord {
+                        resource: limit.resource.clone(),
+                        soft: limit.soft,
+                        hard: limit.hard,
+                    }
+                })
+                .collect()
+        }),
+        affinity: state.affinity.clone(),
+        memory: state.memory.map(|memory| {
+            MemoryRecord {
+                total: memory.total,
+                available: memory.available,
+            }
+        }),
+        filesystem: state.filesystem.map(|filesystem| {
+            FileSystemRecord {
+                kind: filesystem.kind,
+                flags: filesystem.flags,
+            }
+        }),
+        disk: state.disk.map(|disk| {
+            DiskRecord {
+                size: disk.size,
+                free: disk.free,
+            }
+        }),
+    }
 }
 
 /// The connection `connection` that the tracer reported, as a record keeps it.
@@ -716,6 +781,27 @@ const fn step_exit(termination: Termination) -> StepExit {
     match termination {
         Termination::Exited(code) => StepExit::Exited { code },
         Termination::Signaled(signal) => StepExit::Signaled { signal },
+    }
+}
+
+/// The request that runs `step` with the found program `program`: its exact
+/// arguments, environment, working directory, `stdin`, capture mode and echo.
+fn run_request(
+    step: &StepSpec,
+    program: AbsolutePath,
+) -> RunRequest {
+    RunRequest {
+        program,
+        args: step.argv.iter().map(OsString::from).collect(),
+        env: step
+            .env
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect(),
+        cwd: step.cwd.clone(),
+        stdin: step.stdin.as_ref().map(|text| text.as_bytes().to_vec()),
+        capture: step.capture,
+        echo: step.stream,
     }
 }
 
@@ -961,7 +1047,8 @@ impl TaskSteps<'_> {
                 )),
             ));
         }
-        Ok(if checked.is_hit() {
+        let machine = self.changed_machine(key, &record);
+        Ok(if checked.is_hit() && machine.is_empty() {
             Decision::Hit {
                 record: Box::new(record),
                 checked,
@@ -971,6 +1058,7 @@ impl TaskSteps<'_> {
             Decision::Run(
                 RunReason::InputsChanged {
                     differences: checked.differences,
+                    machine,
                 },
                 Some(Baseline::new(
                     &record.observations,
@@ -978,6 +1066,26 @@ impl TaskSteps<'_> {
                 )),
             )
         })
+    }
+
+    /// The values of the machine state that the record `record`, stored under
+    /// `key`, names and that changed since it was made, which the machine query of
+    /// the tracer reads for the record's working directory.
+    ///
+    /// A record that names no part compares nothing and queries nothing. Nor does a
+    /// record whose machine state the build already compared, or whose step already
+    /// ran in the build: each step key is compared at most once per build.
+    fn changed_machine(
+        &self,
+        key: StepKey,
+        record: &StepRecord,
+    ) -> Vec<MachineChange> {
+        let parts = MachinePart::parts(&record.spec.machine);
+        if parts.is_empty() || !lock(&self.engine.machine_compared).insert(key) {
+            return Vec::new();
+        }
+        let current = machine_record(&self.engine.tracer.machine_state(&record.spec.cwd));
+        machine_changes(&parts, &record.machine, &current)
     }
 
     /// The step-position record of the step at `position`, before this decision.
@@ -1021,10 +1129,22 @@ impl TaskSteps<'_> {
         let reasons = match reason {
             RunReason::NeverRun => self.never_run(&txn, previous.as_ref(), key, spec)?,
             RunReason::Always => vec![Reason::Always],
-            RunReason::InputsChanged { differences } => {
-                vec![Reason::InputsChanged {
-                    inputs: changed_inputs(&txn, &context, differences)?,
-                }]
+            RunReason::InputsChanged {
+                differences,
+                machine,
+            } => {
+                let mut reasons = Vec::new();
+                if !differences.is_empty() || machine.is_empty() {
+                    reasons.push(Reason::InputsChanged {
+                        inputs: changed_inputs(&txn, &context, differences)?,
+                    });
+                }
+                if !machine.is_empty() {
+                    reasons.push(Reason::MachineChanged {
+                        changes: machine.clone(),
+                    });
+                }
+                reasons
             },
             RunReason::NotCached { why, differences } => {
                 vec![Reason::NotCached {
@@ -1169,27 +1289,16 @@ impl TaskSteps<'_> {
     }
 
     /// Run `step` with the found program `program`; `checked` holds the locations
-    /// the lookup checked.
+    /// the lookup checked, and `machine` the machine state the command starts with.
     fn run(
         &self,
         step: &StepSpec,
         pending: &Pending,
         program: AbsolutePath,
         checked: Accesses,
+        machine: MachineStateRecord,
     ) -> Result<StepOutcome, StepError> {
-        let request = RunRequest {
-            program: program.clone(),
-            args: step.argv.iter().map(OsString::from).collect(),
-            env: step
-                .env
-                .iter()
-                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-                .collect(),
-            cwd: step.cwd.clone(),
-            stdin: step.stdin.as_ref().map(|text| text.as_bytes().to_vec()),
-            capture: step.capture,
-            echo: step.stream,
-        };
+        let request = run_request(step, program.clone());
         let ran_at = SystemTime::now();
         let started = Instant::now();
         let result = self
@@ -1220,6 +1329,7 @@ impl TaskSteps<'_> {
                     first_reads: result.first_reads,
                     unknown_system_calls: result.unknown_system_calls.into_iter().collect(),
                     connections: stored_connections(&result.connections),
+                    machine,
                 };
                 self.finish_run(step, pending, finished, why, Ok(outcome.clone()))?;
                 Ok(outcome)
@@ -1249,6 +1359,7 @@ impl TaskSteps<'_> {
                     first_reads: FirstReads::new(),
                     unknown_system_calls: Vec::new(),
                     connections: Vec::new(),
+                    machine,
                 })?;
                 Err(StepError::new(message))
             },
@@ -1270,6 +1381,7 @@ impl TaskSteps<'_> {
                     first_reads: FirstReads::new(),
                     unknown_system_calls: Vec::new(),
                     connections: Vec::new(),
+                    machine,
                 };
                 let why = NotCachedReason::StartFailed { message };
                 self.finish_run(step, pending, finished, Some(why), Err(failure.clone()))?;
@@ -1408,6 +1520,7 @@ impl TaskSteps<'_> {
             timestamps: step.timestamps,
             expect: step.expect.clone(),
             occurrence,
+            machine: step.machine.clone(),
         }
     }
 
@@ -1446,11 +1559,17 @@ impl TaskSteps<'_> {
             owners: BTreeSet::new(),
             unknown_system_calls: finished.unknown_system_calls,
             connections: finished.connections,
+            machine: finished.machine,
         }
     }
 
     /// Look the program of `step`, whose first argument is `name`, up and run it,
     /// or record that it is missing or not executable.
+    ///
+    /// Right before it runs the command, or records that the program is missing,
+    /// it queries the machine state that the command starts with, which the record
+    /// keeps whether or not the step names any part of it; the build compares the
+    /// state of this step key no more in this build.
     fn look_up_and_run(
         &self,
         step: &StepSpec,
@@ -1458,9 +1577,11 @@ impl TaskSteps<'_> {
         pending: &Pending,
     ) -> Result<StepOutcome, StepError> {
         let lookup = find_program(name, &step.env, &step.cwd).map_err(StepError::new)?;
+        lock(&self.engine.machine_compared).insert(pending.key);
+        let machine = machine_record(&self.engine.tracer.machine_state(step.cwd.as_path()));
         let exit = match lookup {
             ProgramLookup::Found { program, checked } => {
-                return self.run(step, pending, program, checked);
+                return self.run(step, pending, program, checked, machine);
             },
             ProgramLookup::NotFound { .. } => StepExit::ProgramNotFound,
             ProgramLookup::NotExecutable { .. } => StepExit::ProgramNotExecutable,
@@ -1477,6 +1598,7 @@ impl TaskSteps<'_> {
             first_reads: FirstReads::new(),
             unknown_system_calls: Vec::new(),
             connections: Vec::new(),
+            machine,
         })?;
         Err(StepError::new(message))
     }

@@ -45,10 +45,14 @@
 //! the descriptor that an opening call returned, and through the path for the
 //! program of an `exec` and each interpreter and loader that the kernel loaded.
 //!
-//! [`LinuxTracer`] also answers the attribute query of the tracer interface: it
+//! [`LinuxTracer`] also answers the platform queries of the tracer interface. It
 //! reads the extended attributes of a path with `listxattr` and `getxattr`, or
 //! `llistxattr` and `lgetxattr` without following a final symbolic link, and a file
-//! system that keeps none (`EOPNOTSUPP`) has none.
+//! system that keeps none (`EOPNOTSUPP`) has none. It reads the machine state that
+//! a command it starts inherits from its own thread: the kernel with `uname`, every
+//! resource limit with `getrlimit`, the CPUs with `sched_getaffinity`, the
+//! `MemTotal` and `MemAvailable` lines of `/proc/meminfo`, and the file system of
+//! the working directory with `statfs`, and its mount flags with `statvfs`.
 //!
 //! When a request is cancelled, the tracer interrupts the tree: it sends `SIGINT`
 //! once to every live process. It follows the tree as before for
@@ -82,8 +86,8 @@ pub use filter::{
     KNOWN_SYSTEM_CALLS, TRACKED_SYSTEM_CALLS, TrackedSystemCall, UNTRACEABLE_SYSTEM_CALLS,
 };
 use kizz_trace::{
-    Accesses, Cancellation, EchoSink, ExtendedAttributes, FirstReads, OutputStream, RunRequest,
-    RunResult, TraceError, Tracer,
+    Accesses, Cancellation, EchoSink, ExtendedAttributes, FirstReads, MachineState, OutputStream,
+    RunRequest, RunResult, TraceError, Tracer,
 };
 
 use crate::{
@@ -363,5 +367,12 @@ impl Tracer for LinuxTracer {
         follow: bool,
     ) -> io::Result<ExtendedAttributes> {
         sys::extended_attributes(path, follow)
+    }
+
+    fn machine_state(
+        &self,
+        cwd: &Path,
+    ) -> MachineState {
+        sys::machine_state(cwd)
     }
 }

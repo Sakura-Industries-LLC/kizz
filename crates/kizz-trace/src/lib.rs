@@ -31,12 +31,14 @@
 //! caches the result.
 //!
 //! Through the same interface, the engine reads what the standard library cannot:
-//! the extended attributes of a path, with [`Tracer::extended_attributes`].
+//! the extended attributes of a path, with [`Tracer::extended_attributes`], and the
+//! [`MachineState`] that a command starts with, with [`Tracer::machine_state`].
 //!
 //! Version 1 has one tracer, for Linux, in `kizz_trace_linux`; tests of the engine
 //! implement [`Tracer`] with a fake, which notes first reads with
 //! [`FirstReads::note_at`] as it reads or runs files, as the Linux tracer does, and
-//! answers the attribute query from attributes that the test sets.
+//! answers the attribute query from attributes that the test sets and the machine
+//! query with a state that the test scripts.
 //! Nothing in the engine changes when the tracer does.
 
 use std::{
@@ -1022,6 +1024,76 @@ impl TraceError {
     }
 }
 
+/// The kernel that runs a command, as `uname` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Kernel {
+    /// The kernel release, such as `6.12.0`.
+    pub release: String,
+    /// The kernel version, such as `#1 SMP PREEMPT_DYNAMIC`.
+    pub version: String,
+}
+
+/// One resource limit of a process, soft and hard.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceLimit {
+    /// The resource, as `prlimit` names it, such as `nofile`.
+    pub resource: String,
+    /// The soft limit, or `None` when it is unlimited.
+    pub soft: Option<u64>,
+    /// The hard limit, or `None` when it is unlimited.
+    pub hard: Option<u64>,
+}
+
+/// The memory of the machine, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Memory {
+    /// The total memory.
+    pub total: u64,
+    /// The memory available to start new work without swapping.
+    pub available: u64,
+}
+
+/// The file system that holds a working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileSystem {
+    /// The type of the file system, as the platform numbers it.
+    pub kind: u64,
+    /// The mount flags, as the platform numbers them.
+    pub flags: u64,
+}
+
+/// The size and free space of the file system that holds a working directory, in
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Disk {
+    /// The size of the file system.
+    pub size: u64,
+    /// The free space that a process without privileges may use.
+    pub free: u64,
+}
+
+/// The machine and process state that a command inherits when it starts, in six
+/// parts. A part that could not be read is `None`.
+///
+/// Kizz records it with every step that runs, and compares only the parts that a
+/// step names with `run(..., machine = [...])`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct MachineState {
+    /// `kernel`: the kernel release and version.
+    pub kernel: Option<Kernel>,
+    /// `limits`: every resource limit, soft and hard, in the platform's order.
+    pub limits: Option<Vec<ResourceLimit>>,
+    /// `affinity`: the CPUs the command may run on, by number, sorted.
+    pub affinity: Option<Vec<u32>>,
+    /// `memory`: the total and the available memory.
+    pub memory: Option<Memory>,
+    /// `filesystem`: the type and mount flags of the file system that holds the
+    /// working directory.
+    pub filesystem: Option<FileSystem>,
+    /// `disk`: the size and free space of that file system.
+    pub disk: Option<Disk>,
+}
+
 /// The extended attributes of one path: each name with its value, as bytes, sorted
 /// by name.
 pub type ExtendedAttributes = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -1068,6 +1140,18 @@ pub trait Tracer: Send + Sync {
         path: &Path,
         follow: bool,
     ) -> io::Result<ExtendedAttributes>;
+
+    /// The machine and process state that a command started in `cwd` inherits: the
+    /// kernel, the resource limits, the CPUs it may run on, the memory, and the file
+    /// system that holds `cwd`, with its size and free space. A part that cannot be
+    /// read is `None`.
+    ///
+    /// The core reads machine state only through this query, because the standard
+    /// library cannot read it.
+    fn machine_state(
+        &self,
+        cwd: &Path,
+    ) -> MachineState;
 }
 
 /// Unit tests for the logic of the tracer interface.

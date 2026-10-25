@@ -152,6 +152,14 @@ impl Tracer for FakeTracer {
             None => fs::symlink_metadata(path).map(|_| ExtendedAttributes::new()),
         }
     }
+
+    /// These tests name no machine state, so the fake knows no part.
+    fn machine_state(
+        &self,
+        _cwd: &Path,
+    ) -> kizz_trace::MachineState {
+        kizz_trace::MachineState::default()
+    }
 }
 
 /// A tracer failure from `error`.
@@ -369,6 +377,7 @@ impl Fixture {
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,
+            machine: Vec::new(),
             expect: None,
         })
     }
@@ -496,7 +505,7 @@ const PROGRAM: ProgramHash = ProgramHash::from_bytes([7; 32]);
 /// The why of a record's reason, with its differences.
 fn differences(record: &StepRecord) -> Vec<Difference> {
     match &record.reason {
-        RunReason::InputsChanged { differences } | RunReason::NotCached { differences, .. } => {
+        RunReason::InputsChanged { differences, .. } | RunReason::NotCached { differences, .. } => {
             differences.clone()
         },
         RunReason::NeverRun | RunReason::Always => Vec::new(),

@@ -41,6 +41,11 @@ pub struct StepSpec {
     /// the step read, ran, listed, or checked is a change, even when the content is
     /// the same.
     pub timestamps: bool,
+    /// The names of the parts of the machine state that count as an input of the
+    /// step, sorted and without repeats; each is a [`MachinePart`] name.
+    ///
+    /// [`MachinePart`]: kizz_store::MachinePart
+    pub machine: Vec<String>,
     /// The acceptable exit codes, or `None` when the exit status never fails the
     /// task.
     pub expect: Option<Vec<i32>>,

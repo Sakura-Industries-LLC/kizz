@@ -11,7 +11,8 @@
 
 use std::{
     ffi::{CStr, CString},
-    fs, io, mem,
+    fs, io,
+    mem::{self, MaybeUninit},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
@@ -23,7 +24,9 @@ use std::{
     ptr,
 };
 
-use kizz_trace::{ExtendedAttributes, FileMetadata};
+use kizz_trace::{
+    Disk, ExtendedAttributes, FileMetadata, FileSystem, Kernel, MachineState, Memory, ResourceLimit,
+};
 use libc::{c_int, c_long, c_uint, c_ulong, c_void, pid_t};
 
 use crate::decode;
@@ -583,6 +586,206 @@ pub(crate) fn extended_attributes(
     Ok(attributes)
 }
 
+/// The file that reports the memory of the machine.
+const MEMINFO_FILE: &str = "/proc/meminfo";
+
+/// The resources whose limits a process inherits, each with the name that
+/// `prlimit` gives it, in the kernel's order.
+pub(crate) const RESOURCES: [(&str, libc::__rlimit_resource_t); 16] = [
+    ("cpu", libc::RLIMIT_CPU),
+    ("fsize", libc::RLIMIT_FSIZE),
+    ("data", libc::RLIMIT_DATA),
+    ("stack", libc::RLIMIT_STACK),
+    ("core", libc::RLIMIT_CORE),
+    ("rss", libc::RLIMIT_RSS),
+    ("nproc", libc::RLIMIT_NPROC),
+    ("nofile", libc::RLIMIT_NOFILE),
+    ("memlock", libc::RLIMIT_MEMLOCK),
+    ("as", libc::RLIMIT_AS),
+    ("locks", libc::RLIMIT_LOCKS),
+    ("sigpending", libc::RLIMIT_SIGPENDING),
+    ("msgqueue", libc::RLIMIT_MSGQUEUE),
+    ("nice", libc::RLIMIT_NICE),
+    ("rtprio", libc::RLIMIT_RTPRIO),
+    ("rttime", libc::RLIMIT_RTTIME),
+];
+
+/// The number of 64-bit words in the CPU mask that `sched_getaffinity` fills:
+/// room for 1,024 CPUs, as in `cpu_set_t`.
+const AFFINITY_WORDS: usize = 16;
+
+/// The text of a field of `uname`, which ends with a zero byte within the field.
+fn uname_field(field: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = field
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| {
+            let [byte] = byte.to_ne_bytes();
+            byte
+        })
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The release and version of the kernel, from `uname`.
+fn kernel() -> io::Result<Kernel> {
+    let mut names = MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: the pointer is valid for writing a `utsname`.
+    check(unsafe { libc::uname(names.as_mut_ptr()) })?;
+    // SAFETY: `uname` succeeded, so it initialized `names`.
+    let names = unsafe { names.assume_init() };
+    Ok(Kernel {
+        release: uname_field(&names.release),
+        version: uname_field(&names.version),
+    })
+}
+
+/// A limit as `getrlimit` reports it, or `None` for no limit (`RLIM_INFINITY`).
+fn finite(value: libc::rlim_t) -> Option<u64> {
+    (value != libc::RLIM_INFINITY).then_some(value)
+}
+
+/// Every resource limit of the calling process, soft and hard, from `getrlimit`,
+/// in the order of [`RESOURCES`].
+fn limits() -> io::Result<Vec<ResourceLimit>> {
+    RESOURCES
+        .iter()
+        .map(|&(name, resource)| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `limit` is a valid, writable `rlimit`.
+            check(unsafe { libc::getrlimit(resource, &raw mut limit) })?;
+            Ok(ResourceLimit {
+                resource: name.to_owned(),
+                soft: finite(limit.rlim_cur),
+                hard: finite(limit.rlim_max),
+            })
+        })
+        .collect()
+}
+
+/// The CPUs that the calling thread, and so a process it starts, may run on, by
+/// number, sorted, from `sched_getaffinity`.
+fn affinity() -> io::Result<Vec<u32>> {
+    let mut mask = [0_u64; AFFINITY_WORDS];
+    // SAFETY: `mask` has room for the size passed, which is all the kernel writes.
+    let written = unsafe {
+        libc::syscall(
+            libc::SYS_sched_getaffinity,
+            0,
+            mem::size_of_val(&mask),
+            mask.as_mut_ptr(),
+        )
+    };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut cpus = Vec::new();
+    for (first, word) in (0_u32..).step_by(64).zip(mask) {
+        for bit in 0..u64::BITS {
+            if word.checked_shr(bit).unwrap_or(0) & 1 == 1 {
+                cpus.push(first.saturating_add(bit));
+            }
+        }
+    }
+    Ok(cpus)
+}
+
+/// The value of the line `name` of `/proc/meminfo`, in bytes.
+fn meminfo_field(
+    text: &str,
+    name: &str,
+) -> io::Result<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+        .and_then(|rest| rest.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())
+        .and_then(|kibibytes| kibibytes.checked_mul(1_024))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{MEMINFO_FILE} has no `{name}` line in kB"),
+            )
+        })
+}
+
+/// The total and the available memory of the machine, from the `MemTotal` and
+/// `MemAvailable` lines of `/proc/meminfo`.
+fn memory() -> io::Result<Memory> {
+    let text = fs::read_to_string(MEMINFO_FILE)?;
+    Ok(Memory {
+        total: meminfo_field(&text, "MemTotal")?,
+        available: meminfo_field(&text, "MemAvailable")?,
+    })
+}
+
+/// The statistics of the file system that holds `path`: its type and sizes from
+/// `statfs`, and its mount flags from `statvfs`, which reads them with the same
+/// `statfs` call, because the `statfs` structure of the `libc` crate leaves them
+/// out.
+fn file_system(path: &Path) -> io::Result<(libc::statfs, libc::statvfs)> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let mut stats = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is a NUL-terminated string, and the pointer is valid for
+    // writing a `statfs`.
+    check(unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) })?;
+    // SAFETY: `statfs` succeeded, so it initialized `stats`.
+    let stats = unsafe { stats.assume_init() };
+    let mut mount = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a NUL-terminated string, and the pointer is valid for
+    // writing a `statvfs`.
+    check(unsafe { libc::statvfs(path.as_ptr(), mount.as_mut_ptr()) })?;
+    // SAFETY: `statvfs` succeeded, so it initialized `mount`.
+    Ok((stats, unsafe { mount.assume_init() }))
+}
+
+/// The type of the file system that `stats` describes and its mount flags, from
+/// `mount`.
+const fn file_system_of(
+    stats: &libc::statfs,
+    mount: &libc::statvfs,
+) -> FileSystem {
+    FileSystem {
+        kind: u64::from_ne_bytes(stats.f_type.to_ne_bytes()),
+        flags: mount.f_flag,
+    }
+}
+
+/// The size and the free space, for a process without privileges, of the file
+/// system that `stats` describes, in bytes.
+fn disk_of(stats: &libc::statfs) -> Disk {
+    let fragment = if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    };
+    let fragment = u64::try_from(fragment).unwrap_or(0);
+    Disk {
+        size: stats.f_blocks.saturating_mul(fragment),
+        free: stats.f_bavail.saturating_mul(fragment),
+    }
+}
+
+/// The machine and process state that a command started in `cwd` by the calling
+/// thread inherits: the kernel from `uname`, every resource limit from
+/// `getrlimit`, the CPUs from `sched_getaffinity`, the memory from
+/// `/proc/meminfo`, and the file system that holds `cwd` from `statfs`. A part
+/// that cannot be read is `None`, such as the file system of a missing `cwd`.
+pub(crate) fn machine_state(cwd: &Path) -> MachineState {
+    let stats = file_system(cwd).ok();
+    MachineState {
+        kernel: kernel().ok(),
+        limits: limits().ok(),
+        affinity: affinity().ok(),
+        memory: memory().ok(),
+        filesystem: stats
+            .as_ref()
+            .map(|(stats, mount)| file_system_of(stats, mount)),
+        disk: stats.as_ref().map(|(stats, _)| disk_of(stats)),
+    }
+}
+
 /// Unit tests for the wrappers that need no traced process.
 #[cfg(test)]
 mod tests {
@@ -685,5 +888,160 @@ mod tests {
         );
         let missing = extended_attributes(&dir.path().join("missing"), true).unwrap_err();
         assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    /// The text of a field of `uname`, read by the test itself.
+    fn uname_text(field: &[libc::c_char]) -> String {
+        // SAFETY: `uname` ends every field with a zero byte within the field.
+        unsafe { CStr::from_ptr(field.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The CPUs in the `Cpus_allowed_list` line of the calling thread's status, as
+    /// the kernel lists them, such as `0-3,6`.
+    fn allowed_cpus() -> Vec<u32> {
+        let status = fs::read_to_string("/proc/thread-self/status").unwrap();
+        let allowed = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .unwrap()
+            .trim();
+        let mut cpus = Vec::new();
+        for range in allowed.split(',') {
+            let (first, last) = range.split_once('-').unwrap_or((range, range));
+            cpus.extend(first.parse::<u32>().unwrap()..=last.parse::<u32>().unwrap());
+        }
+        cpus
+    }
+
+    /// The type, mount flags and size of the file system of `dir`, which the test
+    /// reads itself through `libc` with `fstatfs` and `fstatvfs`.
+    fn own_file_system(dir: &Path) -> (FileSystem, u64) {
+        let opened = fs::File::open(dir).unwrap();
+        let mut system = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the descriptor is open, and the pointer is valid for writing a
+        // `statfs`.
+        assert_eq!(
+            unsafe { libc::fstatfs(opened.as_raw_fd(), system.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: `fstatfs` succeeded, so it initialized `system`.
+        let system = unsafe { system.assume_init() };
+        let mut mount = MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the descriptor is open, and the pointer is valid for writing a
+        // `statvfs`.
+        assert_eq!(
+            unsafe { libc::fstatvfs(opened.as_raw_fd(), mount.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: `fstatvfs` succeeded, so it initialized `mount`.
+        let mount = unsafe { mount.assume_init() };
+        let fragment = u64::try_from(system.f_frsize).unwrap();
+        (
+            FileSystem {
+                kind: u64::from_ne_bytes(system.f_type.to_ne_bytes()),
+                flags: mount.f_flag,
+            },
+            system.f_blocks.checked_mul(fragment).unwrap(),
+        )
+    }
+
+    /// The machine query of the tracer reports what the test reads itself through
+    /// `libc`: the release and version from `uname`, each resource limit from
+    /// `prlimit`, as many CPUs as `sched_getaffinity` sets, the very CPUs the kernel
+    /// lists for the thread, the total memory from `sysinfo`, and the type, flags
+    /// and size of the file system of the working directory from `fstatfs` and
+    /// `fstatvfs`.
+    #[test]
+    fn the_machine_state_is_what_libc_reports() {
+        use kizz_trace::Tracer as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let queried = crate::LinuxTracer.machine_state(dir.path());
+
+        let mut names = MaybeUninit::<libc::utsname>::uninit();
+        // SAFETY: the pointer is valid for writing a `utsname`.
+        assert_eq!(unsafe { libc::uname(names.as_mut_ptr()) }, 0);
+        // SAFETY: `uname` succeeded, so it initialized `names`.
+        let names = unsafe { names.assume_init() };
+        assert_eq!(
+            queried.kernel,
+            Some(Kernel {
+                release: uname_text(&names.release),
+                version: uname_text(&names.version),
+            })
+        );
+
+        let limits = queried.limits.unwrap();
+        assert_eq!(limits.len(), RESOURCES.len());
+        for (limit, &(name, resource)) in limits.iter().zip(&RESOURCES) {
+            let mut read = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: a null new limit changes nothing, and `read` is a valid,
+            // writable `rlimit`.
+            let ret = unsafe { libc::prlimit(0, resource, ptr::null(), &raw mut read) };
+            assert_eq!(ret, 0, "{name}: {}", io::Error::last_os_error());
+            assert_eq!(limit, &ResourceLimit {
+                resource: name.to_owned(),
+                soft: (read.rlim_cur != libc::RLIM_INFINITY).then_some(read.rlim_cur),
+                hard: (read.rlim_max != libc::RLIM_INFINITY).then_some(read.rlim_max),
+            });
+        }
+
+        let mut mask = [0_u64; AFFINITY_WORDS];
+        // SAFETY: `mask` is as large and as aligned as a `cpu_set_t`, and the call
+        // writes no more than the size passed.
+        let ret = unsafe {
+            libc::sched_getaffinity(0, mem::size_of_val(&mask), mask.as_mut_ptr().cast())
+        };
+        assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+        let set: u32 = mask.iter().map(|word| word.count_ones()).sum();
+        let affinity = queried.affinity.unwrap();
+        assert_ne!(set, 0);
+        assert_eq!(u32::try_from(affinity.len()).unwrap(), set);
+        assert_eq!(affinity, allowed_cpus());
+
+        let mut info = MaybeUninit::<libc::sysinfo>::uninit();
+        // SAFETY: the pointer is valid for writing a `sysinfo`.
+        assert_eq!(unsafe { libc::sysinfo(info.as_mut_ptr()) }, 0);
+        // SAFETY: `sysinfo` succeeded, so it initialized `info`.
+        let info = unsafe { info.assume_init() };
+        let memory = queried.memory.unwrap();
+        assert_eq!(
+            Some(memory.total),
+            info.totalram.checked_mul(u64::from(info.mem_unit))
+        );
+        assert!(memory.available > 0 && memory.available <= memory.total);
+
+        let (file_system, size) = own_file_system(dir.path());
+        assert_eq!(queried.filesystem, Some(file_system));
+        let disk = queried.disk.unwrap();
+        assert_eq!(disk.size, size);
+        assert!(disk.size > 0 && disk.free <= disk.size);
+    }
+
+    /// A working directory that does not exist has no file system, and every other
+    /// part is still read.
+    #[test]
+    fn a_missing_working_directory_has_no_file_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = machine_state(&dir.path().join("missing"));
+        assert_eq!((state.filesystem, state.disk), (None, None));
+        assert!(state.kernel.is_some() && state.limits.is_some());
+        assert!(state.affinity.is_some() && state.memory.is_some());
+    }
+
+    /// `/proc/meminfo` lines are read in kibibytes and reported in bytes, and a
+    /// missing line is an error.
+    #[test]
+    fn meminfo_lines_are_read_in_bytes() {
+        let text = "MemTotal:       16 kB\nMemFree: 1 kB\nMemAvailable:    8 kB\n";
+        assert_eq!(meminfo_field(text, "MemTotal").unwrap(), 16_384);
+        assert_eq!(meminfo_field(text, "MemAvailable").unwrap(), 8_192);
+        let missing = meminfo_field("MemTotal: 1 kB\n", "MemAvailable").unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::InvalidData);
     }
 }
