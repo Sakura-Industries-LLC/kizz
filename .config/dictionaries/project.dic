@@ -82,6 +82,7 @@ kizz
 lchown
 ldflags
 libc
+libtest
 linkat
 MAXINSNS
 MAXSYMLINKS

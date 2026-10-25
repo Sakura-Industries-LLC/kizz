@@ -824,23 +824,30 @@ mod tests {
                 pause_forever();
             },
             Some(mode @ ("interrupt-leader-exec" | "interrupt-thread-exec")) => {
-                // The thread that runs `exec` starts with `SIGINT` blocked, so it
-                // never takes the interrupt.
+                // A `SIGINT` sent to the process waits in its shared pending set
+                // until a thread that does not block it takes it, whichever thread
+                // Linux wakes for it, so only a thread that does not block it can
+                // take the interrupt. libtest runs this test on a thread of its
+                // own while the leader waits for it. This thread blocks `SIGINT`
+                // for good, and the thread that runs `exec` inherits the block
+                // until the test releases it, after the interrupt was taken.
                 set_interrupt_mask(libc::SIG_BLOCK);
                 drop(thread::spawn(exec_when_released));
                 if mode == "interrupt-thread-exec" {
                     // The test blocks `SIGINT` in the leader from its first stop on,
-                    // and every thread inherits that, so only this new thread, which
-                    // does not lead the process, takes the interrupt.
+                    // before the process has any other thread, and every thread
+                    // inherits that, so this new thread, which does not lead the
+                    // process and unblocks it, is the only one that can take the
+                    // interrupt.
                     drop(thread::spawn(|| {
                         set_interrupt_mask(libc::SIG_UNBLOCK);
                         mark_ready();
                         pause_forever();
                     }));
                 } else {
-                    // The leader, which no thread here can block, takes the
-                    // interrupt: Linux offers a process its signals first.
-                    set_interrupt_mask(libc::SIG_UNBLOCK);
+                    // The leader, which libtest leaves with `SIGINT` unblocked once
+                    // it has started this thread, is the only thread that does not
+                    // block it, so it is the only one that can take the interrupt.
                     mark_ready();
                 }
                 pause_forever();
@@ -1129,15 +1136,69 @@ mod tests {
         );
     }
 
+    /// The signal set `field`, such as `ShdPnd` or `SigBlk`, of the `/proc` status
+    /// file `status`, as a bit set in which signal N is the bit N - 1.
+    fn signal_set(
+        status: &str,
+        field: &str,
+    ) -> u64 {
+        let status = fs::read_to_string(status).unwrap();
+        let set = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap();
+        u64::from_str_radix(set.trim(), 16).unwrap()
+    }
+
     /// The signals pending for the whole process `pid`, as a bit set in which
     /// signal N is the bit N - 1.
     fn shared_pending(pid: pid_t) -> u64 {
-        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-        let set = status
-            .lines()
-            .find_map(|line| line.strip_prefix("ShdPnd:"))
-            .unwrap();
-        u64::from_str_radix(set.trim(), 16).unwrap()
+        signal_set(&format!("/proc/{pid}/status"), "ShdPnd")
+    }
+
+    /// Whether the thread `tid` of the process `pid` blocks `SIGINT`.
+    fn blocks_interrupt(
+        pid: pid_t,
+        tid: pid_t,
+    ) -> bool {
+        (signal_set(&format!("/proc/{pid}/task/{tid}/status"), "SigBlk") & INTERRUPT_BIT) != 0
+    }
+
+    /// The threads of the process `pid` that do not block `SIGINT`: the only
+    /// threads that can take a `SIGINT` sent to the process, which waits in the
+    /// process's shared pending set until one of them takes it.
+    fn interrupt_takers(pid: pid_t) -> BTreeSet<pid_t> {
+        fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .map(|entry| {
+                let name = entry.unwrap().file_name();
+                name.to_str().unwrap().parse::<pid_t>().unwrap()
+            })
+            .filter(|&tid| !blocks_interrupt(pid, tid))
+            .collect()
+    }
+
+    /// Wait until the thread `tid` of the process `pid`, which the helper leaves
+    /// with `SIGINT` unblocked, no longer blocks it.
+    ///
+    /// glibc's `pthread_create` blocks every signal in the calling thread until it
+    /// has started the new thread, so a leader that started a thread may still
+    /// block `SIGINT` for a while after that thread has begun to run, and never
+    /// blocks it again. The wait only lets the test observe the leader's final
+    /// mask: a `SIGINT` sent while the leader still blocks it waits in the shared
+    /// pending set, so the thread that takes it is the same either way.
+    fn await_unblocked(
+        pid: pid_t,
+        tid: pid_t,
+    ) {
+        let deadline = Instant::now().checked_add(PATIENCE).unwrap();
+        while blocks_interrupt(pid, tid) {
+            assert!(
+                Instant::now() < deadline,
+                "thread {tid} kept SIGINT blocked"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Whether a wait status is a `ptrace` stop at `event`.
@@ -1374,6 +1435,19 @@ mod tests {
                     })
             });
         tree.handle(ready, status).unwrap();
+        // Only the thread that the variant names can take the interrupt: it is the
+        // one thread of the helper that does not block `SIGINT`, and none of the
+        // others unblocks it before the test releases the thread that runs `exec`.
+        let named = match taker {
+            Taker::Leader => root,
+            Taker::Thread => ready,
+        };
+        await_unblocked(root, named);
+        assert_eq!(
+            interrupt_takers(root),
+            BTreeSet::from([named]),
+            "another thread of the helper does not block SIGINT"
+        );
         interrupt_all(&live);
         let held = drive_until(&mut tree, &live, "stop for the interrupt", |_, status| {
             libc::WIFSTOPPED(status)
