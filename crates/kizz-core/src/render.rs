@@ -168,6 +168,12 @@ impl Render {
                 format!("{} in an earlier build", self.step_of(task, *position))
             },
             Writer::Outside => "something outside kizz".to_owned(),
+            Writer::ProgramThisBuild { task } => {
+                format!("the program of {} in this build", self.task(task))
+            },
+            Writer::ProgramEarlierBuild { task } => {
+                format!("the program of {} in an earlier build", self.task(task))
+            },
         }
     }
 

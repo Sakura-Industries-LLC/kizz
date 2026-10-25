@@ -638,6 +638,38 @@ fn unchanged_writes_leave_the_file_untouched() -> TestResult {
     Ok(())
 }
 
+/// The run reports the files that `fs.write` and `fs.write_json` changed, in the
+/// order the program first changed each, without repeats; a write that leaves the
+/// file as it was is no change, and the other `fs` functions change nothing.
+#[test]
+fn the_run_reports_the_files_its_writes_changed() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("same.txt", "unchanged\n")?;
+    fixture.write("same.json", "{\n  \"a\": 1\n}\n")?;
+    fixture.write("old.txt", "old\n")?;
+    let ran = fixture.run(
+        "fs.write(\"same.txt\", \"unchanged\\n\")\nfs.write_json(\"same.json\", {\"a\": \
+         1})\nfs.write(\"old.txt\", \"new\\n\")\nfs.write_json(\"gen/new.json\", {\"b\": \
+         2})\nfs.write(\"old.txt\", \"newer\\n\")\nfs.write(\"old.txt\", \"newer\\n\")\n\
+         print(fs.read(\"old.txt\"), fs.exists(\"gen\"), fs.list(\"gen\"))\n",
+        &Env::new(),
+    )?;
+    ran.run.result.clone()?;
+    let changed: Vec<PathBuf> = ran
+        .run
+        .changes
+        .paths()
+        .iter()
+        .map(|path| path.as_path().to_path_buf())
+        .collect();
+    assert_eq!(changed, [
+        fixture.root().join("project/old.txt"),
+        fixture.root().join("project/gen/new.json"),
+    ]);
+    assert_eq!(fixture.read("old.txt")?, "newer\n");
+    Ok(())
+}
+
 /// Every `fs` function's accesses appear in the task's record, missing files and
 /// directory listings included, and paths resolve against the task directory,
 /// with absolute paths and paths outside the tree allowed.

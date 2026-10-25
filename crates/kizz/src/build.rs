@@ -15,10 +15,12 @@
 //! Output: one line for each command that runs, with its one-line reason; with
 //! `--verbose` or `--explain`, one line for each command that came from the cache,
 //! the first time the build reaches it; with `--explain`, the full reasons under each
-//! of those lines. A failing task prints its error, the Starlark stack, and the
-//! failing command's captured output. Warnings are loud and repeated in the final
-//! summary, which counts the commands that ran and those that came from the cache,
-//! and gives the number of passes the build settled in.
+//! of those lines. Each pass after the first starts with a line that says what the
+//! pass before did: a command ran, a task program changed a file, or both. A failing
+//! task prints its error, the Starlark stack, and the failing command's captured
+//! output. Warnings are loud and repeated in the final summary, which counts the
+//! commands that ran and those that came from the cache, and gives the number of
+//! passes the build settled in.
 //!
 //! Exit status: 0 on success, [`TASK_FAILED`] when a task fails or the build does not
 //! settle, [`USAGE_ERROR`] for usage and configuration errors and for a cache that
@@ -38,9 +40,9 @@ use std::{
 };
 
 use kizz_core::{
-    BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, LoadError, PrintSink, Project,
-    Render, StepDecision, TargetExpr, TaskInfo, TaskResult, Warning, build, load, task_id,
-    task_label,
+    BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, LoadError, PrintSink,
+    ProgramWrite, Project, Render, StepDecision, TargetExpr, TaskInfo, TaskResult, Warning, build,
+    load, task_id, task_label,
 };
 use kizz_store::{
     CacheLock, LockDetails, NotCachedReason, StepKey, StepRecord, Store, TaskId, Verdict,
@@ -213,6 +215,8 @@ fn build_selected(
         engine: &engine,
         store,
         seen: RefCell::new(BTreeSet::new()),
+        pass_ran: Cell::new(false),
+        pass_changed: Cell::new(false),
         repeated_shown: Cell::new(0),
         incomplete_shown: RefCell::new(BTreeSet::new()),
         warnings: RefCell::new(warnings),
@@ -292,6 +296,35 @@ fn failure(message: &str) -> ExitCode {
     ExitCode::from(USAGE_ERROR)
 }
 
+/// What a pass did, as the build output says it: `a command ran`, `a task program
+/// changed a file`, or both; `ran` says whether a command ran in it, and `changed`
+/// whether a task program changed a file in it.
+const fn work_done(
+    ran: bool,
+    changed: bool,
+) -> &'static str {
+    match (ran, changed) {
+        (true, true) => "a command ran and a task program changed a file",
+        (false, true) => "a task program changed a file",
+        (_, false) => "a command ran",
+    }
+}
+
+/// The line at the start of pass `pass`, a pass after the first, which says what
+/// the pass before did: `ran` says whether a command ran in it, and `changed`
+/// whether a task program changed a file in it.
+fn pass_line(
+    pass: usize,
+    ran: bool,
+    changed: bool,
+) -> String {
+    format!(
+        "pass {pass}: {} in pass {}, so every selected task is checked again",
+        work_done(ran, changed),
+        pass.saturating_sub(1)
+    )
+}
+
 /// A step of a task as the build output tells steps apart: the task, the position
 /// of the step in the task's run, and its command.
 type StepId = (TaskId, u32, String);
@@ -317,6 +350,10 @@ struct Output<'a> {
     store: &'a Store,
     /// Every step the build reached so far.
     seen: RefCell<BTreeSet<StepId>>,
+    /// Whether a command ran in the current pass.
+    pass_ran: Cell<bool>,
+    /// Whether a task program changed a file in the current pass.
+    pass_changed: Cell<bool>,
     /// How many of the engine's warnings for repeated self-inflicted reasons are
     /// printed.
     repeated_shown: Cell<usize>,
@@ -341,11 +378,14 @@ impl BuildEvents for Output<'_> {
         pass: usize,
     ) {
         if pass > 1 {
-            ui::print_summary(&format!(
-                "pass {pass}: a command ran in pass {}, so every selected task is checked again",
-                pass.saturating_sub(1)
+            ui::print_summary(&pass_line(
+                pass,
+                self.pass_ran.get(),
+                self.pass_changed.get(),
             ));
         }
+        self.pass_ran.set(false);
+        self.pass_changed.set(false);
     }
 
     fn task_finished(
@@ -354,6 +394,9 @@ impl BuildEvents for Output<'_> {
         result: &TaskResult,
     ) {
         let task = self.render.task(&task_label(&result.task));
+        self.pass_ran.set(self.pass_ran.get() || result.ran());
+        self.pass_changed
+            .set(self.pass_changed.get() || result.changed_files());
         for decision in &result.decisions {
             let first = self
                 .seen
@@ -486,9 +529,10 @@ impl Output<'_> {
             BuildOutcome::NotSettled {
                 limit,
                 changing,
-                ran,
+                written,
+                worked,
             } => {
-                self.not_settled(*limit, changing, ran);
+                self.not_settled(*limit, changing, written, worked);
                 ("build did not settle", 0, TASK_FAILED)
             },
             BuildOutcome::Interrupted => {
@@ -521,19 +565,26 @@ impl Output<'_> {
     }
 
     /// Print why a build that reached its pass limit `limit` did not settle: the
-    /// inputs `changing` that kept changing and who writes them, or else the tasks
-    /// `ran` that kept running commands.
+    /// inputs `changing` that kept changing and who writes them, the files `written`
+    /// that task programs kept changing, or else the tasks `worked` that kept
+    /// running commands.
     fn not_settled(
         &self,
         limit: usize,
         changing: &[ChangingInput],
-        ran: &[TaskInfo],
+        written: &[ProgramWrite],
+        worked: &[TaskInfo],
     ) {
+        let what = match (self.pass_ran.get(), self.pass_changed.get()) {
+            (true, true) => "still ran a command, and a task program still changed a file",
+            (false, true) => "a task program still changed a file",
+            (_, false) => "still ran a command",
+        };
         ui::print_error(&format!(
-            "the build did not settle: its last allowed pass, pass {limit}, still ran a command"
+            "the build did not settle: its last allowed pass, pass {limit}, {what}"
         ));
-        if changing.is_empty() {
-            for task in ran {
+        if changing.is_empty() && written.is_empty() {
+            for task in worked {
                 ui::print_error_detail(&format!(
                     "{} kept running commands",
                     self.render.task(&task_label(task))
@@ -541,7 +592,9 @@ impl Output<'_> {
             }
             return;
         }
-        ui::print_error_detail("these inputs kept changing:");
+        if !changing.is_empty() {
+            ui::print_error_detail("these inputs kept changing:");
+        }
         for input in changing {
             ui::print_error_detail(&format!(
                 "`{}`, read by step {} of {}, last written by {}",
@@ -549,6 +602,16 @@ impl Output<'_> {
                 input.position.saturating_add(1),
                 self.render.task(&input.reader),
                 self.render.writer(&input.writer)
+            ));
+        }
+        if !written.is_empty() {
+            ui::print_error_detail("task programs kept changing these files:");
+        }
+        for file in written {
+            ui::print_error_detail(&format!(
+                "`{}`, written by the program of {}",
+                self.render.path(&file.path),
+                self.render.task(&file.writer)
             ));
         }
     }
@@ -573,14 +636,15 @@ fn command_counts(report: &BuildReport) -> (usize, usize) {
     (ran, reached.difference(&ran_steps).count())
 }
 
-/// Unit tests for counting the commands of a build.
+/// Unit tests for counting the commands of a build and for the line at the start
+/// of a pass.
 #[cfg(test)]
 mod tests {
     use kizz_core::{BuildOutcome, BuildReport, Pass, StepDecision, TaskInfo, TaskResult};
     use kizz_store::{Explanation, Reason, Verdict};
     use kizz_trace::AbsolutePath;
 
-    use super::command_counts;
+    use super::{command_counts, pass_line};
 
     /// A task run whose steps have the verdicts `verdicts`, ran when `true`.
     fn result(verdicts: &[bool]) -> TaskResult {
@@ -616,7 +680,27 @@ mod tests {
                 .collect(),
             result: Ok(()),
             missing: Vec::new(),
+            changed: Vec::new(),
         }
+    }
+
+    /// The line at the start of a pass says what the pass before did.
+    #[test]
+    fn the_pass_line_says_what_the_pass_before_did() {
+        assert_eq!(
+            pass_line(2, true, false),
+            "pass 2: a command ran in pass 1, so every selected task is checked again"
+        );
+        assert_eq!(
+            pass_line(3, false, true),
+            "pass 3: a task program changed a file in pass 2, so every selected task is checked \
+             again"
+        );
+        assert_eq!(
+            pass_line(4, true, true),
+            "pass 4: a command ran and a task program changed a file in pass 3, so every \
+             selected task is checked again"
+        );
     }
 
     /// Every run counts as a command that ran, and a step counts as cached only

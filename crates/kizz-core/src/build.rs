@@ -21,12 +21,15 @@
 //! cache without running anything. A missing file is a dependency like any other,
 //! never a scheduling signal: nothing waits for a path to appear.
 //!
-//! If any command ran during a pass, another pass checks every selected task again.
-//! The build ends when a pass runs nothing: it succeeds if no task failed in that
-//! pass, and otherwise it fails, listing each failed task with the paths it looked
-//! for and did not find. The pass limit is one more than the number of tasks
-//! ([`pass_limit`]); when the last pass it allows still runs a command, the build
-//! stops, naming the paths that keep changing and who writes them. A command marked
+//! A pass does work when a command runs in it or a task program changes a file in
+//! it through `fs.write` or `fs.write_json`; a write that leaves the file as it was
+//! is no change. After a pass that did work, another pass checks every selected
+//! task. The build ends when a pass does no work: it succeeds if no task failed in
+//! that pass, and otherwise it fails, listing each failed task with the paths it
+//! looked for and did not find. The pass limit is one more than the number of tasks
+//! ([`pass_limit`]); when the last pass it allows still does work, the build stops,
+//! naming the paths that keep changing and who writes them, and the files that task
+//! programs changed in it. A command marked
 //! `always` runs at most once per build, when a pass first reaches it, normally the
 //! first one, because the engine runs each `always` step key once per build; later
 //! passes reuse its result, and one first reached in a later pass, or with a new step
@@ -39,7 +42,10 @@
 //! After every build that is not interrupted, kizz records, for each task that ran,
 //! the tasks whose outputs it consumed: the last writers of the paths its steps and
 //! its program read, checked, listed, or ran, including the paths written into a
-//! directory it listed, and the paths other task programs wrote in this build.
+//! directory it listed, and the paths other task programs wrote in this build. A
+//! task program that changes a file is stored as the file's last writer when its run
+//! ends ([`Engine::program_wrote`]), so the order learned from it holds in a later
+//! build in which the program does not write the file.
 //! Each run of a task ends with [`TaskSteps::finish`], which stores the task record:
 //! the program hash and a summary of the run.
 
@@ -53,7 +59,7 @@ use kizz_store::{
     AccessBits, LastWriter, LearnedOrder, PathKey, PathState, Reason, StepKey, StepRecord, Store,
     StoreError, TaskId, TaskLabel, Txn, Verdict, Writer, path_prefix,
 };
-use kizz_trace::{AccessKind, Accesses};
+use kizz_trace::{AbsolutePath, AccessKind, Accesses};
 
 use crate::{
     engine::{Engine, TaskSteps},
@@ -125,6 +131,10 @@ pub struct TaskResult {
     pub result: Result<(), TaskFailure>,
     /// When the task failed, the paths it looked for and did not find, sorted.
     pub missing: Vec<PathBuf>,
+    /// The files the task program changed through `fs.write` and `fs.write_json`
+    /// in the run, its modules' top-level code included, in the order it first
+    /// changed each, without repeats.
+    pub changed: Vec<AbsolutePath>,
 }
 
 impl TaskResult {
@@ -134,6 +144,18 @@ impl TaskResult {
         self.decisions
             .iter()
             .any(|decision| matches!(decision.verdict, Verdict::Ran(_)))
+    }
+
+    /// Whether the task program changed a file in the run.
+    #[must_use]
+    pub const fn changed_files(&self) -> bool {
+        !self.changed.is_empty()
+    }
+
+    /// Whether the run did work: a command ran, or the program changed a file.
+    #[must_use]
+    pub fn did_work(&self) -> bool {
+        self.ran() || self.changed_files()
     }
 
     /// Whether the task failed.
@@ -157,6 +179,18 @@ impl Pass {
     #[must_use]
     pub fn ran(&self) -> bool {
         self.tasks.iter().any(TaskResult::ran)
+    }
+
+    /// Whether a task program changed a file during the pass.
+    #[must_use]
+    pub fn changed_files(&self) -> bool {
+        self.tasks.iter().any(TaskResult::changed_files)
+    }
+
+    /// Whether the pass did work: a command ran, or a task program changed a file.
+    #[must_use]
+    pub fn did_work(&self) -> bool {
+        self.ran() || self.changed_files()
     }
 }
 
@@ -185,24 +219,36 @@ pub struct ChangingInput {
     pub writer: Writer,
 }
 
+/// A file that a task program changed in the last pass a build allows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramWrite {
+    /// The absolute path.
+    pub path: PathBuf,
+    /// The task whose program changed it.
+    pub writer: TaskLabel,
+}
+
 /// How a build ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildOutcome {
-    /// A pass ran nothing, and no task failed in it.
+    /// A pass did no work, and no task failed in it.
     Succeeded,
-    /// A pass ran nothing, and these tasks failed in it, in the order they ran.
+    /// A pass did no work, and these tasks failed in it, in the order they ran.
     Failed {
         /// The failed tasks.
         failures: Vec<FailedTask>,
     },
-    /// The last pass the limit allows still ran a command.
+    /// The last pass the limit allows still did work.
     NotSettled {
         /// The pass limit.
         limit: usize,
         /// The changed inputs that made steps run in that pass, sorted by path.
         changing: Vec<ChangingInput>,
-        /// The tasks that ran a command in that pass, in the order they ran.
-        ran: Vec<TaskInfo>,
+        /// The files that task programs changed in that pass, each with its task,
+        /// sorted by path, then by task.
+        written: Vec<ProgramWrite>,
+        /// The tasks that did work in that pass, in the order they ran.
+        worked: Vec<TaskInfo>,
     },
     /// Cancellation was requested, so the build started nothing new.
     Interrupted,
@@ -220,11 +266,11 @@ pub struct BuildReport {
 }
 
 impl BuildReport {
-    /// The number of passes the build took to settle: the last pass that ran a
-    /// command, or 1 when no pass ran one. The final pass, which ran nothing,
-    /// only confirms that nothing changed, so it adds to the count only when it is
-    /// the only pass. A build that did not settle or was interrupted reports every
-    /// pass it tried.
+    /// The number of passes the build took to settle: the last pass that did work,
+    /// by running a command or by a task program changing a file, or 1 when no pass
+    /// did. The final pass, which did no work, only confirms that nothing changed,
+    /// so it adds to the count only when it is the only pass. A build that did not
+    /// settle or was interrupted reports every pass it tried.
     #[must_use]
     pub fn settled_in(&self) -> usize {
         match self.outcome {
@@ -232,7 +278,7 @@ impl BuildReport {
                 self.passes
                     .iter()
                     .rev()
-                    .find(|pass| pass.ran())
+                    .find(|pass| pass.did_work())
                     .map_or(1, |pass| pass.number)
             },
             BuildOutcome::NotSettled { .. } | BuildOutcome::Interrupted => self.passes.len(),
@@ -287,13 +333,15 @@ struct Builder<'b> {
 }
 
 impl Builder<'_> {
-    /// Run the task `task` once: load its program, run it, and finish the run.
+    /// Run the task `task` once: load its program, run it, and finish the run,
+    /// storing its program as the last writer of every file it changed.
     fn run_task(
         &self,
         task: &TaskInfo,
     ) -> Result<(TaskResult, TaskTrace), StoreError> {
         let load = TaskProgram::load(task.clone(), self.print);
         let mut accesses = load.accesses;
+        let mut changes = load.changes;
         let (result, decisions, keys) = match load.program {
             Err(failure) => (Err(failure), Vec::new(), Vec::new()),
             Ok(program) => {
@@ -304,10 +352,12 @@ impl Builder<'_> {
                 };
                 let run = program.run(self.caller, &executor, self.print);
                 accesses.merge(run.accesses);
+                changes.merge(run.changes);
                 steps.finish(run.result.is_ok())?;
                 (run.result, steps.decisions(), steps.keys())
             },
         };
+        self.engine.program_wrote(&task_id(task), &changes)?;
         let missing = if result.is_err() {
             missing_paths(self.engine.store(), &keys, &accesses)?
         } else {
@@ -319,6 +369,7 @@ impl Builder<'_> {
                 decisions,
                 result,
                 missing,
+                changed: changes.paths(),
             },
             TaskTrace { keys, accesses },
         ))
@@ -353,7 +404,7 @@ impl Builder<'_> {
 }
 
 /// Build `tasks`, the selected tasks in the default order, with `engine`, in
-/// passes until a pass runs nothing; `caller` is the caller environment, the lines
+/// passes until a pass does no work; `caller` is the caller environment, the lines
 /// task programs print go to `print`, and `events` follows the build.
 ///
 /// # Errors
@@ -384,7 +435,7 @@ pub fn build(
         let (pass, interrupted) = builder.pass(number, &ordered, &mut traces, events)?;
         let outcome = if interrupted {
             Some(BuildOutcome::Interrupted)
-        } else if !pass.ran() {
+        } else if !pass.did_work() {
             Some(settled(&pass))
         } else if number >= limit {
             Some(not_settled(&pass, limit))
@@ -406,7 +457,7 @@ pub fn build(
     })
 }
 
-/// The outcome of a build whose pass `pass` ran nothing.
+/// The outcome of a build whose pass `pass` did no work.
 fn settled(pass: &Pass) -> BuildOutcome {
     let failures: Vec<FailedTask> = pass
         .tasks
@@ -428,13 +479,14 @@ fn settled(pass: &Pass) -> BuildOutcome {
     }
 }
 
-/// The outcome of a build whose pass `pass`, the last one `limit` allows, still ran
-/// a command.
+/// The outcome of a build whose pass `pass`, the last one `limit` allows, still did
+/// work.
 fn not_settled(
     pass: &Pass,
     limit: usize,
 ) -> BuildOutcome {
     let mut changing = Vec::new();
+    let mut written = Vec::new();
     for result in &pass.tasks {
         let reader = task_label(&result.task);
         for decision in &result.decisions {
@@ -450,17 +502,26 @@ fn not_settled(
                 });
             }
         }
+        for path in &result.changed {
+            written.push(ProgramWrite {
+                path: path.as_path().to_path_buf(),
+                writer: reader.clone(),
+            });
+        }
     }
     changing.sort_by(|a, b| {
         (&a.path, &a.reader.task, a.position).cmp(&(&b.path, &b.reader.task, b.position))
     });
+    written.sort_by(|a, b| (&a.path, &a.writer.task).cmp(&(&b.path, &b.writer.task)));
+    written.dedup();
     BuildOutcome::NotSettled {
         limit,
         changing,
-        ran: pass
+        written,
+        worked: pass
             .tasks
             .iter()
-            .filter(|result| result.ran())
+            .filter(|result| result.did_work())
             .map(|result| result.task.clone())
             .collect(),
     }

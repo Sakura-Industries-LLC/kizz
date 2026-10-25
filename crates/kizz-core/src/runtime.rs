@@ -23,7 +23,8 @@
 //! environment and the caller environment exist only while the task runs, so while
 //! a module is being loaded, the `env` functions other than `env.read` are errors,
 //! like `run()`. The `fs` functions and `env.read` work there too, and every file
-//! access they make, like each module read, is recorded against the task.
+//! access they make, like each module read, is recorded against the task, as is
+//! every file that `fs.write` or `fs.write_json` changes.
 
 use std::{
     cell::RefCell,
@@ -55,7 +56,7 @@ use starlark::{
 
 use crate::{
     dotenv::{self, DotenvError},
-    files::{FileError, Files},
+    files::{FileChanges, FileError, Files},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
     tasks::Task,
 };
@@ -335,6 +336,8 @@ struct TaskState<'a> {
     env: RefCell<BTreeMap<String, String>>,
     /// Every file access the program makes.
     accesses: RefCell<Accesses>,
+    /// Every file the program changes.
+    changes: RefCell<FileChanges>,
     /// The step whose exit status `expect` did not accept, if any.
     unexpected: RefCell<Option<UnexpectedExit>>,
 }
@@ -348,6 +351,8 @@ struct LoadingModule {
     dir: AbsolutePath,
     /// Every file access the module's top-level code makes.
     accesses: RefCell<Accesses>,
+    /// Every file the module's top-level code changes.
+    changes: RefCell<FileChanges>,
 }
 
 /// The error for `call`, a function that needs the running task, when `eval`
@@ -384,7 +389,7 @@ fn with_task<R>(
 }
 
 /// Call `f` with the file operations of the task that `eval` evaluates or loads a
-/// module for, so every access is recorded against that task.
+/// module for, so every access and every change is recorded against that task.
 ///
 /// # Errors
 ///
@@ -399,11 +404,13 @@ fn with_files<R>(
         f(&mut Files::new(
             &state.task.dir,
             &mut state.accesses.borrow_mut(),
+            &mut state.changes.borrow_mut(),
         ))
     } else if let Some(loading) = extra.and_then(|extra| extra.downcast_ref::<LoadingModule>()) {
         f(&mut Files::new(
             &loading.dir,
             &mut loading.accesses.borrow_mut(),
+            &mut loading.changes.borrow_mut(),
         ))
     } else {
         return Err(outside_task(eval, call));
@@ -687,7 +694,8 @@ fn env_functions(builder: &mut GlobalsBuilder) {
                 vars.insert(name.to_owned(), value.to_owned());
             }
             let mut accesses = state.accesses.borrow_mut();
-            let mut files = Files::new(&state.task.dir, &mut accesses);
+            let mut changes = state.changes.borrow_mut();
+            let mut files = Files::new(&state.task.dir, &mut accesses, &mut changes);
             let file = if required {
                 Some(require_dotenv(&mut files, call, path)?)
             } else {
@@ -997,6 +1005,8 @@ struct ModuleLoader<'a> {
     printer: &'a TaskPrinter<'a>,
     /// Every module read, and every module path found missing.
     accesses: Accesses,
+    /// Every file the modules' top-level code changed.
+    changes: FileChanges,
     /// The modules loaded so far, by absolute path.
     loaded: HashMap<AbsolutePath, FrozenModule>,
     /// The modules being loaded, outermost first, to find load cycles.
@@ -1073,6 +1083,7 @@ impl ModuleLoader<'_> {
             self.globals,
             self.printer,
             &mut self.accesses,
+            &mut self.changes,
         )?;
         self.sources.push((path.clone(), source));
         self.loaded.insert(path.clone(), module.clone());
@@ -1081,7 +1092,11 @@ impl ModuleLoader<'_> {
 }
 
 /// Evaluate and freeze one module, outside any task, recording the file accesses
-/// of its top-level code in `accesses`.
+/// of its top-level code in `accesses` and the files it changed in `changes`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate part of the loading context"
+)]
 fn evaluate_module(
     ast: AstModule,
     path: &AbsolutePath,
@@ -1090,11 +1105,13 @@ fn evaluate_module(
     globals: &Globals,
     printer: &TaskPrinter<'_>,
     accesses: &mut Accesses,
+    changes: &mut FileChanges,
 ) -> Result<FrozenModule, TaskFailure> {
     let marker = LoadingModule {
         path: path.clone(),
         dir: task.dir.clone(),
         accesses: RefCell::new(Accesses::new()),
+        changes: RefCell::new(FileChanges::new()),
     };
     let result = Module::with_temp_heap(|module| {
         set_task_value(&module, task);
@@ -1114,6 +1131,7 @@ fn evaluate_module(
         })
     });
     accesses.merge(marker.accesses.into_inner());
+    changes.merge(marker.changes.into_inner());
     result
 }
 
@@ -1144,6 +1162,9 @@ pub struct ProgramLoad {
     /// Every module the task read and every module path it found missing, with the
     /// file accesses of the modules' top-level code.
     pub accesses: Accesses,
+    /// Every file the modules' top-level code changed through `fs.write` and
+    /// `fs.write_json`, in the order it first changed each.
+    pub changes: FileChanges,
     /// The loaded program, or why it could not be loaded.
     pub program: Result<TaskProgram, TaskFailure>,
 }
@@ -1197,6 +1218,7 @@ impl TaskProgram {
             globals: &globals,
             printer: &printer,
             accesses: Accesses::new(),
+            changes: FileChanges::new(),
             loaded: HashMap::new(),
             loading: Vec::new(),
             sources: Vec::new(),
@@ -1212,7 +1234,10 @@ impl TaskProgram {
                 Ok((ast, imports))
             });
         let ModuleLoader {
-            accesses, sources, ..
+            accesses,
+            changes,
+            sources,
+            ..
         } = loader;
         let program = parsed.map(|(ast, imports)| {
             let mut hasher = blake3::Hasher::new_derive_key(PROGRAM_HASH_CONTEXT);
@@ -1244,7 +1269,11 @@ impl TaskProgram {
                 parts,
             }
         });
-        ProgramLoad { accesses, program }
+        ProgramLoad {
+            accesses,
+            changes,
+            program,
+        }
     }
 
     /// The hash of the block and every module it loads.
@@ -1271,7 +1300,8 @@ impl TaskProgram {
     ///
     /// The task environment starts empty. `caller` is the caller environment, the
     /// only one that `env.caller` and `env.inherit` read. The result holds every
-    /// file access the program made while it ran, whether or not it failed.
+    /// file access the program made while it ran, and every file it changed,
+    /// whether or not it failed.
     #[must_use]
     pub fn run(
         self,
@@ -1293,6 +1323,7 @@ impl TaskProgram {
             caller,
             env: RefCell::new(BTreeMap::new()),
             accesses: RefCell::new(Accesses::new()),
+            changes: RefCell::new(FileChanges::new()),
             unexpected: RefCell::new(None),
         };
         let result = Module::with_temp_heap(|module| {
@@ -1317,6 +1348,7 @@ impl TaskProgram {
         });
         TaskRun {
             accesses: state.accesses.into_inner(),
+            changes: state.changes.into_inner(),
             result,
         }
     }
@@ -1329,6 +1361,9 @@ pub struct TaskRun {
     /// functions, `env.load_file`, and `env.read`, missing files and directory
     /// listings included.
     pub accesses: Accesses,
+    /// Every file the program changed through `fs.write` and `fs.write_json` while
+    /// it ran, in the order it first changed each, without repeats.
+    pub changes: FileChanges,
     /// Whether the program succeeded, or why it failed.
     pub result: Result<(), TaskFailure>,
 }

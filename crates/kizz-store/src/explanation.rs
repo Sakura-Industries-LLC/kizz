@@ -81,10 +81,25 @@ pub enum Writer {
         #[n(1)]
         position: u32,
     },
-    /// Something outside kizz: no step recorded a write to the path after the
-    /// recorded state was taken.
+    /// Something outside kizz: no step or task program recorded a write to the path
+    /// after the recorded state was taken.
     #[n(3)]
     Outside,
+    /// The program of a task, through `fs.write` or `fs.write_json`, in this build.
+    #[n(4)]
+    ProgramThisBuild {
+        /// The task.
+        #[n(0)]
+        task: TaskLabel,
+    },
+    /// The program of a task, through `fs.write` or `fs.write_json`, in an earlier
+    /// build.
+    #[n(5)]
+    ProgramEarlierBuild {
+        /// The task.
+        #[n(0)]
+        task: TaskLabel,
+    },
 }
 
 /// Why a changed input is a self-inflicted reason to run: kizz's own build changes
@@ -429,6 +444,8 @@ mod tests {
                         None,
                     ),
                     input(Writer::Outside, None),
+                    input(Writer::ProgramThisBuild { task: label() }, None),
+                    input(Writer::ProgramEarlierBuild { task: label() }, None),
                 ],
             },
             Reason::Always,

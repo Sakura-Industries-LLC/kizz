@@ -15,16 +15,19 @@
 //! * a write is a `write` of the file and of every parent directory it created.
 //!
 //! Writes happen only when the content differs, so an unchanged file keeps its
-//! timestamps; a write is recorded either way. Text is UTF-8: bytes that are not
-//! valid UTF-8 are replaced with U+FFFD, as with command output. JSON is written in
-//! a stable form: object keys sorted by their UTF-8 bytes, `indent` spaces per
-//! level, and a trailing newline.
+//! timestamps; a write is recorded either way. A write that changes the file is
+//! also a change, which [`FileChanges`] keeps with when it happened, so a pass in
+//! which a task program changed a file does work and the task is the file's last
+//! writer. Text is UTF-8: bytes that are not valid UTF-8 are replaced with U+FFFD, as
+//! with command output. JSON is written in a stable form: object keys sorted by their
+//! UTF-8 bytes, `indent` spaces per level, and a trailing newline.
 
 use std::{
     collections::BTreeSet,
     fs,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use globset::{GlobBuilder, GlobMatcher};
@@ -90,22 +93,106 @@ fn is_missing(error: &io::Error) -> bool {
     matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
 
+/// A file that a task program changed, and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    /// The absolute path of the file.
+    pub path: AbsolutePath,
+    /// When the program last changed it, in nanoseconds since the Unix epoch.
+    pub at_nanos: u64,
+}
+
+/// The files that a task program changed through `fs.write` and `fs.write_json`, in
+/// the order it first changed each one, without repeats.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileChanges {
+    /// The changed files.
+    files: Vec<ChangedFile>,
+}
+
+impl FileChanges {
+    /// No changes.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { files: Vec::new() }
+    }
+
+    /// Note that the file at `path` changed at `at_nanos`; a file already noted
+    /// keeps its place and takes the later time.
+    pub fn record(
+        &mut self,
+        path: AbsolutePath,
+        at_nanos: u64,
+    ) {
+        if let Some(file) = self.files.iter_mut().find(|file| file.path == path) {
+            file.at_nanos = file.at_nanos.max(at_nanos);
+        } else {
+            self.files.push(ChangedFile { path, at_nanos });
+        }
+    }
+
+    /// Add the changes of `other`, which came after these.
+    pub fn merge(
+        &mut self,
+        other: Self,
+    ) {
+        for file in other.files {
+            self.record(file.path, file.at_nanos);
+        }
+    }
+
+    /// Whether no file changed.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// The changed files, in the order they first changed.
+    #[must_use]
+    pub fn files(&self) -> &[ChangedFile] {
+        &self.files
+    }
+
+    /// The paths of the changed files, in the order they first changed.
+    #[must_use]
+    pub fn paths(&self) -> Vec<AbsolutePath> {
+        self.files.iter().map(|file| file.path.clone()).collect()
+    }
+}
+
+/// Now, in nanoseconds since the Unix epoch.
+fn now_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
 /// The file operations of one task: paths resolve against the task directory, and
-/// every access is recorded.
+/// every access is recorded, with every file a write changed.
 pub struct Files<'a> {
     /// The task directory.
     dir: &'a AbsolutePath,
     /// The task's accesses.
     accesses: &'a mut Accesses,
+    /// The files the task's writes changed.
+    changes: &'a mut FileChanges,
 }
 
 impl<'a> Files<'a> {
-    /// The file operations of the task in `dir`, recording into `accesses`.
+    /// The file operations of the task in `dir`, recording into `accesses` and,
+    /// for writes that change a file, into `changes`.
     pub const fn new(
         dir: &'a AbsolutePath,
         accesses: &'a mut Accesses,
+        changes: &'a mut FileChanges,
     ) -> Self {
-        Self { dir, accesses }
+        Self {
+            dir,
+            accesses,
+            changes,
+        }
     }
 
     /// The absolute path of `path`, relative to the task directory unless absolute.
@@ -181,7 +268,7 @@ impl<'a> Files<'a> {
 
     /// Write `content` to the file at `path`, creating parent directories, unless
     /// the file already holds exactly `content`. Returns whether the file was
-    /// written.
+    /// written; a written file is noted as changed.
     ///
     /// # Errors
     ///
@@ -217,7 +304,9 @@ impl<'a> Files<'a> {
                 })?;
             }
         }
-        fs::write(&path, content).map_err(|error| FileError::io("cannot write", path, error))?;
+        fs::write(&path, content)
+            .map_err(|error| FileError::io("cannot write", path.clone(), error))?;
+        self.changes.record(path, now_nanos());
         Ok(true)
     }
 
@@ -501,7 +590,7 @@ mod tests {
     use kizz_trace::{AbsolutePath, Accesses};
     use serde_json::json;
 
-    use super::{Files, stable_json};
+    use super::{FileChanges, Files, stable_json};
 
     /// The accesses as `(path relative to root, kinds)` pairs.
     fn shown(
@@ -556,22 +645,54 @@ mod tests {
     }
 
     /// A write creates parent directories and records them, and a write with
-    /// unchanged content does not touch the file.
+    /// unchanged content does not touch the file; only the writes that changed the
+    /// file are changes, noted once, in order.
     #[test]
     fn writes_create_parents_and_skip_unchanged_content() {
         let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("same.txt"), "same").unwrap();
         let dir = AbsolutePath::new(root.path()).unwrap();
         let mut accesses = Accesses::new();
-        let mut files = Files::new(&dir, &mut accesses);
+        let mut changes = FileChanges::new();
+        let mut files = Files::new(&dir, &mut accesses, &mut changes);
         assert!(files.write_bytes("a/b/c.txt", b"one").unwrap());
         assert!(!files.write_bytes("a/b/c.txt", b"one").unwrap());
+        assert!(!files.write_bytes("same.txt", b"same").unwrap());
+        assert!(files.write_bytes("d.txt", b"d").unwrap());
         assert!(files.write_bytes("a/b/c.txt", b"two").unwrap());
         assert_eq!(fs::read(root.path().join("a/b/c.txt")).unwrap(), b"two");
         assert_eq!(shown(root.path(), &accesses), [
             ("a".to_owned(), "write".to_owned()),
             ("a/b".to_owned(), "write".to_owned()),
             ("a/b/c.txt".to_owned(), "write".to_owned()),
+            ("d.txt".to_owned(), "write".to_owned()),
+            ("same.txt".to_owned(), "write".to_owned()),
         ]);
+        assert_eq!(changes.paths(), [dir.join("a/b/c.txt"), dir.join("d.txt")]);
+        let [first, second] = changes.files() else {
+            panic!("{changes:?}");
+        };
+        // The file changed twice keeps its first place and takes its last time.
+        assert!(first.at_nanos >= second.at_nanos, "{changes:?}");
+    }
+
+    /// Merged changes keep the order of first change, without repeats, and the
+    /// later time of a file changed in both.
+    #[test]
+    fn changes_merge_in_order_without_repeats() {
+        let path = |name: &str| AbsolutePath::new(format!("/w/{name}")).unwrap();
+        let mut changes = FileChanges::new();
+        assert!(changes.is_empty());
+        changes.record(path("a"), 5);
+        changes.record(path("b"), 6);
+        let mut later = FileChanges::new();
+        later.record(path("c"), 7);
+        later.record(path("a"), 8);
+        changes.merge(later);
+        assert!(!changes.is_empty());
+        assert_eq!(changes.paths(), [path("a"), path("b"), path("c")]);
+        let times: Vec<u64> = changes.files().iter().map(|file| file.at_nanos).collect();
+        assert_eq!(times, [8, 6, 7]);
     }
 
     /// Text reads replace bytes that are not valid UTF-8.
@@ -581,7 +702,8 @@ mod tests {
         fs::write(root.path().join("bytes"), b"ok \xff end").unwrap();
         let dir = AbsolutePath::new(root.path()).unwrap();
         let mut accesses = Accesses::new();
-        let mut files = Files::new(&dir, &mut accesses);
+        let mut changes = FileChanges::new();
+        let mut files = Files::new(&dir, &mut accesses, &mut changes);
         assert_eq!(
             files.read_text("bytes").unwrap(),
             format!("ok {} end", char::REPLACEMENT_CHARACTER)
@@ -609,7 +731,8 @@ mod tests {
         link_dir(&root.path().join("src"), &root.path().join("src/deep/loop")).unwrap();
         let dir = AbsolutePath::new(root.path()).unwrap();
         let mut accesses = Accesses::new();
-        let mut files = Files::new(&dir, &mut accesses);
+        let mut changes = FileChanges::new();
+        let mut files = Files::new(&dir, &mut accesses, &mut changes);
         assert_eq!(files.glob("*.txt").unwrap(), [".hidden.txt", "a.txt"]);
         assert_eq!(files.glob("src/*.txt").unwrap(), ["src/x.txt"]);
         assert_eq!(files.glob("*/*.txt").unwrap(), ["src/x.txt"]);

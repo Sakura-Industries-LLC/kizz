@@ -59,11 +59,13 @@
 //! also stores, with each step record it writes, a last-writer record for every path
 //! the step wrote and the step-position record with the explanation; a cached step's
 //! position is stored when [`TaskSteps::finish`] stores the task record, which also
-//! removes the positions the run no longer reached. A step that re-runs in
-//! consecutive builds for the same self-inflicted reason adds a [`RepeatedWarning`].
+//! removes the positions the run no longer reached. [`Engine::program_wrote`] stores
+//! a task program as the last writer of each file it changed through `fs.write` or
+//! `fs.write_json`. A step that re-runs in consecutive builds for the same
+//! self-inflicted reason adds a [`RepeatedWarning`].
 //!
 //! Owners ("Cleaning up the cache"): every step record carries the tasks that own
-//! it, by [`TaskId`](kizz_store::TaskId). A run made with [`Engine::task_for`] adds
+//! it, by [`TaskId`]. A run made with [`Engine::task_for`] adds
 //! its task to the owners of the record it stores, in the transaction that stores
 //! it, and keeps the owners of the record it replaces under the same key, a record
 //! marked as not cached included; a run without a task identity
@@ -91,11 +93,12 @@ use std::{
 use kizz_store::{
     AccessBits, BuildId, Capture, ContentHash, Explanation, LastWriter, NotCachedReason,
     Observation, PathKey, PositionKey, ProgramPath, Reason, RecordedOutput, RunReason, StepExit,
-    StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskRecord, Txn, Verdict,
+    StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Txn,
+    Verdict, WrittenBy,
 };
 use kizz_trace::{
-    AbsolutePath, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink, RunRequest,
-    RunResult, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
+    RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 
 use crate::{
@@ -104,6 +107,7 @@ use crate::{
         Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
         changed_inputs, spec_reasons,
     },
+    files::FileChanges,
     key::Occurrences,
     lookup::{ProgramLookup, find_program},
     observe::observe,
@@ -272,6 +276,47 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub const fn file_states(&self) -> &FileStates {
         &self.states
+    }
+
+    /// Store the program of the task `task` as the last writer of each file in
+    /// `changes`, the files it changed through `fs.write` and `fs.write_json` in this
+    /// build, with the time of each change, and drop their cached hashes. A file
+    /// whose last writer wrote it later, such as a step that the program ran after
+    /// its write, keeps that writer.
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when a record cannot be read or written.
+    pub fn program_wrote(
+        &self,
+        task: &TaskId,
+        changes: &FileChanges,
+    ) -> Result<(), StoreError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut written = Accesses::new();
+        for file in changes.files() {
+            written.record(file.path.clone(), AccessKind::Write);
+        }
+        self.states.forget_written(&written);
+        let mut txn = self.store.write()?;
+        for file in changes.files() {
+            let key = PathKey(file.path.as_path().to_path_buf());
+            if txn
+                .get::<LastWriter>(&key)?
+                .is_some_and(|entry| entry.written_at_nanos > file.at_nanos)
+            {
+                continue;
+            }
+            txn.put(&key, &LastWriter {
+                task: task.clone(),
+                by: WrittenBy::Program,
+                build: self.build,
+                written_at_nanos: file.at_nanos,
+            })?;
+        }
+        txn.commit()
     }
 
     /// The steps of the build whose last result was not cached, with why, sorted by
@@ -682,8 +727,10 @@ impl TaskSteps<'_> {
                     if observation.access.contains(AccessBits::WRITE) {
                         txn.put(&PathKey(observation.path.clone()), &LastWriter {
                             task: identity.id.clone(),
-                            step: pending.key,
-                            position: pending.position,
+                            by: WrittenBy::Step {
+                                step: pending.key,
+                                position: pending.position,
+                            },
                             build: self.engine.build,
                             written_at_nanos: record.recorded_at_nanos,
                         })?;

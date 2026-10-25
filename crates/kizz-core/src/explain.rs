@@ -17,14 +17,17 @@
 //!   ran.
 //! * Each changed input names who last wrote it, from the last-writer records: this
 //!   command on its previous run, another step in this build, a step of an earlier build,
-//!   or something outside kizz. A write that kizz recorded before the step's recorded
-//!   state was taken cannot have changed the path since, so then the writer is something
-//!   outside kizz.
+//!   the program of a task, through `fs.write` or `fs.write_json`, in this build or an
+//!   earlier one, or something outside kizz. A write that kizz recorded before the step's
+//!   recorded state was taken cannot have changed the path since, so then the writer is
+//!   something outside kizz. A task program is named as the writer even when it is the
+//!   program of the step's own task.
 //! * A changed input is self-inflicted when this command last wrote it on its previous
 //!   run and also reads it, or when the step that wrote it in this build runs on every
 //!   build, because it is marked `always` or re-runs for a self-inflicted reason itself.
 //!   A path the command read and wrote before is not self-inflicted when something
-//!   outside kizz or another task changed it since.
+//!   outside kizz, another task, or a task program changed it since; a change that a task
+//!   program made is never self-inflicted.
 //! * A step that re-runs for a self-inflicted input that also made it run in its task's
 //!   previous build gets the loud warning for consecutive builds: the step-position
 //!   record carries the self-inflicted inputs of the previous build's run.
@@ -38,7 +41,7 @@ use kizz_store::{
     AccessBits, BuildId, ChangedInput, ContentHash, Difference, EnvChange, LastWriter,
     ModuleChange, ModuleChangeKind, ModuleHash, Observation, PathKey, PositionKey, Reason,
     SelfInflicted, StepKey, StepPosition, StepSpecRecord, StoreError, TaskId, TaskLabel,
-    TaskRecord, Txn, Verdict, Writer,
+    TaskRecord, Txn, Verdict, Writer, WrittenBy,
 };
 use kizz_trace::AbsolutePath;
 
@@ -396,23 +399,26 @@ fn attribute(
         // path since did so outside kizz.
         return Ok(Writer::Outside);
     }
+    let this_build = entry.build == context.build;
+    let WrittenBy::Step { step, position } = entry.by else {
+        let task = label_of(txn, context.identity, &entry.task)?;
+        return Ok(if this_build {
+            Writer::ProgramThisBuild { task }
+        } else {
+            Writer::ProgramEarlierBuild { task }
+        });
+    };
     let same_position = context
         .identity
-        .is_some_and(|identity| identity.id == entry.task && entry.position == context.position);
-    if entry.step == context.key || same_position {
+        .is_some_and(|identity| identity.id == entry.task && position == context.position);
+    if step == context.key || same_position {
         return Ok(Writer::ThisCommand);
     }
     let task = label_of(txn, context.identity, &entry.task)?;
-    Ok(if entry.build == context.build {
-        Writer::ThisBuild {
-            task,
-            position: entry.position,
-        }
+    Ok(if this_build {
+        Writer::ThisBuild { task, position }
     } else {
-        Writer::EarlierBuild {
-            task,
-            position: entry.position,
-        }
+        Writer::EarlierBuild { task, position }
     })
 }
 
@@ -446,20 +452,24 @@ fn label_of(
 
 /// Whether the step that `entry` names, which wrote its path in `build`, runs on
 /// every build: in this build it ran because it is marked `always` or for a
-/// self-inflicted reason.
+/// self-inflicted reason. A task program is not a step, so this is never so for
+/// one.
 fn writes_every_build(
     txn: &Txn<'_>,
     entry: &LastWriter,
     build: BuildId,
 ) -> Result<bool, StoreError> {
-    let position = txn.get::<StepPosition>(&PositionKey {
+    let WrittenBy::Step { step, position } = entry.by else {
+        return Ok(false);
+    };
+    let position_record = txn.get::<StepPosition>(&PositionKey {
         task: entry.task.clone(),
-        position: entry.position,
+        position,
     })?;
-    Ok(position.is_some_and(|position| {
-        position.build == build
-            && position.step == entry.step
-            && matches!(&position.verdict, Verdict::Ran(explanation) if explanation.runs_every_build())
+    Ok(position_record.is_some_and(|record| {
+        record.build == build
+            && record.step == step
+            && matches!(&record.verdict, Verdict::Ran(explanation) if explanation.runs_every_build())
     }))
 }
 

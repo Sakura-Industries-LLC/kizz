@@ -51,8 +51,11 @@ const WIPED_DIR: &str = "db.wiped";
 /// exited with a code of its own after the build was interrupted, which, like a
 /// command that a signal stopped then, is never a cache hit. Version 7 added the
 /// owners of step records: the tasks that produced or used each record, which path
-/// resets and `kizz cache clean` use.
-pub const SCHEMA_VERSION: u32 = 7;
+/// resets and `kizz cache clean` use. Version 8 added task programs as last
+/// writers: each last writer names its task and either the step that wrote the path,
+/// with its position, or the task program, and explanations name a task program
+/// that last wrote a changed input.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -606,5 +609,12 @@ mod tests {
         );
         assert!(message.contains("`kizz cache reset --all`"), "{message}");
         assert!(message.contains("/cache/db"), "{message}");
+    }
+
+    /// Version 8 stores task programs as last writers, one more than version 7,
+    /// whose last writers named only steps.
+    #[test]
+    fn schema_version_8_has_program_last_writers() {
+        assert_eq!(SCHEMA_VERSION, 8);
     }
 }

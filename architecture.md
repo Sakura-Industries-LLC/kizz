@@ -314,6 +314,8 @@ Paths are relative to the task directory; absolute paths and paths outside the t
   with a trailing newline.
 * `fs.exists(path)`, `fs.list(path = ".")` (sorted names) and `fs.glob(pattern)` (sorted matches) inspect the file system.
 * Writes happen only when the content differs, so unchanged files keep their timestamps.
+  A write that changes a file counts as work in its pass, as a command that runs does, so another pass follows.
+  Kizz records the task as the file's last writer, for the learned order and for explanations.
 
 The task program runs on every build, so its own reads always see current data.
 Kizz still records every file access the program makes, including missing files and directory listings,
@@ -498,7 +500,7 @@ The store holds these records:
 * step positions: the step key each task used last time at each step position,
   so kizz can explain what changed when the key itself changed
 * task records: the task program hash and a summary of the task's last run
-* last writers: for each path, the step that wrote it most recently
+* last writers: for each path, the step or the task program that wrote it most recently
 * learned order: for each task, the tasks whose outputs it consumed
 * a schema version
 
@@ -628,7 +630,8 @@ These are the reasons:
 * the working directory, `stdin`, capture mode, ignore patterns or `track` patterns changed
 * inputs changed: every changed path, what changed about it
   (it appeared or disappeared, or its content, size, type, directory entries or link target changed),
-  and who last wrote it: this command on its previous run, another task in this build, an earlier build, or something outside kizz
+  and who last wrote it: this command on its previous run, another task's command or program in this build,
+  a command or task program of an earlier build, or something outside kizz
 * the command is marked `always`
 * the previous run could not be cached, and why
 
@@ -649,15 +652,18 @@ and the user can decide whether to add an ignore pattern.
 * By default, parent directories come before their subdirectories, sibling directories come in sorted order,
   and task blocks come in file order.
 * After each build, kizz records which tasks consumed paths that another task wrote, including directories another task wrote into.
+  A task writes a path through its commands and through its program's `fs.write` and `fs.write_json`.
   The next build runs those producers before their consumers and keeps the default order where there is no such edge.
 * Every pass tries every selected task; a failed task does not stop the pass.
-* If any command ran during a pass, kizz checks every selected task again in another pass.
+* If any command ran during a pass, or a task program changed a file with `fs.write` or `fs.write_json`,
+  kizz checks every selected task again in another pass.
   A task whose recorded inputs changed runs again: one whose inputs a later task wrote,
   or one that failed and whose looked-for dependencies have since appeared.
   A task whose inputs did not change is a cache hit, and a failed one fails again from the cache without running.
+  A pass runs nothing when no command ran in it and no task program changed a file.
   The build ends when a pass runs nothing; it succeeds if no task failed in that pass, and fails otherwise.
-  A build settles in the passes up to and including the last one that ran a command, or in one pass if no command ran.
-  After a pass that ran a command, the final pass, which runs nothing, only confirms the build and is not counted.
+  A build settles in the passes up to and including the last one that ran a command or changed a file, or in one pass if none did.
+  After such a pass, the final pass, which runs nothing, only confirms the build and is not counted.
   A first build may take extra passes to settle; later builds usually settle in one, because the order has been learned.
   A command marked `always` runs at most once per build, when a pass first reaches it; later passes reuse its result.
 * If the build has not settled after a fixed number of passes (one more than the number of tasks),

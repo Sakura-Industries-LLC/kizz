@@ -16,7 +16,8 @@
 //! * [`runtime`]: the Starlark runtime of task programs, with module loading, the program
 //!   hash, and the `env` and `fs` functions.
 //! * [`dotenv`]: the dotenv files that `env.load_file` and `env.read` read.
-//! * [`files`]: the file operations behind the `fs` functions, which record every access.
+//! * [`files`]: the file operations behind the `fs` functions, which record every access
+//!   and every file a write changed.
 //! * [`step`]: the step specification that `run()` builds, and the step executor the
 //!   runtime hands it to.
 //! * [`warning`]: the warnings of discovery and parsing.
@@ -37,7 +38,7 @@
 //! * [`render`]: the one-line and full reasons as output shows them.
 //! * [`why`](mod@why): the report of `kizz why`, read from the cache.
 //! * [`build`](mod@build): building the selected tasks in passes, in the default or
-//!   learned order, until a pass runs nothing, with failure handling and the pass limit.
+//!   learned order, until a pass does no work, with failure handling and the pass limit.
 //! * [`cleanup`]: the entries `kizz cache clean` removes because their files are gone,
 //!   and the entries `kizz cache reset` wipes for the tasks under a path.
 
@@ -65,7 +66,7 @@ pub mod why;
 
 pub use build::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, FailedTask, INTERRUPTED, NoEvents, Pass,
-    TaskResult, build, learned_order, pass_limit, task_id, task_label,
+    ProgramWrite, TaskResult, build, learned_order, pass_limit, task_id, task_label,
 };
 pub use check::{Checked, RACY_WINDOW_NANOS, check};
 pub use cleanup::{Cleaned, ResetPlan, clean, plan_reset};
@@ -76,7 +77,7 @@ pub use explain::{
     Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
     changed_inputs, spec_reasons,
 };
-pub use files::{FileError, Files, stable_json};
+pub use files::{ChangedFile, FileChanges, FileError, Files, stable_json};
 pub use key::{KeyError, Occurrences, STEP_KEY_CONTEXT, step_key};
 pub use lookup::{NoPathError, PATH_VARIABLE, ProgramLookup, find_program};
 pub use observe::{

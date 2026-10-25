@@ -321,6 +321,61 @@ fn explain_prints_the_full_reason_for_every_command() -> TestResult {
     Ok(())
 }
 
+/// A later task's program that changes a cached command's input is work: pass 2
+/// starts with a line that says a task program changed a file in pass 1, runs
+/// `cat` again, and names the program as the input's last writer; the summary
+/// reports the passes, and the next build, in the learned order, settles in one.
+#[test]
+fn a_task_program_that_changes_an_input_runs_the_command_again() -> TestResult {
+    let project = Project::new()?;
+    project.write("in.txt", "old\n")?;
+    project.kizz_md("", &[("Use", "run(\"cat\", \"in.txt\")")])?;
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        text(&[
+            &ran("cat in.txt", "kizz.md:3 (Use)", NEVER_RUN),
+            &pass(2),
+            "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+
+    project.kizz_md("", &[
+        ("Use", "run(\"cat\", \"in.txt\")"),
+        ("Update", "fs.write(\"in.txt\", \"newer text\\n\")"),
+    ])?;
+    let second = project.run("", &["build", "--explain", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(
+        second.stdout,
+        text(&[
+            "cached `cat in.txt` in kizz.md:3 (Use) step 1",
+            "  cached: no recorded input changed",
+            "pass 2: a task program changed a file in pass 1, so every selected task is checked \
+             again",
+            "ran `cat in.txt` in kizz.md:3 (Use) step 1",
+            "  ran because:",
+            "    1 input changed:",
+            "      `in.txt`: size changed from 4 to 11 bytes; last written by the program of \
+             kizz.md:10 (Update) in this build",
+            &pass(3),
+            "build succeeded: 2 tasks, settled in 2 passes; 1 command ran, 0 cached",
+        ])
+    );
+    assert_eq!(second.stderr, "", "{second:?}");
+
+    let third = project.run("", &["build", "ci"])?;
+    assert_eq!(third.status, Some(0), "{third:?}");
+    assert_eq!(
+        third.stdout,
+        text(&["build succeeded: 2 tasks, settled in 1 pass; 0 commands ran, 1 cached"])
+    );
+    assert_eq!(third.stderr, "", "{third:?}");
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
 /// Building in a subdirectory and then in its parent directory reuses the
 /// subdirectory's results.
 #[test]

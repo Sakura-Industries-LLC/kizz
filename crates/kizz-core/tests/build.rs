@@ -4,7 +4,9 @@
 
 //! Tests of builds in passes: the default and learned order, failed tasks that run
 //! again once a path they looked for appears, failures from the cache, the pass
-//! limit, `always` commands, and interruption.
+//! limit, `always` commands, interruption, and task programs whose `fs.write`
+//! changes a file, which is work in its pass and makes the task the file's last
+//! writer.
 //!
 //! Each test writes `kizz.md` files into a temporary project directory and opens
 //! the store in a temporary cache directory. A build loads the project, selects the
@@ -36,7 +38,7 @@ use std::{
 
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, INTERRUPTED, Pass, PrintSink,
-    TargetExpr, TaskFailure, TaskInfo, TaskResult, build, load, task_id,
+    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, build, load, task_id,
 };
 use kizz_store::{
     BuildId, Change, LearnedOrder, Reason, Store, TaskId, TaskLabel, TaskRecord, Verdict, Writer,
@@ -368,12 +370,28 @@ impl Fixture {
         cancel: Cancellation,
         events: &dyn BuildEvents,
     ) -> TestResult<Built> {
+        self.build_full(tracer, cancel, events, &[])
+    }
+
+    /// Run one build of the tasks of target `ci` with `tracer` and `cancel`,
+    /// reporting to `events`, with the variables `vars` in the caller environment
+    /// besides `PATH`.
+    fn build_full(
+        &self,
+        tracer: &FakeTracer,
+        cancel: Cancellation,
+        events: &dyn BuildEvents,
+        vars: &[(&str, &str)],
+    ) -> TestResult<Built> {
         let tasks = self.tasks()?;
-        let caller: BTreeMap<String, String> = [(
+        let mut caller: BTreeMap<String, String> = [(
             "PATH".to_owned(),
             self.path("bin").to_string_lossy().into_owned(),
         )]
         .into();
+        for (name, value) in vars {
+            caller.insert((*name).to_owned(), (*value).to_owned());
+        }
         let store = self.store()?;
         let engine = Engine::new(tracer, &store, &NoEcho, cancel, None);
         let report = build(&engine, &tasks, &caller, &NoPrint, events)?;
@@ -389,6 +407,26 @@ impl Fixture {
         tracer: &FakeTracer,
     ) -> TestResult<Built> {
         self.build_with(tracer, Cancellation::new(), &Events::default())
+    }
+
+    /// Run one build of the tasks of target `ci` with `tracer`, with the variables
+    /// `vars` in the caller environment besides `PATH`.
+    fn build_vars(
+        &self,
+        tracer: &FakeTracer,
+        vars: &[(&str, &str)],
+    ) -> TestResult<BuildReport> {
+        Ok(self
+            .build_full(tracer, Cancellation::new(), &Events::default(), vars)?
+            .report)
+    }
+
+    /// Read `relative` in the project.
+    fn read(
+        &self,
+        relative: &str,
+    ) -> TestResult<String> {
+        Ok(fs::read_to_string(self.path(relative))?)
     }
 
     /// The producers learned for the task `task`, if any were stored.
@@ -753,7 +791,8 @@ fn tasks_that_keep_changing_each_others_inputs_stop_at_the_pass_limit() -> TestR
     let BuildOutcome::NotSettled {
         limit,
         changing,
-        ran,
+        written,
+        worked,
     } = &report.outcome
     else {
         return Err(format!("unexpected outcome {:?}", report.outcome).into());
@@ -775,8 +814,9 @@ fn tasks_that_keep_changing_each_others_inputs_stop_at_the_pass_limit() -> TestR
         (fixture.path("a.txt"), Some("Pong"), Some("Ping")),
         (fixture.path("b.txt"), Some("Ping"), Some("Pong")),
     ]);
-    let ran: Vec<Option<&str>> = ran.iter().map(|task| task.name.as_deref()).collect();
-    assert_eq!(ran, vec![Some("Ping"), Some("Pong")]);
+    assert!(written.is_empty(), "{written:?}");
+    let worked: Vec<Option<&str>> = worked.iter().map(|task| task.name.as_deref()).collect();
+    assert_eq!(worked, vec![Some("Ping"), Some("Pong")]);
     Ok(())
 }
 
@@ -1063,5 +1103,279 @@ fn an_interrupted_build_starts_nothing_new() -> TestResult {
         tracer.runs().get(before..),
         Some(&lines(&["tool interrupt", "tool interrupt"])[..])
     );
+    Ok(())
+}
+
+/// No task program changed a file, as [`changed_in`] shows it.
+const NO_CHANGES: [(String, Vec<String>); 0] = [];
+
+/// The files that each task program changed in pass `pass` of `report`, counting
+/// passes from 1, as `(heading, paths relative to the project)` for each task that
+/// changed one, in the order the tasks ran.
+fn changed_in(
+    fixture: &Fixture,
+    report: &BuildReport,
+    pass: usize,
+) -> TestResult<Vec<(String, Vec<String>)>> {
+    let pass = report
+        .passes
+        .iter()
+        .find(|candidate| candidate.number == pass)
+        .ok_or("no such pass")?;
+    Ok(pass
+        .tasks
+        .iter()
+        .filter(|result| result.changed_files())
+        .map(|result| {
+            let paths = result
+                .changed
+                .iter()
+                .map(|path| {
+                    path.as_path()
+                        .strip_prefix(fixture.project.path())
+                        .unwrap_or(path.as_path())
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            (result.task.name.clone().unwrap_or_default(), paths)
+        })
+        .collect())
+}
+
+/// The only changed input of the first step of the task with heading `heading` in
+/// pass `pass` of `report`, which must have run for it.
+fn only_input<'r>(
+    report: &'r BuildReport,
+    pass: usize,
+    heading: &str,
+) -> TestResult<&'r kizz_store::ChangedInput> {
+    let rerun = task_in(report, pass, heading)?;
+    let Some(Verdict::Ran(explanation)) = rerun.decisions.first().map(|step| &step.verdict) else {
+        return Err(format!("{heading} did not run in pass {pass}").into());
+    };
+    let [Reason::InputsChanged { inputs }] = explanation.reasons.as_slice() else {
+        return Err(format!("unexpected reasons {:?}", explanation.reasons).into());
+    };
+    let [input] = inputs.as_slice() else {
+        return Err(format!("unexpected inputs {inputs:?}").into());
+    };
+    Ok(input)
+}
+
+/// The review's case without commands: a task earlier in the default order copies
+/// `in.txt` to `out.txt` with `fs.read` and `fs.write`, and a later task's program
+/// writes new text to `in.txt`. The write is work, so another pass copies the new
+/// text, and the build settles in 2 passes and runs 3; the next build settles in 1
+/// and changes nothing. The learned order runs the writer first, and it still does
+/// after a build in which the program does not write the file, because the program
+/// is stored as the file's last writer.
+#[test]
+fn a_task_program_write_is_work_that_another_pass_follows() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("in.txt", "old\n")?;
+    fixture.kizz("", &[
+        ("Copy", "fs.write(\"out.txt\", fs.read(\"in.txt\"))"),
+        (
+            "Update",
+            "if env.caller(\"SKIP\", \"\") != \"1\":\n    fs.write(\"in.txt\", \"new\\n\")",
+        ),
+    ])?;
+    let tracer = FakeTracer::default();
+    let first = fixture.build(&tracer)?.report;
+    assert_eq!(first.outcome, BuildOutcome::Succeeded);
+    assert_eq!(order_headings(&first)?, lines(&["Copy", "Update"]));
+    assert_eq!(first.passes.len(), 3);
+    assert_eq!(first.settled_in(), 2);
+    assert_eq!(changed_in(&fixture, &first, 1)?, vec![
+        ("Copy".to_owned(), lines(&["out.txt"])),
+        ("Update".to_owned(), lines(&["in.txt"])),
+    ]);
+    assert_eq!(changed_in(&fixture, &first, 2)?, vec![(
+        "Copy".to_owned(),
+        lines(&["out.txt"])
+    )]);
+    assert_eq!(changed_in(&fixture, &first, 3)?, NO_CHANGES);
+    assert!(first.passes.iter().all(|pass| !pass.ran()));
+    assert_eq!(tracer.runs(), Vec::<String>::new());
+    assert_eq!(fixture.read("out.txt")?, "new\n");
+    assert_eq!(
+        fixture.learned(&fixture.id("", 0))?,
+        Some(vec![fixture.id("", 1)])
+    );
+    assert_eq!(fixture.learned(&fixture.id("", 1))?, None);
+
+    let second = fixture.build(&tracer)?.report;
+    assert_eq!(second.outcome, BuildOutcome::Succeeded);
+    assert_eq!(order_headings(&second)?, lines(&["Update", "Copy"]));
+    assert_eq!(second.passes.len(), 1);
+    assert_eq!(second.settled_in(), 1);
+    assert_eq!(changed_in(&fixture, &second, 1)?, NO_CHANGES);
+    assert_eq!(fixture.read("out.txt")?, "new\n");
+
+    // A build in which the program does not write the file keeps the order,
+    // because the program is still the file's last writer.
+    let third = fixture.build_vars(&tracer, &[("SKIP", "1")])?;
+    assert_eq!(third.outcome, BuildOutcome::Succeeded);
+    assert_eq!(order_headings(&third)?, lines(&["Update", "Copy"]));
+    assert_eq!(third.settled_in(), 1);
+    assert_eq!(
+        fixture.learned(&fixture.id("", 0))?,
+        Some(vec![fixture.id("", 1)])
+    );
+    let fourth = fixture.build_vars(&tracer, &[("SKIP", "1")])?;
+    assert_eq!(order_headings(&fourth)?, lines(&["Update", "Copy"]));
+    assert_eq!(fourth.settled_in(), 1);
+    assert_eq!(tracer.runs(), Vec::<String>::new());
+    Ok(())
+}
+
+/// A cached command whose input a later task's program changes runs again in the
+/// next pass, and its reason names the input and the writing task's program, in
+/// this build; a program write of an earlier build is named as such. The learned
+/// order then runs the writer first.
+#[test]
+fn a_cached_command_runs_again_when_a_task_program_changes_its_input() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("in.txt", "old\n")?;
+    let user = (
+        "Use",
+        "if env.caller(\"SKIP\", \"\") != \"1\":\n    run(\"tool\", \"read:in.txt\")",
+    );
+    fixture.kizz("", &[user])?;
+    let tracer = FakeTracer::default();
+    let first = fixture.build(&tracer)?.report;
+    assert_eq!(first.outcome, BuildOutcome::Succeeded);
+    assert_eq!(tracer.runs(), lines(&["tool read:in.txt"]));
+
+    fixture.kizz("", &[
+        user,
+        (
+            "Update",
+            "fs.write(\"in.txt\", env.caller(\"TEXT\", \"new\\n\"))",
+        ),
+    ])?;
+    let second = fixture.build(&tracer)?.report;
+    assert_eq!(second.outcome, BuildOutcome::Succeeded);
+    assert_eq!(passes(&second), vec![
+        lines(&["Use cached ok", "Update cached ok"]),
+        lines(&["Use ran ok", "Update cached ok"]),
+        lines(&["Use cached ok", "Update cached ok"]),
+    ]);
+    assert_eq!(second.settled_in(), 2);
+    assert_eq!(changed_in(&fixture, &second, 1)?, vec![(
+        "Update".to_owned(),
+        lines(&["in.txt"])
+    )]);
+    assert_eq!(
+        tracer.runs(),
+        lines(&["tool read:in.txt", "tool read:in.txt"])
+    );
+    let input = only_input(&second, 2, "Use")?;
+    assert_eq!(input.path, fixture.path("in.txt"));
+    assert_eq!(input.self_inflicted, None);
+    let Writer::ProgramThisBuild { task } = &input.writer else {
+        return Err(format!("unexpected writer {:?}", input.writer).into());
+    };
+    assert!(is_task(task, "Update"), "{task:?}");
+    assert_eq!(task.task, fixture.id("", 1));
+    let render = Render {
+        base: fixture.project.path().to_path_buf(),
+        home: None,
+        verbose: false,
+    };
+    let named = render.writer(&input.writer);
+    assert!(
+        named.starts_with("the program of kizz.md:") && named.ends_with(" (Update) in this build"),
+        "{named}"
+    );
+    assert_eq!(
+        fixture.learned(&fixture.id("", 0))?,
+        Some(vec![fixture.id("", 1)])
+    );
+
+    // The learned order runs the writer first, and nothing runs.
+    let third = fixture.build(&tracer)?.report;
+    assert_eq!(order_headings(&third)?, lines(&["Update", "Use"]));
+    assert_eq!(third.settled_in(), 1);
+    assert_eq!(tracer.runs().len(), 2);
+
+    // The program changes the file in a build that does not run the command; the
+    // next build runs it, naming the program of that earlier build.
+    let fourth = fixture.build_vars(&tracer, &[("SKIP", "1"), ("TEXT", "newer\n")])?;
+    assert_eq!(fourth.outcome, BuildOutcome::Succeeded);
+    assert_eq!(fourth.settled_in(), 1);
+    assert_eq!(tracer.runs().len(), 2);
+    let fifth = fixture.build_vars(&tracer, &[("TEXT", "newer\n")])?;
+    assert_eq!(fifth.settled_in(), 1);
+    assert_eq!(tracer.runs().len(), 3);
+    let input = only_input(&fifth, 1, "Use")?;
+    assert_eq!(input.path, fixture.path("in.txt"));
+    assert_eq!(input.self_inflicted, None);
+    assert!(
+        matches!(&input.writer, Writer::ProgramEarlierBuild { task } if is_task(task, "Update")),
+        "{:?}",
+        input.writer
+    );
+    let named = render.writer(&input.writer);
+    assert!(named.ends_with(" (Update) in an earlier build"), "{named}");
+    Ok(())
+}
+
+/// A program write that leaves its file as it was is no work and adds no pass.
+#[test]
+fn a_program_write_that_changes_nothing_adds_no_pass() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("same.txt", "same\n")?;
+    fixture.kizz("", &[
+        ("Same", "fs.write(\"same.txt\", \"same\\n\")"),
+        ("Json", "fs.write_json(\"same.json\", {\"a\": 1})"),
+    ])?;
+    fixture.write("same.json", "{\n  \"a\": 1\n}\n")?;
+    let tracer = FakeTracer::default();
+    let report = fixture.build(&tracer)?.report;
+    assert_eq!(report.outcome, BuildOutcome::Succeeded);
+    assert_eq!(report.passes.len(), 1);
+    assert_eq!(report.settled_in(), 1);
+    assert_eq!(changed_in(&fixture, &report, 1)?, NO_CHANGES);
+    assert!(report.passes.iter().all(|pass| !pass.did_work()));
+    Ok(())
+}
+
+/// A program that writes different text to a file it reads, on every pass, stops
+/// the build at the pass limit, and the outcome names the file with that task's
+/// program as its writer.
+#[test]
+fn a_program_that_keeps_changing_a_file_stops_at_the_pass_limit() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("count.txt", "")?;
+    fixture.kizz("", &[(
+        "Count",
+        "fs.write(\"count.txt\", fs.read(\"count.txt\") + \"+\")",
+    )])?;
+    let tracer = FakeTracer::default();
+    let report = fixture.build(&tracer)?.report;
+    assert_eq!(report.passes.len(), 2);
+    assert_eq!(report.settled_in(), 2);
+    assert_eq!(fixture.read("count.txt")?, "++");
+    let BuildOutcome::NotSettled {
+        limit,
+        changing,
+        written,
+        worked,
+    } = &report.outcome
+    else {
+        return Err(format!("unexpected outcome {:?}", report.outcome).into());
+    };
+    assert_eq!(*limit, 2);
+    assert!(changing.is_empty(), "{changing:?}");
+    let [write] = written.as_slice() else {
+        return Err(format!("unexpected writes {written:?}").into());
+    };
+    assert_eq!(write.path, fixture.path("count.txt"));
+    assert!(is_task(&write.writer, "Count"), "{write:?}");
+    assert_eq!(write.writer.task, fixture.id("", 0));
+    let worked: Vec<Option<&str>> = worked.iter().map(|task| task.name.as_deref()).collect();
+    assert_eq!(worked, vec![Some("Count")]);
     Ok(())
 }

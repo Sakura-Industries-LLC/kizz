@@ -31,7 +31,8 @@ pub use location::{LocationError, cache_dir, cache_dir_from_env};
 pub use lock::{CacheLock, LOCK_FILE_NAME, LockDetails, LockError, LockOptions};
 pub use records::{
     Family, LastWriter, LearnedOrder, ModuleHash, PathKey, PositionKey, Record, RecordKey,
-    SchemaKey, SchemaVersion, StepKey, StepPosition, TaskId, TaskRecord, database_key, path_prefix,
+    SchemaKey, SchemaVersion, StepKey, StepPosition, TaskId, TaskRecord, WrittenBy, database_key,
+    path_prefix,
 };
 pub use step::{
     AccessBits, Capture, Change, ContentHash, Difference, DirEntry, EntryKind, FileMeta, Listing,

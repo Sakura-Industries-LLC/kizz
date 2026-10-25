@@ -23,7 +23,7 @@ use kizz_store::{
     LastWriter, LearnedOrder, Observation, PathKey, PathState, PositionKey, ProgramPath,
     RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey,
     StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Verdict,
-    path_prefix,
+    WrittenBy, path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -159,10 +159,19 @@ fn records_survive_closing_and_reopening_the_store() {
     txn.put(&task("/w/a", 0), &task_record(2)).unwrap();
     txn.put(&PathKey(PathBuf::from("/w/a/out")), &LastWriter {
         task: task("/w/a", 0),
-        step: StepKey([1; 32]),
-        position: 0,
+        by: WrittenBy::Step {
+            step: StepKey([1; 32]),
+            position: 0,
+        },
         build: BuildId(1),
         written_at_nanos: 1,
+    })
+    .unwrap();
+    txn.put(&PathKey(PathBuf::from("/w/a/notes")), &LastWriter {
+        task: task("/w/a", 0),
+        by: WrittenBy::Program,
+        build: BuildId(1),
+        written_at_nanos: 2,
     })
     .unwrap();
     txn.put(&task("/w/b", 0), &LearnedOrder {
@@ -193,8 +202,21 @@ fn records_survive_closing_and_reopening_the_store() {
     assert_eq!(
         txn.get::<LastWriter>(&PathKey(PathBuf::from("/w/a/out")))
             .unwrap()
-            .map(|writer| writer.step),
-        Some(StepKey([1; 32]))
+            .map(|writer| writer.by),
+        Some(WrittenBy::Step {
+            step: StepKey([1; 32]),
+            position: 0,
+        })
+    );
+    assert_eq!(
+        txn.get::<LastWriter>(&PathKey(PathBuf::from("/w/a/notes")))
+            .unwrap(),
+        Some(LastWriter {
+            task: task("/w/a", 0),
+            by: WrittenBy::Program,
+            build: BuildId(1),
+            written_at_nanos: 2,
+        })
     );
     assert_eq!(
         txn.get::<LearnedOrder>(&task("/w/b", 0)).unwrap(),
@@ -479,8 +501,10 @@ fn the_inventory_counts_any_cache_and_a_wipe_empties_it() {
     }
     txn.put(&PathKey(PathBuf::from("/w/a/out")), &LastWriter {
         task: task("/w/a", 0),
-        step: StepKey([1; 32]),
-        position: 0,
+        by: WrittenBy::Step {
+            step: StepKey([1; 32]),
+            position: 0,
+        },
         build: BuildId(1),
         written_at_nanos: 1,
     })
