@@ -20,6 +20,9 @@ The Justfile holds every command:
 * `just check-ci` sorts the spelling dictionary, runs the checks, checks licenses, and builds the release binaries.
 * `just fix-ci` runs `fix` and then `check-ci`.
 
+The Justfile loads a `.env` file beside it if there is one; it holds one machine's settings, and Git ignores it.
+If a seccomp filter refuses calls before kizz's tracer sees them, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` there skips their checks.
+
 ## License
 
 AGPL-3.0-only; see [LICENSE](LICENSE).

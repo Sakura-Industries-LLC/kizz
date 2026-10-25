@@ -53,14 +53,29 @@
  * with arguments that the kernel rejects with EINVAL before it looks the path up:
  * a structure size of 0, or a flag that the call does not accept. So the check can
  * neither succeed nor change anything, and it records nothing under the task
- * directory. ENOSYS means that the kernel lacks the call, and EINVAL that it has
- * it; any other result is a mismatch, and the call then counts as available. For
- * each of the six, in the order of TRACKED_SYSTEM_CALLS, the program prints
- * "coverage: available: NAME" or "coverage: unavailable: NAME" before its summary
- * line. It makes the calls of a group, and creates its files, only where the
- * kernel has every gated call that the group needs: the group of file_setattr
- * needs file_getattr too, because it sets only the attributes that file_getattr
- * read. The entries of those groups in expected.txt name the calls they need.
+ * directory. A call that returns ENOSYS is unavailable: ENOSYS means that the
+ * kernel lacks the call, or that a seccomp filter installed before kizz's own
+ * refuses it. EINVAL means that the call is available; any other result is a
+ * mismatch, and the call then counts as available. For each of the six, in the
+ * order of TRACKED_SYSTEM_CALLS, the program prints "coverage: available: NAME" or
+ * "coverage: unavailable: NAME" before its summary line. It makes the calls of a
+ * group, and creates its files, only where every gated call that the group needs
+ * is available: the group of file_setattr needs file_getattr too, because it sets
+ * only the attributes that file_getattr read. The entries of those groups in
+ * expected.txt name the calls they need.
+ *
+ * Run with one argument that starts with `incomplete-`, the program is a step of
+ * the coverage-incomplete task: it makes only the one call that the mode names, a
+ * call that marks the run as incompletely traced, in a way that changes nothing if
+ * it succeeds, and exits with 0 whatever the call returns. For open_tree_attr and
+ * fchroot, which a kernel may lack, it also prints "coverage: available: NAME", or
+ * "coverage: unavailable: NAME" when the call failed with ENOSYS. With
+ * `unknown-400` or `unknown-1000000`, it makes only that system call, which the
+ * tracer does not know, and exits with 0 whatever it returns; those modes exist only
+ * on x86_64, whose table the numbers belong to.
+ *
+ * The main program also calls unshare without CLONE_NEWNS and setns with another
+ * namespace type, which leave the run completely traced.
  */
 
 #define _GNU_SOURCE
@@ -80,6 +95,8 @@
 #include <unistd.h>
 
 #ifdef __linux__
+#include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/syscall.h>
 #endif
@@ -100,6 +117,11 @@
 #define CHANGES "in/changes"
 /* The output directory of the control mode of the coverage-changes task. */
 #define CHANGES_OUT "out/changes"
+/* The start of each mode of the coverage-incomplete task for a call that marks the run. */
+#define INCOMPLETE_PREFIX "incomplete-"
+/* The start of each mode of the coverage-incomplete task for a number that the tracer
+ * does not know. */
+#define UNKNOWN_PREFIX "unknown-"
 
 /* Serializes the counters and the output of the threads. */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1193,7 +1215,7 @@ static const char *const gated_names[GATED_CALLS] = {
     "file_getattr", "getxattrat", "listxattrat", "setxattrat", "removexattrat", "file_setattr",
 };
 
-/* Whether the kernel has each gated call, as check_availability found. */
+/* Whether each gated call is available, as check_availability found. */
 static int gated_available[GATED_CALLS];
 
 /* A flag that listxattrat and removexattrat do not accept. */
@@ -1233,9 +1255,11 @@ static long check_call(enum gated_call call)
 }
 
 /*
- * Check whether the kernel has each gated call: ENOSYS means that it lacks the call,
- * and EINVAL that it has it; any other result is a mismatch, and the call then
- * counts as available. Print one line for each, in order.
+ * Check whether each gated call is available: ENOSYS means that the kernel lacks
+ * the call, or that a seccomp filter installed before kizz's own refuses it, so the
+ * call is unavailable, and EINVAL that it is available; any other result is a
+ * mismatch, and the call then counts as available. Print one line for each, in
+ * order.
  */
 static void check_availability(void)
 {
@@ -1275,7 +1299,7 @@ static void linux_file_systems_and_watches(void)
     EXPECT(0, "fstatfs", MADE "/fstatfs", syscall(SYS_fstatfs, fd, &stat_buffer));
     close_fd(fd);
 
-    /* The group of file_getattr, only where the kernel has it. */
+    /* The group of file_getattr, only where it is available. */
     memset(&attributes, 0, sizeof attributes);
     if (gated_available[GATED_FILE_GETATTR]) {
         make("file_getattr");
@@ -1293,7 +1317,7 @@ static void linux_file_systems_and_watches(void)
 
     /*
      * The group of file_setattr, which sets only the attributes that file_getattr
-     * read through the link, only where the kernel has both calls.
+     * read through the link, only where both calls are available.
      */
     if (gated_available[GATED_FILE_GETATTR] && gated_available[GATED_FILE_SETATTR]) {
         make("file_setattr");
@@ -1384,7 +1408,7 @@ static void linux_attribute_reads(void)
            syscall(SYS_fgetxattr, fd, ATTRIBUTE, attribute_buffer, sizeof attribute_buffer));
     close_fd(fd);
 
-    /* The group of getxattrat, only where the kernel has it. */
+    /* The group of getxattrat, only where it is available. */
     if (gated_available[GATED_GETXATTRAT]) {
         make_with_attribute("getxattrat");
         EXPECT(0, "getxattrat", MADE "/getxattrat",
@@ -1423,7 +1447,7 @@ static void linux_attribute_reads(void)
     EXPECT(0, "flistxattr", MADE "/flistxattr",
            syscall(SYS_flistxattr, fd, attribute_buffer, sizeof attribute_buffer));
     close_fd(fd);
-    /* The group of listxattrat, only where the kernel has it. */
+    /* The group of listxattrat, only where it is available. */
     if (gated_available[GATED_LISTXATTRAT]) {
         make_with_attribute("listxattrat");
         EXPECT(0, "listxattrat", MADE "/listxattrat",
@@ -1462,7 +1486,7 @@ static void linux_attribute_changes(void)
     EXPECT(0, "fsetxattr", MADE "/fsetxattr",
            syscall(SYS_fsetxattr, fd, ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
     close_fd(fd);
-    /* The group of setxattrat, only where the kernel has it. */
+    /* The group of setxattrat, only where it is available. */
     if (gated_available[GATED_SETXATTRAT]) {
         make("setxattrat");
         EXPECT(0, "setxattrat", MADE "/setxattrat",
@@ -1487,7 +1511,7 @@ static void linux_attribute_changes(void)
     set_attribute("fremovexattr");
     EXPECT(0, "fremovexattr", MADE "/fremovexattr", syscall(SYS_fremovexattr, fd, ATTRIBUTE));
     close_fd(fd);
-    /* The group of removexattrat, only where the kernel has it. */
+    /* The group of removexattrat, only where it is available. */
     if (gated_available[GATED_REMOVEXATTRAT]) {
         make_with_attribute("removexattrat");
         EXPECT(0, "removexattrat", MADE "/removexattrat",
@@ -1513,8 +1537,20 @@ static void linux_attribute_changes(void)
 }
 
 /*
+ * Calls that would mark the run with other arguments but leave it complete with
+ * these: unshare without CLONE_NEWNS, and setns with another namespace type on an
+ * invalid descriptor. Their results do not matter, because an environment may
+ * forbid them, so they are not checked.
+ */
+static void linux_namespaces(void)
+{
+    (void)syscall(SYS_unshare, CLONE_FILES);
+    (void)syscall(SYS_setns, -1, CLONE_NEWUTS);
+}
+
+/*
  * The Linux section: every tracked system call, made through syscall(), after the
- * check of the gated calls, whose groups it makes only where the kernel has them.
+ * check of the gated calls, whose groups it makes only where they are available.
  */
 static void linux_section(void)
 {
@@ -1537,6 +1573,7 @@ static void linux_section(void)
     linux_file_systems_and_watches();
     linux_attribute_reads();
     linux_attribute_changes();
+    linux_namespaces();
 
 #ifdef SYS_io_uring_setup
     /* io_uring would bypass the tracer, so it is not available. */
@@ -1689,6 +1726,228 @@ static void child(const char *mode)
 #endif
 }
 
+#ifdef __linux__
+
+/* A path that names nothing in the task directory, for the calls that take one. */
+#define MISSING "in/incomplete/missing"
+
+/* The numbers of the calls that older C library headers lack, as the kernel's
+ * x86_64 table and its generic table give them. */
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+#ifndef SYS_fsopen
+#define SYS_fsopen 430
+#endif
+#ifndef SYS_fsconfig
+#define SYS_fsconfig 431
+#endif
+#ifndef SYS_fsmount
+#define SYS_fsmount 432
+#endif
+#ifndef SYS_fspick
+#define SYS_fspick 433
+#endif
+#ifndef SYS_clone3
+#define SYS_clone3 435
+#endif
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+#ifndef SYS_quotactl_fd
+#define SYS_quotactl_fd 443
+#endif
+#ifndef SYS_open_tree_attr
+#define SYS_open_tree_attr 467
+#endif
+#ifndef SYS_fchroot
+#define SYS_fchroot 472
+#endif
+
+/* QCMD(Q_GETFMT, USRQUOTA): read the quota format of a file system. */
+#define QUOTA_GET_FORMAT 0x80000400
+
+/* `struct clone_args`, which clone3 takes: CLONE_ARGS_SIZE_VER0 bytes. */
+struct clone_args_argument {
+    uint64_t flags;
+    uint64_t pidfd;
+    uint64_t child_tid;
+    uint64_t parent_tid;
+    uint64_t exit_signal;
+    uint64_t stack;
+    uint64_t stack_size;
+    uint64_t tls;
+};
+
+/*
+ * Make the call `call` of the coverage-incomplete task in a way that changes
+ * nothing if it succeeds: on a missing path, an invalid descriptor or handle, or
+ * with flags that the kernel rejects before it acts. Set `*known` when `call` is one
+ * of them, and return the call's result.
+ */
+static long incomplete_call(const char *call, int *known)
+{
+    struct handle_argument handle;
+    struct clone_args_argument clone_args;
+    memset(&handle, 0, sizeof handle);
+    memset(&clone_args, 0, sizeof clone_args);
+    /* The kernel rejects a new mount namespace that shares its file system information. */
+    clone_args.flags = CLONE_NEWNS | CLONE_FS;
+    *known = 1;
+    if (strcmp(call, "open_by_handle_at") == 0) {
+        return syscall(SYS_open_by_handle_at, -1, &handle, O_RDONLY);
+    }
+    if (strcmp(call, "chroot") == 0) {
+        return syscall(SYS_chroot, MISSING);
+    }
+    if (strcmp(call, "fchroot") == 0) {
+        return syscall(SYS_fchroot, -1);
+    }
+    if (strcmp(call, "pivot_root") == 0) {
+        return syscall(SYS_pivot_root, MISSING, MISSING);
+    }
+    if (strcmp(call, "mount") == 0) {
+        return syscall(SYS_mount, MISSING, MISSING, "none", 0, NULL);
+    }
+    if (strcmp(call, "umount2") == 0) {
+        return syscall(SYS_umount2, MISSING, 0);
+    }
+    if (strcmp(call, "fsopen") == 0) {
+        return syscall(SYS_fsopen, "kizz-no-such-file-system", 0);
+    }
+    if (strcmp(call, "fsconfig") == 0) {
+        return syscall(SYS_fsconfig, -1, 0, "ro", NULL, 0);
+    }
+    if (strcmp(call, "fsmount") == 0) {
+        return syscall(SYS_fsmount, -1, 0, 0);
+    }
+    if (strcmp(call, "fspick") == 0) {
+        return syscall(SYS_fspick, AT_FDCWD, MISSING, 0);
+    }
+    if (strcmp(call, "move_mount") == 0) {
+        return syscall(SYS_move_mount, AT_FDCWD, MISSING, AT_FDCWD, MISSING, 0);
+    }
+    if (strcmp(call, "open_tree") == 0) {
+        return syscall(SYS_open_tree, AT_FDCWD, MISSING, 0);
+    }
+    if (strcmp(call, "open_tree_attr") == 0) {
+        return syscall(SYS_open_tree_attr, AT_FDCWD, MISSING, 0, NULL, 0);
+    }
+    if (strcmp(call, "mount_setattr") == 0) {
+        return syscall(SYS_mount_setattr, -1, "", AT_EMPTY_PATH, NULL, 0);
+    }
+    if (strcmp(call, "unshare") == 0) {
+        /* CLONE_VFORK is not a flag of unshare, so the kernel rejects the call. */
+        return syscall(SYS_unshare, CLONE_NEWNS | CLONE_VFORK);
+    }
+    if (strcmp(call, "setns") == 0) {
+        return syscall(SYS_setns, -1, CLONE_NEWNS);
+    }
+    if (strcmp(call, "clone") == 0) {
+        return syscall(SYS_clone, CLONE_NEWNS | CLONE_FS | SIGCHLD, 0, 0, 0, 0);
+    }
+    if (strcmp(call, "clone3") == 0) {
+        /* A size of 0 is smaller than any struct clone_args, which the kernel rejects. */
+        return syscall(SYS_clone3, &clone_args, 0);
+    }
+#ifdef SYS_uselib
+    if (strcmp(call, "uselib") == 0) {
+        return syscall(SYS_uselib, MISSING);
+    }
+#endif
+    if (strcmp(call, "acct") == 0) {
+        return syscall(SYS_acct, MISSING);
+    }
+    if (strcmp(call, "quotactl") == 0) {
+        return syscall(SYS_quotactl, QUOTA_GET_FORMAT, MISSING, 0, attribute_buffer);
+    }
+    if (strcmp(call, "quotactl_fd") == 0) {
+        return syscall(SYS_quotactl_fd, -1, QUOTA_GET_FORMAT, 0, attribute_buffer);
+    }
+    if (strcmp(call, "swapon") == 0) {
+        return syscall(SYS_swapon, MISSING, 0);
+    }
+    if (strcmp(call, "swapoff") == 0) {
+        return syscall(SYS_swapoff, MISSING);
+    }
+    *known = 0;
+    return -1;
+}
+
+/*
+ * A step of the coverage-incomplete task: make the one call `call`, which marks the
+ * run as incompletely traced, and exit with 0 whatever it returns. For
+ * open_tree_attr and fchroot, which a kernel may lack, also print whether the call
+ * is available: it is unavailable when it failed with ENOSYS, because the kernel
+ * lacks it or a seccomp filter installed before kizz's own refuses it.
+ */
+static int incomplete(const char *call)
+{
+    int known = 0;
+    errno = 0;
+    long result = incomplete_call(call, &known);
+    int error = errno;
+    if (!known) {
+        fprintf(stderr, "coverage: %s is not a call of the coverage-incomplete task\n", call);
+        return 2;
+    }
+    if (strcmp(call, "open_tree_attr") == 0 || strcmp(call, "fchroot") == 0) {
+        printf("coverage: %s: %s\n",
+               result < 0 && error == ENOSYS ? "unavailable" : "available", call);
+    }
+    printf("coverage: made %s: %s\n", call, result < 0 ? error_name(error) : "success");
+    return 0;
+}
+
+/*
+ * A step of the coverage-incomplete task: make the system call `number`, 400 or
+ * 1000000, which the tracer does not know, and exit with 0 whatever it returns. The
+ * numbers belong to the x86_64 table, so the mode exists only there.
+ */
+static int unknown(const char *number)
+{
+#ifdef __x86_64__
+    long call = 0;
+    if (strcmp(number, "400") == 0) {
+        call = 400;
+    } else if (strcmp(number, "1000000") == 0) {
+        call = 1000000;
+    } else {
+        fprintf(stderr, "coverage: %s is not a number of the coverage-incomplete task\n", number);
+        return 2;
+    }
+    errno = 0;
+    long result = syscall(call);
+    int error = errno;
+    printf("coverage: made system call %ld: %s\n", call, result < 0 ? error_name(error) : "success");
+    return 0;
+#else
+    fprintf(stderr, "coverage: system call %s belongs to the x86_64 table\n", number);
+    return 2;
+#endif
+}
+
+#else
+
+/* The coverage-incomplete task makes Linux calls only. */
+static int incomplete(const char *call)
+{
+    fprintf(stderr, "coverage: %s is a Linux call\n", call);
+    return 2;
+}
+
+/* The coverage-incomplete task makes Linux calls only. */
+static int unknown(const char *number)
+{
+    fprintf(stderr, "coverage: system call %s belongs to the x86_64 table of Linux\n", number);
+    return 2;
+}
+
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], INTERPRETED) == 0) {
@@ -1698,6 +1957,12 @@ int main(int argc, char **argv)
         snprintf(task_dir, sizeof task_dir, "%s", argv[2]);
         child(argv[1]);
         return mismatches == 0 ? 0 : 1;
+    }
+    if (argc == 2 && strncmp(argv[1], INCOMPLETE_PREFIX, strlen(INCOMPLETE_PREFIX)) == 0) {
+        return incomplete(argv[1] + strlen(INCOMPLETE_PREFIX));
+    }
+    if (argc == 2 && strncmp(argv[1], UNKNOWN_PREFIX, strlen(UNKNOWN_PREFIX)) == 0) {
+        return unknown(argv[1] + strlen(UNKNOWN_PREFIX));
     }
     if (argc == 2 && strncmp(argv[1], CHANGE_PREFIX, strlen(CHANGE_PREFIX)) == 0) {
         change(argv[1] + strlen(CHANGE_PREFIX));
@@ -1709,7 +1974,8 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: coverage [change-MODE | MODE TASK-DIRECTORY]\n");
+        fprintf(stderr, "usage: coverage [change-MODE | incomplete-CALL | unknown-NUMBER | MODE "
+                        "TASK-DIRECTORY]\n");
         return 2;
     }
     if (getcwd(task_dir, sizeof task_dir) == NULL) {

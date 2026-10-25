@@ -10,8 +10,8 @@
 //! content, the capture mode, and whether output is echoed live. A [`Tracer`] runs
 //! the command and returns a [`RunResult`]: how the command ended, its raw captured
 //! output, every path its process tree touched with the combined [`AccessKinds`]
-//! for each path, the [`FirstReads`] of the run, and a report when the trace is
-//! incomplete.
+//! for each path, the [`FirstReads`] of the run, the system calls of the run that
+//! the tracer does not know, and a report when the trace is incomplete.
 //!
 //! The first reads hold, for each path whose first read or run of a regular file
 //! came before any write of that path in the run, the file's [`FileMetadata`] at
@@ -19,6 +19,10 @@
 //! file that changed after the command read it, whether the command rewrote it or
 //! something else changed it while the command ran, keeps the result out of the
 //! cache.
+//!
+//! A system call that the tracer does not know is not a reason for an incomplete
+//! trace: the tracer reports its number in [`RunResult::unknown_system_calls`], and
+//! the engine decides whether such a run is cached.
 //!
 //! Through the same interface, the engine reads what the standard library cannot:
 //! the extended attributes of a path, with [`Tracer::extended_attributes`].
@@ -30,7 +34,7 @@
 //! Nothing in the engine changes when the tracer does.
 
 use std::{
-    collections::{BTreeMap, btree_map},
+    collections::{BTreeMap, BTreeSet, btree_map},
     ffi::OsString,
     fmt, fs,
     io::{self, Write},
@@ -833,6 +837,13 @@ pub enum IncompleteReason {
         /// A description of the interface and the call.
         detail: String,
     },
+    /// A process made a system call that can change what a path means, such as
+    /// `chroot`, `mount` or a change of mount namespace, or that uses a path in a way
+    /// the tracer does not record, such as `uselib` or `swapon`.
+    UntraceableSystemCall {
+        /// The process and the call, named in backticks.
+        detail: String,
+    },
     /// Any other reason the tracer could not observe every access.
     Other {
         /// A description of what the tracer could not observe.
@@ -848,6 +859,9 @@ impl fmt::Display for IncompleteReason {
         match self {
             Self::NonNativeSystemCall { detail } => {
                 write!(f, "a system call used a non-native interface: {detail}")
+            },
+            Self::UntraceableSystemCall { detail } => {
+                write!(f, "a system call that kizz cannot trace: {detail}")
             },
             Self::Other { detail } => f.write_str(detail),
         }
@@ -869,6 +883,11 @@ pub struct RunResult {
     /// The first-read metadata of the regular files the process tree read or ran
     /// before it wrote them, as [`FirstReads`] describes.
     pub first_reads: FirstReads,
+    /// The native numbers of the system calls that the tracer does not know, as
+    /// the filter saw them, which a process of the tree made, sorted and without
+    /// repeats. They do not make the trace incomplete: the engine decides whether a
+    /// run that made any is cached.
+    pub unknown_system_calls: BTreeSet<u32>,
 }
 
 impl RunResult {
@@ -1007,7 +1026,7 @@ pub trait Tracer: Send + Sync {
 /// Unit tests for the logic of the tracer interface.
 #[cfg(test)]
 mod tests {
-    use std::{fs, io, path::Path};
+    use std::{collections::BTreeSet, fs, io, path::Path};
 
     use super::{
         AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
@@ -1274,6 +1293,7 @@ mod tests {
             accesses: Accesses::new(),
             incomplete: None,
             first_reads: FirstReads::new(),
+            unknown_system_calls: BTreeSet::new(),
         };
         assert!(result.is_complete());
         result.incomplete = Some(IncompleteReason::NonNativeSystemCall {
@@ -1291,6 +1311,17 @@ mod tests {
             .to_string(),
             "lost a process"
         );
+        assert_eq!(
+            IncompleteReason::UntraceableSystemCall {
+                detail: "process 7 made `chroot`".to_owned()
+            }
+            .to_string(),
+            "a system call that kizz cannot trace: process 7 made `chroot`"
+        );
+        // Unknown system calls alone leave the trace complete.
+        result.incomplete = None;
+        result.unknown_system_calls = BTreeSet::from([400, 1_000_000]);
+        assert!(result.is_complete());
     }
 
     /// Errors tell a missing program, another failure to start, and a tracer

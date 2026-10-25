@@ -39,17 +39,42 @@
 //! The availability gate covers the tracked calls that a kernel may lack because a
 //! newer Linux added them, [`GATED_CALLS`]: `file_getattr`, `file_setattr` and the
 //! `xattrat` calls. The tracer tracks them on every kernel, but the program makes
-//! each once with arguments that cannot succeed, reports whether the kernel has it
-//! in a line of its output, and makes a group's calls only where the kernel has
-//! every call that the group needs. The entries of those groups carry a mark after
-//! their platform that names the gated calls they need, and an entry is expected
-//! only where each of them is available. So where a call exists, each of its
-//! entries is recorded exactly; where it is missing, the exact comparison requires
-//! that nothing is recorded at its entries' paths. The test checks each gated call
-//! itself in its own process, which no tracer follows, and a report that disagrees
-//! is a problem; for each call that the kernel lacks it writes a notice that starts
+//! each once with arguments that cannot succeed, reports whether it is available in
+//! a line of its output, and makes a group's calls only where every call that the
+//! group needs is available. A call that returns `ENOSYS` is unavailable: `ENOSYS`
+//! means that the kernel lacks the call, or that a seccomp filter installed before
+//! kizz's own refuses it. The entries of those groups carry a mark after their
+//! platform that names the gated calls they need, and an entry is expected only
+//! where each of them is available. So where a call is available, each of its
+//! entries is recorded exactly; where it is unavailable, the exact comparison
+//! requires that nothing is recorded at its entries' paths. The test checks each
+//! gated call itself in its own process, which no tracer follows, and a report that
+//! disagrees is a problem; for each unavailable call it writes a notice that starts
 //! with `NOTICE:` to its standard error. The static checks do not depend on the
 //! kernel: every tracked call keeps the entries that only it explains.
+//!
+//! Two more end-to-end tests build `coverage-incomplete` in copies of their own,
+//! after `coverage-build` and a reset. Each of its steps runs the program in a mode
+//! that makes one call of [`UNTRACEABLE_SYSTEM_CALLS`], the list that
+//! `architecture.md` gives under [`UNTRACEABLE_HEADING`], so its result is not
+//! cached and its reason names the call, or one of [`UNKNOWN_NUMBERS`], which the
+//! tracer does not know, so its result is not cached and its reason names the
+//! number, and the build warns about it and repeats the warning in its summary.
+//! With `--cache-unknown-syscalls` the steps of the numbers are cached, with the
+//! numbers in their records; a later build without the option finds them cached
+//! and warns about neither, and `kizz why` lists their numbers. Of the calls,
+//! `open_tree_attr` and `fchroot` are checked only where they are available, as
+//! the test's own check and the program's report, which must agree, find; where one
+//! is unavailable, its step need not be marked, and a notice names it.
+//!
+//! A seccomp filter installed before kizz's own can refuse a call before the tracer
+//! sees it. A call or number that the tracer never saw, whose step is cached and
+//! lists no unknown system call, fails these two tests with a message
+//! that names it and [`SKIP_VARIABLE`], unless that variable is `1` in the test's
+//! environment: then its checks are skipped, and a notice that starts with
+//! `NOTICE:` names it. Either way its step must have exited with 0, and its mode
+//! must report the call with an error. A call or number that the tracer saw is
+//! checked in full.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -68,7 +93,7 @@ use kizz_store::{
     AccessBits, Attribute, Attributes, ChangedRead, NotCachedReason, PathState, RecordedOutput,
     SpecialKind, StepExit, StepKey, StepRecord, Store, TaskId,
 };
-use kizz_trace_linux::TRACKED_SYSTEM_CALLS;
+use kizz_trace_linux::{TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
 use libc::c_long;
 
 /// The result of a test or a test helper.
@@ -98,6 +123,28 @@ const TEST_BLOCK: u32 = 1;
 
 /// The index of the `coverage-changes` block in the fixture's `kizz.md`.
 const CHANGES_BLOCK: u32 = 2;
+
+/// The index of the `coverage-incomplete` block in the fixture's `kizz.md`.
+const INCOMPLETE_BLOCK: u32 = 3;
+
+/// The line of `architecture.md` that introduces the system calls that mark a run
+/// as incompletely traced.
+const UNTRACEABLE_HEADING: &str = "System calls that mark the run as incompletely traced, by \
+                                   x86_64 name:";
+
+/// The calls that mark a run and that a kernel may lack because a newer Linux added
+/// them, in the order of [`UNTRACEABLE_SYSTEM_CALLS`].
+const GATED_UNTRACEABLE: [&str; 2] = ["fchroot", "open_tree_attr"];
+
+/// The system calls that the `coverage-incomplete` task makes and that the tracer
+/// does not know.
+const UNKNOWN_NUMBERS: [u32; 2] = [400, 1_000_000];
+
+/// The variable that, set to `1` in the environment of the test process, makes the
+/// tests of `coverage-incomplete` skip, with a notice, each call or number that the
+/// tracer never saw, because a seccomp filter installed before kizz's own may have
+/// refused it. Only test code reads it, and only [`skip_mode`].
+const SKIP_VARIABLE: &str = "KIZZ_TEST_SKIP_BLOCKED_SYSCALLS";
 
 /// Each mode of the `coverage-changes` task, after its `change-` prefix, with the
 /// file under the task directory that it reads or runs and then rewrites, or
@@ -162,12 +209,12 @@ const GATED_CALLS: [&str; 6] = [
     "file_setattr",
 ];
 
-/// The start of the line in which the program reports that the kernel has a gated
-/// call, before the call's name.
+/// The start of the line in which the program reports that a gated call is
+/// available, before the call's name.
 const AVAILABLE_LINE: &str = "coverage: available: ";
 
-/// The start of the line in which the program reports that the kernel lacks a
-/// gated call, before the call's name.
+/// The start of the line in which the program reports that a gated call is
+/// unavailable, because it returned `ENOSYS`, before the call's name.
 const UNAVAILABLE_LINE: &str = "coverage: unavailable: ";
 
 /// The path on which the availability check makes each gated call: the root,
@@ -676,7 +723,7 @@ struct Entry {
     /// The platforms that expect the entry.
     platform: Platform,
     /// The gated calls that the entry's mark names, which its group needs: the
-    /// entry is expected only where the kernel has each of them.
+    /// entry is expected only where each of them is available.
     needs: Vec<String>,
     /// Every call that touches the path in the run.
     sources: Vec<Source>,
@@ -947,12 +994,19 @@ fn coverage_problems(
 /// The tracked system calls that `architecture.md`'s text lists: every name in
 /// backticks in the bullets under [`TRACKED_HEADING`], in order.
 fn spec_tracked_calls(text: &str) -> Result<Vec<String>, String> {
-    let mut lines = text
-        .lines()
-        .skip_while(|line| *line != TRACKED_HEADING)
-        .skip(1);
-    if text.lines().all(|line| line != TRACKED_HEADING) {
-        return Err(format!("architecture.md has no line `{TRACKED_HEADING}`"));
+    spec_calls(text, TRACKED_HEADING)
+}
+
+/// The system calls that `architecture.md`'s text lists under `heading`: every name
+/// in backticks in the bullets after that line, with their continuation lines, in
+/// order.
+fn spec_calls(
+    text: &str,
+    heading: &str,
+) -> Result<Vec<String>, String> {
+    let mut lines = text.lines().skip_while(|line| *line != heading).skip(1);
+    if text.lines().all(|line| line != heading) {
+        return Err(format!("architecture.md has no line `{heading}`"));
     }
     let mut names = Vec::new();
     let mut started = false;
@@ -965,7 +1019,9 @@ fn spec_tracked_calls(text: &str) -> Result<Vec<String>, String> {
         }
     }
     if names.is_empty() {
-        return Err("architecture.md lists no tracked system call".to_owned());
+        return Err(format!(
+            "architecture.md lists no system call under `{heading}`"
+        ));
     }
     Ok(names)
 }
@@ -1217,7 +1273,8 @@ fn output_of(record: &StepRecord) -> String {
 }
 
 /// The problems of the one step record that `coverage-test`, the task `task`,
-/// recorded in `steps`, and its captured output.
+/// recorded in `steps`, and its captured output: it must be cached, so complete,
+/// and list no system call that the tracer does not know.
 fn record_problems(
     steps: &[(StepKey, StepRecord)],
     task: &TaskId,
@@ -1248,6 +1305,12 @@ fn record_problems(
     if let Some(reason) = &record.not_cached {
         problems.push(format!("the result is not cached: {reason}"));
     }
+    if !record.unknown_system_calls.is_empty() {
+        problems.push(format!(
+            "the step record lists unknown system calls: {:?}",
+            record.unknown_system_calls
+        ));
+    }
     if record.ignored != 0 {
         problems.push(format!("{} accesses were ignored", record.ignored));
     }
@@ -1260,7 +1323,8 @@ fn record_problems(
     (problems, Some(record.clone()))
 }
 
-/// Whether the kernel has each gated call, by name.
+/// Whether each gated call is available, by name: unavailable when its check
+/// returned `ENOSYS`.
 type Availability = BTreeMap<String, bool>;
 
 /// The expected kinds and states of `entries` for the platform the test runs on,
@@ -1321,7 +1385,7 @@ fn check_call(name: &str) -> TestResult<Option<i32>> {
     let [a0, a1, a2, a3, a4, a5] = arguments;
     // SAFETY: the pointers name live memory: two NUL-terminated strings and
     // `buffer`, which is writable for its whole length; the kernel rejects the
-    // arguments before it uses them, or lacks the call.
+    // arguments before it uses them, or the call is unavailable.
     let result = unsafe { libc::syscall(number, a0, a1, a2, a3, a4, a5) };
     if result >= 0 {
         return Ok(None);
@@ -1338,9 +1402,11 @@ const fn availability_word(available: bool) -> &'static str {
     }
 }
 
-/// Whether the kernel has each of [`GATED_CALLS`], checked in this process with
-/// [`check_call`]: `ENOSYS` means that it lacks the call, and `EINVAL` that it has
-/// it; any other result is a problem, and the call then counts as available.
+/// Whether each of [`GATED_CALLS`] is available, checked in this process with
+/// [`check_call`]: `ENOSYS` means that the kernel lacks the call, or that a seccomp
+/// filter installed before kizz's own refuses it, so the call is unavailable, and
+/// `EINVAL` that it is available; any other result is a problem, and the call then
+/// counts as available.
 fn own_availability() -> TestResult<(Availability, Vec<String>)> {
     let mut available = Availability::new();
     let mut problems = Vec::new();
@@ -1390,7 +1456,7 @@ fn reported_availability(output: &str) -> (Availability, Vec<String>) {
     for name in GATED_CALLS {
         if !reported.contains_key(name) {
             problems.push(format!(
-                "the program did not report whether the kernel has {name}"
+                "the program did not report whether {name} is available"
             ));
         }
     }
@@ -1431,7 +1497,8 @@ fn unavailable_notice(
         .collect();
     (!missing.is_empty()).then(|| {
         format!(
-            "NOTICE: {test}: the kernel lacks {}, so the test required that nothing was \
+            "NOTICE: {test}: {} returned ENOSYS (the kernel lacks the call, or a seccomp filter \
+             installed before kizz's own refuses it), so the test required that nothing was \
              recorded at their paths instead of checking their accesses",
             missing.join(", ")
         )
@@ -1450,10 +1517,10 @@ fn write_notice(
 
 /// Run the fixture's two builds and the reset in a copy of it, and compare the
 /// step that `coverage-test` recorded with the expectation file, leaving out the
-/// entries that name a gated call that the kernel lacks, as the test's own check
-/// and the program's report, which must agree, find. Every problem is reported at
-/// once, with the output of `kizz` and of the program, and a notice names each
-/// gated call that the kernel lacks.
+/// entries that name an unavailable gated call, as the test's own check and the
+/// program's report, which must agree, find. Every problem is reported at once,
+/// with the output of `kizz` and of the program, and a notice names each
+/// unavailable gated call.
 #[test]
 fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     let (available, mut problems) = own_availability()?;
@@ -1624,6 +1691,683 @@ fn each_way_of_first_reading_a_file_is_checked_for_a_rewrite() -> TestResult {
         problems.join("\n")
     );
     Ok(())
+}
+
+/// The `x86_64` number of `name`, a call that marks a run.
+fn untraceable_number(name: &str) -> TestResult<c_long> {
+    Ok(UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .find(|call| call.name == name)
+        .ok_or_else(|| format!("{name} does not mark a run"))?
+        .number)
+}
+
+/// Whether each of [`GATED_UNTRACEABLE`] is available, checked in this process,
+/// which no tracer follows, with arguments that cannot succeed: `fchroot` on an
+/// invalid descriptor, and `open_tree_attr` on `/` with a flag that it does not
+/// accept. `ENOSYS` means that the kernel lacks the call, or that a seccomp filter
+/// installed before kizz's own refuses it, so the call is unavailable; any other
+/// result means that it is available.
+fn own_untraceable_availability() -> TestResult<Availability> {
+    let mut available = Availability::new();
+    for name in GATED_UNTRACEABLE {
+        let number = untraceable_number(name)?;
+        let arguments: [c_long; 3] = match name {
+            "fchroot" => [-1, 0, 0],
+            _ => {
+                [
+                    c_long::from(libc::AT_FDCWD),
+                    address(CHECKED_PATH.as_ptr()),
+                    c_long::from(libc::AT_REMOVEDIR),
+                ]
+            },
+        };
+        let [a0, a1, a2] = arguments;
+        // SAFETY: the one pointer names a NUL-terminated string; the kernel rejects
+        // the arguments before it acts, or the call is unavailable.
+        let result = unsafe { libc::syscall(number, a0, a1, a2, 0, 0, 0) };
+        let error = (result < 0)
+            .then(|| io::Error::last_os_error().raw_os_error())
+            .flatten();
+        available.insert(name.to_owned(), error != Some(libc::ENOSYS));
+    }
+    Ok(available)
+}
+
+/// Write to the standard error of this process, through [`io::stderr`], which the
+/// test harness does not capture, a notice that names `test` and each of
+/// [`GATED_UNTRACEABLE`] that `available` marks unavailable, if any.
+fn write_untraceable_notice(
+    test: &str,
+    available: &Availability,
+) -> io::Result<()> {
+    let missing: Vec<&str> = GATED_UNTRACEABLE
+        .iter()
+        .copied()
+        .filter(|name| available.get(*name) == Some(&false))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        io::stderr(),
+        "NOTICE: {test}: {} returned ENOSYS (the kernel lacks the call, or a seccomp filter \
+         installed before kizz's own refuses it), so the test did not require that their \
+         steps mark the run",
+        missing.join(", ")
+    )
+}
+
+/// The step record of the `coverage-incomplete` step that runs the program in
+/// `mode`, the task `task`, in `steps`.
+fn incomplete_record<'a>(
+    steps: &'a [(StepKey, StepRecord)],
+    task: &TaskId,
+    mode: &str,
+) -> Option<&'a StepRecord> {
+    let argv = ["./coverage".to_owned(), mode.to_owned()];
+    steps
+        .iter()
+        .find(|(_, record)| record.spec.argv == argv && record.owners.contains(task))
+        .map(|(_, record)| record)
+}
+
+/// Whether `value`, the value of [`SKIP_VARIABLE`], or `None` when it is unset,
+/// turns skipping on: only `1` does, and unset, empty or any other value leaves the
+/// tests strict.
+fn skips_blocked(value: Option<&OsStr>) -> bool {
+    value == Some(OsStr::new("1"))
+}
+
+/// Whether this test process skips the calls and numbers that the tracer never
+/// saw: the one place that reads [`SKIP_VARIABLE`], from the environment that the
+/// test process was started with.
+fn skip_mode() -> bool {
+    skips_blocked(std::env::var_os(SKIP_VARIABLE).as_deref())
+}
+
+/// A call or number that a step of `coverage-incomplete` makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    /// A call that marks a run, by name.
+    Call(&'static str),
+    /// A system call that the tracer does not know, by number.
+    Number(u32),
+}
+
+impl Made {
+    /// The mode of the program that makes it.
+    fn mode(self) -> String {
+        match self {
+            Self::Call(name) => format!("incomplete-{name}"),
+            Self::Number(number) => format!("unknown-{number}"),
+        }
+    }
+
+    /// The start of the line in which that mode reports what the call returned,
+    /// before the result.
+    fn report(self) -> String {
+        match self {
+            Self::Call(name) => format!("coverage: made {name}: "),
+            Self::Number(number) => format!("coverage: made system call {number}: "),
+        }
+    }
+
+    /// The call in a message: a name in backticks, or a number after "system call".
+    fn quoted(self) -> String {
+        match self {
+            Self::Call(name) => format!("`{name}`"),
+            Self::Number(number) => format!("system call {number}"),
+        }
+    }
+}
+
+impl fmt::Display for Made {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        match self {
+            Self::Call(name) => f.write_str(name),
+            Self::Number(number) => write!(f, "system call {number}"),
+        }
+    }
+}
+
+/// Whether the tracer saw the call or number that the `coverage-incomplete` step of
+/// `record` made, judged in the build that ran it: only a step that is cached and
+/// lists no system call that the tracer does not know made a call that the tracer
+/// never saw. A step that is not cached, for any reason, or that lists an unknown
+/// system call, made one that it saw, and gets the full check.
+fn tracer_saw(record: &StepRecord) -> bool {
+    record.not_cached.is_some() || !record.unknown_system_calls.is_empty()
+}
+
+/// The problems of the step of `record`, which made `made` and whose call the
+/// tracer never saw, that hold whether or not the tests skip it: it must have
+/// exited with 0, and its mode must have reported the call once, with an error,
+/// because a call that a filter refuses fails.
+fn unseen_problems(
+    record: &StepRecord,
+    made: Made,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!("the step of {made} ended with {:?}", record.exit));
+    }
+    let output = output_of(record);
+    let report = made.report();
+    let results: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(report.as_str()))
+        .collect();
+    if !matches!(results.as_slice(), [result] if *result != "success") {
+        problems.push(format!(
+            "the tracer never saw {}, but its step did not report it once with an error: \
+             {output}",
+            made.quoted()
+        ));
+    }
+    problems
+}
+
+/// The calls and numbers that a test skipped because the tracer never saw them, and
+/// whether it may skip them.
+#[derive(Debug)]
+struct Skips {
+    /// Whether [`SKIP_VARIABLE`] is `1`, as [`skips_blocked`] reads it.
+    skip: bool,
+    /// Each call and number skipped so far, in order.
+    skipped: Vec<Made>,
+}
+
+impl Skips {
+    /// No call skipped yet, in the mode `skip`.
+    const fn new(skip: bool) -> Self {
+        Self {
+            skip,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// The problems of `made`, which the tracer never saw, with `ran`, the problems
+    /// of its step that hold in both modes: with skipping off, also a problem that
+    /// names it and [`SKIP_VARIABLE`]; with skipping on, it is skipped instead, unless
+    /// `ran` holds a problem, which fails the test anyway.
+    fn never_saw(
+        &mut self,
+        made: Made,
+        ran: Vec<String>,
+    ) -> Vec<String> {
+        let mut problems = ran;
+        if self.skip {
+            if problems.is_empty() {
+                self.skipped.push(made);
+            }
+        } else {
+            problems.push(format!(
+                "the tracer never saw {}; if a seccomp filter installed before kizz refuses it, \
+                 set {SKIP_VARIABLE}=1",
+                made.quoted()
+            ));
+        }
+        problems
+    }
+
+    /// The notice that names `test`, [`SKIP_VARIABLE`] and each call and number
+    /// skipped, or `None` when none was.
+    fn notice(
+        &self,
+        test: &str,
+    ) -> Option<String> {
+        (!self.skipped.is_empty()).then(|| {
+            let skipped: Vec<String> = self.skipped.iter().map(ToString::to_string).collect();
+            format!(
+                "NOTICE: {test}: the tracer never saw {}, which a seccomp filter installed \
+                 before kizz's own may have refused, so {SKIP_VARIABLE}=1 skipped their checks",
+                skipped.join(", ")
+            )
+        })
+    }
+
+    /// Write the notice of [`Skips::notice`], if any, to the standard error of this
+    /// process through [`io::stderr`], which the test harness does not capture, so
+    /// the output of a passing run shows it.
+    fn write_notice(
+        &self,
+        test: &str,
+    ) -> io::Result<()> {
+        self.notice(test)
+            .map_or(Ok(()), |notice| writeln!(io::stderr(), "{notice}"))
+    }
+}
+
+/// The problems of the step of `coverage-incomplete`, the task `task`, that makes
+/// the call `name`, in `steps`, as [`call_problems`] gives them.
+fn untraceable_problems(
+    steps: &[(StepKey, StepRecord)],
+    task: &TaskId,
+    name: &'static str,
+    available: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let Some(record) = incomplete_record(steps, task, &Made::Call(name).mode()) else {
+        return vec![format!("no step record of the {name} step")];
+    };
+    call_problems(record, name, available, skips)
+}
+
+/// The problems of `record`, the step of `coverage-incomplete` that makes the call
+/// `name`, which `available` gives as available or not. For a gated call, the
+/// program's report must agree with `available`. Where the call is available and
+/// the tracer never saw it, [`Skips::never_saw`] judges it. Otherwise the step must
+/// have exited with 0 and list no unknown system call; where the call is available,
+/// its result must be not cached, with an incomplete reason that names the call,
+/// and where it is unavailable, it may also be cached.
+fn call_problems(
+    record: &StepRecord,
+    name: &'static str,
+    available: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if GATED_UNTRACEABLE.contains(&name) {
+        let output = output_of(record);
+        let reported: Vec<bool> = output
+            .lines()
+            .filter_map(|line| {
+                if line == format!("{AVAILABLE_LINE}{name}") {
+                    Some(true)
+                } else if line == format!("{UNAVAILABLE_LINE}{name}") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if reported != [available] {
+            problems.push(format!(
+                "the {name} step reported {reported:?}, but the test's own check found it {}: \
+                 {output}",
+                availability_word(available)
+            ));
+        }
+    }
+    if available && !tracer_saw(record) {
+        let made = Made::Call(name);
+        problems.extend(skips.never_saw(made, unseen_problems(record, made)));
+        return problems;
+    }
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!("the {name} step ended with {:?}", record.exit));
+    }
+    if !record.unknown_system_calls.is_empty() {
+        problems.push(format!(
+            "the {name} step lists unknown system calls: {:?}",
+            record.unknown_system_calls
+        ));
+    }
+    let named = format!("`{name}`");
+    let names_call = matches!(
+        &record.not_cached,
+        Some(NotCachedReason::Incomplete { detail }) if detail.contains(&named)
+    );
+    if (available || record.not_cached.is_some()) && !names_call {
+        problems.push(format!(
+            "the {name} step is marked {:?}, not incompletely traced for {named}",
+            record.not_cached
+        ));
+    }
+    problems
+}
+
+/// The problems of the step of `coverage-incomplete`, the task `task`, that makes
+/// the system call `number`, in `steps`, as [`number_problems`] gives them.
+fn unknown_problems(
+    steps: &[(StepKey, StepRecord)],
+    task: &TaskId,
+    number: u32,
+    cached: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let Some(record) = incomplete_record(steps, task, &Made::Number(number).mode()) else {
+        return vec![format!(
+            "no step record of the step of system call {number}"
+        )];
+    };
+    number_problems(record, number, cached, skips)
+}
+
+/// The problems of `record`, the step of `coverage-incomplete` that makes the system
+/// call `number`. Where the tracer never saw it, [`Skips::never_saw`] judges it.
+/// Otherwise the step must have exited with 0, list only that number, and be not
+/// cached for it, unless `cached`, when it must be cached.
+fn number_problems(
+    record: &StepRecord,
+    number: u32,
+    cached: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    if !tracer_saw(record) {
+        let made = Made::Number(number);
+        return skips.never_saw(made, unseen_problems(record, made));
+    }
+    let mut problems = Vec::new();
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!(
+            "the step of system call {number} ended with {:?}",
+            record.exit
+        ));
+    }
+    if record.unknown_system_calls != [number] {
+        problems.push(format!(
+            "the step of system call {number} lists {:?}",
+            record.unknown_system_calls
+        ));
+    }
+    let expected = (!cached).then(|| {
+        NotCachedReason::UnknownSystemCalls {
+            numbers: vec![number],
+        }
+    });
+    if record.not_cached != expected {
+        problems.push(format!(
+            "the step of system call {number} is marked {:?}, not {expected:?}",
+            record.not_cached
+        ));
+    }
+    problems
+}
+
+/// The problems of the warnings of `run` that hold every one of `parts`: there must
+/// be exactly one, which starts with `warning: `, and the summary must repeat it
+/// once, indented by two spaces.
+fn warning_problems(
+    run: &Run,
+    parts: &[&str],
+) -> Vec<String> {
+    let holds = |line: &str| parts.iter().all(|part| line.contains(part));
+    let warned = run
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("warning: ") && holds(line))
+        .count();
+    let repeated = run
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("  ") && holds(line))
+        .count();
+    if (warned, repeated) == (1, 1) {
+        Vec::new()
+    } else {
+        vec![format!(
+            "kizz {} warned {warned} times and repeated it {repeated} times in its summary, not \
+             once each, about {parts:?}",
+            run.args.join(" ")
+        )]
+    }
+}
+
+/// A copy of the fixture with its cache after `coverage-build`, a reset, and a
+/// build of `coverage-incomplete`.
+struct IncompleteBuild {
+    /// The temporary directory that holds the copy.
+    _dir: tempfile::TempDir,
+    /// The copy, the task directory.
+    copy: PathBuf,
+    /// The cache.
+    cache: tempfile::TempDir,
+    /// The runs of `kizz`, in order.
+    runs: Vec<Run>,
+    /// The problems found so far: each run that failed.
+    problems: Vec<String>,
+}
+
+impl IncompleteBuild {
+    /// Copy the fixture, build `coverage-build`, reset the copy's entries, and build
+    /// `coverage-incomplete` with `options` before the target.
+    fn new(options: &[&str]) -> TestResult<Self> {
+        let dir = tempfile::tempdir()?;
+        let copy = dir.path().canonicalize()?.join(FIXTURE);
+        copy_tree(&fixture_dir(), &copy)?;
+        let cache = tempfile::tempdir()?;
+        let copy_text = copy.to_str().ok_or("the copy's path is not UTF-8")?;
+        let mut incomplete: Vec<&str> = vec!["build"];
+        incomplete.extend_from_slice(options);
+        incomplete.push("coverage-incomplete");
+        let mut built = Self {
+            _dir: dir,
+            copy: copy.clone(),
+            cache,
+            runs: Vec::new(),
+            problems: Vec::new(),
+        };
+        for args in [
+            &["build", "coverage-build"][..],
+            &["cache", "reset", copy_text, "--yes"][..],
+            &incomplete[..],
+        ] {
+            built.run(args)?;
+        }
+        Ok(built)
+    }
+
+    /// Run `kizz` with `args` in the copy and keep the run, with a problem when it
+    /// fails.
+    fn run(
+        &mut self,
+        args: &[&str],
+    ) -> TestResult<&Run> {
+        let run = run_kizz(&self.copy, self.cache.path(), args)?;
+        if run.status != Some(0) {
+            self.problems
+                .push(format!("kizz {} failed", args.join(" ")));
+        }
+        self.runs.push(run);
+        self.runs.last().ok_or_else(|| "no run".into())
+    }
+
+    /// The task `coverage-incomplete`.
+    fn task(&self) -> TaskId {
+        TaskId {
+            file: self.copy.join("kizz.md"),
+            index: INCOMPLETE_BLOCK,
+        }
+    }
+
+    /// The problems of the steps of the calls that mark a run in `steps`, whose
+    /// availability `available` gives, with the skips of `skips`, and of the
+    /// warnings of `run` about those that are available and that the tracer saw.
+    fn untraceable_problems(
+        &self,
+        steps: &[(StepKey, StepRecord)],
+        available: &Availability,
+        run: &Run,
+        skips: &mut Skips,
+    ) -> Vec<String> {
+        let task = self.task();
+        let mut problems = Vec::new();
+        for call in UNTRACEABLE_SYSTEM_CALLS {
+            let has = available.get(call.name).copied().unwrap_or(true);
+            problems.extend(untraceable_problems(steps, &task, call.name, has, skips));
+            let seen = incomplete_record(steps, &task, &Made::Call(call.name).mode())
+                .is_some_and(tracer_saw);
+            if has && seen {
+                let command = format!("incomplete-{}`", call.name);
+                let named = format!("`{}`", call.name);
+                problems.extend(warning_problems(run, &[
+                    command.as_str(),
+                    "was traced incompletely",
+                    named.as_str(),
+                ]));
+            }
+        }
+        problems
+    }
+
+    /// Fail with every problem, the runs of `kizz` and the output of every step.
+    fn assert_no_problems(
+        &self,
+        problems: &[String],
+    ) -> TestResult {
+        let mut report = String::new();
+        for (_, record) in step_records(self.cache.path())? {
+            writeln!(
+                report,
+                "{}: {:?}\n{}",
+                record.spec.argv.join(" "),
+                record.not_cached,
+                output_of(&record)
+            )?;
+        }
+        for run in &self.runs {
+            writeln!(report, "{run}")?;
+        }
+        assert!(
+            problems.is_empty(),
+            "{} problems:\n{}\n\n{report}",
+            problems.len(),
+            problems.join("\n")
+        );
+        Ok(())
+    }
+}
+
+/// Build `coverage-incomplete` in a copy of the fixture, after `coverage-build` and
+/// a reset. The list of `architecture.md` is [`UNTRACEABLE_SYSTEM_CALLS`]. The step
+/// of each call is not cached, with an incomplete reason that names the call, and
+/// the build warns about it; where `open_tree_attr` or `fchroot` is unavailable, as
+/// the test's own check and the program's report find, the step may be cached, and
+/// a notice names the call. The step of each unknown number is not cached, with
+/// the reason that names the number, its record lists only that number, and the
+/// build warns about it, names the option, and repeats the warning in its summary.
+/// A call or number that the tracer never saw fails the test, unless
+/// [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn each_call_that_marks_a_run_and_each_unknown_number_leaves_its_result_uncached() -> TestResult {
+    let test = "each_call_that_marks_a_run_and_each_unknown_number_leaves_its_result_uncached";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let spec =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../architecture.md"))?;
+    let listed = spec_calls(&spec, UNTRACEABLE_HEADING)?;
+    let names: Vec<&str> = UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .map(|call| call.name)
+        .collect();
+    let built = IncompleteBuild::new(&[])?;
+    let mut problems = built.problems.clone();
+    if listed != names {
+        problems.push(format!(
+            "architecture.md lists {listed:?}, but the tracer marks the run for {names:?}"
+        ));
+    }
+    let steps = step_records(built.cache.path())?;
+    let expected_steps = UNTRACEABLE_SYSTEM_CALLS
+        .len()
+        .saturating_add(UNKNOWN_NUMBERS.len());
+    if steps.len() != expected_steps {
+        problems.push(format!(
+            "the cache holds {} step records after building coverage-incomplete, not \
+             {expected_steps}",
+            steps.len()
+        ));
+    }
+    let run = built.runs.last().ok_or("no build")?;
+    let task = built.task();
+    problems.extend(built.untraceable_problems(&steps, &available, run, &mut skips));
+    for number in UNKNOWN_NUMBERS {
+        let seen =
+            incomplete_record(&steps, &task, &Made::Number(number).mode()).is_some_and(tracer_saw);
+        problems.extend(unknown_problems(&steps, &task, number, false, &mut skips));
+        if !seen {
+            continue;
+        }
+        let made = format!(
+            "made system call {number}, which the tracer does not know, so its result was not \
+             cached and it runs again on the next build"
+        );
+        problems.extend(warning_problems(run, &[
+            format!("unknown-{number}`").as_str(),
+            made.as_str(),
+            "`kizz build --cache-unknown-syscalls`",
+        ]));
+    }
+    skips.write_notice(test)?;
+    built.assert_no_problems(&problems)
+}
+
+/// Build `coverage-incomplete` with `--cache-unknown-syscalls` in a copy of the
+/// fixture, after `coverage-build` and a reset: the steps of the unknown numbers are
+/// cached and list their numbers, the build warns that the option cached them and
+/// repeats the warning in its summary, and the steps of the calls that mark a run
+/// are still not cached. A following build without the option finds the steps of
+/// the numbers cached and warns about neither, and `kizz why` lists their numbers.
+/// A call or number that the tracer never saw fails the test, unless
+/// [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn with_the_option_the_steps_of_unknown_numbers_are_cached() -> TestResult {
+    let test = "with_the_option_the_steps_of_unknown_numbers_are_cached";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let mut built = IncompleteBuild::new(&["--cache-unknown-syscalls"])?;
+    let mut problems = Vec::new();
+    let steps = step_records(built.cache.path())?;
+    let task = built.task();
+    let run = built.runs.last().ok_or("no build")?;
+    problems.extend(built.untraceable_problems(&steps, &available, run, &mut skips));
+    let mut unseen = BTreeSet::new();
+    for number in UNKNOWN_NUMBERS {
+        let seen =
+            incomplete_record(&steps, &task, &Made::Number(number).mode()).is_some_and(tracer_saw);
+        problems.extend(unknown_problems(&steps, &task, number, true, &mut skips));
+        if !seen {
+            unseen.insert(number);
+            continue;
+        }
+        let made = format!(
+            "made system call {number}, which the tracer does not know; its result was cached \
+             because `kizz build --cache-unknown-syscalls` was given"
+        );
+        let command = format!("unknown-{number}`");
+        problems.extend(warning_problems(run, &[command.as_str(), made.as_str()]));
+    }
+
+    let again = built.run(&["build", "coverage-incomplete"])?;
+    if again.stderr.contains("which the tracer does not know") {
+        problems.push("a build that found the unknown numbers cached warned about them".to_owned());
+    }
+    let later = step_records(built.cache.path())?;
+    for number in UNKNOWN_NUMBERS {
+        let mode = Made::Number(number).mode();
+        let ran_at = |records: &[(StepKey, StepRecord)]| {
+            incomplete_record(records, &task, &mode).map(|record| record.ran_at_nanos)
+        };
+        if ran_at(&later).is_none() || ran_at(&later) != ran_at(&steps) {
+            problems.push(format!(
+                "the step of system call {number} ran again in a build without the option"
+            ));
+        }
+        if !unseen.contains(&number) {
+            problems.extend(unknown_problems(&later, &task, number, true, &mut skips));
+        }
+    }
+
+    let why = built.run(&["why"])?;
+    for number in UNKNOWN_NUMBERS {
+        if unseen.contains(&number) {
+            continue;
+        }
+        let line = format!("system calls that the tracer does not know: {number}");
+        if !why.stdout.lines().any(|shown| shown.trim() == line) {
+            problems.push(format!("kizz why does not show `{line}`"));
+        }
+    }
+    problems.extend(built.problems.iter().cloned());
+    skips.write_notice(test)?;
+    built.assert_no_problems(&problems)
 }
 
 /// The little-endian field of `size` bytes, at most eight, at `offset` in `bytes`.
@@ -2033,7 +2777,7 @@ fn availability_lines_are_read_and_their_problems_reported() {
     assert_eq!(problems, vec![
         "the program reported file_getattr more than once",
         "the program reported stat, which is not a gated call",
-        "the program did not report whether the kernel has file_setattr",
+        "the program did not report whether file_setattr is available",
     ]);
 }
 
@@ -2070,11 +2814,264 @@ fn the_notice_names_the_test_and_each_unavailable_call() {
     assert_eq!(
         unavailable_notice("t", &availability_without(&["file_setattr", "getxattrat"])),
         Some(
-            "NOTICE: t: the kernel lacks getxattrat, file_setattr, so the test required that \
-             nothing was recorded at their paths instead of checking their accesses"
+            "NOTICE: t: getxattrat, file_setattr returned ENOSYS (the kernel lacks the call, or \
+             a seccomp filter installed before kizz's own refuses it), so the test required \
+             that nothing was recorded at their paths instead of checking their accesses"
                 .to_owned()
         )
     );
+}
+
+/// A step record of `coverage-incomplete` with `not_cached`, the unknown system
+/// calls `unknown`, the exit code `code` and the captured output `output`.
+fn incomplete_step(
+    not_cached: Option<NotCachedReason>,
+    unknown: &[u32],
+    code: i32,
+    output: &str,
+) -> StepRecord {
+    use kizz_store::{Capture, ContentHash, RunReason, StepSpecRecord};
+
+    StepRecord {
+        spec: StepSpecRecord {
+            program_hash: ContentHash([0; 32]),
+            cwd: PathBuf::from("/t"),
+            argv: vec!["./coverage".to_owned()],
+            env: BTreeMap::new(),
+            stdin: None,
+            capture: Capture::Merged,
+            stream: false,
+            always: false,
+            ignore: Vec::new(),
+            track: Vec::new(),
+            timestamps: false,
+            expect: None,
+            occurrence: 0,
+        },
+        program: None,
+        observations: Vec::new(),
+        ignored: 0,
+        exit: StepExit::Exited { code },
+        output: RecordedOutput::Merged {
+            output: output.as_bytes().to_vec(),
+        },
+        duration_nanos: 0,
+        ran_at_nanos: 0,
+        reason: RunReason::NeverRun,
+        recorded_at_nanos: 0,
+        failure: None,
+        not_cached,
+        owners: BTreeSet::new(),
+        unknown_system_calls: unknown.to_vec(),
+    }
+}
+
+/// The incomplete reason of a run in which a process made `name`.
+fn marked(name: &str) -> NotCachedReason {
+    NotCachedReason::Incomplete {
+        detail: format!("a system call that kizz cannot trace: process 7 made `{name}`"),
+    }
+}
+
+/// Only the value `1` of the variable turns skipping on: unset, empty, `0` and
+/// `true` leave the tests strict.
+#[test]
+fn only_the_value_1_turns_skipping_on() {
+    assert!(skips_blocked(Some(OsStr::new("1"))));
+    for value in [None, Some(""), Some("0"), Some("true")] {
+        assert!(!skips_blocked(value.map(OsStr::new)), "{value:?}");
+    }
+}
+
+/// A step that is not cached, whatever its reason, or that lists an unknown system
+/// call, cached or not, made a call that the tracer saw; only a cached step that
+/// lists none made one that it never saw.
+#[test]
+fn step_records_are_judged_as_seen_or_never_seen() {
+    let seen = [
+        incomplete_step(Some(marked("acct")), &[], 0, ""),
+        incomplete_step(
+            Some(NotCachedReason::UnknownSystemCalls { numbers: vec![400] }),
+            &[400],
+            0,
+            "",
+        ),
+        incomplete_step(None, &[400], 0, ""),
+        incomplete_step(
+            Some(NotCachedReason::ChangedAfterRead { files: Vec::new() }),
+            &[],
+            0,
+            "",
+        ),
+    ];
+    for record in &seen {
+        assert!(tracer_saw(record), "{:?}", record.not_cached);
+    }
+    let unseen = incomplete_step(None, &[], 0, "");
+    assert!(!tracer_saw(&unseen), "{:?}", unseen.not_cached);
+}
+
+/// In both modes, a step that exited with 0 and reported its call or number with an
+/// error, but is not cached for a reason other than the call's, was seen: it gets
+/// the full check, which fails on its reason and numbers, and it is never skipped.
+#[test]
+fn a_step_not_cached_for_another_reason_is_checked_in_full_in_both_modes() {
+    let changed = || Some(NotCachedReason::ChangedAfterRead { files: Vec::new() });
+    let call = incomplete_step(changed(), &[], 0, "coverage: made acct: EPERM\n");
+    let number = incomplete_step(
+        changed(),
+        &[],
+        0,
+        "coverage: made system call 400: ENOSYS\n",
+    );
+    for on in [false, true] {
+        let mut skips = Skips::new(on);
+        assert_eq!(call_problems(&call, "acct", true, &mut skips), vec![
+            "the acct step is marked Some(ChangedAfterRead { files: [] }), not incompletely \
+             traced for `acct`"
+        ]);
+        assert_eq!(number_problems(&number, 400, false, &mut skips), vec![
+            "the step of system call 400 lists []".to_owned(),
+            "the step of system call 400 is marked Some(ChangedAfterRead { files: [] }), not \
+             Some(UnknownSystemCalls { numbers: [400] })"
+                .to_owned(),
+        ]);
+        assert_eq!(number_problems(&number, 400, true, &mut skips), vec![
+            "the step of system call 400 lists []".to_owned(),
+            "the step of system call 400 is marked Some(ChangedAfterRead { files: [] }), not None"
+                .to_owned(),
+        ]);
+        assert_eq!(skips.skipped, Vec::new(), "skipping {on}");
+        assert_eq!(skips.notice("t"), None, "skipping {on}");
+    }
+}
+
+/// A call or number that the tracer never saw, whose step exited with 0 and
+/// reported it with an error, fails with a message that names it and the variable
+/// when skipping is off, and is skipped, with no problem, when it is on.
+#[test]
+fn a_call_that_the_tracer_never_saw_fails_unless_skipping_is_on() {
+    let call = incomplete_step(None, &[], 0, "coverage: made acct: EPERM\n");
+    let number = incomplete_step(None, &[], 0, "coverage: made system call 400: ENOSYS\n");
+
+    let mut strict = Skips::new(false);
+    assert_eq!(call_problems(&call, "acct", true, &mut strict), vec![
+        "the tracer never saw `acct`; if a seccomp filter installed before kizz refuses it, set \
+         KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1"
+    ]);
+    assert_eq!(number_problems(&number, 400, false, &mut strict), vec![
+        "the tracer never saw system call 400; if a seccomp filter installed before kizz refuses \
+         it, set KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1"
+    ]);
+    assert_eq!(strict.skipped, Vec::new());
+
+    let mut skipping = Skips::new(true);
+    assert_eq!(
+        call_problems(&call, "acct", true, &mut skipping),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        number_problems(&number, 400, true, &mut skipping),
+        Vec::<String>::new()
+    );
+    assert_eq!(skipping.skipped, vec![
+        Made::Call("acct"),
+        Made::Number(400)
+    ]);
+}
+
+/// In both modes, a call or number that the tracer saw and mishandled fails, and so
+/// does one that it never saw whose step did not exit with 0 or did not report the
+/// call with an error; none of them is skipped. A gated call that is unavailable
+/// follows decision 8, not the variable.
+#[test]
+fn mishandled_or_failed_calls_fail_in_both_modes() {
+    let ok_call = "coverage: made acct: EPERM\n";
+    let ok_number = "coverage: made system call 400: ENOSYS\n";
+    for on in [false, true] {
+        let mut skips = Skips::new(on);
+        // Seen, with a reason that names another call.
+        let wrong = incomplete_step(Some(marked("chroot")), &[], 0, ok_call);
+        assert_eq!(call_problems(&wrong, "acct", true, &mut skips).len(), 1);
+        // Seen, with an extra number.
+        let extra = incomplete_step(
+            Some(NotCachedReason::UnknownSystemCalls {
+                numbers: vec![400, 401],
+            }),
+            &[400, 401],
+            0,
+            ok_number,
+        );
+        assert_eq!(number_problems(&extra, 400, false, &mut skips).len(), 2);
+        // Seen, and cached without the option.
+        let cached = incomplete_step(None, &[400], 0, ok_number);
+        assert_eq!(number_problems(&cached, 400, false, &mut skips).len(), 1);
+        // Never seen, but the step failed.
+        let failed = incomplete_step(None, &[], 1, ok_call);
+        assert!(
+            call_problems(&failed, "acct", true, &mut skips)
+                .contains(&"the step of acct ended with Exited { code: 1 }".to_owned())
+        );
+        // Never seen, but the call succeeded or was not reported.
+        for output in ["coverage: made acct: success\n", ""] {
+            let unreported = incomplete_step(None, &[], 0, output);
+            let problems = call_problems(&unreported, "acct", true, &mut skips);
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains("did not report it once with an error")),
+                "{problems:?}"
+            );
+        }
+        let unreported = incomplete_step(None, &[], 0, "coverage: made system call 401: ENOSYS\n");
+        let problems = number_problems(&unreported, 400, false, &mut skips);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("did not report it once with an error")),
+            "{problems:?}"
+        );
+        // Unavailable under decision 8: cached and reported as unavailable.
+        let unavailable = incomplete_step(
+            None,
+            &[],
+            0,
+            "coverage: unavailable: fchroot\ncoverage: made fchroot: ENOSYS\n",
+        );
+        assert_eq!(
+            call_problems(&unavailable, "fchroot", false, &mut skips),
+            Vec::<String>::new()
+        );
+        assert_eq!(skips.skipped, Vec::new(), "skipping {on}");
+    }
+}
+
+/// The notice of the skipped calls and numbers names the test, the variable and
+/// each of them, in order, and there is none when nothing was skipped.
+#[test]
+fn the_skip_notice_names_the_test_the_variable_and_each_skipped_call() {
+    let mut skips = Skips::new(true);
+    assert_eq!(skips.notice("t"), None);
+    assert_eq!(
+        skips.never_saw(Made::Call("acct"), Vec::new()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        skips.never_saw(Made::Number(400), Vec::new()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        skips.notice("t"),
+        Some(
+            "NOTICE: t: the tracer never saw acct, system call 400, which a seccomp filter \
+             installed before kizz's own may have refused, so KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1 \
+             skipped their checks"
+                .to_owned()
+        )
+    );
+    let mut strict = Skips::new(false);
+    assert_eq!(strict.never_saw(Made::Call("acct"), Vec::new()).len(), 1);
+    assert_eq!(strict.notice("t"), None);
 }
 
 /// The coverage check requires, for each call, an entry on which it succeeded and,
@@ -2121,6 +3118,11 @@ fn the_spec_list_is_read_from_its_bullets() {
         "open", "creat", "stat", "lstat", "access"
     ]);
     assert!(spec_tracked_calls("nothing here").is_err());
+    let both = format!("{text}\n{UNTRACEABLE_HEADING}\n\n* c: `mount`,\n  `chroot`\n\nafter `x`\n");
+    assert_eq!(spec_calls(&both, UNTRACEABLE_HEADING).unwrap(), vec![
+        "mount", "chroot"
+    ]);
+    assert_eq!(spec_tracked_calls(&both).unwrap().len(), 5);
 }
 
 /// The comparison reports a missing, an unexpected, and a mismatched entry
@@ -2239,6 +3241,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         failure: None,
         not_cached: None,
         owners: BTreeSet::new(),
+        unknown_system_calls: Vec::new(),
     };
     let recorded: Vec<String> = recorded_under(&record, Path::new("/t"))
         .into_iter()

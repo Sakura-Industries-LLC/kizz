@@ -73,7 +73,7 @@ pub use check::{Checked, RACY_WINDOW_NANOS, check};
 pub use cleanup::{Cleaned, ResetPlan, clean, plan_reset};
 pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
 pub use dotenv::DotenvError;
-pub use engine::{Engine, TaskSteps};
+pub use engine::{Engine, TaskSteps, UnknownCalls};
 pub use explain::{
     Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
     changed_inputs, spec_reasons,

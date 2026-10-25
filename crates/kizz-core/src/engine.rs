@@ -39,7 +39,11 @@
 //! signal ended it or it exited with a code after it handled the interrupt, a run
 //! that the tracer reports as incompletely traced, a run in which a file changed
 //! after the command first read it or ran it, and a command that could not start
-//! for a reason other than a missing or non-executable program. After it records
+//! for a reason other than a missing or non-executable program. A run that made a
+//! system call that the tracer does not know is not cached either, unless the build
+//! caches such results (`kizz build --cache-unknown-syscalls`, see
+//! [`Engine::with_cache_unknown_system_calls`]); the tracer reports only the
+//! numbers of such calls, and the record lists them either way. After it records
 //! the states, the engine compares the first-read metadata that the tracer noted
 //! with them (see [`changed_after_read`]); a change, when no other reason applies,
 //! is the reason, and lists each changed file with whether the command wrote it.
@@ -153,6 +157,19 @@ struct NotCachedRun {
     result: Result<StepOutcome, StepError>,
 }
 
+/// A run of a step that made system calls that the tracer does not know, as the
+/// engine keeps it for the build's warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCalls {
+    /// The step key.
+    pub key: StepKey,
+    /// The number of each such call, sorted and without repeats.
+    pub numbers: Vec<u32>,
+    /// Whether the result was cached: only when the build caches such results and
+    /// no other reason kept it out of the cache.
+    pub cached: bool,
+}
+
 /// What every task of a build shares to run, check, and record its steps.
 pub struct Engine<'a> {
     /// Runs and traces the commands.
@@ -177,6 +194,12 @@ pub struct Engine<'a> {
     /// The warnings for steps that re-ran in consecutive builds for the same
     /// self-inflicted reason, in the order they ran.
     warnings: Mutex<Vec<RepeatedWarning>>,
+    /// Whether a run that made system calls that the tracer does not know is cached
+    /// as if it had made none.
+    cache_unknown_system_calls: bool,
+    /// The runs of the build that made system calls that the tracer does not know,
+    /// in the order they ended.
+    unknown_calls: Mutex<Vec<UnknownCalls>>,
 }
 
 impl fmt::Debug for Engine<'_> {
@@ -192,6 +215,11 @@ impl fmt::Debug for Engine<'_> {
             .field("not_cached", &self.not_cached)
             .field("build", &self.build)
             .field("warnings", &self.warnings)
+            .field(
+                "cache_unknown_system_calls",
+                &self.cache_unknown_system_calls,
+            )
+            .field("unknown_calls", &self.unknown_calls)
             .finish_non_exhaustive()
     }
 }
@@ -224,7 +252,37 @@ impl<'a> Engine<'a> {
             not_cached: Mutex::new(HashMap::new()),
             build: next_build(),
             warnings: Mutex::new(Vec::new()),
+            cache_unknown_system_calls: false,
+            unknown_calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The engine, which caches the result of a run that made system calls that
+    /// the tracer does not know, as if it had made none, when `cache` is set, as
+    /// `kizz build --cache-unknown-syscalls` asks. Without it, such a result is not
+    /// cached unless no other reason applies. The option is in no step key or
+    /// record.
+    #[must_use]
+    pub const fn with_cache_unknown_system_calls(
+        mut self,
+        cache: bool,
+    ) -> Self {
+        self.cache_unknown_system_calls = cache;
+        self
+    }
+
+    /// Whether the engine caches the results of runs that made system calls that
+    /// the tracer does not know.
+    #[must_use]
+    pub const fn caches_unknown_system_calls(&self) -> bool {
+        self.cache_unknown_system_calls
+    }
+
+    /// The runs of the build that made system calls that the tracer does not know,
+    /// in the order they ended, each with whether its result was cached.
+    #[must_use]
+    pub fn unknown_system_calls(&self) -> Vec<UnknownCalls> {
+        lock(&self.unknown_calls).clone()
     }
 
     /// The identity of the build.
@@ -500,6 +558,10 @@ struct Finished {
     /// The first-read metadata the tracer noted, empty for a command that did not
     /// run.
     first_reads: FirstReads,
+    /// The numbers of the system calls that the command made and that the tracer
+    /// does not know, sorted and without repeats; empty for a command that did not
+    /// run.
+    unknown_system_calls: Vec<u32>,
 }
 
 /// A step error from a store error.
@@ -1084,6 +1146,7 @@ impl TaskSteps<'_> {
                     ran_at,
                     failure: None,
                     first_reads: result.first_reads,
+                    unknown_system_calls: result.unknown_system_calls.into_iter().collect(),
                 };
                 self.finish_run(step, pending, finished, why, Ok(outcome.clone()))?;
                 Ok(outcome)
@@ -1111,6 +1174,7 @@ impl TaskSteps<'_> {
                     ran_at,
                     failure: Some(message.clone()),
                     first_reads: FirstReads::new(),
+                    unknown_system_calls: Vec::new(),
                 })?;
                 Err(StepError::new(message))
             },
@@ -1130,6 +1194,7 @@ impl TaskSteps<'_> {
                     ran_at,
                     failure: Some(message.clone()),
                     first_reads: FirstReads::new(),
+                    unknown_system_calls: Vec::new(),
                 };
                 let why = NotCachedReason::StartFailed { message };
                 self.finish_run(step, pending, finished, Some(why), Err(failure.clone()))?;
@@ -1143,7 +1208,10 @@ impl TaskSteps<'_> {
     ///
     /// Every run that returns once cancellation has been requested is interrupted,
     /// however it ended: by a signal, or with an exit code that the command chose
-    /// after it handled the interrupt.
+    /// after it handled the interrupt. A run that the tracer reports as incompletely
+    /// traced is not cached for that reason; otherwise a run that made system calls
+    /// that the tracer does not know is not cached for them, unless the build caches
+    /// such results.
     fn not_cached_reason(
         &self,
         result: &RunResult,
@@ -1157,11 +1225,18 @@ impl TaskSteps<'_> {
         if let Termination::Signaled(signal) = result.termination {
             return Some(NotCachedReason::Signaled { signal });
         }
-        result.incomplete.as_ref().map(|reason| {
-            NotCachedReason::Incomplete {
+        if let Some(reason) = &result.incomplete {
+            return Some(NotCachedReason::Incomplete {
                 detail: reason.to_string(),
-            }
-        })
+            });
+        }
+        (!result.unknown_system_calls.is_empty() && !self.engine.cache_unknown_system_calls).then(
+            || {
+                NotCachedReason::UnknownSystemCalls {
+                    numbers: result.unknown_system_calls.iter().copied().collect(),
+                }
+            },
+        )
     }
 
     /// Record the state of every path `finished` touched, and store the record of
@@ -1173,7 +1248,9 @@ impl TaskSteps<'_> {
     /// of the first-read metadata with the recorded states finds. Such a record is
     /// marked with the reason and replaces any older record of its key, so no older
     /// result is replayed, and the result is kept in memory for the rest of the
-    /// build, with the states of the paths it touched.
+    /// build, with the states of the paths it touched. A run that made system calls
+    /// that the tracer does not know is kept for the build's warnings, with whether
+    /// its result was cached.
     fn finish_run(
         &self,
         step: &StepSpec,
@@ -1188,6 +1265,13 @@ impl TaskSteps<'_> {
             let files = changed_after_read(&record.observations, &first_reads);
             (!files.is_empty()).then_some(NotCachedReason::ChangedAfterRead { files })
         });
+        if !record.unknown_system_calls.is_empty() {
+            lock(&self.engine.unknown_calls).push(UnknownCalls {
+                key: pending.key,
+                numbers: record.unknown_system_calls.clone(),
+                cached: why.is_none(),
+            });
+        }
         let Some(why) = why else {
             return self.put_run(pending, &mut record);
         };
@@ -1278,6 +1362,7 @@ impl TaskSteps<'_> {
             failure: finished.failure,
             not_cached: None,
             owners: BTreeSet::new(),
+            unknown_system_calls: finished.unknown_system_calls,
         }
     }
 
@@ -1307,6 +1392,7 @@ impl TaskSteps<'_> {
             ran_at: SystemTime::now(),
             failure: Some(message.clone()),
             first_reads: FirstReads::new(),
+            unknown_system_calls: Vec::new(),
         })?;
         Err(StepError::new(message))
     }

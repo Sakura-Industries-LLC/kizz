@@ -15,18 +15,34 @@
 //! set in the request's explicit environment.
 //!
 //! The calls that a kernel may lack because a newer Linux added them,
-//! [`GATED_CALLS`], are checked only where the kernel has them: the test first
+//! [`GATED_CALLS`], are checked only where they are available: the test first
 //! makes each in its own process, which no tracer follows, with arguments that
-//! cannot succeed, and `ENOSYS` means that the kernel lacks it. The helper then
-//! skips each call that the kernel lacks, the test requires that nothing is
-//! recorded at its path, and it writes a notice that names the call to its
-//! standard error. Every other call is required on every kernel.
+//! cannot succeed, and a call that returns `ENOSYS` is unavailable. `ENOSYS` means
+//! that the kernel lacks the call, or that a seccomp filter installed before kizz's
+//! own refuses it. The helper then skips each unavailable call, the test requires
+//! that nothing is recorded at its path, and it writes a notice that names the call
+//! to its standard error. Every other call is required on every kernel.
+//!
+//! The calls that mark a run as incompletely traced are made one by one, each by a
+//! helper that makes only that call, in a way that changes nothing if it succeeds.
+//! Of them, `open_tree_attr` and `fchroot` are checked only where they are
+//! available, the same way: the test checks each in its own process first, and
+//! writes a notice that names each unavailable one.
+//!
+//! A seccomp filter installed before kizz's own can also refuse a call that marks a
+//! run, or a system call that the tracer does not know, before the tracer sees it.
+//! A call that leaves its run complete, or a number that the run does not list,
+//! is one that the tracer never saw: it fails its test with a message that names it
+//! and [`SKIP_VARIABLE`], unless that variable is `1` in the test's environment,
+//! when its checks are skipped and a notice that starts with `NOTICE:` names it.
+//! Either way the helper must have exited with 0, and a call or number that the
+//! tracer saw is checked in full.
 
 use std::{
     collections::BTreeMap,
     error::Error,
     ffi::{CString, OsStr, OsString},
-    fs,
+    fmt, fs,
     io::{self, Write as _},
     mem,
     os::unix::{
@@ -41,17 +57,18 @@ use std::{
 };
 
 use kizz_trace::{
-    AbsolutePath, AccessKind, AccessKinds, Cancellation, CaptureMode, CapturedOutput, FileMetadata,
-    RunRequest, RunResult, StdioEcho, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
+    FileMetadata, FirstReads, IncompleteReason, RunRequest, RunResult, StdioEcho, Termination,
+    TraceError, Tracer,
 };
-use kizz_trace_linux::{LinuxTracer, TRACKED_SYSTEM_CALLS};
+use kizz_trace_linux::{LinuxTracer, TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
 use libc::{c_int, c_long};
 
 /// The variable that selects the helper mode of this test executable.
 const HELPER_VARIABLE: &str = "KIZZ_TRACE_TEST_HELPER";
 /// The search path of the shell commands in these tests.
 const SEARCH_PATH: &str = "/usr/bin:/bin";
-/// The variable that names, joined with `,`, the gated calls that the kernel has,
+/// The variable that names, joined with `,`, the gated calls that are available,
 /// which the helper of [`every_tracked_system_call_is_decoded_in_a_real_process`]
 /// makes.
 const AVAILABLE_VARIABLE: &str = "KIZZ_TRACE_TEST_AVAILABLE";
@@ -66,6 +83,14 @@ const GATED_CALLS: [&str; 6] = [
     "removexattrat",
     "file_setattr",
 ];
+/// The variable that, set to `1` in the environment of the test process, makes the
+/// tests of the calls that mark a run and of unknown system calls skip, with a
+/// notice, each call or number that the tracer never saw, because a seccomp filter
+/// installed before kizz's own may have refused it. Only test code reads it, and
+/// only [`skip_mode`].
+const SKIP_VARIABLE: &str = "KIZZ_TEST_SKIP_BLOCKED_SYSCALLS";
+/// The system calls that the tests make and that the tracer does not know.
+const UNKNOWN_NUMBERS: [u32; 2] = [400, 1_000_000];
 
 /// The result of a test helper.
 type Outcome<T> = Result<T, Box<dyn Error>>;
@@ -223,6 +248,10 @@ fn helper_process() {
         "in_root_parent" => helper_in_root_parent(true).unwrap(),
         "in_root_parent_control" => helper_in_root_parent(false).unwrap(),
         "unknown_format" => helper_unknown_format().unwrap(),
+        "untraceable" => helper_untraceable().unwrap(),
+        "clone3_thread" => helper_clone3_thread().unwrap(),
+        "unknown_calls" => helper_unknown_calls(true).unwrap(),
+        "known_calls" => helper_unknown_calls(false).unwrap(),
         other => panic!("unknown helper mode {other}"),
     }
 }
@@ -541,7 +570,7 @@ fn xattr_args(
     bytes
 }
 
-/// Whether the test found that the kernel has the gated call `name`, as
+/// Whether the test found the gated call `name` available, as
 /// [`AVAILABLE_VARIABLE`] in the helper's environment names it.
 fn helper_may_make(name: &str) -> bool {
     std::env::var(AVAILABLE_VARIABLE)
@@ -550,8 +579,8 @@ fn helper_may_make(name: &str) -> bool {
 
 /// Check file systems, file attributes and file handles, and watch paths through
 /// an inotify instance and a fanotify group that the helper creates. The gated
-/// calls are made only where the kernel has them, and `file_setattr` only where it
-/// also has `file_getattr`.
+/// calls are made only where they are available, and `file_setattr` only where
+/// `file_getattr` is available too.
 fn file_systems_and_watches(s: &mut Strings) -> Outcome<()> {
     let cwd = cwd();
     let figures = zeroed(s, mem::size_of::<libc::statfs>());
@@ -620,7 +649,7 @@ fn file_systems_and_watches(s: &mut Strings) -> Outcome<()> {
 /// Read, list, set and remove extended attributes, by path, through descriptors
 /// opened by symbolic links, and relative to the working directory, and read
 /// attributes in ways that fail with `ENODATA`, `ERANGE` and `ENOENT`. The
-/// `xattrat` calls are made only where the kernel has them.
+/// `xattrat` calls are made only where they are available.
 fn extended_attributes(s: &mut Strings) -> Outcome<()> {
     let cwd = cwd();
     let name = s.text(ATTRIBUTE)?;
@@ -1770,13 +1799,14 @@ const GATED_PATHS: &[(&str, &[&str])] = &[
     ("removexattrat.f", &["removexattrat"]),
 ];
 
-/// Whether the kernel has the gated call `name`: make it once in this process,
+/// Whether the gated call `name` is available: make it once in this process,
 /// which no tracer follows, on `/`, with arguments that the kernel rejects with
 /// `EINVAL` before it looks the path up, a structure size of 0 for `getxattrat`,
 /// `setxattrat`, `file_getattr` and `file_setattr` and a flag that the call does
-/// not accept for `listxattrat` and `removexattrat`. `ENOSYS` means that the
-/// kernel lacks the call, `EINVAL` that it has it, and any other result is an
-/// error.
+/// not accept for `listxattrat` and `removexattrat`. `ENOSYS` means that the kernel
+/// lacks the call, or that a seccomp filter installed before kizz's own refuses it,
+/// so the call is unavailable; `EINVAL` means that it is available, and any other
+/// result is an error.
 fn kernel_has(name: &str) -> Outcome<bool> {
     let mut s = Strings::default();
     let path = s.text("/")?;
@@ -1799,7 +1829,7 @@ fn kernel_has(name: &str) -> Outcome<bool> {
     }
 }
 
-/// The gated calls that the kernel has, by [`kernel_has`], in order.
+/// The gated calls that are available, by [`kernel_has`], in order.
 fn available_gated_calls() -> Outcome<Vec<&'static str>> {
     let mut available = Vec::new();
     for name in GATED_CALLS {
@@ -1823,24 +1853,26 @@ fn unavailable_notice(
         .collect();
     (!missing.is_empty()).then(|| {
         format!(
-            "NOTICE: {test}: the kernel lacks {}, so the test required that nothing was \
+            "NOTICE: {test}: {} returned ENOSYS (the kernel lacks the call, or a seccomp filter \
+             installed before kizz's own refuses it), so the test required that nothing was \
              recorded at their paths instead of checking their accesses",
             missing.join(", ")
         )
     })
 }
 
-/// The notice names the test and each gated call that the kernel lacks, in order,
-/// and there is none when the kernel has them all.
+/// The notice names the test and each unavailable gated call, in order, and there
+/// is none when they are all available.
 #[test]
 fn the_notice_names_the_test_and_each_unavailable_call() {
     assert_eq!(unavailable_notice("t", &GATED_CALLS), None);
     assert_eq!(
         unavailable_notice("t", &["file_getattr", "listxattrat", "setxattrat"]),
         Some(
-            "NOTICE: t: the kernel lacks getxattrat, removexattrat, file_setattr, so the test \
-             required that nothing was recorded at their paths instead of checking their \
-             accesses"
+            "NOTICE: t: getxattrat, removexattrat, file_setattr returned ENOSYS (the kernel \
+             lacks the call, or a seccomp filter installed before kizz's own refuses it), so \
+             the test required that nothing was recorded at their paths instead of checking \
+             their accesses"
                 .to_owned()
         )
     );
@@ -1848,7 +1880,7 @@ fn the_notice_names_the_test_and_each_unavailable_call() {
 
 /// Every tracked system call, made by a real process on fixtures that only it
 /// touches, records the exact kinds of its rule, and a failed call the kinds of
-/// its failure. A gated call that the kernel lacks is skipped: nothing may be
+/// its failure. An unavailable gated call is skipped: nothing may be
 /// recorded at its path, and a notice to the standard error of the test process,
 /// through [`io::stderr`], which the test harness does not capture, names it.
 #[test]
@@ -2234,4 +2266,638 @@ fn the_linux_tracer_answers_the_attribute_query() {
         .extended_attributes(&workspace.path("missing"), false)
         .unwrap_err();
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+}
+
+/// The variable that names the one call that the helper of
+/// [`each_untraceable_call_marks_the_run_in_a_real_process`] makes.
+const CALL_VARIABLE: &str = "KIZZ_TRACE_TEST_CALL";
+
+/// The calls that mark a run and that a kernel may lack because a newer Linux added
+/// them, in the order of [`UNTRACEABLE_SYSTEM_CALLS`].
+const GATED_UNTRACEABLE: [&str; 2] = ["fchroot", "open_tree_attr"];
+
+/// A path that names nothing in the helper's working directory.
+const MISSING_PATH: &str = "kizz-missing";
+
+/// `QCMD(Q_GETFMT, USRQUOTA)`, from the kernel's `include/uapi/linux/quota.h`: read
+/// the quota format of a file system.
+const QUOTA_GET_FORMAT: c_long = 0x8000_0400;
+
+/// The size of `struct clone_args`, `CLONE_ARGS_SIZE_VER0`.
+const CLONE_ARGS_SIZE: usize = 64;
+
+/// The `x86_64` number of `name`, a call that marks a run.
+fn untraceable_number(name: &str) -> Outcome<c_long> {
+    Ok(UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .find(|call| call.name == name)
+        .ok_or_else(|| format!("{name} does not mark a run"))?
+        .number)
+}
+
+/// The bytes of a `struct clone_args` with `flags` and every other field zero.
+fn clone_args(flags: c_int) -> Vec<u8> {
+    let mut bytes = u64::from(flags.cast_unsigned()).to_ne_bytes().to_vec();
+    bytes.resize(CLONE_ARGS_SIZE, 0);
+    bytes
+}
+
+/// Make the call `name`, which marks a run, in a way that changes nothing if it
+/// succeeds: on a missing path, an invalid descriptor or handle, or with flags that
+/// the kernel rejects before it acts. Returns the call's result.
+fn make_untraceable(
+    name: &str,
+    s: &mut Strings,
+) -> Outcome<io::Result<c_long>> {
+    let missing = s.text(MISSING_PATH)?;
+    let arguments: Vec<c_long> = match name {
+        "open_by_handle_at" => vec![-1, zeroed(s, HANDLE_BUFFER_SIZE), flag(libc::O_RDONLY)],
+        "chroot" | "uselib" | "acct" | "swapoff" => vec![missing],
+        "fchroot" | "fsmount" => vec![-1],
+        "pivot_root" => vec![missing, missing],
+        "mount" => vec![missing, missing, s.text("none")?],
+        "umount2" | "swapon" => vec![missing, 0],
+        "fsopen" => vec![s.text("kizz-no-such-file-system")?],
+        "fsconfig" => vec![-1, 0, s.text("ro")?],
+        "fspick" | "open_tree" | "open_tree_attr" => vec![cwd(), missing],
+        "move_mount" => vec![cwd(), missing, cwd(), missing],
+        "mount_setattr" => vec![-1, s.text("")?, flag(libc::AT_EMPTY_PATH)],
+        // `CLONE_VFORK` is not a flag of `unshare`, so the kernel rejects the call.
+        "unshare" => vec![flag(libc::CLONE_NEWNS | libc::CLONE_VFORK)],
+        "setns" => vec![-1, flag(libc::CLONE_NEWNS)],
+        // The kernel rejects a new mount namespace that shares file system
+        // information, and a `struct clone_args` of size 0.
+        "clone" => vec![flag(libc::CLONE_NEWNS | libc::CLONE_FS | libc::SIGCHLD)],
+        "clone3" => {
+            vec![
+                filled(s, &clone_args(libc::CLONE_NEWNS | libc::CLONE_FS)),
+                0,
+            ]
+        },
+        "quotactl" => vec![QUOTA_GET_FORMAT, missing, 0, zeroed(s, 64)],
+        "quotactl_fd" => vec![-1, QUOTA_GET_FORMAT, 0, zeroed(s, 64)],
+        other => return Err(format!("{other} does not mark a run").into()),
+    };
+    Ok(raw(untraceable_number(name)?, &arguments))
+}
+
+/// Make the one call that [`CALL_VARIABLE`] names, whatever it returns.
+fn helper_untraceable() -> Outcome<()> {
+    let name = std::env::var(CALL_VARIABLE)?;
+    let mut s = Strings::default();
+    // The call marks the run when it is made, so its result does not matter.
+    let _result = make_untraceable(&name, &mut s)?;
+    Ok(())
+}
+
+/// Read `thread.txt` from a thread that the standard library creates, which the C
+/// library does with `clone3` where the kernel has it, and make `clone3` with the
+/// flags of a thread and a size of 0, which the kernel rejects.
+fn helper_clone3_thread() -> Outcome<()> {
+    thread::spawn(|| fs::read("thread.txt"))
+        .join()
+        .map_err(|_| "the thread panicked")??;
+    let mut s = Strings::default();
+    let flags = libc::CLONE_VM
+        | libc::CLONE_FS
+        | libc::CLONE_FILES
+        | libc::CLONE_SIGHAND
+        | libc::CLONE_THREAD;
+    let arguments = filled(&mut s, &clone_args(flags));
+    if raw(libc::SYS_clone3, &[arguments, 0]).is_ok() {
+        return Err("clone3 with a size of 0 succeeded".into());
+    }
+    Ok(())
+}
+
+/// Read `before.txt`, fork a child that makes the system calls 1,000,000, 400 and
+/// 400 again, which the tracer does not know, when `unknown` is set, and nothing
+/// otherwise, wait for it, and read `after.txt`.
+fn helper_unknown_calls(unknown: bool) -> Outcome<()> {
+    fs::read("before.txt")?;
+    // SAFETY: the child only makes raw system calls and exits.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        if unknown {
+            for number in [1_000_000, 400, 400] {
+                // SAFETY: the kernel has no call with these numbers, which take no
+                // arguments.
+                unsafe { libc::syscall(number) };
+            }
+        }
+        // SAFETY: `_exit` has no requirements.
+        unsafe { libc::_exit(0) };
+    }
+    if pid < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut status: c_int = 0;
+    // SAFETY: `status` is a valid `int` for `waitpid` to fill.
+    if unsafe { libc::waitpid(pid, &raw mut status, 0) } != pid {
+        return Err(io::Error::last_os_error().into());
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(format!("the child ended with status {status:#x}").into());
+    }
+    fs::read("after.txt")?;
+    Ok(())
+}
+
+/// Whether `name`, a call that marks a run and that a newer Linux added, is
+/// available: make it once in this process, which no tracer follows, with arguments
+/// that cannot succeed, `fchroot` on an invalid descriptor and `open_tree_attr` on
+/// `/` with a flag that it does not accept. `ENOSYS` means that the kernel lacks
+/// the call, or that a seccomp filter installed before kizz's own refuses it, so the
+/// call is unavailable; any other result means that it is available.
+fn kernel_has_untraceable(name: &str) -> Outcome<bool> {
+    let mut s = Strings::default();
+    let arguments = match name {
+        "fchroot" => vec![-1],
+        "open_tree_attr" => vec![cwd(), s.text("/")?, flag(libc::AT_REMOVEDIR)],
+        _ => return Err(format!("{name} is not a gated call that marks a run").into()),
+    };
+    let result = raw(untraceable_number(name)?, &arguments);
+    Ok(!matches!(result, Err(error) if error.raw_os_error() == Some(libc::ENOSYS)))
+}
+
+/// The notice that names `test` and each gated call that marks a run that
+/// `available` lacks, or `None` when it lacks none.
+fn untraceable_notice(
+    test: &str,
+    available: &[&str],
+) -> Option<String> {
+    let missing: Vec<&str> = GATED_UNTRACEABLE
+        .iter()
+        .copied()
+        .filter(|name| !available.contains(name))
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "NOTICE: {test}: {} returned ENOSYS (the kernel lacks the call, or a seccomp filter \
+             installed before kizz's own refuses it), so the test did not make them or check \
+             that they mark the run",
+            missing.join(", ")
+        )
+    })
+}
+
+/// The notice names the test and each unavailable gated call that marks a run, and
+/// there is none when they are both available.
+#[test]
+fn the_notice_names_each_unavailable_call_that_marks_a_run() {
+    assert_eq!(untraceable_notice("t", &GATED_UNTRACEABLE), None);
+    assert_eq!(
+        untraceable_notice("t", &["open_tree_attr"]),
+        Some(
+            "NOTICE: t: fchroot returned ENOSYS (the kernel lacks the call, or a seccomp filter \
+             installed before kizz's own refuses it), so the test did not make them or check \
+             that they mark the run"
+                .to_owned()
+        )
+    );
+}
+
+/// Whether `value`, the value of [`SKIP_VARIABLE`], or `None` when it is unset,
+/// turns skipping on: only `1` does, and unset, empty or any other value leaves the
+/// tests strict.
+fn skips_blocked(value: Option<&OsStr>) -> bool {
+    value == Some(OsStr::new("1"))
+}
+
+/// Whether this test process skips the calls and numbers that the tracer never
+/// saw: the one place that reads [`SKIP_VARIABLE`], from the environment that the
+/// test process was started with.
+fn skip_mode() -> bool {
+    skips_blocked(std::env::var_os(SKIP_VARIABLE).as_deref())
+}
+
+/// A call or number that a real process makes in these tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    /// A call that marks a run, by name.
+    Call(&'static str),
+    /// A system call that the tracer does not know, by number.
+    Number(u32),
+}
+
+impl Made {
+    /// The call in a message: a name in backticks, or a number after "system call".
+    fn quoted(self) -> String {
+        match self {
+            Self::Call(name) => format!("`{name}`"),
+            Self::Number(number) => format!("system call {number}"),
+        }
+    }
+}
+
+impl fmt::Display for Made {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        match self {
+            Self::Call(name) => f.write_str(name),
+            Self::Number(number) => write!(f, "system call {number}"),
+        }
+    }
+}
+
+/// Whether the tracer saw the one call that the run of `result` made: the run is
+/// marked as incompletely traced, or lists a system call that the tracer does not
+/// know. A run that is complete and lists none made a call that it never saw.
+fn tracer_saw(result: &RunResult) -> bool {
+    result.incomplete.is_some() || !result.unknown_system_calls.is_empty()
+}
+
+/// The calls and numbers that a test skipped because the tracer never saw them, and
+/// whether it may skip them.
+#[derive(Debug)]
+struct Skips {
+    /// Whether [`SKIP_VARIABLE`] is `1`, as [`skips_blocked`] reads it.
+    skip: bool,
+    /// Each call and number skipped so far, in order.
+    skipped: Vec<Made>,
+}
+
+impl Skips {
+    /// No call skipped yet, in the mode `skip`.
+    const fn new(skip: bool) -> Self {
+        Self {
+            skip,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// The problems of `made`, which the tracer never saw, with `ran`, the problems
+    /// of its helper that hold in both modes: with skipping off, also a problem that
+    /// names it and [`SKIP_VARIABLE`]; with skipping on, it is skipped instead, unless
+    /// `ran` holds a problem, which fails the test anyway.
+    fn never_saw(
+        &mut self,
+        made: Made,
+        ran: Vec<String>,
+    ) -> Vec<String> {
+        let mut problems = ran;
+        if self.skip {
+            if problems.is_empty() {
+                self.skipped.push(made);
+            }
+        } else {
+            problems.push(format!(
+                "the tracer never saw {}; if a seccomp filter installed before kizz refuses it, \
+                 set {SKIP_VARIABLE}=1",
+                made.quoted()
+            ));
+        }
+        problems
+    }
+
+    /// The notice that names `test`, [`SKIP_VARIABLE`] and each call and number
+    /// skipped, or `None` when none was.
+    fn notice(
+        &self,
+        test: &str,
+    ) -> Option<String> {
+        (!self.skipped.is_empty()).then(|| {
+            let skipped: Vec<String> = self.skipped.iter().map(ToString::to_string).collect();
+            format!(
+                "NOTICE: {test}: the tracer never saw {}, which a seccomp filter installed \
+                 before kizz's own may have refused, so {SKIP_VARIABLE}=1 skipped their checks",
+                skipped.join(", ")
+            )
+        })
+    }
+
+    /// Write the notice of [`Skips::notice`], if any, to the standard error of this
+    /// process through [`io::stderr`], which the test harness does not capture, so
+    /// the output of a passing run shows it.
+    fn write_notice(
+        &self,
+        test: &str,
+    ) -> io::Result<()> {
+        self.notice(test)
+            .map_or(Ok(()), |notice| writeln!(io::stderr(), "{notice}"))
+    }
+}
+
+/// The problems of `result`, the run of a helper that made only `name`, a call that
+/// marks a run. Where the tracer never saw the call, the helper must still have
+/// exited with 0, and [`Skips::never_saw`] judges it. Otherwise the helper must have
+/// exited with 0, the run must be incompletely traced with a reason that names the
+/// process and the call, and it must list no unknown system call.
+fn untraceable_problems(
+    name: &'static str,
+    result: &RunResult,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let exited = result.termination == Termination::Exited(0);
+    if !tracer_saw(result) {
+        let ran = if exited {
+            Vec::new()
+        } else {
+            vec![format!(
+                "{name}: the helper ended with {}",
+                result.termination
+            )]
+        };
+        return skips.never_saw(Made::Call(name), ran);
+    }
+    let named = format!("`{name}`");
+    let marked = matches!(
+        &result.incomplete,
+        Some(IncompleteReason::UntraceableSystemCall { detail })
+            if detail.starts_with("process ") && detail.contains(&named)
+    );
+    if exited && marked && result.unknown_system_calls.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{name}: {} {:?} {:?} {:?}",
+        result.termination, result.incomplete, result.unknown_system_calls, result.output
+    )]
+}
+
+/// The problems of the unknown system calls of `result`, the run of a helper that
+/// made each of [`UNKNOWN_NUMBERS`]: the tracer saw each number that the run lists
+/// and never saw one that it does not list, which [`Skips::never_saw`] judges, and
+/// any other number listed is a problem.
+fn unknown_number_problems(
+    result: &RunResult,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let extra: Vec<u32> = result
+        .unknown_system_calls
+        .iter()
+        .copied()
+        .filter(|number| !UNKNOWN_NUMBERS.contains(number))
+        .collect();
+    if !extra.is_empty() {
+        problems.push(format!(
+            "the run lists the unknown system calls {extra:?}, which the helper did not make"
+        ));
+    }
+    for number in UNKNOWN_NUMBERS {
+        if !result.unknown_system_calls.contains(&number) {
+            problems.extend(skips.never_saw(Made::Number(number), Vec::new()));
+        }
+    }
+    problems
+}
+
+/// Each call that marks a run, made by a real process whatever it returns, leaves
+/// the run incompletely traced with a reason that names the process and the call,
+/// and reports no unknown system call. An unavailable gated call is not made, and a
+/// notice to the standard error of the test process names it. A call that the
+/// tracer never saw fails the test, unless [`SKIP_VARIABLE`] is `1`, when a notice
+/// names it instead.
+#[test]
+fn each_untraceable_call_marks_the_run_in_a_real_process() {
+    let test = "each_untraceable_call_marks_the_run_in_a_real_process";
+    let mut available = Vec::new();
+    for name in GATED_UNTRACEABLE {
+        if kernel_has_untraceable(name).unwrap() {
+            available.push(name);
+        }
+    }
+    if let Some(notice) = untraceable_notice(test, &available) {
+        writeln!(io::stderr(), "{notice}").unwrap();
+    }
+    let mut skips = Skips::new(skip_mode());
+    let workspace = Workspace::new().unwrap();
+    let mut wrong = Vec::new();
+    let mut made = 0_usize;
+    for call in UNTRACEABLE_SYSTEM_CALLS {
+        if GATED_UNTRACEABLE.contains(&call.name) && !available.contains(&call.name) {
+            continue;
+        }
+        let mut request = helper("untraceable", &workspace.root).unwrap();
+        request
+            .env
+            .insert(OsString::from(CALL_VARIABLE), OsString::from(call.name));
+        let result = run(&request).unwrap();
+        wrong.extend(untraceable_problems(call.name, &result, &mut skips));
+        made = made.saturating_add(1);
+    }
+    skips.write_notice(test).unwrap();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(made, 22_usize.saturating_add(available.len()));
+}
+
+/// A thread that a process creates, which the C library does with `clone3` where
+/// the kernel has it, and `clone3` with the flags of a thread, leave the run
+/// completely traced, and the thread's read is recorded.
+#[test]
+fn a_thread_created_with_clone3_does_not_mark_the_run() {
+    let workspace = Workspace::new().unwrap();
+    workspace.create(&["thread.txt"]).unwrap();
+    let result = run_successfully(&helper("clone3_thread", &workspace.root).unwrap()).unwrap();
+    // Reading a whole file also checks its size through the descriptor.
+    let read = workspace.kinds(&result, "thread.txt").unwrap();
+    assert!(
+        read.is_some_and(|kinds| kinds.contains(AccessKind::Read)),
+        "{read:?}"
+    );
+    assert!(result.unknown_system_calls.is_empty());
+}
+
+/// A child that makes the system calls 1,000,000, 400 and 400 again, which the
+/// tracer does not know, reports 400 and 1,000,000, sorted and once each, in a run
+/// that stays completely traced, and its file accesses are those of the same run
+/// without the calls, which reports none. A number that the run does not list is
+/// one that the tracer never saw, which fails the test unless [`SKIP_VARIABLE`] is
+/// `1`, when a notice names it instead.
+#[test]
+fn unknown_system_calls_are_reported_without_marking_the_run() {
+    let mut skips = Skips::new(skip_mode());
+    let workspace = Workspace::new().unwrap();
+    workspace.create(&["before.txt", "after.txt"]).unwrap();
+    let unknown = run_successfully(&helper("unknown_calls", &workspace.root).unwrap()).unwrap();
+    let known = run_successfully(&helper("known_calls", &workspace.root).unwrap()).unwrap();
+    let problems = unknown_number_problems(&unknown, &mut skips);
+    skips
+        .write_notice("unknown_system_calls_are_reported_without_marking_the_run")
+        .unwrap();
+    assert!(problems.is_empty(), "{problems:#?}");
+    assert!(known.unknown_system_calls.is_empty());
+    let under = |result: &RunResult| -> Vec<String> {
+        result
+            .accesses
+            .iter()
+            .filter(|(path, _)| path.as_path().starts_with(&workspace.root))
+            .map(|(path, kinds)| format!("{path} {kinds}"))
+            .collect()
+    };
+    assert_eq!(under(&unknown), under(&known));
+    for file in ["before.txt", "after.txt"] {
+        // Reading a whole file also checks its size through the descriptor.
+        let read = workspace.kinds(&unknown, file).unwrap();
+        assert!(
+            read.is_some_and(|kinds| kinds.contains(AccessKind::Read)),
+            "{file}: {read:?}"
+        );
+    }
+}
+
+/// A finished run that exited with `code`, with the incomplete reason `incomplete`
+/// and the unknown system calls `unknown`.
+fn finished(
+    code: i32,
+    incomplete: Option<IncompleteReason>,
+    unknown: &[u32],
+) -> RunResult {
+    RunResult {
+        termination: Termination::Exited(code),
+        output: CapturedOutput::empty(CaptureMode::Split),
+        accesses: Accesses::default(),
+        incomplete,
+        first_reads: FirstReads::default(),
+        unknown_system_calls: unknown.iter().copied().collect(),
+    }
+}
+
+/// The incomplete reason of a run in which a process made `name`.
+fn marked(name: &str) -> IncompleteReason {
+    IncompleteReason::UntraceableSystemCall {
+        detail: format!("process 7 made `{name}`"),
+    }
+}
+
+/// Only the value `1` of the variable turns skipping on: unset, empty, `0` and
+/// `true` leave the tests strict.
+#[test]
+fn only_the_value_1_turns_skipping_on() {
+    assert!(skips_blocked(Some(OsStr::new("1"))));
+    for value in [None, Some(""), Some("0"), Some("true")] {
+        assert!(!skips_blocked(value.map(OsStr::new)), "{value:?}");
+    }
+}
+
+/// A run that is incompletely traced, or that lists an unknown system call, made a
+/// call that the tracer saw; a complete run that lists none made one that it never
+/// saw. Of the run that makes both numbers, the tracer saw each listed number and
+/// never saw the other.
+#[test]
+fn run_results_are_judged_as_seen_or_never_seen() {
+    assert!(tracer_saw(&finished(0, Some(marked("acct")), &[])));
+    assert!(tracer_saw(&finished(0, None, &[400])));
+    assert!(!tracer_saw(&finished(0, None, &[])));
+    for on in [false, true] {
+        let mut skips = Skips::new(on);
+        let both = finished(0, None, &[400, 1_000_000]);
+        assert_eq!(
+            unknown_number_problems(&both, &mut skips),
+            Vec::<String>::new()
+        );
+        assert_eq!(skips.skipped, Vec::new());
+        let one = finished(0, None, &[400]);
+        let problems = unknown_number_problems(&one, &mut skips);
+        if on {
+            assert_eq!(problems, Vec::<String>::new());
+            assert_eq!(skips.skipped, vec![Made::Number(1_000_000)]);
+        } else {
+            assert_eq!(problems.len(), 1);
+            assert!(
+                problems
+                    .iter()
+                    .all(|problem| problem.contains("system call 1000000"))
+            );
+        }
+    }
+}
+
+/// A call or number that the tracer never saw, whose helper exited with 0, fails
+/// with a message that names it and the variable when skipping is off, and is
+/// skipped, with no problem, when it is on.
+#[test]
+fn a_call_that_the_tracer_never_saw_fails_unless_skipping_is_on() {
+    let unseen = finished(0, None, &[]);
+    let mut strict = Skips::new(false);
+    assert_eq!(untraceable_problems("acct", &unseen, &mut strict), vec![
+        "the tracer never saw `acct`; if a seccomp filter installed before kizz refuses it, set \
+         KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1"
+    ]);
+    assert_eq!(unknown_number_problems(&unseen, &mut strict), vec![
+        "the tracer never saw system call 400; if a seccomp filter installed before kizz refuses \
+         it, set KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1",
+        "the tracer never saw system call 1000000; if a seccomp filter installed before kizz \
+         refuses it, set KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1",
+    ]);
+    assert_eq!(strict.skipped, Vec::new());
+
+    let mut skipping = Skips::new(true);
+    assert_eq!(
+        untraceable_problems("acct", &unseen, &mut skipping),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unknown_number_problems(&unseen, &mut skipping),
+        Vec::<String>::new()
+    );
+    assert_eq!(skipping.skipped, vec![
+        Made::Call("acct"),
+        Made::Number(400),
+        Made::Number(1_000_000)
+    ]);
+}
+
+/// In both modes, a call or number that the tracer saw and mishandled fails, and so
+/// does a call that it never saw whose helper did not exit with 0; none of them is
+/// skipped, and a call that it saw and handled passes.
+#[test]
+fn mishandled_or_failed_calls_fail_in_both_modes() {
+    for on in [false, true] {
+        let mut skips = Skips::new(on);
+        assert_eq!(
+            untraceable_problems("acct", &finished(0, Some(marked("acct")), &[]), &mut skips),
+            Vec::<String>::new()
+        );
+        // Seen, with a reason that names another call.
+        let wrong = finished(0, Some(marked("chroot")), &[]);
+        assert_eq!(untraceable_problems("acct", &wrong, &mut skips).len(), 1);
+        // Seen, but listed as an unknown system call instead.
+        let listed = finished(0, None, &[400]);
+        assert_eq!(untraceable_problems("acct", &listed, &mut skips).len(), 1);
+        // Seen, but the helper failed.
+        let failed = finished(1, Some(marked("acct")), &[]);
+        assert_eq!(untraceable_problems("acct", &failed, &mut skips).len(), 1);
+        // Never seen, and the helper failed.
+        let unseen_failed = finished(1, None, &[]);
+        assert!(
+            untraceable_problems("acct", &unseen_failed, &mut skips)
+                .contains(&"acct: the helper ended with exit code 1".to_owned())
+        );
+        // An extra number.
+        let extra = finished(0, None, &[400, 401, 1_000_000]);
+        assert_eq!(unknown_number_problems(&extra, &mut skips).len(), 1);
+        assert_eq!(skips.skipped, Vec::new(), "skipping {on}");
+    }
+}
+
+/// The notice of the skipped calls and numbers names the test, the variable and
+/// each of them, in order, and there is none when nothing was skipped.
+#[test]
+fn the_skip_notice_names_the_test_the_variable_and_each_skipped_call() {
+    let mut skips = Skips::new(true);
+    assert_eq!(skips.notice("t"), None);
+    assert_eq!(
+        skips.never_saw(Made::Call("acct"), Vec::new()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        skips.never_saw(Made::Number(400), Vec::new()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        skips.notice("t"),
+        Some(
+            "NOTICE: t: the tracer never saw acct, system call 400, which a seccomp filter \
+             installed before kizz's own may have refused, so KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1 \
+             skipped their checks"
+                .to_owned()
+        )
+    );
+    let mut strict = Skips::new(false);
+    assert_eq!(strict.never_saw(Made::Call("acct"), Vec::new()).len(), 1);
+    assert_eq!(strict.notice("t"), None);
 }

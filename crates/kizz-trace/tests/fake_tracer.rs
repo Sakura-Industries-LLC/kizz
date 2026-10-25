@@ -5,7 +5,7 @@
 //! A trivial fake implements the [`Tracer`] trait, as the engine's tests will.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io,
     path::{Path, PathBuf},
@@ -30,6 +30,8 @@ struct Script {
     accesses: Vec<(AbsolutePath, AccessKind)>,
     /// How the program ends.
     termination: Termination,
+    /// The system calls the program makes that the tracer does not know.
+    unknown_system_calls: BTreeSet<u32>,
 }
 
 /// A tracer that runs nothing and reports scripted behavior.
@@ -101,6 +103,7 @@ impl Tracer for FakeTracer {
                 accesses,
                 incomplete: None,
                 first_reads,
+                unknown_system_calls: BTreeSet::new(),
             });
         }
 
@@ -140,6 +143,7 @@ impl Tracer for FakeTracer {
             accesses,
             incomplete: None,
             first_reads,
+            unknown_system_calls: script.unknown_system_calls.clone(),
         })
     }
 
@@ -205,6 +209,7 @@ fn tool_script() -> Result<Script, kizz_trace::NotAbsoluteError> {
             (path("/work/out//result.txt")?, AccessKind::Write),
         ],
         termination: Termination::Exited(3),
+        unknown_system_calls: BTreeSet::from([1_000_000, 400]),
     })
 }
 
@@ -244,6 +249,14 @@ fn fake_tracer_reports_split_output_accesses_and_echo() {
         stderr: b"err ".to_vec(),
     });
     assert!(result.is_complete());
+    assert_eq!(
+        result
+            .unknown_system_calls
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        [400, 1_000_000]
+    );
     assert_eq!(result.accesses.len(), 3);
     assert_eq!(
         result.accesses.get(&path("/work/input.txt").unwrap()),

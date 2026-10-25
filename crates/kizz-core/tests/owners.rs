@@ -18,6 +18,7 @@
 //! and any other argument does nothing.
 
 use std::{
+    collections::BTreeSet,
     error::Error,
     fs, io,
     os::unix::fs::PermissionsExt as _,
@@ -99,6 +100,7 @@ impl Tracer for FakeTracer {
             accesses,
             incomplete: None,
             first_reads,
+            unknown_system_calls: BTreeSet::new(),
         })
     }
 

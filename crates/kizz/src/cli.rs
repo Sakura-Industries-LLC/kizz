@@ -76,11 +76,15 @@ impl Cli {
                 ExitCode::from(USAGE_ERROR)
             },
             Command::Build {
-                targets, explain, ..
+                targets,
+                explain,
+                cache_unknown_syscalls,
+                ..
             } => {
                 crate::build::run(targets.as_deref(), crate::build::Options {
                     explain,
                     verbose: self.verbose,
+                    cache_unknown_syscalls,
                 })
             },
             Command::Why { path } => crate::why::run(path.as_deref(), self.verbose),
@@ -146,6 +150,10 @@ pub enum Command {
         /// Print the full reason for every command, cached ones included.
         #[bpaf(long)]
         explain: bool,
+
+        /// Cache commands that made system calls the tracer does not know.
+        #[bpaf(long)]
+        cache_unknown_syscalls: bool,
 
         /// How tasks are scheduled.
         #[bpaf(external(execution), fallback(Execution::Sequential))]
@@ -319,10 +327,11 @@ mod tests {
         match parse(&["build", "ci+check"]).command {
             Command::Build {
                 explain,
+                cache_unknown_syscalls,
                 execution,
                 targets,
             } => {
-                assert!(!explain);
+                assert!(!explain && !cache_unknown_syscalls);
                 assert_eq!(execution, Execution::Sequential);
                 assert_eq!(targets.as_deref(), Some("ci+check"));
             },
@@ -331,12 +340,26 @@ mod tests {
         match parse(&["build", "--explain", "--parallel"]).command {
             Command::Build {
                 explain,
+                cache_unknown_syscalls,
                 execution,
                 targets,
             } => {
-                assert!(explain);
+                assert!(explain && !cache_unknown_syscalls);
                 assert_eq!(execution, Execution::Parallel);
                 assert_eq!(targets, None);
+            },
+            other => panic!("expected build, got {other:?}"),
+        }
+        match parse(&["build", "--cache-unknown-syscalls", "TARGET"]).command {
+            Command::Build {
+                explain,
+                cache_unknown_syscalls,
+                execution,
+                targets,
+            } => {
+                assert!(!explain && cache_unknown_syscalls);
+                assert_eq!(execution, Execution::Sequential);
+                assert_eq!(targets.as_deref(), Some("TARGET"));
             },
             other => panic!("expected build, got {other:?}"),
         }

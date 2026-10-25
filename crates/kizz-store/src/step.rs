@@ -898,6 +898,18 @@ pub fn changed_reads_text(
     format!("{head}: {}", shown.join(", "))
 }
 
+/// The numbers of system calls that the tracer does not know, as text: `system
+/// call 400`, or `system calls 400 and 1000000` for several, in the order given.
+#[must_use]
+pub fn system_call_numbers(numbers: &[u32]) -> String {
+    let shown: Vec<String> = numbers.iter().map(ToString::to_string).collect();
+    match shown.split_last() {
+        None => "no system call".to_owned(),
+        Some((only, [])) => format!("system call {only}"),
+        Some((last, rest)) => format!("system calls {} and {last}", rest.join(", ")),
+    }
+}
+
 /// Why the result of a run was not cached.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum NotCachedReason {
@@ -946,6 +958,15 @@ pub enum NotCachedReason {
         #[n(0)]
         files: Vec<ChangedRead>,
     },
+    /// The command made system calls that the tracer does not know, and the build
+    /// did not ask to cache such results with `kizz build --cache-unknown-syscalls`.
+    #[n(6)]
+    UnknownSystemCalls {
+        /// The number of each such call, as the tracer's filter saw it, sorted and
+        /// without repeats.
+        #[n(0)]
+        numbers: Vec<u32>,
+    },
 }
 
 impl fmt::Display for NotCachedReason {
@@ -967,6 +988,13 @@ impl fmt::Display for NotCachedReason {
                 f.write_str(&changed_reads_text(files, |path| {
                     path.display().to_string()
                 }))
+            },
+            Self::UnknownSystemCalls { numbers } => {
+                write!(
+                    f,
+                    "the command made {}, which the tracer does not know",
+                    system_call_numbers(numbers)
+                )
             },
         }
     }
@@ -1071,6 +1099,13 @@ pub struct StepRecord {
     /// A record with no owner is no task's entry, so no path reset changes it.
     #[n(12)]
     pub owners: BTreeSet<TaskId>,
+    /// The number of each system call that the command made and that the tracer
+    /// does not know, sorted and without repeats, whether the result was cached or
+    /// not: `kizz build --cache-unknown-syscalls` caches such a result, and without it
+    /// the record is marked with [`NotCachedReason::UnknownSystemCalls`] unless
+    /// another reason applies.
+    #[n(13)]
+    pub unknown_system_calls: Vec<u32>,
 }
 
 impl Record for StepRecord {
@@ -1262,6 +1297,7 @@ mod tests {
                 },
             ]
             .into(),
+            unknown_system_calls: vec![400, 1_000_000],
         }
     }
 
@@ -1345,6 +1381,7 @@ mod tests {
                 message: "out of memory".to_owned(),
             },
             changed_after_read(),
+            unknown_system_calls(),
         ];
         let mut reasons = vec![
             RunReason::NeverRun,
@@ -1392,6 +1429,7 @@ mod tests {
                 message: "out of memory".to_owned(),
             }),
             Some(changed_after_read()),
+            Some(unknown_system_calls()),
         ];
         for exit in exits {
             for not_cached in markers.clone() {
@@ -1508,6 +1546,11 @@ mod tests {
                     written: false,
                 }],
             },
+            unknown_system_calls(),
+            NotCachedReason::UnknownSystemCalls { numbers: vec![400] },
+            NotCachedReason::UnknownSystemCalls {
+                numbers: vec![1, 2, 3],
+            },
         ]
         .iter()
         .map(ToString::to_string)
@@ -1522,7 +1565,11 @@ mod tests {
              /p/b (something else changed it while the command ran)",
             "a file changed after the command read it: /p/in (something else changed it while \
              the command ran)",
+            "the command made system calls 400 and 1000000, which the tracer does not know",
+            "the command made system call 400, which the tracer does not know",
+            "the command made system calls 1, 2 and 3, which the tracer does not know",
         ]);
+        assert_eq!(system_call_numbers(&[]), "no system call");
     }
 
     #[test]
@@ -1537,9 +1584,9 @@ mod tests {
     #[test]
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
-        // A definite-length array of thirteen fields, then the specification as a
+        // A definite-length array of fourteen fields, then the specification as a
         // definite-length array of thirteen.
-        assert_eq!(bytes.get(..2), Some(&[0x8D, 0x8D][..]));
+        assert_eq!(bytes.get(..2), Some(&[0x8E, 0x8D][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
@@ -1562,16 +1609,18 @@ mod tests {
             ("/a\u{e9}/kizz.md", 3),
             ("/b/kizz.md", 0)
         ]);
-        // The owners are the last field, a definite-length array of three task
-        // identities, each an array of the file's bytes and the block index.
+        // The owners are the field before the unknown system calls, a
+        // definite-length array of three task identities, each an array of the
+        // file's bytes and the block index.
         let owners = minicbor::to_vec(&record.owners).unwrap();
-        assert!(bytes.ends_with(&owners));
+        let numbers = minicbor::to_vec(&record.unknown_system_calls).unwrap();
+        assert!(bytes.ends_with(&[owners.as_slice(), numbers.as_slice()].concat()));
         assert_eq!(owners.first(), Some(&0x83));
         // A record with no owner keeps an empty set.
         let mut unowned = record;
         unowned.owners.clear();
         let bytes = minicbor::to_vec(&unowned).unwrap();
-        assert_eq!(bytes.last(), Some(&0x80));
+        assert!(bytes.ends_with(&[&[0x80_u8][..], numbers.as_slice()].concat()));
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), unowned);
     }
 
@@ -1809,6 +1858,45 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// The reason of a run that made the system calls 400 and 1,000,000, which the
+    /// tracer does not know.
+    fn unknown_system_calls() -> NotCachedReason {
+        NotCachedReason::UnknownSystemCalls {
+            numbers: vec![400, 1_000_000],
+        }
+    }
+
+    /// The reason for unknown system calls encodes deterministically, as variant 6
+    /// with a definite-length array of the numbers, and round-trips, alone and as a
+    /// record's marker; the numbers of a record encode as its field 13, after the
+    /// owners, and round-trip with a marker and without one.
+    #[test]
+    fn unknown_system_calls_encode_deterministically_and_round_trip() {
+        let why = unknown_system_calls();
+        let first = minicbor::to_vec(&why).unwrap();
+        assert_eq!(first, minicbor::to_vec(why.clone()).unwrap());
+        // The variant index, then its one field: an array of 400 and 1,000,000.
+        assert_eq!(first, [
+            0x82, 0x06, 0x81, 0x82, 0x19, 0x01, 0x90, 0x1A, 0x00, 0x0F, 0x42, 0x40
+        ]);
+        assert_eq!(minicbor::decode::<NotCachedReason>(&first).unwrap(), why);
+        let numbers = minicbor::to_vec(vec![400_u32, 1_000_000]).unwrap();
+        for not_cached in [Some(why), None] {
+            let mut record = record();
+            record.not_cached = not_cached;
+            let bytes = minicbor::to_vec(&record).unwrap();
+            assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+            assert!(bytes.ends_with(&numbers));
+            let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
+            assert_eq!(decoded, record);
+            assert_eq!(decoded.unknown_system_calls, [400, 1_000_000]);
+        }
+        let mut none = record();
+        none.unknown_system_calls = Vec::new();
+        let bytes = minicbor::to_vec(&none).unwrap();
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), none);
     }
 
     /// The reason for files that changed after the command read them encodes

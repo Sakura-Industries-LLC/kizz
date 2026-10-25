@@ -6,8 +6,8 @@
 //! writer, environment values hidden without `--verbose` and shown with it, a step
 //! that writes a file and also reads it, the warning for consecutive builds, the
 //! one-line reasons, permission and owner changes, timestamp changes and the
-//! `timestamps` option, order and entries changes of listed directories, and the
-//! report of `kizz why`.
+//! `timestamps` option, order and entries changes of listed directories, system
+//! calls that the tracer does not know, and the report of `kizz why`.
 //!
 //! Each test builds a project directory and a cache in temporary directories. A
 //! build is one [`Engine`] on a store opened in the cache, and each task runs through
@@ -23,6 +23,8 @@
 //! * `probe:PATH` checks an absolute path;
 //! * `list:PATH` lists a directory;
 //! * `signal` makes a signal kill the command;
+//! * `unknown:NUMBER` reports the system call `NUMBER` as one that the tracer does not
+//!   know;
 //!
 //! and any other argument does nothing. Relative paths are relative to the step's
 //! working directory. As the Linux tracer does, the fake notes the metadata of each
@@ -30,7 +32,7 @@
 //! so `rw` and `bump` leave a result that is not cached.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs::{self, File, FileTimes},
     io,
@@ -83,6 +85,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
     first_reads.note_at(&request.program, &accesses);
     accesses.record(request.program.clone(), AccessKind::Exec);
     let mut termination = Termination::Exited(0);
+    let mut unknown = BTreeSet::new();
     let mut record = |path: PathBuf, kind: AccessKind| -> Result<(), TraceError> {
         let path = AbsolutePath::new(path).map_err(|error| tracer_failure(&error))?;
         if matches!(kind, AccessKind::Read | AccessKind::Exec) {
@@ -123,6 +126,12 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
             "probe" => record(path, AccessKind::Probe)?,
             "list" => record(path, AccessKind::List)?,
             "signal" => termination = Termination::Signaled(9),
+            "unknown" => {
+                unknown.insert(
+                    rest.parse::<u32>()
+                        .map_err(|error| tracer_failure(&error))?,
+                );
+            },
             _ => {},
         }
     }
@@ -132,6 +141,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
         accesses,
         incomplete: None,
         first_reads,
+        unknown_system_calls: unknown,
     })
 }
 
@@ -315,15 +325,18 @@ impl Fixture {
     }
 
     /// Run one build with `tracer`: each task with its steps, in order, in
-    /// `passes` passes, finishing each task run as succeeded.
+    /// `passes` passes, finishing each task run as succeeded; the engine caches the
+    /// results of runs that made unknown system calls when `cache_unknown` is set.
     fn build_passes(
         &self,
         tracer: &FakeTracer,
         tasks: &[(&TaskIdentity, &[&StepSpec])],
         passes: usize,
+        cache_unknown: bool,
     ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None)
+            .with_cache_unknown_system_calls(cache_unknown);
         let mut decisions = Vec::new();
         for _ in 0..passes {
             for (identity, steps) in tasks {
@@ -351,7 +364,7 @@ impl Fixture {
         tracer: &FakeTracer,
         tasks: &[(&TaskIdentity, &[&StepSpec])],
     ) -> TestResult<Built> {
-        self.build_passes(tracer, tasks, 1)
+        self.build_passes(tracer, tasks, 1, false)
     }
 
     /// The renderer of the project, verbose or not.
@@ -1310,7 +1323,7 @@ fn why_reports_the_most_recent_build_of_each_step() -> TestResult {
     first.ignore = vec!["*.tmp".to_owned()];
     let second = fixture.step(&["tool", "second"])?;
 
-    let built = fixture.build_passes(&tracer, &[(&task, &[&first, &second])], 2)?;
+    let built = fixture.build_passes(&tracer, &[(&task, &[&first, &second])], 2, false)?;
     assert_eq!(built.verdict(1, 0)?, &Verdict::Cached);
     assert_eq!(
         fixture.why(false)?,
@@ -1408,4 +1421,64 @@ fn explanations_render_every_reason_in_order() {
     assert_eq!(render.full(&Verdict::Ran(Explanation::default())), [
         "ran because:"
     ]);
+}
+
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// `tool unknown:1000000 unknown:400` once, with the lines `reasons` and the line of
+/// the two system calls that the tracer does not know.
+fn why_for_unknown_system_calls(reasons: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool unknown:1000000 unknown:400`
+{reasons}
+    untracked /proc and /sys accesses: none
+    system calls that the tracer does not know: 400, 1000000
+    ignored accesses: 0
+"
+    )
+}
+
+/// A run that made system calls that the tracer does not know is not cached
+/// without the option: the next build runs the step again, and its full reasons,
+/// its one-line reason and `kizz why` name each number, and `kizz why` lists them on
+/// a line of their own. With the option, the result is cached: `kizz why` still
+/// lists the numbers, and a later build without the option is a cache hit.
+#[test]
+fn unknown_system_calls_are_explained() -> TestResult {
+    let fixture = Fixture::new()?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let step = fixture.step(&["tool", "unknown:1000000", "unknown:400"])?;
+    fixture.build(&tracer, &[(&task, &[&step])])?;
+
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    let reason = "the previous run could not be cached: the command made system calls 400 and \
+                  1000000, which the tracer does not know";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {reason}")])
+    );
+    assert_eq!(fixture.render(false).one_line(built.verdict(0, 0)?), reason);
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_unknown_system_calls(&format!("    ran because:\n      {reason}"))
+    );
+    assert_eq!(tracer.runs(), 2);
+
+    // With the option, the run is cached, and its record still lists the numbers.
+    let built = fixture.build_passes(&tracer, &[(&task, &[&step])], 1, true)?;
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {reason}")])
+    );
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_unknown_system_calls("    cached: no recorded input changed")
+    );
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
 }

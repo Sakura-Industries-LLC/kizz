@@ -38,6 +38,6 @@ pub use step::{
     AccessBits, Attribute, Attributes, Capture, Change, ChangedRead, ContentHash, Difference,
     DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, NotCachedReason, Observation, Owner,
     PERMISSION_BITS, PathState, ProgramPath, RecordedOutput, RunReason, SpecialKind, StepExit,
-    StepRecord, StepSpecRecord, Times, changed_reads_text, permission_bits,
+    StepRecord, StepSpecRecord, Times, changed_reads_text, permission_bits, system_call_numbers,
 };
 pub use store::{DATABASE_DIR, EntryCounts, Inventory, SCHEMA_VERSION, Store, StoreError, Txn};

@@ -34,8 +34,8 @@
 # once, such as linux/getxattrat or linux/file_getattr+file_setattr.
 # The gated calls are file_getattr, getxattrat, listxattrat, setxattrat, removexattrat and file_setattr, which
 # Linux 6.13 and 6.17 added, so a kernel that runs the test may lack them.
-# coverage.c first makes each with arguments that cannot succeed, prints whether the kernel has it, and makes a
-# group's calls only where the kernel has every call that its mark names.
+# coverage.c first makes each with arguments that cannot succeed, prints whether it is available, and makes a
+# group's calls only where every call that its mark names is available.
 # An entry is expected where its platform is current and every call that its mark names is available; where a
 # call is unavailable, nothing may be recorded at the paths of the entries that name it.
 # Only the entries of the gated calls' groups carry a mark, and each entry with a source of a gated call names it.

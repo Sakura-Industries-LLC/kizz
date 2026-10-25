@@ -6,8 +6,10 @@
 //!
 //! [`LinuxTracer`] implements the tracer interface of `kizz_trace` with `ptrace` and
 //! a seccomp-bpf filter that stops a traced process only for the system calls that
-//! touch the file system, [`TRACKED_SYSTEM_CALLS`], and lets every other call run at
-//! full speed. Only the `kizz` binary wires it in.
+//! touch the file system, [`TRACKED_SYSTEM_CALLS`], those that make the trace
+//! incomplete, [`UNTRACEABLE_SYSTEM_CALLS`], and the native calls outside the table
+//! that it knows, [`KNOWN_SYSTEM_CALLS`], and lets every other call run at full
+//! speed. Only the `kizz` binary wires it in.
 //!
 //! The tracer traces only the processes it starts itself: the child requests
 //! tracing with `PTRACE_TRACEME` before it runs the program, and the tracer follows
@@ -20,6 +22,15 @@
 //! result after it returns, and reports every path the tree touched as an absolute
 //! path with its combined access kinds. Successful and failed calls are recorded
 //! alike: a failed call, including a lookup that found nothing, is a probe.
+//!
+//! A process that makes one of [`UNTRACEABLE_SYSTEM_CALLS`], which can change what a
+//! path means or use a path in a way that the tracer does not record, marks the run
+//! as incompletely traced when it makes the call, whether or not the call succeeds,
+//! with a reason that names the process and the call; `clone`, `clone3` and
+//! `unshare` count only with `CLONE_NEWNS`, and `setns` only when it can enter a
+//! mount namespace. A native system call outside [`KNOWN_SYSTEM_CALLS`] leaves the
+//! trace complete: the tracer reports its number in the result's unknown system
+//! calls. Either call then runs unchanged.
 //!
 //! At the exit of a successful call that opens a regular file for reading or runs
 //! one, the tracer also notes the file's metadata as its first read, unless the
@@ -60,7 +71,9 @@ use std::{
     time::Duration,
 };
 
-pub use filter::{TRACKED_SYSTEM_CALLS, TrackedSystemCall};
+pub use filter::{
+    KNOWN_SYSTEM_CALLS, TRACKED_SYSTEM_CALLS, TrackedSystemCall, UNTRACEABLE_SYSTEM_CALLS,
+};
 use kizz_trace::{
     Accesses, Cancellation, EchoSink, ExtendedAttributes, FirstReads, OutputStream, RunRequest,
     RunResult, TraceError, Tracer,
@@ -292,17 +305,27 @@ impl Tracer for LinuxTracer {
             .map_err(|error| tracer_error("could not follow the traced processes", error))?;
         let streams = supervised.streams?;
         supervised.fed?;
-        let (termination, accesses, incomplete, first_reads) = outcome.map_or_else(
-            || (None, Accesses::new(), None, FirstReads::new()),
-            |outcome| {
-                (
-                    outcome.termination,
-                    outcome.accesses,
-                    outcome.incomplete,
-                    outcome.first_reads,
-                )
-            },
-        );
+        let (termination, accesses, incomplete, first_reads, unknown_system_calls) = outcome
+            .map_or_else(
+                || {
+                    (
+                        None,
+                        Accesses::new(),
+                        None,
+                        FirstReads::new(),
+                        BTreeSet::new(),
+                    )
+                },
+                |outcome| {
+                    (
+                        outcome.termination,
+                        outcome.accesses,
+                        outcome.incomplete,
+                        outcome.first_reads,
+                        outcome.unknown_system_calls,
+                    )
+                },
+            );
         if let Some(failure) = spawn::read_failure(report_read)
             .map_err(|error| tracer_error("could not read the failure pipe", error))?
         {
@@ -320,6 +343,7 @@ impl Tracer for LinuxTracer {
             accesses,
             incomplete,
             first_reads,
+            unknown_system_calls,
         })
     }
 

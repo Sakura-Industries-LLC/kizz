@@ -1,4 +1,5 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
+set dotenv-load
 
 spelling_dictionary := ".config/dictionaries/project.dic"
 

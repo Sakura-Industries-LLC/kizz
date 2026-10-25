@@ -18,6 +18,7 @@ Deque
 dirfd
 dntls
 DONT
+dotenv
 DUPFD
 EACCES
 EBADF
@@ -58,6 +59,7 @@ fchmod
 fchmodat
 fchown
 fchownat
+fchroot
 fcntl
 FDCWD
 fgetxattr
@@ -66,7 +68,11 @@ flistxattr
 fopen
 fprog
 fremovexattr
+fsconfig
 fsetxattr
+fsmount
+fsopen
+fspick
 fstat
 fstatat
 fstatfs
@@ -76,6 +82,7 @@ getattr
 getdents
 geteuid
 GETEVENTMSG
+GETFMT
 gethostname
 getpgrp
 getpid
@@ -121,6 +128,9 @@ mknod
 mknodat
 mmap
 newfstatat
+NEWNET
+NEWNS
+NEWUTS
 nlink
 nocapture
 NOCTTY
@@ -134,6 +144,7 @@ openpt
 phentsize
 phnum
 phoff
+pidfd
 pids
 pipefail
 pointee
@@ -143,7 +154,9 @@ projid
 pthread
 ptrace
 ptsname
+QCMD
 quic
+quotactl
 RDONLY
 RDWR
 readlink
@@ -159,6 +172,7 @@ retarget
 retargeted
 rgignore
 Riker
+rseq
 rsplit
 rumdl
 RUSTDOCFLAGS
@@ -170,6 +184,7 @@ SEGV
 setattr
 setext
 SETMASK
+setns
 SETOPTIONS
 setpgid
 SETSIGMASK
@@ -179,6 +194,7 @@ sigaction
 sigaddset
 SIGCHLD
 sigemptyset
+SIGHAND
 sighandler
 siginfo
 sigmask
@@ -193,6 +209,8 @@ Starlark
 statfs
 statx
 SurrealKV
+swapoff
+swapon
 symlinkat
 SYSCALL
 syscalls
@@ -217,7 +235,10 @@ uninit
 unlinkat
 unlockpt
 untrackable
+uprobe
 uring
+uselib
+USRQUOTA
 utime
 utimensat
 utimes

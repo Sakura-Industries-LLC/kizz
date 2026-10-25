@@ -73,7 +73,7 @@ use std::{
 use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, FileMetadata};
 use libc::{c_int, c_long};
 
-use crate::filter::numbers;
+use crate::filter::{UNTRACEABLE_SYSTEM_CALLS, numbers};
 
 /// The six argument registers of a system call, in order.
 pub(crate) type Arguments = [u64; 6];
@@ -1836,6 +1836,60 @@ pub(crate) fn enter(
         });
     }
     Some(decoder.call)
+}
+
+/// The size of the `flags` field at the start of `struct clone_args`, the first
+/// argument of `clone3`.
+const CLONE_ARGS_FLAGS_SIZE: usize = 8;
+
+/// Whether the call `number`, one of [`UNTRACEABLE_SYSTEM_CALLS`], with
+/// `arguments`, marks the run as incompletely traced, and if so what the process
+/// made, for the reason, with the call's name in backticks.
+///
+/// `clone` and `unshare` mark the run only with `CLONE_NEWNS` in their flags, and
+/// `setns` only when it can enter a mount namespace: with a namespace type of 0, or
+/// one that includes `CLONE_NEWNS`. For `clone3` the tracer reads the flags at the
+/// start of its `struct clone_args` from the thread's memory, and marks the run
+/// when they include `CLONE_NEWNS` or cannot be read. Every other call marks the
+/// run. Returns `None` for a call that does not mark it, and for a number that is
+/// not in the list.
+pub(crate) fn untraceable(
+    number: c_long,
+    arguments: Arguments,
+    inspect: &(impl Inspect + ?Sized),
+) -> Option<String> {
+    let call = UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .find(|call| call.number == number)?;
+    let new_namespace = flag(libc::CLONE_NEWNS);
+    let flagged = || format!("made `{}` with `CLONE_NEWNS`", call.name);
+    match number {
+        libc::SYS_clone | libc::SYS_unshare => (arguments[0] & new_namespace != 0).then(flagged),
+        libc::SYS_setns => {
+            let namespace = int(arguments[1]);
+            (namespace == 0 || flag(namespace) & new_namespace != 0)
+                .then(|| "made `setns`, which can enter a mount namespace".to_owned())
+        },
+        libc::SYS_clone3 => {
+            let mut bytes = [0_u8; CLONE_ARGS_FLAGS_SIZE];
+            let unreadable = |problem: &str| {
+                Some(format!(
+                    "made `clone3`, whose flags the tracer could not read: {problem}"
+                ))
+            };
+            if arguments[0] == 0 {
+                return unreadable("its `struct clone_args` is null");
+            }
+            match read_memory(inspect, arguments[0], &mut bytes, false) {
+                Ok(CLONE_ARGS_FLAGS_SIZE) => {
+                    (u64::from_le_bytes(bytes) & new_namespace != 0).then(flagged)
+                },
+                Ok(_) => unreadable("its `struct clone_args` ends early"),
+                Err(problem) => unreadable(&problem),
+            }
+        },
+        _ => Some(format!("made `{}`", call.name)),
+    }
 }
 
 /// Unit tests of the decoding of every tracked call, with a fake thread.
@@ -4246,6 +4300,153 @@ mod tests {
                     case.arguments
                 );
             }
+        }
+    }
+
+    /// The address of a `struct clone_args` whose flags ask for a new mount
+    /// namespace.
+    const CLONE_ARGS_NEW_NAMESPACE: u64 = 0x2_0000;
+    /// The address of a `struct clone_args` whose flags ask for a thread, without a
+    /// new mount namespace.
+    const CLONE_ARGS_THREAD: u64 = 0x2_1000;
+    /// The address of the last four bytes of a region, too few for the flags of a
+    /// `struct clone_args`.
+    const CLONE_ARGS_SHORT: u64 = 0x2_2000;
+
+    /// The fake thread with the `struct clone_args` regions of the `clone3` tests:
+    /// the 64 bytes of `CLONE_ARGS_SIZE_VER0`, with `flags` first.
+    fn clone3_thread() -> Fake {
+        let clone_args = |flags: c_int| {
+            let mut bytes = flag(flags).to_le_bytes().to_vec();
+            bytes.resize(64, 0);
+            bytes
+        };
+        let mut fake = Fake::new();
+        fake.memory.insert(
+            CLONE_ARGS_NEW_NAMESPACE,
+            clone_args(libc::CLONE_NEWNS | libc::CLONE_NEWUTS),
+        );
+        fake.memory.insert(
+            CLONE_ARGS_THREAD,
+            clone_args(libc::CLONE_VM | libc::CLONE_FS | libc::CLONE_FILES | libc::CLONE_THREAD),
+        );
+        fake.memory.insert(CLONE_ARGS_SHORT, vec![0; 4]);
+        fake
+    }
+
+    /// The arguments `values`, padded with zeros to six.
+    fn padded(values: &[u64]) -> Arguments {
+        let mut arguments = [0; 6];
+        for (slot, value) in arguments.iter_mut().zip(values) {
+            *slot = *value;
+        }
+        arguments
+    }
+
+    /// Whether `call` with `values`, in the clone3 thread, marks the run, and what
+    /// it says the process made.
+    fn judged(
+        call: &str,
+        values: &[u64],
+    ) -> Option<String> {
+        let number = crate::UNTRACEABLE_SYSTEM_CALLS
+            .iter()
+            .find(|untraceable| untraceable.name == call)
+            .unwrap()
+            .number;
+        untraceable(number, padded(values), &clone3_thread())
+    }
+
+    /// Each call that can change what a path means, or that uses a path in a way the
+    /// tracer does not record, marks the run with arguments that make it do so,
+    /// whatever else they hold, and the reason names the call in backticks.
+    #[test]
+    fn each_untraceable_call_marks_the_run() {
+        let new_namespace = flag(libc::CLONE_NEWNS);
+        let child_signal = flag(libc::SIGCHLD);
+        for call in crate::UNTRACEABLE_SYSTEM_CALLS {
+            let cases: Vec<Vec<u64>> = match call.name {
+                "clone" => {
+                    vec![vec![new_namespace | child_signal], vec![
+                        new_namespace,
+                        0x10,
+                    ]]
+                },
+                "unshare" => {
+                    vec![vec![new_namespace], vec![
+                        new_namespace | flag(libc::CLONE_FILES),
+                    ]]
+                },
+                "setns" => vec![vec![3, 0], vec![3, new_namespace], vec![CWD, 0]],
+                "clone3" => vec![vec![CLONE_ARGS_NEW_NAMESPACE, 64]],
+                _ => vec![Vec::new(), vec![REL], vec![CLOSED, ABS, CWD, u64::MAX]],
+            };
+            for values in cases {
+                let made = judged(call.name, &values);
+                let named = format!("`{}`", call.name);
+                assert!(
+                    made.as_ref().is_some_and(|made| made.contains(&named)),
+                    "{} {values:?}: {made:?}",
+                    call.name
+                );
+            }
+        }
+        assert_eq!(judged("chroot", &[REL]), Some("made `chroot`".to_owned()));
+        assert_eq!(
+            judged("clone", &[new_namespace]),
+            Some("made `clone` with `CLONE_NEWNS`".to_owned())
+        );
+        assert_eq!(
+            judged("setns", &[3, 0]),
+            Some("made `setns`, which can enter a mount namespace".to_owned())
+        );
+    }
+
+    /// `clone`, `clone3` and `unshare` without `CLONE_NEWNS`, and `setns` with another
+    /// namespace type, do not mark the run.
+    #[test]
+    fn calls_without_a_new_mount_namespace_do_not_mark_the_run() {
+        let child_signal = flag(libc::SIGCHLD);
+        for (call, values) in [
+            ("clone", vec![child_signal]),
+            ("clone", vec![flag(
+                libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_NEWUTS,
+            )]),
+            ("clone3", vec![CLONE_ARGS_THREAD, 64]),
+            ("unshare", vec![flag(libc::CLONE_FILES)]),
+            ("unshare", vec![0]),
+            ("setns", vec![3, flag(libc::CLONE_NEWUTS)]),
+            ("setns", vec![3, flag(libc::CLONE_NEWNET)]),
+        ] {
+            assert_eq!(judged(call, &values), None, "{call} {values:?}");
+        }
+    }
+
+    /// `clone3` marks the run when the tracer cannot read the flags of its
+    /// `struct clone_args`: a null or unmapped pointer, or memory that ends before
+    /// the flags do.
+    #[test]
+    fn clone3_whose_flags_cannot_be_read_marks_the_run() {
+        for address in [0, UNMAPPED, CLONE_ARGS_SHORT] {
+            let made = judged("clone3", &[address, 64]).unwrap_or_default();
+            assert!(
+                made.starts_with("made `clone3`, whose flags the tracer could not read: "),
+                "{address:#x}: {made}"
+            );
+        }
+    }
+
+    /// A number that is not in the list of calls that mark a run, such as a tracked
+    /// call or another known call, is not judged.
+    #[test]
+    fn other_numbers_are_not_untraceable() {
+        let fake = clone3_thread();
+        for number in [libc::SYS_openat, libc::SYS_read, libc::SYS_getpid, 400] {
+            assert_eq!(
+                untraceable(number, padded(&[REL, 0]), &fake),
+                None,
+                "{number}"
+            );
         }
     }
 }

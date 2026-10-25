@@ -22,6 +22,7 @@
 //! Relative paths are relative to the project directory.
 
 use std::{
+    collections::BTreeSet,
     error::Error,
     fs,
     os::unix::fs::{PermissionsExt as _, symlink},
@@ -100,6 +101,7 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
         accesses,
         incomplete: None,
         first_reads,
+        unknown_system_calls: BTreeSet::new(),
     })
 }
 

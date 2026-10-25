@@ -19,6 +19,9 @@ The Justfile holds the commands, written out directly; kizz does not use Moon.
 
 `just fix-ci` is the quality gate: run it from the worktree after your last edit, and it must pass.
 
+The Justfile loads a `.env` file beside it if there is one; it holds one machine's settings, so never commit it.
+If a seccomp filter refuses calls before kizz's tracer sees them, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` there skips their checks.
+
 ## Rules
 
 * Every Rust source file, `build.rs` and tests included, starts with this header, above any `//!` documentation:

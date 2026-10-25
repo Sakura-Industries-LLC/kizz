@@ -54,7 +54,7 @@ These decisions came out of the review of the original outline.
 | Directory listings | Directory listings are dependencies, including the order in which the file system returns the entries. |
 | Explanations | Kizz says exactly why it ran each command and which things changed. |
 | Hermeticity | Not a goal. The goal is fast, cacheable, reliable builds without hand-written dependency lists, which nobody can maintain accurately. |
-| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. |
+| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. A system call that the tracer does not know makes the result not cached unless `kizz build --cache-unknown-syscalls` is given, and kizz warns about it either way. |
 | Tool awareness | None. Tool caches are tracked at file level like any other files. A tool that makes itself uncacheable is uncacheable, and kizz reports exactly why, for example that a command keeps writing a file and consuming it as an input. Users may ignore a file, glob, or regular expression, or a set of them; kizz never adds such exceptions itself. Users drive exceptions, not dependencies. |
 | Inputs | Anything read during the build is an input. To exclude a file, stop the tool from reading it, or add an exception. Kizz itself stays oblivious. |
 | Change detection | Different size: changed. Same size and same metadata: unchanged. Same size but different metadata: maybe changed, so compare hashes. A different type, permission bits or owner is always a change, whatever the content. A command run with `timestamps = True` also counts a different timestamp as a change. |
@@ -165,6 +165,8 @@ Version 1 implements these commands:
   Without a target, `kizz build` exits with an error that lists the available targets.
   A build tries every task, even after a failure, and `--explain` prints the full reason for every command, cached ones included.
   `--sequential`, the default, runs one task at a time; `--parallel` exits with an error until parallel execution exists.
+  `--cache-unknown-syscalls` caches the results of commands that made a system call that the tracer does not know,
+  which are not cached by default; kizz warns about them either way (see [The Linux tracer](#the-linux-tracer)).
 * `kizz why [path]` prints why each command ran or was cached in the most recent build,
   for tasks under `path`, which defaults to the current directory.
 * `kizz list [targets]` lists discovered tasks with their file, line, name and targets, plus any discovery warnings.
@@ -393,7 +395,8 @@ Nothing in the core changes when the tracer does.
 ### The Linux tracer
 
 * It uses `ptrace` with a seccomp-bpf filter in front.
-  The filter stops the process only for system calls that touch the file system and lets everything else run at full speed.
+  The filter stops the process only for system calls that touch the file system or that the tracer does not know,
+  and lets everything else run at full speed.
   Seccomp alone cannot read path arguments or see results, so `ptrace` reads the path at entry and the result at exit.
 * It follows the whole process tree, including threads, forks and `exec`,
   and the traced processes are killed if kizz dies (`PTRACE_O_EXITKILL`).
@@ -444,6 +447,35 @@ Setting or removing an attribute is a write.
 `file_getattr` and `name_to_handle_at` record a probe, and so do `inotify_add_watch` and `fanotify_mark`, which watch a path.
 `file_setattr` is a write; the file attributes that `file_getattr` returns, such as the immutable flag, are not compared.
 `statfs` and `fstatfs` record a probe; the figures they return, such as free space, are not compared.
+
+System calls that mark the run as incompletely traced, by x86_64 name:
+
+* opening by handle: `open_by_handle_at`
+* changing the root: `chroot`, `fchroot` and `pivot_root`
+* mounting: `mount`, `umount2`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
+  `open_tree_attr` and `mount_setattr`
+* mount namespaces: `unshare`, `setns`, `clone` and `clone3`
+* other uses of a path: `uselib`, `acct`, `quotactl`, `quotactl_fd`, `swapon` and `swapoff`
+
+The first four groups can change what a path means, so the paths kizz recorded may not be the ones the command used.
+The last group uses a path in ways that kizz does not record: loading a library, writing process accounting,
+and managing disk quotas or swap space.
+A process that makes one of them marks the run when it makes the call, whether or not the call succeeds.
+`unshare`, `clone` and `clone3` count only with the flag for a new mount namespace, `CLONE_NEWNS`,
+and `setns` only when it can enter a mount namespace: with that flag, or with no namespace type.
+The result is not cached, and kizz warns loudly and names the call.
+
+The tracer knows the native system calls of the x86_64 table of Linux 7.3, numbers 0 through 336 and 424 through 472.
+Those that this section does not name run without a stop,
+so a file-system operation that none of the named calls makes is not recorded.
+Any other native number is an unknown system call, which a newer kernel may have given a meaning the tracer cannot judge.
+The filter stops for it, and the tracer reports its number when a process makes it, then lets the call run.
+By default, a run that makes an unknown system call is treated as incompletely traced: its result is not cached.
+`kizz build --cache-unknown-syscalls` caches such a result anyway.
+Either way, kizz warns loudly when the command runs, naming the command and each unknown call by number,
+and repeats the warning in the summary; `kizz why` lists the unknown calls of each step that made any.
+The option is not part of the step key, so a result cached with it is reused by later builds with or without it,
+until something that the step recorded changes.
 
 ### What is recorded
 
@@ -629,6 +661,7 @@ Hashing uses BLAKE3, multi-threaded for large files.
 
 * Commands killed by a signal, including interrupted commands.
 * Runs that the tracer reports as incompletely traced.
+* Runs that made a system call that the tracer does not know, unless `kizz build --cache-unknown-syscalls` is given.
 * Runs in which a file changed after the command first read it or ran it.
   The explanation names each such file and says whether the command itself wrote it.
 * Commands that could not start for a reason other than a missing or non-executable program.
@@ -703,6 +736,7 @@ and the user can decide whether to add an ignore pattern.
 `kizz build` prints a one-line reason for each command it runs, and `--explain` prints the full reasons.
 `kizz why` prints the reasons stored by the most recent build.
 `kizz why` also lists each step's untracked `/proc` and `/sys` accesses, so the user can decide whether any should be tracked.
+It also lists the system calls that a step made and that the tracer does not know, when there are any.
 
 ## Order of execution
 
@@ -1063,6 +1097,8 @@ Depends on phases 7 and 8.
   It compares the step that `coverage-test` recorded with the expectation file.
 * A `coverage-changes` task runs the program in modes that read or run a file and then rewrite it,
   one for each way in which a command first reads a file, and in a mode that writes a file before it reads it.
+* A `coverage-incomplete` task runs the program once for each system call that marks a run as incompletely traced,
+  and once for each of two numbers that the tracer does not know, 400 and 1,000,000.
 
 Acceptance, end to end with the real tracer and a temporary cache:
 
@@ -1073,6 +1109,8 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * Each tracked system call has an expected entry that a tracer missing that call would record differently.
 * Each step of `coverage-changes` that rewrites a file it read is not cached, and the reason names the file.
 * The step that writes its file before it reads it is cached.
+* Each step of `coverage-incomplete` is not cached, with a reason that names its system call or number.
+* With `kizz build --cache-unknown-syscalls`, the steps of the two numbers are cached and their records list them.
 
 ## Testing
 
@@ -1084,12 +1122,16 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * The tracer conformance test of phase 10 needs a C compiler, `cc`, where the tests run.
   Every tracer must pass it: the x86_64 Linux tracer now, and any later one, for aarch64, macOS or Windows.
   Calls that only some platforms have are compiled only there, and their expected entries name those platforms.
-  Calls that a kernel may lack because a newer Linux added them are checked only where the kernel has them.
-  They are `file_getattr`, `file_setattr` and the `xattrat` calls.
-  The program first makes each one with arguments that cannot succeed, and `ENOSYS` means that the kernel lacks it.
-  Their expected entries name the call they need, and where the kernel has it they are required like every other entry.
-  Where it lacks the call, nothing may be recorded at their paths, and the test prints a notice that names the call.
+  Calls that a kernel may lack because a newer Linux added them are checked only where they are available.
+  They are `file_getattr`, `file_setattr`, the `xattrat` calls, `open_tree_attr` and `fchroot`.
+  The program first makes each one with arguments that cannot succeed, and a call that returns `ENOSYS` is unavailable.
+  `ENOSYS` means that the kernel lacks the call, or that a seccomp filter installed before kizz's own refuses it.
+  Their expected entries name the call they need, and where it is available they are required like every other entry.
+  Where it is unavailable, nothing may be recorded at their paths, and the test prints a notice that names the call.
+  A `coverage-incomplete` step whose call is unavailable need not be marked as incompletely traced.
   The `kizz-trace-linux` tests check these calls the same way; every other call is required on every kernel.
+  A seccomp filter installed before kizz's own can refuse a call before the tracer sees it, and then the test of that call fails.
+  If that call marks a run or is unknown, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` makes the test skip it with a notice.
   On Linux the tests also need a temporary directory on a file system with `user.` extended attributes and file handles.
 
 ## Open questions

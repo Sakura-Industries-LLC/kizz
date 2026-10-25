@@ -69,8 +69,12 @@ const WIPED_DIR: &str = "db.wiped";
 /// the xattr access bit, the extended attributes recorded with a path whose
 /// attributes the command read or listed, each name with a hash of its value, for
 /// the path and, for a symbolic link, for what it points to, and the change that
-/// lists the attributes that appeared, disappeared, or changed.
-pub const SCHEMA_VERSION: u32 = 13;
+/// lists the attributes that appeared, disappeared, or changed. Version 14 adds the
+/// numbers of the system calls that a command made and that the tracer does not
+/// know to every step record, whether or not its result was cached, and the reason
+/// for a run that made such calls, which, like the other reasons a run's result is
+/// not cached, marks a record that is never a cache hit.
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -626,11 +630,11 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 13 adds extended attributes to recorded states and the change that
-    /// names them, one more than version 12, which added the reason for files that
-    /// changed after the command read them.
+    /// Version 14 adds the unknown system calls of a run to step records and the
+    /// reason for a run that made them, one more than version 13, which added
+    /// extended attributes to recorded states.
     #[test]
-    fn schema_version_13_records_extended_attributes() {
-        assert_eq!(SCHEMA_VERSION, 13);
+    fn schema_version_14_records_unknown_system_calls() {
+        assert_eq!(SCHEMA_VERSION, 14);
     }
 }

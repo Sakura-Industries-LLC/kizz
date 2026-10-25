@@ -92,12 +92,22 @@ fn help_lists_every_subcommand() {
 
     let build = kizz(&["build", "--help"]).unwrap();
     assert_eq!(build.status, Some(0), "{build:?}");
-    for option in ["--explain", "--sequential", "--parallel", "TARGETS"] {
+    for option in [
+        "--explain",
+        "--cache-unknown-syscalls",
+        "--sequential",
+        "--parallel",
+        "TARGETS",
+    ] {
         assert!(
             build.stdout.contains(option),
             "build --help lacks {option}: {build:?}"
         );
     }
+    assert!(
+        build.stdout.contains("does not know"),
+        "build --help does not describe --cache-unknown-syscalls: {build:?}"
+    );
 
     let reset = kizz(&["cache", "reset", "--help"]).unwrap();
     assert_eq!(reset.status, Some(0), "{reset:?}");

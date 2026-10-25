@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The report of `kizz why`: the reasons stored by the most recent build for the
-//! tasks under a path, with each step's untracked `/proc` and `/sys` accesses and how
-//! many accesses it ignored.
+//! tasks under a path, with each step's untracked `/proc` and `/sys` accesses, the
+//! system calls it made that the tracer does not know, and how many accesses it
+//! ignored.
 //!
 //! The tasks under a directory are the task records whose `kizz.md` is under it; a
 //! path that names a file selects the tasks of that file. Among those, the most
@@ -40,6 +41,9 @@ pub struct WhyStep {
     pub untracked: Vec<(PathBuf, AccessBits)>,
     /// The number of accesses that ignore patterns left out.
     pub ignored: u64,
+    /// The numbers of the system calls that the step's command made and that the
+    /// tracer does not know, sorted, as its record lists them.
+    pub unknown_system_calls: Vec<u32>,
 }
 
 impl WhyStep {
@@ -169,8 +173,8 @@ fn step(
     position: u32,
     stored: StepPosition,
 ) -> WhyStep {
-    let (argv, untracked, ignored) = record.map_or_else(
-        || (None, Vec::new(), 0),
+    let (argv, untracked, ignored, unknown_system_calls) = record.map_or_else(
+        || (None, Vec::new(), 0, Vec::new()),
         |record| {
             let untracked = record
                 .observations
@@ -178,7 +182,12 @@ fn step(
                 .filter(|observation| observation.state == PathState::Untracked)
                 .map(|observation| (observation.path.clone(), observation.access))
                 .collect();
-            (Some(record.spec.argv), untracked, record.ignored)
+            (
+                Some(record.spec.argv),
+                untracked,
+                record.ignored,
+                record.unknown_system_calls,
+            )
         },
     );
     WhyStep {
@@ -188,13 +197,15 @@ fn step(
         argv,
         untracked,
         ignored,
+        unknown_system_calls,
     }
 }
 
 impl Render {
     /// The report of `kizz why` as text: each task with its targets, and each step
     /// with its command, its full reasons, its untracked `/proc` and `/sys` accesses,
-    /// and how many accesses it ignored.
+    /// on a line of their own the system calls it made that the tracer does not
+    /// know, when there are any, and how many accesses it ignored.
     #[must_use]
     pub fn why(
         &self,
@@ -237,6 +248,17 @@ impl Render {
                         .map(|line| format!("    {line}")),
                 );
                 lines.push(format!("    {}", self.untracked(&step.untracked)));
+                if !step.unknown_system_calls.is_empty() {
+                    let numbers: Vec<String> = step
+                        .unknown_system_calls
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                    lines.push(format!(
+                        "    system calls that the tracer does not know: {}",
+                        numbers.join(", ")
+                    ));
+                }
                 lines.push(format!("    ignored accesses: {}", step.ignored));
             }
         }

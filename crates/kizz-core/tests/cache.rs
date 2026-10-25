@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Cache checks, replay, `always` steps, and results that are not cached, with a fake
-//! tracer and real files.
+//! Cache checks, replay, `always` steps, results that are not cached, and runs that
+//! made system calls that the tracer does not know, with a fake tracer and real
+//! files.
 //!
 //! Each test builds a project directory and a cache in temporary directories and
 //! opens the store in that cache. A build is one [`Engine`]: a test runs a build,
@@ -16,7 +17,7 @@
 //! hour in the past, so the two-second rule does not hash them.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs::{self, File, FileTimes},
     io,
@@ -29,7 +30,7 @@ use std::{
 
 use kizz_core::{
     Engine, PrintSink, ProgramHash, StepExecutor, StepOutcome, StepSpec, TaskInfo, TaskProgram,
-    observe::listing, parse_tasks, step_key,
+    UnknownCalls, observe::listing, parse_tasks, step_key,
 };
 use kizz_store::{
     AccessBits, Attribute, Attributes, Change, ContentHash, Difference, DirEntry, EntryKind,
@@ -215,6 +216,7 @@ fn finished(
         accesses,
         incomplete: None,
         first_reads,
+        unknown_system_calls: BTreeSet::new(),
     })
 }
 
@@ -377,14 +379,40 @@ impl Fixture {
         cancel: Cancellation,
         steps: &[&StepSpec],
     ) -> TestResult<Built> {
+        self.build_engine(tracer, cancel, false, steps)
+    }
+
+    /// Run `steps` in one build with `tracer`, whose engine caches the results of
+    /// runs that made system calls that the tracer does not know, as
+    /// `kizz build --cache-unknown-syscalls` asks.
+    fn build_caching_unknown(
+        &self,
+        tracer: &FakeTracer,
+        steps: &[&StepSpec],
+    ) -> TestResult<Built> {
+        self.build_engine(tracer, Cancellation::new(), true, steps)
+    }
+
+    /// Run `steps` in one build, a new engine with `tracer` and `cancel` that
+    /// caches the results of runs with unknown system calls when `cache_unknown` is
+    /// set, as one run of a task, and return what the build returned.
+    fn build_engine(
+        &self,
+        tracer: &FakeTracer,
+        cancel: Cancellation,
+        cache_unknown: bool,
+        steps: &[&StepSpec],
+    ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None);
+        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None)
+            .with_cache_unknown_system_calls(cache_unknown);
         let task = engine.task(PROGRAM, self.dir()?);
         let results = steps.iter().map(|step| task.execute(step)).collect();
         let built = Built {
             results,
             hashed: engine.files_hashed(),
             not_cached: engine.not_cached(),
+            unknown: engine.unknown_system_calls(),
         };
         drop(task);
         drop(engine);
@@ -431,6 +459,8 @@ struct Built {
     hashed: u64,
     /// The steps whose results were not cached.
     not_cached: Vec<(StepKey, NotCachedReason)>,
+    /// The runs that made system calls that the tracer does not know.
+    unknown: Vec<UnknownCalls>,
 }
 
 impl Built {
@@ -1208,8 +1238,9 @@ fn show(
 
 /// A tracer whose runs read `outcome` in the project and end as it says: `signal`,
 /// `interrupt` (a signal stops the command), `handled` (the command handles the
-/// interrupt and exits with code 130), `incomplete`, `start`, or anything else for
-/// exit status 0.
+/// interrupt and exits with code 130), `incomplete`, `start`, `unknown` (the command
+/// makes the system calls 1,000,000 and 400, which the tracer does not know, and
+/// 400 again), `incomplete-unknown` (both), or anything else for exit status 0.
 fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
     FakeTracer::new(move |request| {
         let text = fs::read_to_string(&outcome).map_err(|error| tracer_failure(&error))?;
@@ -1228,10 +1259,13 @@ fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
             });
         }
         let mut result = finished(request, &accesses, termination)?;
-        if text == "incomplete" {
+        if text.starts_with("incomplete") {
             result.incomplete = Some(IncompleteReason::NonNativeSystemCall {
                 detail: "int 0x80".to_owned(),
             });
+        }
+        if text.ends_with("unknown") {
+            result.unknown_system_calls = [1_000_000, 400, 400].into_iter().collect();
         }
         Ok(result)
     })
@@ -1253,9 +1287,14 @@ fn not_cached_reason(
         "signal" => NotCachedReason::Signaled { signal: 9 },
         "interrupt" => NotCachedReason::Interrupted { signal: 2 },
         "handled" => NotCachedReason::InterruptedExited { code: 130 },
-        "incomplete" => {
+        "incomplete" | "incomplete-unknown" => {
             NotCachedReason::Incomplete {
                 detail: "a system call used a non-native interface: int 0x80".to_owned(),
+            }
+        },
+        "unknown" => {
+            NotCachedReason::UnknownSystemCalls {
+                numbers: UNKNOWN.to_vec(),
             }
         },
         _ => {
@@ -1278,7 +1317,14 @@ fn not_cached_reason(
 /// one that a signal stopped.
 #[test]
 fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
-    for kind in ["signal", "interrupt", "handled", "incomplete", "start"] {
+    for kind in [
+        "signal",
+        "interrupt",
+        "handled",
+        "incomplete",
+        "start",
+        "unknown",
+    ] {
         let fixture = Fixture::new()?;
         let why = not_cached_reason(kind, &fixture.path("bin/tool"));
         let outcome = fixture.write_old("outcome", kind)?;
@@ -1366,7 +1412,14 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
 /// and only the build after that is a cache hit.
 #[test]
 fn an_older_record_is_never_replayed_after_a_result_that_is_not_cached() -> TestResult {
-    for kind in ["signal", "interrupt", "handled", "incomplete", "start"] {
+    for kind in [
+        "signal",
+        "interrupt",
+        "handled",
+        "incomplete",
+        "start",
+        "unknown",
+    ] {
         let fixture = Fixture::new()?;
         let why = not_cached_reason(kind, &fixture.path("bin/tool"));
         let outcome = fixture.write_old("outcome", "ok")?;
@@ -1410,6 +1463,123 @@ fn an_older_record_is_never_replayed_after_a_result_that_is_not_cached() -> Test
         let hit = fixture.build(&tracer, &[&step])?;
         assert!(hit.cached(0)?, "{kind}");
         assert_eq!(tracer.runs(), 3, "{kind}");
+    }
+    Ok(())
+}
+
+/// The system calls that the outcome tracer's `unknown` runs make, sorted and
+/// without repeats, as the tracer reports them.
+const UNKNOWN: [u32; 2] = [400, 1_000_000];
+
+/// Without the option, a run that made system calls that the tracer does not know
+/// is not cached: its marker gives the reason that names each number and lists
+/// them, the engine keeps the run for the warning as not cached, and the next build
+/// runs the step again with that reason. A cache hit keeps nothing for a warning.
+#[test]
+fn a_run_with_unknown_system_calls_is_not_cached_without_the_option() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "unknown")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+    let why = NotCachedReason::UnknownSystemCalls {
+        numbers: UNKNOWN.to_vec(),
+    };
+
+    let first = fixture.build(&tracer, &[&step])?;
+    assert!(!first.cached(0)?);
+    assert_eq!(first.not_cached, [(key, why.clone())]);
+    assert_eq!(first.unknown, [UnknownCalls {
+        key,
+        numbers: UNKNOWN.to_vec(),
+        cached: false,
+    }]);
+    let marker = fixture.record(&step)?.ok_or("no marker")?;
+    assert_eq!(marker.not_cached, Some(why.clone()));
+    assert_eq!(marker.unknown_system_calls, UNKNOWN);
+
+    let second = fixture.build(&tracer, &[&step])?;
+    assert!(!second.cached(0)?);
+    assert_eq!(tracer.runs(), 2);
+    let marker = fixture.record(&step)?.ok_or("no marker")?;
+    assert_eq!(marker.reason, RunReason::NotCached {
+        why: why.clone(),
+        differences: Vec::new(),
+    });
+    assert_eq!(
+        why.to_string(),
+        "the command made system calls 400 and 1000000, which the tracer does not know"
+    );
+    Ok(())
+}
+
+/// With the option, a run that made system calls that the tracer does not know is
+/// cached as if it had made none: its record lists the numbers and has no marker,
+/// and the engine keeps the run for the warning as cached. A later build without
+/// the option finds the record a cache hit, and keeps nothing for a warning.
+#[test]
+fn with_the_option_a_run_with_unknown_system_calls_is_cached() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "unknown")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+
+    let first = fixture.build_caching_unknown(&tracer, &[&step])?;
+    assert!(!first.cached(0)?);
+    assert_eq!(first.not_cached, Vec::new());
+    assert_eq!(first.unknown, [UnknownCalls {
+        key,
+        numbers: UNKNOWN.to_vec(),
+        cached: true,
+    }]);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.not_cached, None);
+    assert_eq!(record.unknown_system_calls, UNKNOWN);
+
+    for later in [
+        fixture.build(&tracer, &[&step])?,
+        fixture.build_caching_unknown(&tracer, &[&step])?,
+    ] {
+        assert!(later.cached(0)?);
+        assert_eq!(later.unknown, Vec::new());
+        assert_eq!(later.not_cached, Vec::new());
+    }
+    assert_eq!(tracer.runs(), 1);
+    Ok(())
+}
+
+/// A run that is also incompletely traced keeps that reason, with or without the
+/// option, and its marker still lists the numbers; the engine keeps the run for the
+/// warning as not cached.
+#[test]
+fn an_incomplete_run_with_unknown_system_calls_keeps_its_reason() -> TestResult {
+    for cache_unknown in [false, true] {
+        let fixture = Fixture::new()?;
+        let outcome = fixture.write_old("outcome", "incomplete-unknown")?;
+        let tracer = outcome_tracer(outcome);
+        let step = fixture.step(&["tool"])?;
+        let key = step_key(PROGRAM, &step, 0)?;
+        let why = not_cached_reason("incomplete-unknown", &fixture.path("bin/tool"));
+
+        let built = if cache_unknown {
+            fixture.build_caching_unknown(&tracer, &[&step])?
+        } else {
+            fixture.build(&tracer, &[&step])?
+        };
+        assert_eq!(built.not_cached, [(key, why.clone())], "{cache_unknown}");
+        assert_eq!(
+            built.unknown,
+            [UnknownCalls {
+                key,
+                numbers: UNKNOWN.to_vec(),
+                cached: false,
+            }],
+            "{cache_unknown}"
+        );
+        let marker = fixture.record(&step)?.ok_or("no marker")?;
+        assert_eq!(marker.not_cached, Some(why), "{cache_unknown}");
+        assert_eq!(marker.unknown_system_calls, UNKNOWN, "{cache_unknown}");
     }
     Ok(())
 }

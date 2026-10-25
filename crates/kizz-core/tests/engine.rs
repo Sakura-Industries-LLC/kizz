@@ -139,6 +139,7 @@ fn finished(
         accesses: reported,
         incomplete: None,
         first_reads,
+        unknown_system_calls: BTreeSet::new(),
     })
 }
 

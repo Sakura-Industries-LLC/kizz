@@ -30,7 +30,7 @@
 //! cached, because the file changed after the command read it.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt::Write as _,
     fs, io,
@@ -135,6 +135,7 @@ fn script(
         accesses,
         incomplete: None,
         first_reads,
+        unknown_system_calls: BTreeSet::new(),
     })
 }
 

@@ -11,7 +11,7 @@
 //! an explicit environment that holds only `KIZZ_CACHE_DIR`, set to that cache.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     ffi::OsString,
     fs,
@@ -103,6 +103,7 @@ impl Tracer for FakeTracer {
             accesses,
             incomplete: None,
             first_reads,
+            unknown_system_calls: BTreeSet::new(),
         })
     }
 

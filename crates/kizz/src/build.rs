@@ -20,10 +20,14 @@
 //! task prints its error, the Starlark stack, and the failing command's captured
 //! output. Warnings are loud and repeated in the final summary, which counts the
 //! commands that ran and those that came from the cache, and gives the number of
-//! passes the build settled in. Among them: a command traced incompletely, and a
-//! command during whose run something else changed a file after the command read
-//! it; a command that rewrote its own input gets no warning, because its reason
-//! says so.
+//! passes the build settled in. Among them: a command traced incompletely, which
+//! names the reason, such as a system call that kizz cannot trace; a command during
+//! whose run something else changed a file after the command read it; and a
+//! command that made system calls that the tracer does not know, once per step and
+//! build, which says whether its result was cached, and without
+//! `--cache-unknown-syscalls` that the command runs again on the next build. A
+//! command that rewrote its own input gets no warning, because its reason says so,
+//! and a cache hit warns about nothing.
 //!
 //! Exit status: 0 on success, [`TASK_FAILED`] when a task fails or the build does not
 //! settle, [`USAGE_ERROR`] for usage and configuration errors and for a cache that
@@ -44,12 +48,12 @@ use std::{
 
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, LoadError, PrintSink,
-    ProgramWrite, Project, Render, StepDecision, TargetExpr, TaskInfo, TaskResult, Warning, build,
-    load, task_id, task_label,
+    ProgramWrite, Project, Render, StepDecision, TargetExpr, TaskInfo, TaskResult, UnknownCalls,
+    Warning, build, load, task_id, task_label,
 };
 use kizz_store::{
     CacheLock, LockDetails, NotCachedReason, StepKey, StepRecord, Store, TaskId, Verdict,
-    cache_dir_from_env,
+    cache_dir_from_env, system_call_numbers,
 };
 use kizz_trace::{AbsolutePath, Cancellation, StdioEcho};
 use kizz_trace_linux::LinuxTracer;
@@ -67,6 +71,9 @@ pub(crate) struct Options {
     pub explain: bool,
     /// List the cached commands, and show environment values in reasons.
     pub verbose: bool,
+    /// Cache the results of commands that made system calls that the tracer does
+    /// not know, `--cache-unknown-syscalls`.
+    pub cache_unknown_syscalls: bool,
 }
 
 /// Build the tasks that `targets` selects under the current directory, and return
@@ -207,7 +214,8 @@ fn build_selected(
         cancel.clone(),
         home.as_deref()
             .and_then(|home| AbsolutePath::new(home).ok()),
-    );
+    )
+    .with_cache_unknown_system_calls(options.cache_unknown_syscalls);
     let output = Output {
         render: Render {
             base: cwd.to_path_buf(),
@@ -223,6 +231,7 @@ fn build_selected(
         repeated_shown: Cell::new(0),
         incomplete_shown: RefCell::new(BTreeSet::new()),
         changed_shown: RefCell::new(BTreeSet::new()),
+        unknown_shown: RefCell::new(BTreeSet::new()),
         warnings: RefCell::new(warnings),
     };
     let status = match build(&engine, &tasks, &caller, &output, &output) {
@@ -366,6 +375,9 @@ struct Output<'a> {
     /// The steps already warned about because something other than the command
     /// changed a file it read while it ran.
     changed_shown: RefCell<BTreeSet<StepKey>>,
+    /// The steps already warned about because their command made system calls that
+    /// the tracer does not know.
+    unknown_shown: RefCell<BTreeSet<StepKey>>,
     /// Every warning printed, for the final summary.
     warnings: RefCell<Vec<String>>,
 }
@@ -462,8 +474,9 @@ impl Output<'_> {
 
     /// Print, loudly, each warning the engine added since the last check: steps
     /// that re-ran in consecutive builds for the same self-inflicted reason, runs
-    /// that were traced incompletely, and runs in which something other than the
-    /// command changed a file after the command read it.
+    /// that were traced incompletely, runs in which something other than the
+    /// command changed a file after the command read it, and runs that made system
+    /// calls that the tracer does not know, each step once per build.
     fn check_warnings(&self) {
         let repeated = self.engine.warnings();
         for warning in repeated.iter().skip(self.repeated_shown.get()) {
@@ -492,7 +505,13 @@ impl Output<'_> {
                 NotCachedReason::Signaled { .. }
                 | NotCachedReason::Interrupted { .. }
                 | NotCachedReason::InterruptedExited { .. }
-                | NotCachedReason::StartFailed { .. } => {},
+                | NotCachedReason::StartFailed { .. }
+                | NotCachedReason::UnknownSystemCalls { .. } => {},
+            }
+        }
+        for calls in self.engine.unknown_system_calls() {
+            if self.unknown_shown.borrow_mut().insert(calls.key) {
+                self.warn(self.unknown_calls(&calls));
             }
         }
     }
@@ -551,6 +570,29 @@ impl Output<'_> {
              result was not cached and it runs again on the next build",
             shown.join(", "),
             self.command(key)
+        )
+    }
+
+    /// The warning for the run `calls`, which made system calls that the tracer does
+    /// not know: the command, each number, and whether its result was cached; when
+    /// the build does not cache such results, also that the command runs again on
+    /// the next build, and the option that would cache it.
+    fn unknown_calls(
+        &self,
+        calls: &UnknownCalls,
+    ) -> String {
+        let outcome = if calls.cached {
+            "; its result was cached because `kizz build --cache-unknown-syscalls` was given"
+        } else if self.engine.caches_unknown_system_calls() {
+            "; its result was not cached for another reason, and it runs again on the next build"
+        } else {
+            ", so its result was not cached and it runs again on the next build; `kizz build \
+             --cache-unknown-syscalls` caches the results of such commands"
+        };
+        format!(
+            "{} made {}, which the tracer does not know{outcome}",
+            self.command(&calls.key),
+            system_call_numbers(&calls.numbers)
         )
     }
 

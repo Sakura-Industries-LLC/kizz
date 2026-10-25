@@ -82,6 +82,14 @@
 //! A thread that runs `exec` from a thread that does not lead its process keeps its
 //! call under the ID it takes over, and a thread that exits inside a call records
 //! the call with its result unknown.
+//!
+//! A call that the filter stops for because it can make the trace incomplete, one
+//! of the untraceable calls of [`filter`], stops its thread once, at its entry: the
+//! loop asks [`decode::untraceable`] whether the call with its arguments marks the
+//! run, marks it with the process and the call unless it is already marked, and
+//! lets the call run. A native call that the tracer does not know stops once too:
+//! the loop notes its number, as the filter saw it, and lets it run, so the trace
+//! stays complete.
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map},
@@ -185,6 +193,9 @@ pub(crate) struct Outcome {
     /// The first-read metadata of the regular files the tree read or ran before it
     /// wrote them.
     pub first_reads: FirstReads,
+    /// The numbers of the native system calls outside the known table that the
+    /// tree made, as the filter saw them.
+    pub unknown_system_calls: BTreeSet<u32>,
 }
 
 /// What the loop knows about one traced thread.
@@ -330,6 +341,7 @@ impl<'a> Tree<'a> {
                 accesses: Accesses::new(),
                 incomplete: None,
                 first_reads: FirstReads::new(),
+                unknown_system_calls: BTreeSet::new(),
             },
         }
     }
@@ -567,25 +579,13 @@ impl<'a> Tree<'a> {
             // A thread that vanished makes no call.
             Err(error) if vanished(&error) => return,
             Err(error) => {
-                self.incomplete(IncompleteReason::Other {
-                    detail: format!(
-                        "could not read the registers of thread {pid} at a system call: {error}"
-                    ),
-                });
+                self.unreadable_registers(pid, &error);
                 return;
             },
         };
-        let arguments = [
-            registers.rdi,
-            registers.rsi,
-            registers.rdx,
-            registers.r10,
-            registers.r8,
-            registers.r9,
-        ];
         let Some(call) = c_long::try_from(registers.orig_rax)
             .ok()
-            .and_then(|number| decode::enter(number, arguments, &sys::Thread(pid)))
+            .and_then(|number| decode::enter(number, arguments(&registers), &sys::Thread(pid)))
         else {
             return;
         };
@@ -681,9 +681,76 @@ impl<'a> Tree<'a> {
         self.resume(pid, 0)
     }
 
+    /// Mark the run as incompletely traced because the registers of thread `pid`
+    /// could not be read at a system call, which the loop then cannot judge.
+    fn unreadable_registers(
+        &mut self,
+        pid: pid_t,
+        error: &io::Error,
+    ) {
+        self.incomplete(IncompleteReason::Other {
+            detail: format!(
+                "could not read the registers of thread {pid} at a system call: {error}"
+            ),
+        });
+    }
+
+    /// Handle the entry of a call that can make the trace incomplete: mark the run
+    /// with the process and the call when the call, with its arguments, marks it,
+    /// unless the run is already marked. The call then runs unchanged.
+    fn untraceable_entry(
+        &mut self,
+        pid: pid_t,
+    ) {
+        if self.outcome.incomplete.is_some() {
+            return;
+        }
+        let registers = match sys::registers(pid) {
+            Ok(registers) => registers,
+            // A thread that vanished makes no call.
+            Err(error) if vanished(&error) => return,
+            Err(error) => {
+                self.unreadable_registers(pid, &error);
+                return;
+            },
+        };
+        let made = c_long::try_from(registers.orig_rax)
+            .ok()
+            .and_then(|number| {
+                decode::untraceable(number, arguments(&registers), &sys::Thread(pid))
+            });
+        if let Some(made) = made {
+            self.incomplete(IncompleteReason::UntraceableSystemCall {
+                detail: format!("process {pid} {made}"),
+            });
+        }
+    }
+
+    /// Handle the entry of a native call that the tracer does not know: note its
+    /// number, the low 32 bits of the number register, as the filter saw it. The
+    /// call then runs unchanged, and the trace stays complete.
+    fn unknown_entry(
+        &mut self,
+        pid: pid_t,
+    ) {
+        match sys::registers(pid) {
+            Ok(registers) => {
+                let low = registers.orig_rax & u64::from(u32::MAX);
+                if let Ok(number) = u32::try_from(low) {
+                    self.outcome.unknown_system_calls.insert(number);
+                }
+            },
+            // A thread that vanished makes no call.
+            Err(error) if vanished(&error) => {},
+            Err(error) => self.unreadable_registers(pid, &error),
+        }
+    }
+
     /// Handle a seccomp stop with the filter's return data. A tracked call is
-    /// decoded, and the thread is resumed to its exit. A non-native call marks the
-    /// run as incompletely traced.
+    /// decoded, and the thread is resumed to its exit. A call that can make the
+    /// trace incomplete is judged, and a native call that the tracer does not know
+    /// is noted, at its entry only. A non-native call marks the run as incompletely
+    /// traced.
     fn seccomp_stop(
         &mut self,
         pid: pid_t,
@@ -692,6 +759,14 @@ impl<'a> Tree<'a> {
         let interface = match u16::try_from(data) {
             Ok(filter::DATA_TRACKED) => {
                 self.system_call_entry(pid);
+                return;
+            },
+            Ok(filter::DATA_UNTRACEABLE) => {
+                self.untraceable_entry(pid);
+                return;
+            },
+            Ok(filter::DATA_UNKNOWN) => {
+                self.unknown_entry(pid);
                 return;
             },
             Ok(filter::DATA_FOREIGN_ARCH) => "the 32-bit `int 0x80` interface",
@@ -714,6 +789,19 @@ impl<'a> Tree<'a> {
             detail: format!("process {pid} made {call} through {interface}"),
         });
     }
+}
+
+/// The six argument registers of a system call, in order, from the registers of a
+/// thread stopped at the call.
+const fn arguments(registers: &libc::user_regs_struct) -> decode::Arguments {
+    [
+        registers.rdi,
+        registers.rsi,
+        registers.rdx,
+        registers.r10,
+        registers.r8,
+        registers.r9,
+    ]
 }
 
 /// Follow the tree whose first process is `root` until all of it has exited.
