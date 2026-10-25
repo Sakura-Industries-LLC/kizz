@@ -15,9 +15,11 @@
 
 use std::{
     error::Error,
+    ffi::CString,
     fs,
     io::{self, BufRead as _, BufReader, Lines},
     os::unix::{
+        ffi::OsStrExt as _,
         fs::{MetadataExt as _, PermissionsExt as _, symlink},
         process::CommandExt as _,
     },
@@ -1009,15 +1011,120 @@ fn a_target_that_selects_no_task_warns() -> TestResult {
 
 /// Act as a helper program when [`HELPER_VARIABLE`] says so, and do nothing
 /// otherwise. In mode `x32`, make one system call through the x32 interface, which
-/// the tracer cannot decode.
+/// the tracer cannot decode. In mode `xattr`, read the file `input.txt` and its
+/// extended attribute `user.kizz`, and print both.
 #[test]
 fn helper_process() {
-    if std::env::var_os(HELPER_VARIABLE).is_some_and(|mode| mode == "x32") {
+    let mode = std::env::var_os(HELPER_VARIABLE);
+    if mode.as_ref().is_some_and(|mode| mode == "x32") {
         // SAFETY: `getpid` takes no arguments; the kernel either runs it or rejects
         // the x32 number with `ENOSYS`.
         let ret = unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
         eprintln!("x32 getpid returned {ret}");
     }
+    if mode.as_ref().is_some_and(|mode| mode == "xattr") {
+        let content = fs::read_to_string("input.txt").unwrap();
+        let path = CString::new("input.txt").unwrap();
+        let name = CString::new("user.kizz").unwrap();
+        let mut value = [0_u8; 64];
+        // SAFETY: `path` and `name` are NUL-terminated strings, and `value` has room
+        // for `value.len()` bytes, which is all the kernel writes.
+        let size = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        let size = usize::try_from(size).unwrap();
+        println!(
+            "{} {}",
+            content.trim_end(),
+            String::from_utf8_lossy(&value[..size])
+        );
+    }
+}
+
+/// Set the extended attribute `name` of the file at `path` to `value`, as the test
+/// itself, outside any build.
+fn set_attribute(
+    path: &Path,
+    name: &str,
+    value: &[u8],
+) -> TestResult {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let name = CString::new(name)?;
+    // SAFETY: `path` and `name` are NUL-terminated strings, and `value` holds
+    // `value.len()` bytes, which the kernel only reads.
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// With the real tracer, a command that read a file and one of its extended
+/// attributes stays cached while nothing changes, runs again when only that
+/// attribute's value changes, with the reason naming the attribute, and is cached
+/// again afterwards.
+#[test]
+fn a_command_that_read_an_extended_attribute_runs_again_when_it_changes() -> TestResult {
+    let project = Project::new()?;
+    project.write("input.txt", "input\n")?;
+    let input = project.root.join("input.txt");
+    set_attribute(&input, "user.kizz", b"one")?;
+    let helper = std::env::current_exe()?;
+    let helper = helper
+        .to_str()
+        .ok_or("the test executable's path is not UTF-8")?;
+    project.kizz_md("", &[(
+        "Attr",
+        &format!(
+            "run(\"{helper}\", \"helper_process\", \"--exact\", \"--test-threads=1\", env = \
+             {{\"{HELPER_VARIABLE}\": \"xattr\"}})"
+        ),
+    )])?;
+    let command = format!("{helper} helper_process --exact --test-threads=1");
+    let cached = text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"]);
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first.stdout.starts_with(&format!(
+            "{}\n",
+            ran(&command, "kizz.md:3 (Attr)", NEVER_RUN)
+        )),
+        "{first:?}"
+    );
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.stdout, cached, "{second:?}");
+
+    set_attribute(&input, "user.kizz", b"two")?;
+    let third = project.run("", &["build", "ci"])?;
+    assert_eq!(third.status, Some(0), "{third:?}");
+    assert!(
+        third.stdout.starts_with(&format!(
+            "{}\n",
+            ran(
+                &command,
+                "kizz.md:3 (Attr)",
+                "`input.txt` changed (extended attributes changed: `user.kizz` changed)"
+            )
+        )),
+        "{third:?}"
+    );
+    let fourth = project.run("", &["build", "ci"])?;
+    assert_eq!(fourth.stdout, cached, "{fourth:?}");
+    Ok(())
 }
 
 /// A command that the tracer traces incompletely gets a loud warning, repeated in

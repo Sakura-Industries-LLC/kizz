@@ -6,8 +6,9 @@
 //!
 //! This crate holds discovery, Markdown parsing, the Starlark runtime, step keys,
 //! cache checks, explanations, and ordering. It contains no Linux-specific code: it
-//! runs commands only through the tracer interface of `kizz_trace` and keeps its
-//! records in `kizz_store`, so its tests use a fake tracer.
+//! runs commands only through the tracer interface of `kizz_trace`, reads extended
+//! attributes only through that interface's attribute query, and keeps its records
+//! in `kizz_store`, so its tests use a fake tracer.
 //!
 //! * [`discovery`]: every `kizz.md` under the current directory, in the default order.
 //! * [`tasks`]: the task blocks of a `kizz.md`.
@@ -82,7 +83,7 @@ pub use key::{KeyError, Occurrences, STEP_KEY_CONTEXT, step_key};
 pub use lookup::{NoPathError, PATH_VARIABLE, ProgramLookup, find_program};
 pub use observe::{
     HashCounter, Observed, access_bits, changed_after_read, is_kernel_path, kernel_links, observe,
-    path_state, reaches_kernel,
+    path_state, reaches_kernel, record_attributes,
 };
 pub use patterns::{PathPatterns, PatternError, REGEX_PREFIX};
 pub use project::{ConfigError, LoadError, Project, load};

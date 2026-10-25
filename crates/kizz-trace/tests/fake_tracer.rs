@@ -8,12 +8,14 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     io,
+    path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
 
 use kizz_trace::{
     AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
-    EchoSink, FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    EchoSink, ExtendedAttributes, FirstReads, OutputStream, RunRequest, RunResult, Termination,
+    TraceError, Tracer,
 };
 
 /// The signal number the fake reports for a cancelled request.
@@ -37,6 +39,9 @@ struct FakeTracer {
     scripts: BTreeMap<AbsolutePath, Script>,
     /// Every request the fake received, in order.
     requests: Mutex<Vec<RunRequest>>,
+    /// The extended attributes of each path, by the path and whether a final link
+    /// is followed, which the attribute query answers.
+    attributes: BTreeMap<(PathBuf, bool), ExtendedAttributes>,
 }
 
 impl FakeTracer {
@@ -136,6 +141,17 @@ impl Tracer for FakeTracer {
             incomplete: None,
             first_reads,
         })
+    }
+
+    fn extended_attributes(
+        &self,
+        path: &Path,
+        follow: bool,
+    ) -> io::Result<ExtendedAttributes> {
+        self.attributes
+            .get(&(path.to_path_buf(), follow))
+            .cloned()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 }
 
@@ -304,4 +320,33 @@ fn fake_tracer_honors_cancellation() {
     assert_eq!(result.termination, Termination::Signaled(SIGKILL));
     assert_eq!(result.termination.code(), None);
     assert_eq!(result.output, CapturedOutput::empty(CaptureMode::Split));
+}
+
+/// The attribute query answers through the trait object with the attributes the
+/// test set, for a path with and without following a final link, and fails for a
+/// path it does not know.
+#[test]
+fn fake_tracer_answers_the_attribute_query() {
+    let mut fake = FakeTracer::default();
+    let own = ExtendedAttributes::from([(b"user.link".to_vec(), b"1".to_vec())]);
+    let pointee = ExtendedAttributes::from([
+        (b"user.b".to_vec(), b"2".to_vec()),
+        (b"user.a".to_vec(), Vec::new()),
+    ]);
+    fake.attributes
+        .insert((PathBuf::from("/work/link"), false), own.clone());
+    fake.attributes
+        .insert((PathBuf::from("/work/link"), true), pointee.clone());
+    let tracer: &dyn Tracer = &fake;
+
+    let link = Path::new("/work/link");
+    assert_eq!(tracer.extended_attributes(link, false).unwrap(), own);
+    let followed = tracer.extended_attributes(link, true).unwrap();
+    assert_eq!(followed, pointee);
+    let names: Vec<&[u8]> = followed.keys().map(Vec::as_slice).collect();
+    assert_eq!(names, [b"user.a".as_slice(), b"user.b".as_slice()]);
+    let missing = tracer
+        .extended_attributes(Path::new("/work/missing"), true)
+        .unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
 }

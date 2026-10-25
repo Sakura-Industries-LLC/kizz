@@ -10,11 +10,12 @@
 //! module, because they must avoid everything that is not async-signal-safe.
 
 use std::{
+    ffi::{CStr, CString},
     fs, io, mem,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
-            ffi::OsStringExt as _,
+            ffi::{OsStrExt as _, OsStringExt as _},
             fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _},
         },
     },
@@ -22,7 +23,7 @@ use std::{
     ptr,
 };
 
-use kizz_trace::FileMetadata;
+use kizz_trace::{ExtendedAttributes, FileMetadata};
 use libc::{c_int, c_long, c_uint, c_ulong, c_void, pid_t};
 
 use crate::decode;
@@ -475,10 +476,121 @@ pub(crate) fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
+/// How many times a read of extended attributes is tried when they grow between
+/// the call that sizes the buffer and the call that fills it.
+const ATTRIBUTE_ATTEMPTS: usize = 8;
+
+/// Read a list or value whose size the kernel tells first: `call` with a null
+/// buffer and a size of zero returns the size, and with a buffer fills it. A
+/// buffer that became too small (`ERANGE`) is sized again.
+///
+/// # Errors
+///
+/// Returns the error of the call, or `ERANGE` when the size kept changing.
+fn sized_read(mut call: impl FnMut(*mut c_void, usize) -> isize) -> io::Result<Vec<u8>> {
+    for _ in 0..ATTRIBUTE_ATTEMPTS {
+        let size =
+            usize::try_from(call(ptr::null_mut(), 0)).map_err(|_| io::Error::last_os_error())?;
+        let mut buffer = vec![0_u8; size];
+        let filled = call(buffer.as_mut_ptr().cast(), buffer.len());
+        if let Ok(filled) = usize::try_from(filled) {
+            buffer.truncate(filled);
+            return Ok(buffer);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ERANGE) {
+            return Err(error);
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::ERANGE))
+}
+
+/// The names of the extended attributes of `path`, as `listxattr` lists them, or
+/// `llistxattr` without following a final symbolic link.
+fn attribute_names(
+    path: &CStr,
+    follow: bool,
+) -> io::Result<Vec<u8>> {
+    sized_read(|buffer, size| {
+        // SAFETY: `path` is a NUL-terminated string, and `buffer` is null with a
+        // size of zero or has room for `size` bytes, which is all the kernel writes.
+        unsafe {
+            if follow {
+                libc::listxattr(path.as_ptr(), buffer.cast(), size)
+            } else {
+                libc::llistxattr(path.as_ptr(), buffer.cast(), size)
+            }
+        }
+    })
+}
+
+/// The value of the extended attribute `name` of `path`, as `getxattr` reads it,
+/// or `lgetxattr` without following a final symbolic link.
+fn attribute_value(
+    path: &CStr,
+    name: &CStr,
+    follow: bool,
+) -> io::Result<Vec<u8>> {
+    sized_read(|buffer, size| {
+        // SAFETY: `path` and `name` are NUL-terminated strings, and `buffer` is null
+        // with a size of zero or has room for `size` bytes, which is all the kernel
+        // writes.
+        unsafe {
+            if follow {
+                libc::getxattr(path.as_ptr(), name.as_ptr(), buffer, size)
+            } else {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), buffer, size)
+            }
+        }
+    })
+}
+
+/// The extended attributes of `path`, each name with its value, following a final
+/// symbolic link when `follow` is set. A file system that keeps no extended
+/// attributes (`EOPNOTSUPP`) has none, and an attribute removed between listing
+/// the names and reading its value (`ENODATA`) is left out.
+///
+/// # Errors
+///
+/// Returns the error of listing the names or reading a value, such as `ENOENT` for
+/// a path that names nothing, and an error for a path with a NUL byte.
+pub(crate) fn extended_attributes(
+    path: &Path,
+    follow: bool,
+) -> io::Result<ExtendedAttributes> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let names = match attribute_names(&path, follow) {
+        Ok(names) => names,
+        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+            return Ok(ExtendedAttributes::new());
+        },
+        Err(error) => return Err(error),
+    };
+    let mut attributes = ExtendedAttributes::new();
+    for name in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let c_name = CString::new(name)?;
+        match attribute_value(&path, &c_name, follow) {
+            Ok(value) => {
+                attributes.insert(name.to_vec(), value);
+            },
+            Err(error) if error.raw_os_error() == Some(libc::ENODATA) => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(attributes)
+}
+
 /// Unit tests for the wrappers that need no traced process.
 #[cfg(test)]
 mod tests {
-    use std::{os::fd::AsRawFd, sync::mpsc, thread};
+    use std::{
+        os::{fd::AsRawFd, unix::fs::symlink},
+        sync::mpsc,
+        thread,
+    };
 
     use super::*;
 
@@ -514,5 +626,64 @@ mod tests {
         assert_eq!(thread_group(tid).unwrap(), process);
         drop(release);
         other.join().unwrap();
+    }
+
+    /// Set the extended attribute `name` of the file at `path` to `value`.
+    fn set_attribute(
+        path: &Path,
+        name: &str,
+        value: &[u8],
+    ) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        // SAFETY: `path` and `name` are NUL-terminated strings, and `value` holds
+        // `value.len()` bytes, which the kernel only reads.
+        let ret = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+    }
+
+    /// The query reads every attribute of a file with its value, sorted by name,
+    /// an empty value and a large one included; through a symbolic link it reads
+    /// those of the file only when it follows the link; and a missing path fails
+    /// with `ENOENT`.
+    #[test]
+    fn extended_attributes_are_read_with_their_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, "content").unwrap();
+        let large = vec![b'x'; 3_000];
+        set_attribute(&file, "user.b", b"2");
+        set_attribute(&file, "user.a", b"");
+        set_attribute(&file, "user.large", &large);
+        let link = dir.path().join("link");
+        symlink("file", &link).unwrap();
+
+        let read = extended_attributes(&file, false).unwrap();
+        let user: Vec<(&[u8], &[u8])> = read
+            .iter()
+            .filter(|(name, _)| name.starts_with(b"user."))
+            .map(|(name, value)| (name.as_slice(), value.as_slice()))
+            .collect();
+        assert_eq!(user, [
+            (b"user.a".as_slice(), b"".as_slice()),
+            (b"user.b".as_slice(), b"2".as_slice()),
+            (b"user.large".as_slice(), large.as_slice()),
+        ]);
+        assert_eq!(extended_attributes(&link, true).unwrap(), read);
+        let own = extended_attributes(&link, false).unwrap();
+        assert!(
+            own.keys().all(|name| !name.starts_with(b"user.")),
+            "{own:?}"
+        );
+        let missing = extended_attributes(&dir.path().join("missing"), true).unwrap_err();
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
     }
 }

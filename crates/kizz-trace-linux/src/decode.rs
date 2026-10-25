@@ -15,6 +15,10 @@
 //! * a call that failed records a probe for each path: it checked the path's existence or
 //!   metadata, including a lookup that found nothing (`ENOENT`), and it read, wrote and
 //!   ran nothing;
+//! * a call that reads or lists extended attributes and fails because the attribute does
+//!   not exist (`ENODATA`), the buffer is too small (`ERANGE`), or the file system has
+//!   none (`EOPNOTSUPP`) records the xattr kind rather than a probe, because each of
+//!   those answers depends on the attributes;
 //! * a call whose result was never seen, because its thread was killed, records the kinds
 //!   of its rule and a probe, since it may or may not have taken effect;
 //! * a call that a signal interrupts fails like any other, with `EINTR` or with one of
@@ -69,6 +73,8 @@ use std::{
 use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, FileMetadata};
 use libc::{c_int, c_long};
 
+use crate::filter::numbers;
+
 /// The six argument registers of a system call, in order.
 pub(crate) type Arguments = [u64; 6];
 
@@ -86,6 +92,14 @@ const LOWEST_ERROR_RESULT: i64 = -4095;
 /// The `RESOLVE_IN_ROOT` flag of `openat2`: the directory descriptor is the root
 /// of the lookup.
 const RESOLVE_IN_ROOT: u64 = 0x10;
+/// The `FAN_MARK_FLUSH` flag of `fanotify_mark`, from the kernel's
+/// `include/uapi/linux/fanotify.h`: the call removes marks and names no path.
+const FAN_MARK_FLUSH: u64 = 0x80;
+/// The errors with which a call that reads or lists extended attributes answers
+/// from the attributes themselves: no such attribute (`ENODATA`), a buffer too
+/// small for the answer (`ERANGE`), or a file system without attributes
+/// (`EOPNOTSUPP`). Such a failure records the xattr kind, not a probe.
+const ATTRIBUTE_ANSWERS: [c_int; 3] = [libc::ENODATA, libc::ERANGE, libc::EOPNOTSUPP];
 /// The most symbolic links one lookup follows: the kernel's `MAXSYMLINKS`.
 const MAX_SYMBOLIC_LINKS: usize = 40;
 /// The size of `struct open_how`, the third argument of `openat2`.
@@ -315,6 +329,10 @@ enum Operand {
     /// The path of `openat2`, relative to its directory descriptor, with its flags
     /// and resolution in the `struct open_how` that the third argument points to.
     OpenHow,
+    /// The path that `fanotify_mark` marks: its fifth argument, relative to the
+    /// directory descriptor in its fourth, where a null path names the descriptor
+    /// itself, and no path at all with `FAN_MARK_FLUSH` in the flags of its second.
+    FanotifyMark,
 }
 
 /// The access kinds a call records for a path when it succeeds.
@@ -358,6 +376,9 @@ const LIST: Kinds = Kinds::Fixed(AccessKinds::only(AccessKind::List));
 const WRITE: Kinds = Kinds::Fixed(AccessKinds::only(AccessKind::Write));
 /// A program run when the call succeeds.
 const EXEC: Kinds = Kinds::Fixed(AccessKinds::only(AccessKind::Exec));
+/// Extended attributes read or listed when the call succeeds, and also when it
+/// fails with one of [`ATTRIBUTE_ANSWERS`].
+const XATTR: Kinds = Kinds::Fixed(AccessKinds::only(AccessKind::Xattr));
 
 /// The rule for the path in argument `path`, relative to the working directory.
 const fn path(
@@ -457,6 +478,72 @@ pub(crate) const SYSTEM_CALLS: &[SystemCall] = &[
         Empty::Flag(3),
         PROBE,
     )]),
+    // `file_getattr` reads the file attributes of a path, such as the immutable
+    // flag, and `name_to_handle_at` its file handle: both look the path up.
+    call(numbers::SYS_FILE_GETATTR, "file_getattr", &[at(
+        0,
+        1,
+        Empty::Flag(4),
+        PROBE,
+    )]),
+    call(libc::SYS_name_to_handle_at, "name_to_handle_at", &[at(
+        0,
+        1,
+        Empty::Flag(4),
+        PROBE,
+    )]),
+    // File systems: the figures of the file system that holds a path, or the path
+    // behind a descriptor.
+    call(libc::SYS_statfs, "statfs", &[path(0, PROBE)]),
+    call(libc::SYS_fstatfs, "fstatfs", &[descriptor(0, PROBE)]),
+    // Watches: a watch looks up the path it watches.
+    call(libc::SYS_inotify_add_watch, "inotify_add_watch", &[path(
+        1, PROBE,
+    )]),
+    call(libc::SYS_fanotify_mark, "fanotify_mark", &[Rule {
+        operand: Operand::FanotifyMark,
+        kinds: PROBE,
+    }]),
+    // Extended attributes: reading or listing them records the xattr kind, and
+    // setting or removing one is a write. The `at` calls take their flags third.
+    call(libc::SYS_getxattr, "getxattr", &[path(0, XATTR)]),
+    call(libc::SYS_lgetxattr, "lgetxattr", &[path(0, XATTR)]),
+    call(libc::SYS_fgetxattr, "fgetxattr", &[descriptor(0, XATTR)]),
+    call(numbers::SYS_GETXATTRAT, "getxattrat", &[at(
+        0,
+        1,
+        Empty::Flag(2),
+        XATTR,
+    )]),
+    call(libc::SYS_listxattr, "listxattr", &[path(0, XATTR)]),
+    call(libc::SYS_llistxattr, "llistxattr", &[path(0, XATTR)]),
+    call(libc::SYS_flistxattr, "flistxattr", &[descriptor(0, XATTR)]),
+    call(numbers::SYS_LISTXATTRAT, "listxattrat", &[at(
+        0,
+        1,
+        Empty::Flag(2),
+        XATTR,
+    )]),
+    call(libc::SYS_setxattr, "setxattr", &[path(0, WRITE)]),
+    call(libc::SYS_lsetxattr, "lsetxattr", &[path(0, WRITE)]),
+    call(libc::SYS_fsetxattr, "fsetxattr", &[descriptor(0, WRITE)]),
+    call(numbers::SYS_SETXATTRAT, "setxattrat", &[at(
+        0,
+        1,
+        Empty::Flag(2),
+        WRITE,
+    )]),
+    call(libc::SYS_removexattr, "removexattr", &[path(0, WRITE)]),
+    call(libc::SYS_lremovexattr, "lremovexattr", &[path(0, WRITE)]),
+    call(libc::SYS_fremovexattr, "fremovexattr", &[descriptor(
+        0, WRITE,
+    )]),
+    call(numbers::SYS_REMOVEXATTRAT, "removexattrat", &[at(
+        0,
+        1,
+        Empty::Flag(2),
+        WRITE,
+    )]),
     // Links: reading a link reads its content, the target; creating a link writes
     // the new name, and a hard link also changes the existing file's link count.
     // The target of a symbolic link is only text, so it is not a path touched.
@@ -537,6 +624,12 @@ pub(crate) const SYSTEM_CALLS: &[SystemCall] = &[
         Empty::Never,
         WRITE,
     )]),
+    call(numbers::SYS_FCHMODAT2, "fchmodat2", &[at(
+        0,
+        1,
+        Empty::Flag(3),
+        WRITE,
+    )]),
     call(libc::SYS_chown, "chown", &[path(0, WRITE)]),
     call(libc::SYS_lchown, "lchown", &[path(0, WRITE)]),
     call(libc::SYS_fchownat, "fchownat", &[at(
@@ -559,10 +652,18 @@ pub(crate) const SYSTEM_CALLS: &[SystemCall] = &[
         Empty::Null,
         WRITE,
     )]),
+    // `file_setattr` sets the file attributes that `file_getattr` reads.
+    call(numbers::SYS_FILE_SETATTR, "file_setattr", &[at(
+        0,
+        1,
+        Empty::Flag(4),
+        WRITE,
+    )]),
     // Changes through a descriptor, to the path behind it.
     call(libc::SYS_ftruncate, "ftruncate", &[descriptor(0, WRITE)]),
     call(libc::SYS_fchmod, "fchmod", &[descriptor(0, WRITE)]),
     call(libc::SYS_fchown, "fchown", &[descriptor(0, WRITE)]),
+    call(libc::SYS_fallocate, "fallocate", &[descriptor(0, WRITE)]),
 ];
 
 /// A tracked call decoded at its entry, waiting for its result.
@@ -786,7 +887,9 @@ impl Call {
     /// A call that failed records a probe for each path. That includes a call that a
     /// signal interrupted, which returns `EINTR`, or one of the kernel's internal
     /// restart errors when it restarts: either way its lookup happened, and a call
-    /// that restarts is decoded again at its next entry.
+    /// that restarts is decoded again at its next entry. A call that reads or lists
+    /// extended attributes and fails with one of [`ATTRIBUTE_ANSWERS`] records the
+    /// xattr kind instead, because that answer depends on the attributes.
     ///
     /// A part of the call that could not be decoded makes the trace incomplete,
     /// unless the call failed with the error the kernel gives that same input
@@ -808,8 +911,16 @@ impl Call {
                 return None;
             }
         }
+        let answered = errno.is_some_and(|errno| {
+            ATTRIBUTE_ANSWERS
+                .into_iter()
+                .any(|code| i64::from(code) == errno)
+        });
         for (path, kinds) in self.operands {
             let recorded = match (result, errno) {
+                (Some(_), Some(_)) if answered && kinds.contains(AccessKind::Xattr) => {
+                    AccessKinds::only(AccessKind::Xattr)
+                },
                 (Some(_), Some(_)) => AccessKinds::only(AccessKind::Probe),
                 (Some(_), None) => kinds,
                 (None, _) => kinds.with(AccessKind::Probe),
@@ -1632,6 +1743,18 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
             },
             Operand::Descriptor(index) => self.descriptor(int(self.argument(index)), kinds),
             Operand::OpenHow => self.open_how(),
+            Operand::FanotifyMark => {
+                // Flushing marks looks no path up.
+                if self.argument(1) & FAN_MARK_FLUSH == 0 {
+                    self.path(
+                        int(self.argument(3)),
+                        self.argument(4),
+                        Empty::Null,
+                        Lookup::Ordinary,
+                        kinds,
+                    );
+                }
+            },
         }
     }
 
@@ -3404,5 +3527,725 @@ mod tests {
             first_reads_in(&fake, "execve", &[PROGRAM, 0, 0], None),
             noted(&[])
         );
+    }
+
+    /// `AT_SYMLINK_FOLLOW` as a register holds it.
+    const SYMLINK_FOLLOW: u64 = 0x400;
+    /// `AT_SYMLINK_NOFOLLOW` as a register holds it.
+    const SYMLINK_NOFOLLOW: u64 = 0x100;
+    /// A descriptor of an inotify instance or a fanotify group, which names no
+    /// path that the call touches.
+    const WATCHER: u64 = 12;
+    /// `FAN_MARK_ADD`, from the kernel's `include/uapi/linux/fanotify.h`.
+    const MARK_ADD: u64 = 0x1;
+    /// `FAN_MARK_DONT_FOLLOW`, from the kernel's `include/uapi/linux/fanotify.h`.
+    const MARK_DONT_FOLLOW: u64 = 0x4;
+    /// `FAN_OPEN`, a mask of `fanotify_mark`.
+    const FAN_OPEN: u64 = 0x20;
+    /// `IN_DONT_FOLLOW` with `IN_OPEN`, a mask of `inotify_add_watch`.
+    const IN_DONT_FOLLOW_OPEN: u64 = 0x0200_0020;
+
+    /// `file_getattr` and `name_to_handle_at` probe the path relative to their
+    /// directory descriptor, and the descriptor itself with `AT_EMPTY_PATH`, whether
+    /// or not they follow a final link; `statfs` probes its path and `fstatfs` the
+    /// path behind its descriptor; a failure is a probe too.
+    #[test]
+    fn file_attributes_handles_and_file_systems_are_probes() {
+        for name in ["file_getattr", "name_to_handle_at"] {
+            assert_eq!(
+                succeed(name, &[DIR, REL, 0, 0, 0]),
+                expect(&[("/dir/rel", "probe")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[CWD, ABS, 0, 0, SYMLINK_NOFOLLOW]),
+                expect(&[("/abs/x/y", "probe")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[DIR, EMPTY, 0, 0, EMPTY_PATH]),
+                expect(&[("/dir", "probe")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[FILE, EMPTY, 0, 0, EMPTY_PATH]),
+                expect(&[("/dir/file", "probe")]),
+                "{name}"
+            );
+            assert_eq!(succeed(name, &[DIR, EMPTY, 0, 0, 0]), expect(&[]), "{name}");
+            assert_eq!(
+                finish(name, &[DIR, REL, 0, 0, 0], failed(libc::ENOENT)),
+                (expect(&[("/dir/rel", "probe")]), None),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            succeed("name_to_handle_at", &[CWD, REL, 0, 0, SYMLINK_FOLLOW]),
+            expect(&[("/work/rel", "probe")])
+        );
+        assert_eq!(succeed("statfs", &[REL]), expect(&[("/work/rel", "probe")]));
+        assert_eq!(
+            succeed("fstatfs", &[FILE]),
+            expect(&[("/dir/file", "probe")])
+        );
+        assert_eq!(succeed("fstatfs", &[PIPE]), expect(&[]));
+        assert_eq!(
+            finish("statfs", &[REL], failed(libc::ENOENT)),
+            (expect(&[("/work/rel", "probe")]), None)
+        );
+    }
+
+    /// `inotify_add_watch` probes the path it watches, relative to the working
+    /// directory, and `fanotify_mark` the path relative to its directory
+    /// descriptor, or the descriptor itself for a null path; flushing marks names
+    /// no path, and neither does an empty path.
+    #[test]
+    fn watches_probe_the_paths_they_watch() {
+        assert_eq!(
+            succeed("inotify_add_watch", &[WATCHER, REL, 0x20]),
+            expect(&[("/work/rel", "probe")])
+        );
+        assert_eq!(
+            succeed("inotify_add_watch", &[WATCHER, ABS, IN_DONT_FOLLOW_OPEN]),
+            expect(&[("/abs/x/y", "probe")])
+        );
+        assert_eq!(
+            finish(
+                "inotify_add_watch",
+                &[WATCHER, REL, 0x20],
+                failed(libc::ENOENT)
+            ),
+            (expect(&[("/work/rel", "probe")]), None)
+        );
+        assert_eq!(
+            succeed("fanotify_mark", &[WATCHER, MARK_ADD, FAN_OPEN, DIR, REL]),
+            expect(&[("/dir/rel", "probe")])
+        );
+        assert_eq!(
+            succeed("fanotify_mark", &[
+                WATCHER,
+                MARK_ADD | MARK_DONT_FOLLOW,
+                FAN_OPEN,
+                CWD,
+                REL
+            ]),
+            expect(&[("/work/rel", "probe")])
+        );
+        assert_eq!(
+            succeed("fanotify_mark", &[WATCHER, MARK_ADD, FAN_OPEN, FILE, 0]),
+            expect(&[("/dir/file", "probe")])
+        );
+        assert_eq!(
+            succeed("fanotify_mark", &[WATCHER, MARK_ADD, FAN_OPEN, DIR, EMPTY]),
+            expect(&[])
+        );
+        assert_eq!(
+            succeed("fanotify_mark", &[WATCHER, FAN_MARK_FLUSH, 0, DIR, REL]),
+            expect(&[])
+        );
+        assert_eq!(
+            finish(
+                "fanotify_mark",
+                &[WATCHER, MARK_ADD, FAN_OPEN, DIR, REL],
+                failed(libc::ENOENT)
+            ),
+            (expect(&[("/dir/rel", "probe")]), None)
+        );
+    }
+
+    /// Reading or listing extended attributes records the xattr kind for the path,
+    /// the path behind a descriptor, or the descriptor of an `at` call with
+    /// `AT_EMPTY_PATH`; a failure that answers from the attributes records the xattr
+    /// kind too, any other failure a probe, and an unseen result both.
+    #[test]
+    fn reading_and_listing_extended_attributes_records_xattr() {
+        for name in ["getxattr", "lgetxattr", "listxattr", "llistxattr"] {
+            assert_eq!(
+                succeed(name, &[REL, OTHER, 0, 0]),
+                expect(&[("/work/rel", "xattr")]),
+                "{name}"
+            );
+        }
+        for name in ["fgetxattr", "flistxattr"] {
+            assert_eq!(
+                succeed(name, &[FILE, OTHER, 0, 0]),
+                expect(&[("/dir/file", "xattr")]),
+                "{name}"
+            );
+        }
+        for name in ["getxattrat", "listxattrat"] {
+            assert_eq!(
+                succeed(name, &[DIR, REL, 0, OTHER, 0, 0]),
+                expect(&[("/dir/rel", "xattr")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[CWD, ABS, SYMLINK_NOFOLLOW, OTHER, 0, 0]),
+                expect(&[("/abs/x/y", "xattr")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[FILE, EMPTY, EMPTY_PATH, OTHER, 0, 0]),
+                expect(&[("/dir/file", "xattr")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[FILE, 0, EMPTY_PATH, OTHER, 0, 0]),
+                expect(&[("/dir/file", "xattr")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[DIR, EMPTY, 0, OTHER, 0, 0]),
+                expect(&[]),
+                "{name}"
+            );
+        }
+        for errno in [libc::ENODATA, libc::ERANGE, libc::EOPNOTSUPP] {
+            for (name, arguments) in [
+                ("getxattr", [REL, OTHER, 0, 0, 0, 0]),
+                ("listxattr", [REL, 0, 0, 0, 0, 0]),
+                ("fgetxattr", [FILE, OTHER, 0, 0, 0, 0]),
+                ("getxattrat", [DIR, REL, 0, OTHER, 0, 0]),
+            ] {
+                let (paths, problem) = finish(name, &arguments, failed(errno));
+                assert_eq!(problem, None, "{name} {errno}");
+                assert_eq!(paths.len(), 1, "{name} {errno}");
+                assert_eq!(paths[0].1, "xattr", "{name} {errno}");
+            }
+        }
+        for errno in [libc::ENOENT, libc::EACCES, libc::EINTR] {
+            assert_eq!(
+                finish("getxattr", &[REL, OTHER, 0, 0], failed(errno)),
+                (expect(&[("/work/rel", "probe")]), None),
+                "{errno}"
+            );
+        }
+        assert_eq!(
+            finish("lgetxattr", &[REL, OTHER, 0, 0], None),
+            (expect(&[("/work/rel", "probe+xattr")]), None)
+        );
+    }
+
+    /// Setting or removing an extended attribute is a write, of the path, the path
+    /// behind a descriptor, or the descriptor of an `at` call with `AT_EMPTY_PATH`,
+    /// and a failure is a probe, even one that says the attribute does not exist.
+    #[test]
+    fn setting_and_removing_extended_attributes_are_writes() {
+        for name in ["setxattr", "lsetxattr", "removexattr", "lremovexattr"] {
+            assert_eq!(
+                succeed(name, &[REL, OTHER, 0, 0, 0]),
+                expect(&[("/work/rel", "write")]),
+                "{name}"
+            );
+        }
+        for name in ["fsetxattr", "fremovexattr"] {
+            assert_eq!(
+                succeed(name, &[FILE, OTHER, 0, 0, 0]),
+                expect(&[("/dir/file", "write")]),
+                "{name}"
+            );
+        }
+        for name in ["setxattrat", "removexattrat"] {
+            assert_eq!(
+                succeed(name, &[DIR, REL, 0, OTHER, 0, 0]),
+                expect(&[("/dir/rel", "write")]),
+                "{name}"
+            );
+            assert_eq!(
+                succeed(name, &[FILE, EMPTY, EMPTY_PATH, OTHER, 0, 0]),
+                expect(&[("/dir/file", "write")]),
+                "{name}"
+            );
+        }
+        for errno in [libc::ENODATA, libc::ENOENT, libc::EOPNOTSUPP] {
+            assert_eq!(
+                finish("removexattr", &[REL, OTHER], failed(errno)),
+                (expect(&[("/work/rel", "probe")]), None),
+                "{errno}"
+            );
+        }
+    }
+
+    /// `fchmodat2` and `file_setattr` write the path relative to their directory
+    /// descriptor, or the descriptor itself with `AT_EMPTY_PATH`, whether or not
+    /// they follow a final link, and `fallocate` writes the path behind its
+    /// descriptor; a failure is a probe.
+    #[test]
+    fn fchmodat2_file_setattr_and_fallocate_are_writes() {
+        assert_eq!(
+            succeed("fchmodat2", &[DIR, REL, 0o644, 0]),
+            expect(&[("/dir/rel", "write")])
+        );
+        assert_eq!(
+            succeed("fchmodat2", &[CWD, REL, 0o644, SYMLINK_NOFOLLOW]),
+            expect(&[("/work/rel", "write")])
+        );
+        assert_eq!(
+            succeed("fchmodat2", &[FILE, EMPTY, 0o644, EMPTY_PATH]),
+            expect(&[("/dir/file", "write")])
+        );
+        assert_eq!(
+            finish("fchmodat2", &[DIR, REL, 0o644, 0], failed(libc::ENOENT)),
+            (expect(&[("/dir/rel", "probe")]), None)
+        );
+        assert_eq!(
+            succeed("file_setattr", &[DIR, REL, 0, 0, 0]),
+            expect(&[("/dir/rel", "write")])
+        );
+        assert_eq!(
+            succeed("file_setattr", &[FILE, EMPTY, 0, 0, EMPTY_PATH]),
+            expect(&[("/dir/file", "write")])
+        );
+        assert_eq!(
+            succeed("file_setattr", &[CWD, ABS, 0, 0, SYMLINK_NOFOLLOW]),
+            expect(&[("/abs/x/y", "write")])
+        );
+        assert_eq!(
+            succeed("fallocate", &[FILE, 0, 0, 10]),
+            expect(&[("/dir/file", "write")])
+        );
+        assert_eq!(
+            finish("fallocate", &[FILE, 0, 0, 10], failed(libc::ENOSPC)),
+            (expect(&[("/dir/file", "probe")]), None)
+        );
+    }
+
+    /// One decoder case of a call on extended attributes, file attributes, file
+    /// handles, file systems or watches, or of `fchmodat2` or `fallocate`.
+    struct Case {
+        /// The name of the call.
+        name: &'static str,
+        /// Its arguments, which `decode` pads with zeros.
+        arguments: &'static [u64],
+        /// The path that the call names and the kinds that a success records, or
+        /// `None` when the arguments name no path.
+        named: Option<(&'static str, &'static str)>,
+    }
+
+    /// The case of the call `name` with `arguments`, which names `path` and
+    /// records `kinds` when it succeeds.
+    const fn names(
+        name: &'static str,
+        arguments: &'static [u64],
+        path: &'static str,
+        kinds: &'static str,
+    ) -> Case {
+        Case {
+            name,
+            arguments,
+            named: Some((path, kinds)),
+        }
+    }
+
+    /// The case of the call `name` with `arguments`, which name no path.
+    const fn names_nothing(
+        name: &'static str,
+        arguments: &'static [u64],
+    ) -> Case {
+        Case {
+            name,
+            arguments,
+            named: None,
+        }
+    }
+
+    /// The 25 tracked calls on extended attributes, file attributes, file handles,
+    /// file systems and watches, with `fchmodat2` and `fallocate`, in the order of
+    /// `TRACKED_SYSTEM_CALLS`.
+    const NEW_CALLS: [&str; 25] = [
+        "file_getattr",
+        "name_to_handle_at",
+        "statfs",
+        "fstatfs",
+        "inotify_add_watch",
+        "fanotify_mark",
+        "getxattr",
+        "lgetxattr",
+        "fgetxattr",
+        "getxattrat",
+        "listxattr",
+        "llistxattr",
+        "flistxattr",
+        "listxattrat",
+        "setxattr",
+        "lsetxattr",
+        "fsetxattr",
+        "setxattrat",
+        "removexattr",
+        "lremovexattr",
+        "fremovexattr",
+        "removexattrat",
+        "fchmodat2",
+        "file_setattr",
+        "fallocate",
+    ];
+
+    /// The calls that read or list extended attributes, whose failures with
+    /// [`ANSWERS`] record the xattr kind.
+    const READS_ATTRIBUTES: [&str; 8] = [
+        "getxattr",
+        "lgetxattr",
+        "fgetxattr",
+        "getxattrat",
+        "listxattr",
+        "llistxattr",
+        "flistxattr",
+        "listxattrat",
+    ];
+
+    /// The failures that answer from the attributes: the attribute does not
+    /// exist, the buffer is too small, or the file system has no attributes.
+    const ANSWERS: [c_int; 3] = [libc::ENODATA, libc::ERANGE, libc::EOPNOTSUPP];
+
+    /// Ordinary failures, which record a probe for every call.
+    const ORDINARY: [c_int; 4] = [libc::ENOENT, libc::EACCES, libc::EPERM, libc::EINTR];
+
+    /// Every case of every call in [`NEW_CALLS`]: its arguments, flags,
+    /// descriptors, null and empty paths.
+    const CASES: &[Case] = &[
+        // File attributes and handles: a path relative to a directory descriptor,
+        // with or without following a final link, or the descriptor itself with
+        // `AT_EMPTY_PATH`.
+        names("file_getattr", &[DIR, REL, 0, 0, 0], "/dir/rel", "probe"),
+        names(
+            "file_getattr",
+            &[CWD, ABS, 0, 0, SYMLINK_NOFOLLOW],
+            "/abs/x/y",
+            "probe",
+        ),
+        names(
+            "file_getattr",
+            &[DIR, EMPTY, 0, 0, EMPTY_PATH],
+            "/dir",
+            "probe",
+        ),
+        names(
+            "file_getattr",
+            &[FILE, EMPTY, 0, 0, EMPTY_PATH],
+            "/dir/file",
+            "probe",
+        ),
+        names_nothing("file_getattr", &[DIR, EMPTY, 0, 0, 0]),
+        names(
+            "name_to_handle_at",
+            &[DIR, REL, 0, 0, 0],
+            "/dir/rel",
+            "probe",
+        ),
+        names(
+            "name_to_handle_at",
+            &[CWD, REL, 0, 0, SYMLINK_FOLLOW],
+            "/work/rel",
+            "probe",
+        ),
+        names(
+            "name_to_handle_at",
+            &[CWD, ABS, 0, 0, SYMLINK_NOFOLLOW],
+            "/abs/x/y",
+            "probe",
+        ),
+        names(
+            "name_to_handle_at",
+            &[DIR, EMPTY, 0, 0, EMPTY_PATH],
+            "/dir",
+            "probe",
+        ),
+        names(
+            "name_to_handle_at",
+            &[FILE, EMPTY, 0, 0, EMPTY_PATH],
+            "/dir/file",
+            "probe",
+        ),
+        names_nothing("name_to_handle_at", &[DIR, EMPTY, 0, 0, 0]),
+        // File systems: a path, or the path behind a descriptor.
+        names("statfs", &[REL], "/work/rel", "probe"),
+        names("statfs", &[ABS], "/abs/x/y", "probe"),
+        names_nothing("statfs", &[EMPTY]),
+        names("fstatfs", &[FILE], "/dir/file", "probe"),
+        names_nothing("fstatfs", &[PIPE]),
+        // Watches.
+        names(
+            "inotify_add_watch",
+            &[WATCHER, REL, 0x20],
+            "/work/rel",
+            "probe",
+        ),
+        names(
+            "inotify_add_watch",
+            &[WATCHER, ABS, IN_DONT_FOLLOW_OPEN],
+            "/abs/x/y",
+            "probe",
+        ),
+        names_nothing("inotify_add_watch", &[WATCHER, EMPTY, 0x20]),
+        names(
+            "fanotify_mark",
+            &[WATCHER, MARK_ADD, FAN_OPEN, DIR, REL],
+            "/dir/rel",
+            "probe",
+        ),
+        names(
+            "fanotify_mark",
+            &[WATCHER, MARK_ADD | MARK_DONT_FOLLOW, FAN_OPEN, CWD, REL],
+            "/work/rel",
+            "probe",
+        ),
+        names(
+            "fanotify_mark",
+            &[WATCHER, MARK_ADD, FAN_OPEN, FILE, 0],
+            "/dir/file",
+            "probe",
+        ),
+        names_nothing("fanotify_mark", &[WATCHER, MARK_ADD, FAN_OPEN, DIR, EMPTY]),
+        names_nothing("fanotify_mark", &[WATCHER, FAN_MARK_FLUSH, 0, DIR, REL]),
+        // Reading and listing extended attributes.
+        names("getxattr", &[REL, OTHER, 0, 0], "/work/rel", "xattr"),
+        names("getxattr", &[ABS, OTHER, 0, 0], "/abs/x/y", "xattr"),
+        names_nothing("getxattr", &[EMPTY, OTHER, 0, 0]),
+        names("lgetxattr", &[REL, OTHER, 0, 0], "/work/rel", "xattr"),
+        names("lgetxattr", &[ABS, OTHER, 0, 0], "/abs/x/y", "xattr"),
+        names_nothing("lgetxattr", &[EMPTY, OTHER, 0, 0]),
+        names("fgetxattr", &[FILE, OTHER, 0, 0], "/dir/file", "xattr"),
+        names_nothing("fgetxattr", &[PIPE, OTHER, 0, 0]),
+        names(
+            "getxattrat",
+            &[DIR, REL, 0, OTHER, 0, 0],
+            "/dir/rel",
+            "xattr",
+        ),
+        names(
+            "getxattrat",
+            &[CWD, ABS, SYMLINK_NOFOLLOW, OTHER, 0, 0],
+            "/abs/x/y",
+            "xattr",
+        ),
+        names(
+            "getxattrat",
+            &[FILE, EMPTY, EMPTY_PATH, OTHER, 0, 0],
+            "/dir/file",
+            "xattr",
+        ),
+        names(
+            "getxattrat",
+            &[FILE, 0, EMPTY_PATH, OTHER, 0, 0],
+            "/dir/file",
+            "xattr",
+        ),
+        names_nothing("getxattrat", &[DIR, EMPTY, 0, OTHER, 0, 0]),
+        names("listxattr", &[REL, 0, 0], "/work/rel", "xattr"),
+        names("listxattr", &[ABS, 0, 0], "/abs/x/y", "xattr"),
+        names_nothing("listxattr", &[EMPTY, 0, 0]),
+        names("llistxattr", &[REL, 0, 0], "/work/rel", "xattr"),
+        names("llistxattr", &[ABS, 0, 0], "/abs/x/y", "xattr"),
+        names_nothing("llistxattr", &[EMPTY, 0, 0]),
+        names("flistxattr", &[FILE, 0, 0], "/dir/file", "xattr"),
+        names_nothing("flistxattr", &[PIPE, 0, 0]),
+        names("listxattrat", &[DIR, REL, 0, 0, 0], "/dir/rel", "xattr"),
+        names(
+            "listxattrat",
+            &[CWD, ABS, SYMLINK_NOFOLLOW, 0, 0],
+            "/abs/x/y",
+            "xattr",
+        ),
+        names(
+            "listxattrat",
+            &[FILE, EMPTY, EMPTY_PATH, 0, 0],
+            "/dir/file",
+            "xattr",
+        ),
+        names(
+            "listxattrat",
+            &[FILE, 0, EMPTY_PATH, 0, 0],
+            "/dir/file",
+            "xattr",
+        ),
+        names_nothing("listxattrat", &[DIR, EMPTY, 0, 0, 0]),
+        // Setting and removing extended attributes.
+        names("setxattr", &[REL, OTHER, 0, 0, 0], "/work/rel", "write"),
+        names("setxattr", &[ABS, OTHER, 0, 0, 0], "/abs/x/y", "write"),
+        names_nothing("setxattr", &[EMPTY, OTHER, 0, 0, 0]),
+        names("lsetxattr", &[REL, OTHER, 0, 0, 0], "/work/rel", "write"),
+        names("lsetxattr", &[ABS, OTHER, 0, 0, 0], "/abs/x/y", "write"),
+        names_nothing("lsetxattr", &[EMPTY, OTHER, 0, 0, 0]),
+        names("fsetxattr", &[FILE, OTHER, 0, 0, 0], "/dir/file", "write"),
+        names_nothing("fsetxattr", &[PIPE, OTHER, 0, 0, 0]),
+        names(
+            "setxattrat",
+            &[DIR, REL, 0, OTHER, 0, 0],
+            "/dir/rel",
+            "write",
+        ),
+        names(
+            "setxattrat",
+            &[CWD, ABS, SYMLINK_NOFOLLOW, OTHER, 0, 0],
+            "/abs/x/y",
+            "write",
+        ),
+        names(
+            "setxattrat",
+            &[FILE, EMPTY, EMPTY_PATH, OTHER, 0, 0],
+            "/dir/file",
+            "write",
+        ),
+        names(
+            "setxattrat",
+            &[FILE, 0, EMPTY_PATH, OTHER, 0, 0],
+            "/dir/file",
+            "write",
+        ),
+        names_nothing("setxattrat", &[DIR, EMPTY, 0, OTHER, 0, 0]),
+        names("removexattr", &[REL, OTHER], "/work/rel", "write"),
+        names("removexattr", &[ABS, OTHER], "/abs/x/y", "write"),
+        names_nothing("removexattr", &[EMPTY, OTHER]),
+        names("lremovexattr", &[REL, OTHER], "/work/rel", "write"),
+        names("lremovexattr", &[ABS, OTHER], "/abs/x/y", "write"),
+        names_nothing("lremovexattr", &[EMPTY, OTHER]),
+        names("fremovexattr", &[FILE, OTHER], "/dir/file", "write"),
+        names_nothing("fremovexattr", &[PIPE, OTHER]),
+        names("removexattrat", &[DIR, REL, 0, OTHER], "/dir/rel", "write"),
+        names(
+            "removexattrat",
+            &[CWD, ABS, SYMLINK_NOFOLLOW, OTHER],
+            "/abs/x/y",
+            "write",
+        ),
+        names(
+            "removexattrat",
+            &[FILE, EMPTY, EMPTY_PATH, OTHER],
+            "/dir/file",
+            "write",
+        ),
+        names(
+            "removexattrat",
+            &[FILE, 0, EMPTY_PATH, OTHER],
+            "/dir/file",
+            "write",
+        ),
+        names_nothing("removexattrat", &[DIR, EMPTY, 0, OTHER]),
+        // Changes of modes, file attributes and allocation.
+        names("fchmodat2", &[DIR, REL, 0o644, 0], "/dir/rel", "write"),
+        names(
+            "fchmodat2",
+            &[CWD, REL, 0o644, SYMLINK_NOFOLLOW],
+            "/work/rel",
+            "write",
+        ),
+        names(
+            "fchmodat2",
+            &[FILE, EMPTY, 0o644, EMPTY_PATH],
+            "/dir/file",
+            "write",
+        ),
+        names_nothing("fchmodat2", &[DIR, EMPTY, 0o644, 0]),
+        names("file_setattr", &[DIR, REL, 0, 0, 0], "/dir/rel", "write"),
+        names(
+            "file_setattr",
+            &[CWD, ABS, 0, 0, SYMLINK_NOFOLLOW],
+            "/abs/x/y",
+            "write",
+        ),
+        names(
+            "file_setattr",
+            &[DIR, EMPTY, 0, 0, EMPTY_PATH],
+            "/dir",
+            "write",
+        ),
+        names(
+            "file_setattr",
+            &[FILE, EMPTY, 0, 0, EMPTY_PATH],
+            "/dir/file",
+            "write",
+        ),
+        names_nothing("file_setattr", &[DIR, EMPTY, 0, 0, 0]),
+        names("fallocate", &[FILE, 0, 0, 10], "/dir/file", "write"),
+        names_nothing("fallocate", &[PIPE, 0, 0, 10]),
+    ];
+
+    /// The table of cases covers each of the 25 calls, in the order in which they
+    /// are tracked, with at least one case that names a path and one that names
+    /// none.
+    #[test]
+    fn every_new_call_has_cases_that_name_a_path_and_cases_that_name_none() {
+        let tracked: Vec<&str> = TRACKED_SYSTEM_CALLS
+            .iter()
+            .map(|call| call.name)
+            .filter(|name| NEW_CALLS.contains(name))
+            .collect();
+        assert_eq!(tracked, NEW_CALLS);
+        for name in NEW_CALLS {
+            let cases: Vec<&Case> = CASES.iter().filter(|case| case.name == name).collect();
+            assert!(cases.iter().any(|case| case.named.is_some()), "{name}");
+            assert!(cases.iter().any(|case| case.named.is_none()), "{name}");
+        }
+        for case in CASES {
+            assert!(NEW_CALLS.contains(&case.name), "{}", case.name);
+        }
+        for name in READS_ATTRIBUTES {
+            assert!(NEW_CALLS.contains(&name), "{name}");
+        }
+    }
+
+    /// Each case records its path with the kinds of its call when the call
+    /// succeeds, and arguments that name no path record nothing.
+    #[test]
+    fn every_new_call_records_its_kinds_when_it_succeeds() {
+        for case in CASES {
+            let expected = case
+                .named
+                .map_or_else(Vec::new, |(path, kinds)| expect(&[(path, kinds)]));
+            assert_eq!(
+                succeed(case.name, case.arguments),
+                expected,
+                "{} {:?}",
+                case.name,
+                case.arguments
+            );
+        }
+    }
+
+    /// An ordinary failure of every call records exactly a probe of its path,
+    /// and a failure of arguments that name no path records nothing.
+    #[test]
+    fn every_new_call_records_a_probe_when_it_fails() {
+        for case in CASES {
+            let expected = case
+                .named
+                .map_or_else(Vec::new, |(path, _)| expect(&[(path, "probe")]));
+            for errno in ORDINARY {
+                assert_eq!(
+                    finish(case.name, case.arguments, failed(errno)),
+                    (expected.clone(), None),
+                    "{} {:?} {errno}",
+                    case.name,
+                    case.arguments
+                );
+            }
+        }
+    }
+
+    /// Each of the eight calls that read or list extended attributes records
+    /// exactly the xattr kind when it fails with `ENODATA`, `ERANGE` or
+    /// `EOPNOTSUPP`, because that answer depends on the attributes; for every other
+    /// call those failures are ordinary and record a probe.
+    #[test]
+    fn only_attribute_reads_record_xattr_for_the_answers_of_the_attributes() {
+        for case in CASES {
+            let kinds = if READS_ATTRIBUTES.contains(&case.name) {
+                "xattr"
+            } else {
+                "probe"
+            };
+            let expected = case
+                .named
+                .map_or_else(Vec::new, |(path, _)| expect(&[(path, kinds)]));
+            for errno in ANSWERS {
+                assert_eq!(
+                    finish(case.name, case.arguments, failed(errno)),
+                    (expected.clone(), None),
+                    "{} {:?} {errno}",
+                    case.name,
+                    case.arguments
+                );
+            }
+        }
     }
 }

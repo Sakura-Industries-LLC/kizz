@@ -105,6 +105,15 @@ impl Tracer for FakeTracer {
             first_reads,
         })
     }
+
+    /// These tests read no extended attributes, so there are none.
+    fn extended_attributes(
+        &self,
+        _path: &std::path::Path,
+        _follow: bool,
+    ) -> std::io::Result<kizz_trace::ExtendedAttributes> {
+        Ok(kizz_trace::ExtendedAttributes::new())
+    }
 }
 
 /// Echoes nothing.

@@ -788,6 +788,7 @@ impl TaskSteps<'_> {
                 run.recorded_at_nanos,
                 step.timestamps,
                 &self.engine.states,
+                self.engine.tracer,
             );
             return Ok(if checked.is_hit() {
                 Decision::Replay(run.result)
@@ -810,6 +811,7 @@ impl TaskSteps<'_> {
             record.recorded_at_nanos,
             record.spec.timestamps,
             &self.engine.states,
+            self.engine.tracer,
         );
         if let Some(why) = record.not_cached {
             // The record of a run of an earlier build whose result was not cached:
@@ -1258,6 +1260,7 @@ impl TaskSteps<'_> {
             &pending.ignore,
             &pending.track,
             &self.engine.states,
+            self.engine.tracer,
         );
         StepRecord {
             spec: self.spec_record(step, pending.occurrence),

@@ -65,8 +65,12 @@ const WIPED_DIR: &str = "db.wiped";
 /// what a cache check finds. Version 12 adds the reason for a run in which files
 /// changed after the command first read them or ran them, which lists each such
 /// file and whether the command wrote it, and, like the other reasons a run's
-/// result is not cached, marks a record that is never a cache hit.
-pub const SCHEMA_VERSION: u32 = 12;
+/// result is not cached, marks a record that is never a cache hit. Version 13 adds
+/// the xattr access bit, the extended attributes recorded with a path whose
+/// attributes the command read or listed, each name with a hash of its value, for
+/// the path and, for a symbolic link, for what it points to, and the change that
+/// lists the attributes that appeared, disappeared, or changed.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -622,11 +626,11 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 12 adds the reason for files that changed after the command read
-    /// them, one more than version 11, which stored directory listings in
-    /// file-system order with a sorted hash.
+    /// Version 13 adds extended attributes to recorded states and the change that
+    /// names them, one more than version 12, which added the reason for files that
+    /// changed after the command read them.
     #[test]
-    fn schema_version_12_marks_files_that_changed_after_they_were_read() {
-        assert_eq!(SCHEMA_VERSION, 12);
+    fn schema_version_13_records_extended_attributes() {
+        assert_eq!(SCHEMA_VERSION, 13);
     }
 }

@@ -40,6 +40,7 @@ fn observation(
         access: AccessBits(AccessBits::READ),
         tracked: false,
         state,
+        attributes: None,
     }
 }
 

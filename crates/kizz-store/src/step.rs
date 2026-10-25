@@ -186,7 +186,7 @@ pub struct StepSpecRecord {
 /// The combined kinds of access a step made to one path, one bit per kind.
 ///
 /// The bits follow the order of the tracer interface's access kinds: read, probe,
-/// list, write, exec.
+/// list, write, exec, xattr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Encode, Decode)]
 #[cbor(transparent)]
 pub struct AccessBits(#[n(0)] pub u8);
@@ -202,6 +202,8 @@ impl AccessBits {
     pub const READ: u8 = 0b0000_0001;
     /// The path was created, modified, renamed, removed, or had its metadata changed.
     pub const WRITE: u8 = 0b0000_1000;
+    /// The path's extended attributes were read or listed.
+    pub const XATTR: u8 = 0b0010_0000;
 
     /// Whether every bit of `bit` is set.
     #[must_use]
@@ -473,6 +475,34 @@ pub enum PathState {
     },
 }
 
+/// One extended attribute of a path: its name, and a BLAKE3 hash of its value.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Attribute {
+    /// The attribute's name, as bytes, such as `user.origin`.
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub name: Vec<u8>,
+    /// The BLAKE3 hash of the attribute's value.
+    #[n(1)]
+    pub hash: ContentHash,
+}
+
+/// The extended attributes recorded with a path whose attributes a step read or
+/// listed: those of the path itself and, for a symbolic link, those of what it
+/// points to, each sorted by name. A file system without attributes records none.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct Attributes {
+    /// The path's own attributes, without following a final symbolic link, sorted
+    /// by name, or `None` when they could not be read, as when nothing is at the
+    /// path.
+    #[n(0)]
+    pub own: Option<Vec<Attribute>>,
+    /// For a symbolic link, the attributes of what it points to, following every
+    /// link, sorted by name; `None` for a path that is not a symbolic link, or when
+    /// they could not be read, as for a link that points to nothing.
+    #[n(1)]
+    pub pointee: Option<Vec<Attribute>>,
+}
+
 /// One path a step touched, how it touched it, and its state when the step
 /// finished.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -490,6 +520,12 @@ pub struct Observation {
     /// The state of the path when the step finished.
     #[n(3)]
     pub state: PathState,
+    /// The extended attributes of the path when the step finished, part of its
+    /// state, recorded when the step read or listed them (the xattr kind); `None`
+    /// for any other path, and for a path under `/proc` or `/sys` that no `track`
+    /// pattern matched.
+    #[n(4)]
+    pub attributes: Option<Attributes>,
 }
 
 /// How a recorded step ended.
@@ -624,6 +660,23 @@ pub enum Change {
     /// A listed directory has the same entries in a different order.
     #[n(11)]
     Order,
+    /// The extended attributes of a path whose attributes were recorded changed,
+    /// for the path itself or, for a symbolic link, for what it points to: the
+    /// attributes that appeared, disappeared, or changed value, each sorted by
+    /// name. All three lists are empty when only whether the attributes could be
+    /// read changed.
+    #[n(12)]
+    Attributes {
+        /// The attributes that appeared, with their current hash.
+        #[n(0)]
+        appeared: Vec<Attribute>,
+        /// The attributes that disappeared, as recorded.
+        #[n(1)]
+        disappeared: Vec<Attribute>,
+        /// The attributes whose value changed, with their current hash.
+        #[n(2)]
+        changed: Vec<Attribute>,
+    },
     /// A symbolic link points somewhere else.
     #[n(7)]
     LinkTarget {
@@ -659,6 +712,11 @@ impl fmt::Display for Change {
                 retyped,
             } => write_entries(f, appeared, disappeared, retyped),
             Self::Order => f.write_str("the order of its entries changed"),
+            Self::Attributes {
+                appeared,
+                disappeared,
+                changed,
+            } => write_attributes(f, appeared, disappeared, changed),
             Self::LinkTarget { old, new } => {
                 write!(
                     f,
@@ -703,6 +761,42 @@ fn write_entries(
             write!(f, "`{}`", String::from_utf8_lossy(&entry.name))?;
         }
         let more = entries.len().saturating_sub(SHOWN_ENTRY_NAMES);
+        if more > 0 {
+            write!(f, " and {more} more")?;
+        }
+        write!(f, " {what}")?;
+    }
+    Ok(())
+}
+
+/// Write an extended-attribute change: the attributes that appeared, disappeared,
+/// and changed value, each group when it is not empty, with at most
+/// [`SHOWN_ENTRY_NAMES`] names each.
+fn write_attributes(
+    f: &mut fmt::Formatter<'_>,
+    appeared: &[Attribute],
+    disappeared: &[Attribute],
+    changed: &[Attribute],
+) -> fmt::Result {
+    f.write_str("extended attributes changed")?;
+    let mut separator = ": ";
+    for (attributes, what) in [
+        (appeared, "appeared"),
+        (disappeared, "disappeared"),
+        (changed, "changed"),
+    ] {
+        if attributes.is_empty() {
+            continue;
+        }
+        f.write_str(separator)?;
+        separator = "; ";
+        for (index, attribute) in attributes.iter().take(SHOWN_ENTRY_NAMES).enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "`{}`", String::from_utf8_lossy(&attribute.name))?;
+        }
+        let more = attributes.len().saturating_sub(SHOWN_ENTRY_NAMES);
         if more > 0 {
             write!(f, " and {more} more")?;
         }
@@ -1080,7 +1174,29 @@ mod tests {
         ]
     }
 
-    /// A step record with one observation of each state.
+    /// The recorded attributes of a symbolic link with one attribute of its own and
+    /// two of what it points to, one with a name that is not UTF-8.
+    fn attributes() -> Attributes {
+        Attributes {
+            own: Some(vec![Attribute {
+                name: b"user.link".to_vec(),
+                hash: ContentHash([6; 32]),
+            }]),
+            pointee: Some(vec![
+                Attribute {
+                    name: b"security.selinux".to_vec(),
+                    hash: ContentHash([7; 32]),
+                },
+                Attribute {
+                    name: b"user.\xff".to_vec(),
+                    hash: ContentHash([8; 32]),
+                },
+            ]),
+        }
+    }
+
+    /// A step record with one observation of each state, two of them with recorded
+    /// extended attributes.
     fn record() -> StepRecord {
         let states = states();
         StepRecord {
@@ -1108,11 +1224,14 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(index, state)| {
+                    let xattr = matches!(index, 1 | 5);
+                    let bits = if xattr { AccessBits::XATTR } else { 0 };
                     Observation {
                         path: PathBuf::from(format!("/p/{index}")),
-                        access: AccessBits(AccessBits::READ | AccessBits::PROBE),
+                        access: AccessBits(AccessBits::READ | AccessBits::PROBE | bits),
                         tracked: index == 1,
                         state,
+                        attributes: xattr.then(attributes),
                     }
                 })
                 .collect(),
@@ -1196,6 +1315,12 @@ mod tests {
                 }],
             },
             Change::Order,
+            attributes_change(),
+            Change::Attributes {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                changed: Vec::new(),
+            },
             Change::LinkTarget {
                 old: PathBuf::from("a"),
                 new: PathBuf::from("b\u{e9}"),
@@ -1711,6 +1836,112 @@ mod tests {
         let bytes = minicbor::to_vec(&record).unwrap();
         assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+    }
+
+    /// An attribute named `name` whose value hashes to `byte` repeated.
+    fn attribute(
+        name: &[u8],
+        byte: u8,
+    ) -> Attribute {
+        Attribute {
+            name: name.to_vec(),
+            hash: ContentHash([byte; 32]),
+        }
+    }
+
+    /// An attribute change in which one attribute appeared, one disappeared, and
+    /// one, whose name is not UTF-8, changed value.
+    fn attributes_change() -> Change {
+        Change::Attributes {
+            appeared: vec![attribute(b"user.new", 1)],
+            disappeared: vec![attribute(b"user.old", 2)],
+            changed: vec![attribute(b"user.\xff", 3)],
+        }
+    }
+
+    /// Recorded attributes encode deterministically, each attribute as a
+    /// definite-length array of its name as a byte string and its hash, and
+    /// round-trip; attributes that could not be read differ from no attributes; and
+    /// the attribute change encodes as variant 12 and round-trips, alone and in a
+    /// record, as do observations with and without attributes.
+    #[test]
+    fn attributes_and_their_changes_encode_deterministically_and_round_trip() {
+        let mut expected = vec![0x82, 0x46];
+        expected.extend_from_slice(b"user.a");
+        expected.extend_from_slice(&[0x58, 0x20]);
+        expected.extend_from_slice(&[9; 32]);
+        assert_eq!(minicbor::to_vec(attribute(b"user.a", 9)).unwrap(), expected);
+        let none = Attributes {
+            own: Some(Vec::new()),
+            pointee: None,
+        };
+        let unreadable = Attributes {
+            own: None,
+            pointee: None,
+        };
+        for recorded in [attributes(), none.clone(), unreadable.clone()] {
+            let first = minicbor::to_vec(&recorded).unwrap();
+            assert_eq!(first, minicbor::to_vec(recorded.clone()).unwrap());
+            assert_eq!(minicbor::decode::<Attributes>(&first).unwrap(), recorded);
+        }
+        assert_ne!(
+            minicbor::to_vec(&none).unwrap(),
+            minicbor::to_vec(&unreadable).unwrap()
+        );
+
+        let change = attributes_change();
+        let first = minicbor::to_vec(&change).unwrap();
+        assert_eq!(first, minicbor::to_vec(change.clone()).unwrap());
+        assert_eq!(first.get(..3), Some(&[0x82, 0x0C, 0x83][..]));
+        assert_eq!(minicbor::decode::<Change>(&first).unwrap(), change);
+
+        let record = record();
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+        let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.observations[5].attributes, Some(attributes()));
+        assert!(decoded.observations[5].access.contains(AccessBits::XATTR));
+        assert_eq!(decoded.observations[0].attributes, None);
+    }
+
+    /// An attribute change names what appeared, disappeared, and changed value,
+    /// each group only when it is not empty and with at most ten names, and says
+    /// only that the attributes changed when it names none.
+    #[test]
+    fn attribute_changes_display() {
+        let many: Vec<Attribute> = (0..12)
+            .map(|index| attribute(format!("user.{index:02}").as_bytes(), 0))
+            .collect();
+        let shown: Vec<String> = [
+            attributes_change(),
+            Change::Attributes {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                changed: Vec::new(),
+            },
+            Change::Attributes {
+                appeared: Vec::new(),
+                disappeared: many,
+                changed: vec![attribute(b"user.x", 1)],
+            },
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let not_utf8 = format!(
+            "extended attributes changed: `user.new` appeared; `user.old` disappeared; `user.{}` \
+             changed",
+            char::REPLACEMENT_CHARACTER
+        );
+        assert_eq!(shown, [
+            not_utf8.as_str(),
+            "extended attributes changed",
+            "extended attributes changed: `user.00`, `user.01`, `user.02`, `user.03`, `user.04`, \
+             `user.05`, `user.06`, `user.07`, `user.08`, `user.09` and 2 more disappeared; \
+             `user.x` changed",
+        ]);
+        assert_eq!(AccessBits::XATTR, 0b0010_0000);
     }
 
     #[test]

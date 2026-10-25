@@ -20,6 +20,13 @@
 //! * symbolic links: the target, plus the state of what the link points to;
 //! * devices, FIFOs, and sockets: type only.
 //!
+//! A path whose extended attributes the step read or listed, the xattr kind, also
+//! records them with its state (see [`record_attributes`]): each name with a BLAKE3
+//! hash of its value, sorted by name, for the path itself and, for a symbolic link,
+//! for what it points to. Kizz reads them only through the attribute query of the
+//! tracer interface, [`Tracer::extended_attributes`], because the standard library
+//! cannot read them.
+//!
 //! Paths under `/proc` and `/sys` are recorded as [`PathState::Untracked`] unless a
 //! `track` pattern matches them; a tracked one gets its state, with the content of
 //! a regular file read and hashed again whatever the access, never from the cache.
@@ -48,10 +55,13 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, ChangedRead, ContentHash, DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES,
-    Observation, Owner, PathState, SpecialKind, Times,
+    AccessBits, Attribute, Attributes, ChangedRead, ContentHash, DirEntry, EntryKind, FileMeta,
+    Listing, MAX_LISTED_NAMES, Observation, Owner, PathState, SpecialKind, Times,
 };
-use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, FileMetadata, FirstReads};
+use kizz_trace::{
+    AbsolutePath, AccessKind, AccessKinds, Accesses, ExtendedAttributes, FileMetadata, FirstReads,
+    Tracer,
+};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use crate::{patterns::PathPatterns, states::FileStates};
@@ -223,19 +233,23 @@ pub fn access_bits(kinds: AccessKinds) -> AccessBits {
             AccessKind::List => AccessBits::LIST,
             AccessKind::Write => AccessBits::WRITE,
             AccessKind::Exec => AccessBits::EXEC,
+            AccessKind::Xattr => AccessBits::XATTR,
         }
     }))
 }
 
 /// Record the state of every path in `accesses`, concurrently, leaving out and
 /// counting the paths that `ignore` matches, and hashing the `/proc` and `/sys`
-/// paths that `track` matches. Hashes go through `states`.
+/// paths that `track` matches. Hashes go through `states`, and the extended
+/// attributes of the paths whose attributes were read or listed come from the
+/// attribute query of `tracer`.
 #[must_use]
 pub fn observe(
     accesses: &Accesses,
     ignore: &PathPatterns,
     track: &PathPatterns,
     states: &FileStates,
+    tracer: &dyn Tracer,
 ) -> Observed {
     let (kept, ignored): (Vec<_>, Vec<_>) = accesses
         .iter()
@@ -243,7 +257,7 @@ pub fn observe(
         .partition(|(path, _)| !ignore.matches(path));
     let recorded: Vec<(Observation, Vec<Observation>)> = kept
         .par_iter()
-        .map(|&(path, kinds)| observation(path, kinds, track, states))
+        .map(|&(path, kinds)| observation(path, kinds, track, states, tracer))
         .collect();
     let mut observations = BTreeMap::new();
     let mut links = Vec::new();
@@ -264,21 +278,30 @@ pub fn observe(
 }
 
 /// The observation of one path that a step touched with `kinds`, and the
-/// observations of the symbolic links that lead it into `/proc` or `/sys`.
+/// observations of the symbolic links that lead it into `/proc` or `/sys`. A path
+/// whose extended attributes were read or listed records them, unless it leads
+/// into `/proc` or `/sys` and no `track` pattern matched it.
 fn observation(
     path: &AbsolutePath,
     kinds: AccessKinds,
     track: &PathPatterns,
     states: &FileStates,
+    tracer: &dyn Tracer,
 ) -> (Observation, Vec<Observation>) {
     let route = kernel_route(path.as_path());
     let tracked = route.is_some() && track.matches(path);
+    let attributes = || {
+        kinds
+            .contains(AccessKind::Xattr)
+            .then(|| record_attributes(path.as_path(), tracer))
+    };
     let Some(route) = route else {
         let observation = Observation {
             path: path.as_path().to_path_buf(),
             access: access_bits(kinds),
             tracked,
             state: path_state(path.as_path(), kinds, false, states),
+            attributes: attributes(),
         };
         return (observation, Vec::new());
     };
@@ -300,6 +323,7 @@ fn observation(
                 access: AccessBits(AccessBits::PROBE),
                 tracked: false,
                 state: untracked_link(target),
+                attributes: None,
             }
         })
         .collect();
@@ -308,8 +332,43 @@ fn observation(
         access: access_bits(kinds),
         tracked,
         state,
+        attributes: if tracked { attributes() } else { None },
     };
     (observation, on_the_way)
+}
+
+/// The extended attributes of `path` now, as a path whose attributes were read or
+/// listed records them, read through the attribute query of `tracer`: those of the
+/// path itself, without following a final symbolic link, and, when the path is a
+/// symbolic link, those of what it points to. Each list holds every name with a
+/// BLAKE3 hash of its value, sorted by name, or is `None` when the query fails, as
+/// it does when nothing is at the path; a file system without attributes has none.
+///
+/// A cache check reads them again the same way and compares the two.
+#[must_use]
+pub fn record_attributes(
+    path: &Path,
+    tracer: &dyn Tracer,
+) -> Attributes {
+    let hashed = |follow: bool| tracer.extended_attributes(path, follow).ok().map(hashes);
+    let link = fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    Attributes {
+        own: hashed(false),
+        pointee: if link { hashed(true) } else { None },
+    }
+}
+
+/// Each attribute of `attributes` with a BLAKE3 hash of its value, sorted by name.
+fn hashes(attributes: ExtendedAttributes) -> Vec<Attribute> {
+    attributes
+        .into_iter()
+        .map(|(name, value)| {
+            Attribute {
+                name,
+                hash: ContentHash(*blake3::hash(&value).as_bytes()),
+            }
+        })
+        .collect()
 }
 
 /// The state of a symbolic link to `target`, which leads into `/proc` or `/sys`:
@@ -660,6 +719,7 @@ mod tests {
             access: AccessBits(access),
             tracked,
             state,
+            attributes: None,
         }
     }
 

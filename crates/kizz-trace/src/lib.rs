@@ -20,9 +20,13 @@
 //! something else changed it while the command ran, keeps the result out of the
 //! cache.
 //!
+//! Through the same interface, the engine reads what the standard library cannot:
+//! the extended attributes of a path, with [`Tracer::extended_attributes`].
+//!
 //! Version 1 has one tracer, for Linux, in `kizz_trace_linux`; tests of the engine
 //! implement [`Tracer`] with a fake, which notes first reads with
-//! [`FirstReads::note_at`] as it reads or runs files, as the Linux tracer does.
+//! [`FirstReads::note_at`] as it reads or runs files, as the Linux tracer does, and
+//! answers the attribute query from attributes that the test sets.
 //! Nothing in the engine changes when the tracer does.
 
 use std::{
@@ -57,11 +61,22 @@ pub enum AccessKind {
     Write,
     /// The path was run as a program.
     Exec,
+    /// The path's extended attributes were read or listed, including a read that
+    /// found no such attribute (`ENODATA`), a buffer too small for the answer
+    /// (`ERANGE`), or a file system without attributes (`EOPNOTSUPP`).
+    Xattr,
 }
 
 impl AccessKind {
     /// Every access kind, in the order [`AccessKinds`] lists them.
-    pub const ALL: [Self; 5] = [Self::Read, Self::Probe, Self::List, Self::Write, Self::Exec];
+    pub const ALL: [Self; 6] = [
+        Self::Read,
+        Self::Probe,
+        Self::List,
+        Self::Write,
+        Self::Exec,
+        Self::Xattr,
+    ];
 
     /// The bit that represents this kind in [`AccessKinds`].
     const fn bit(self) -> u8 {
@@ -71,6 +86,7 @@ impl AccessKind {
             Self::List => 0b0000_0100,
             Self::Write => 0b0000_1000,
             Self::Exec => 0b0001_0000,
+            Self::Xattr => 0b0010_0000,
         }
     }
 
@@ -83,6 +99,7 @@ impl AccessKind {
             Self::List => "list",
             Self::Write => "write",
             Self::Exec => "exec",
+            Self::Xattr => "xattr",
         }
     }
 }
@@ -939,10 +956,15 @@ impl TraceError {
     }
 }
 
-/// Runs and traces commands.
+/// The extended attributes of one path: each name with its value, as bytes, sorted
+/// by name.
+pub type ExtendedAttributes = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// Runs and traces commands, and answers the platform queries of the core.
 ///
 /// The Linux tracer implements it with `ptrace` and seccomp, and tests implement it
-/// with a fake that performs scripted file operations and reports them.
+/// with a fake that performs scripted file operations and reports them, and that
+/// answers the queries from values the test sets.
 pub trait Tracer: Send + Sync {
     /// Run one command, wait for its whole process tree to finish, and report what
     /// it did.
@@ -963,6 +985,23 @@ pub trait Tracer: Send + Sync {
         echo: &dyn EchoSink,
         cancel: &Cancellation,
     ) -> Result<RunResult, TraceError>;
+
+    /// The extended attributes of `path`, each name with its value, sorted by name,
+    /// following a final symbolic link when `follow` is set, or not when it is not.
+    /// A file system that keeps no extended attributes has none.
+    ///
+    /// The core reads extended attributes only through this query, because the
+    /// standard library cannot read them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of reading the attributes, such as
+    /// [`io::ErrorKind::NotFound`] when nothing is at the path.
+    fn extended_attributes(
+        &self,
+        path: &Path,
+        follow: bool,
+    ) -> io::Result<ExtendedAttributes>;
 }
 
 /// Unit tests for the logic of the tracer interface.
@@ -1012,7 +1051,7 @@ mod tests {
         );
     }
 
-    /// Every kind has its own bit, so the full set holds all five.
+    /// Every kind has its own bit, so the full set holds all six.
     #[test]
     fn every_access_kind_is_distinct() {
         let all: AccessKinds = AccessKind::ALL.into_iter().collect();
@@ -1033,6 +1072,17 @@ mod tests {
             .with(AccessKind::Probe)
             .with(AccessKind::Read);
         assert_eq!(kinds.to_string(), "read+probe+exec");
+    }
+
+    /// The extended-attribute kind is named `xattr`, comes after `exec`, and has its
+    /// own bit.
+    #[test]
+    fn the_xattr_kind_follows_exec() {
+        assert_eq!(AccessKind::Xattr.to_string(), "xattr");
+        assert_eq!(AccessKind::ALL.last(), Some(&AccessKind::Xattr));
+        let kinds = AccessKinds::only(AccessKind::Xattr).with(AccessKind::Exec);
+        assert_eq!(kinds.to_string(), "exec+xattr");
+        assert!(!AccessKinds::only(AccessKind::Exec).contains(AccessKind::Xattr));
     }
 
     /// Accesses to the same path combine into one entry, in sorted path order.

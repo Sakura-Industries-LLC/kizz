@@ -386,6 +386,7 @@ def go_build(package, output, version):
 The core never starts a process itself and knows nothing about system calls.
 It asks a tracer to run one command with an exact program, arguments, environment, working directory and `stdin`.
 The tracer returns the exit status, the captured output, and every path the process tree touched, with how it touched it.
+Through the same interface, the core reads what the standard library cannot: the extended attributes of a path.
 Version 1 has one tracer, for Linux, and tests use a fake one.
 Nothing in the core changes when the tracer does.
 
@@ -419,14 +420,30 @@ Nothing in the core changes when the tracer does.
 Tracked system calls, by x86_64 name:
 
 * opening files: `open`, `openat`, `openat2` and `creat`
-* metadata and existence: `stat`, `lstat`, `newfstatat`, `statx`, `access`, `faccessat` and `faccessat2`
+* metadata and existence: `stat`, `lstat`, `newfstatat`, `statx`, `access`, `faccessat`, `faccessat2`,
+  `file_getattr` and `name_to_handle_at`
+* file systems: `statfs`, and `fstatfs` on the file system behind a descriptor
+* watches: `inotify_add_watch` and `fanotify_mark`
+* extended attributes: `getxattr`, `lgetxattr`, `fgetxattr`, `getxattrat`, `listxattr`, `llistxattr`, `flistxattr`,
+  `listxattrat`, `setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat`, `removexattr`, `lremovexattr`, `fremovexattr`
+  and `removexattrat`, those on a descriptor resolved to the path behind it
 * links: `readlink`, `readlinkat`, `link`, `linkat`, `symlink` and `symlinkat`
 * directory listings: `getdents` and `getdents64`
 * programs: `execve` and `execveat`
 * working directory: `chdir` and `fchdir`
 * changes: `rename`, `renameat`, `renameat2`, `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`, `mknod`, `mknodat`,
-  `truncate`, `chmod`, `fchmodat`, `chown`, `lchown`, `fchownat`, `utime`, `utimes`, `utimensat` and `futimesat`
-* descriptor-based changes such as `ftruncate`, `fchmod` and `fchown`, resolved to the path behind the descriptor
+  `truncate`, `chmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`, `fchownat`, `utime`, `utimes`,
+  `utimensat`, `futimesat` and `file_setattr`
+* descriptor-based changes: `ftruncate`, `fchmod`, `fchown` and `fallocate`,
+  resolved to the path behind the descriptor
+
+Reading or listing extended attributes records the xattr kind, also when the call fails
+because the attribute does not exist (`ENODATA`), the buffer is too small (`ERANGE`) or the file system has none (`EOPNOTSUPP`):
+each of those answers depends on the attributes.
+Setting or removing an attribute is a write.
+`file_getattr` and `name_to_handle_at` record a probe, and so do `inotify_add_watch` and `fanotify_mark`, which watch a path.
+`file_setattr` is a write; the file attributes that `file_getattr` returns, such as the immutable flag, are not compared.
+`statfs` and `fstatfs` record a probe; the figures they return, such as free space, are not compared.
 
 ### What is recorded
 
@@ -437,6 +454,7 @@ For each step, kizz records every path the command touched, combining the kinds 
 * list: a directory's entries were read
 * write: the path was created, modified, renamed, removed or had its metadata changed
 * exec: the path was run as a program, or the kernel loaded it to run one, as a `#!` interpreter or an ELF loader
+* xattr: the path's extended attributes were read or listed
 
 When the command finishes, kizz records the state of every touched path, concurrently.
 The next cache check compares the current state with that recorded state, so a file a step writes and then reads,
@@ -463,6 +481,8 @@ Directory listings are compared by their final state only.
   (up to 1,000), so explanations can name what appeared or disappeared, or say that only the order changed.
   Entry inode numbers are not recorded.
 * Symbolic link: the link target, plus the state of what it points to.
+* A path whose extended attributes were read or listed also records them: their names and a hash of each value,
+  for the path itself and, for a symbolic link, for what it points to.
 * Device, FIFO or socket: type only.
 * Anything under `/proc` or `/sys`: recorded so explanations and `kizz why` show the access,
   but never compared when kizz checks the cache unless the user tracks it, as described below.
@@ -586,6 +606,8 @@ A regular file that was not read has no hash, so its metadata is the whole depen
 any difference in size or metadata is a change.
 A directory's mode and owner are always compared.
 A listed directory is listed again and compared by its entries, in the order the file system returns them.
+A path whose extended attributes were recorded is compared by them too: an attribute that appeared,
+disappeared or changed is a change.
 Untracked paths under `/proc` and `/sys` are never compared.
 
 Programs cannot set the change time, so a tool that restores modification times
@@ -666,8 +688,8 @@ These are the reasons:
   with values shown only with `--verbose`, because values can be secrets
 * the working directory, `stdin`, capture mode, ignore patterns, `track` patterns or `timestamps` changed
 * inputs changed: every changed path, what changed about it
-  (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, directory entries,
-  entry order or link target changed),
+  (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, extended attributes,
+  directory entries, entry order or link target changed),
   and who last wrote it: this command on its previous run, another task's command or program in this build,
   a command or task program of an earlier build, or something outside kizz
 * the command is marked `always`
@@ -741,7 +763,8 @@ crates/
   kizz-core/         the engine, with no Linux code: discovery, Markdown, Starlark runtime, step keys,
                      cache checks, explanations and ordering
   kizz-store/        the cache location, the lock file, and the SurrealKV store of typed records
-  kizz-trace/        the tracer interface: the run request, the result, access kinds and the tracer trait
+  kizz-trace/        the tracer interface: the run request, the result, access kinds, the tracer trait
+                     and the platform queries of the core, such as extended attributes
   kizz-trace-linux/  the ptrace and seccomp-bpf tracer
 ```
 
@@ -1061,6 +1084,13 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * The tracer conformance test of phase 10 needs a C compiler, `cc`, where the tests run.
   Every tracer must pass it: the x86_64 Linux tracer now, and any later one, for aarch64, macOS or Windows.
   Calls that only some platforms have are compiled only there, and their expected entries name those platforms.
+  Calls that a kernel may lack because a newer Linux added them are checked only where the kernel has them.
+  They are `file_getattr`, `file_setattr` and the `xattrat` calls.
+  The program first makes each one with arguments that cannot succeed, and `ENOSYS` means that the kernel lacks it.
+  Their expected entries name the call they need, and where the kernel has it they are required like every other entry.
+  Where it lacks the call, nothing may be recorded at their paths, and the test prints a notice that names the call.
+  The `kizz-trace-linux` tests check these calls the same way; every other call is required on every kernel.
+  On Linux the tests also need a temporary directory on a file system with `user.` extended attributes and file handles.
 
 ## Open questions
 

@@ -735,6 +735,7 @@ mod tests {
                 access: AccessBits(access),
                 tracked: false,
                 state: kizz_store::PathState::Absent,
+                attributes: None,
             }
         };
         let baseline = Baseline::new(

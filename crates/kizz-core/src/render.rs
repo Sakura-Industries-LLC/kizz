@@ -91,6 +91,7 @@ pub fn access_kinds(bits: AccessBits) -> String {
         (AccessBits::LIST, "list"),
         (AccessBits::WRITE, "write"),
         (AccessBits::EXEC, "exec"),
+        (AccessBits::XATTR, "xattr"),
     ]
     .into_iter()
     .filter(|(bit, _)| bits.contains(*bit))
@@ -643,6 +644,10 @@ mod tests {
         assert_eq!(
             access_kinds(AccessBits(AccessBits::READ | AccessBits::LIST)),
             "read, list"
+        );
+        assert_eq!(
+            access_kinds(AccessBits(AccessBits::EXEC | AccessBits::XATTR)),
+            "exec, xattr"
         );
     }
 

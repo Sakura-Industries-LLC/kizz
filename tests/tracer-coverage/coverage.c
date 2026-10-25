@@ -39,6 +39,28 @@
  * name, and a later call on out/linux/made, or on a descriptor that names it, is
  * then the only call recorded on that path, so a tracer that missed it would record
  * the path differently.
+ *
+ * Linux also sets the extended attribute user.kizz, only on files that it creates
+ * under out/linux, through out/linux/made-link, before a call reads, lists or
+ * removes it under out/linux/made. It watches paths through an inotify instance and
+ * a fanotify group that it creates itself, and with file_setattr it sets only the
+ * file attributes that file_getattr read.
+ *
+ * Six tracked calls are newer than some kernels that run the test: file_getattr
+ * and file_setattr, which Linux 6.17 added, and getxattrat, listxattrat,
+ * setxattrat and removexattrat, which Linux 6.13 added. Before the Linux section
+ * makes any of them, the program makes each once on /, outside the task directory,
+ * with arguments that the kernel rejects with EINVAL before it looks the path up:
+ * a structure size of 0, or a flag that the call does not accept. So the check can
+ * neither succeed nor change anything, and it records nothing under the task
+ * directory. ENOSYS means that the kernel lacks the call, and EINVAL that it has
+ * it; any other result is a mismatch, and the call then counts as available. For
+ * each of the six, in the order of TRACKED_SYSTEM_CALLS, the program prints
+ * "coverage: available: NAME" or "coverage: unavailable: NAME" before its summary
+ * line. It makes the calls of a group, and creates its files, only where the
+ * kernel has every gated call that the group needs: the group of file_setattr
+ * needs file_getattr too, because it sets only the attributes that file_getattr
+ * read. The entries of those groups in expected.txt name the calls they need.
  */
 
 #define _GNU_SOURCE
@@ -110,6 +132,16 @@ static const char *error_name(int error)
         return "EINVAL";
     case EBADF:
         return "EBADF";
+    case ERANGE:
+        return "ERANGE";
+#ifdef ENODATA
+    case ENODATA:
+        return "ENODATA";
+#endif
+#ifdef EOPNOTSUPP
+    case EOPNOTSUPP:
+        return "EOPNOTSUPP";
+#endif
     default:
         return strerror(error);
     }
@@ -1049,9 +1081,444 @@ static void linux_changes(void)
     close_fd(fd);
 }
 
-/* The Linux section: every tracked system call, made through syscall(). */
+/* The extended attribute that the Linux section sets, only on files that it creates. */
+#define ATTRIBUTE "user.kizz"
+/* The value of ATTRIBUTE. */
+#define ATTRIBUTE_VALUE "coverage"
+
+/*
+ * The numbers of the calls that older C library headers lack. Each was added after
+ * the system call tables were unified, so it has the same number on every
+ * architecture, as the kernel's x86_64 table and its generic table give it.
+ */
+#ifndef SYS_fchmodat2
+#define SYS_fchmodat2 452
+#endif
+#ifndef SYS_setxattrat
+#define SYS_setxattrat 463
+#endif
+#ifndef SYS_getxattrat
+#define SYS_getxattrat 464
+#endif
+#ifndef SYS_listxattrat
+#define SYS_listxattrat 465
+#endif
+#ifndef SYS_removexattrat
+#define SYS_removexattrat 466
+#endif
+#ifndef SYS_file_getattr
+#define SYS_file_getattr 468
+#endif
+#ifndef SYS_file_setattr
+#define SYS_file_setattr 469
+#endif
+
+/* The class of a fanotify group that an unprivileged process may create since Linux
+ * 5.13: FAN_CLASS_NOTIF (0) with FAN_REPORT_FID, and FAN_CLOEXEC. */
+#define FANOTIFY_CLASS 0x201
+/* FAN_MARK_ADD, which adds a mark. */
+#define FANOTIFY_MARK_ADD 0x1
+/* FAN_OPEN, the event of opening a file. */
+#define FANOTIFY_OPEN 0x20
+/* IN_OPEN, the event of opening a file. */
+#define INOTIFY_OPEN 0x20
+
+/* `struct file_attr`, which file_getattr and file_setattr take: FILE_ATTR_SIZE_VER0 bytes. */
+struct file_attr_argument {
+    uint64_t xflags;
+    uint32_t extsize;
+    uint32_t nextents;
+    uint32_t projid;
+    uint32_t cowextsize;
+};
+
+/* `struct xattr_args`, which the xattrat calls take: where a value is, and its size. */
+struct xattr_args_argument {
+    uint64_t value;
+    uint32_t size;
+    uint32_t flags;
+};
+
+/* `struct file_handle` with room for MAX_HANDLE_SZ bytes of the handle. */
+struct handle_argument {
+    uint32_t bytes;
+    int32_t type;
+    unsigned char handle[128];
+};
+
+/* A buffer for the values and names of extended attributes. */
+static char attribute_buffer[256];
+
+/* Set ATTRIBUTE on the file MADE_LINK/name, which is also MADE/name. */
+static void set_attribute(const char *name)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, MADE_LINK "/%s", name);
+    EXPECT(0, "setxattr", path,
+           syscall(SYS_setxattr, path, ATTRIBUTE, ATTRIBUTE_VALUE, strlen(ATTRIBUTE_VALUE), 0));
+}
+
+/* Create MADE_LINK/name and set ATTRIBUTE on it. */
+static void make_with_attribute(const char *name)
+{
+    make(name);
+    set_attribute(name);
+}
+
+/* The arguments of an xattrat call whose value is `size` bytes at `value`. */
+static struct xattr_args_argument xattr_args(const void *value, size_t size)
+{
+    struct xattr_args_argument arguments = {(uint64_t)(uintptr_t)value, (uint32_t)size, 0};
+    return arguments;
+}
+
+/*
+ * The tracked calls that a kernel may lack because a newer Linux added them, in
+ * the order of TRACKED_SYSTEM_CALLS.
+ */
+enum gated_call {
+    GATED_FILE_GETATTR,
+    GATED_GETXATTRAT,
+    GATED_LISTXATTRAT,
+    GATED_SETXATTRAT,
+    GATED_REMOVEXATTRAT,
+    GATED_FILE_SETATTR,
+};
+
+/* The number of gated calls. */
+#define GATED_CALLS 6
+
+/* The name of each gated call. */
+static const char *const gated_names[GATED_CALLS] = {
+    "file_getattr", "getxattrat", "listxattrat", "setxattrat", "removexattrat", "file_setattr",
+};
+
+/* Whether the kernel has each gated call, as check_availability found. */
+static int gated_available[GATED_CALLS];
+
+/* A flag that listxattrat and removexattrat do not accept. */
+#define UNACCEPTED_FLAG AT_REMOVEDIR
+
+/* The path of each availability check: the root, outside the task directory. */
+#define CHECKED_PATH "/"
+
+/*
+ * Make the gated call `call` once on CHECKED_PATH with arguments that the kernel
+ * rejects with EINVAL before it looks the path up, where it has the call: a
+ * structure size of 0, or a flag that the call does not accept. The call can
+ * neither succeed nor change anything.
+ */
+static long check_call(enum gated_call call)
+{
+    struct xattr_args_argument arguments = xattr_args(attribute_buffer, sizeof attribute_buffer);
+    struct file_attr_argument attributes;
+    memset(&attributes, 0, sizeof attributes);
+    switch (call) {
+    case GATED_FILE_GETATTR:
+        return syscall(SYS_file_getattr, AT_FDCWD, CHECKED_PATH, &attributes, 0, 0);
+    case GATED_GETXATTRAT:
+        return syscall(SYS_getxattrat, AT_FDCWD, CHECKED_PATH, 0, ATTRIBUTE, &arguments, 0);
+    case GATED_LISTXATTRAT:
+        return syscall(SYS_listxattrat, AT_FDCWD, CHECKED_PATH, UNACCEPTED_FLAG, attribute_buffer,
+                       sizeof attribute_buffer);
+    case GATED_SETXATTRAT:
+        return syscall(SYS_setxattrat, AT_FDCWD, CHECKED_PATH, 0, ATTRIBUTE, &arguments, 0);
+    case GATED_REMOVEXATTRAT:
+        return syscall(SYS_removexattrat, AT_FDCWD, CHECKED_PATH, UNACCEPTED_FLAG, ATTRIBUTE);
+    case GATED_FILE_SETATTR:
+        return syscall(SYS_file_setattr, AT_FDCWD, CHECKED_PATH, &attributes, 0, 0);
+    }
+    /* No other call is gated; a success here would be a mismatch. */
+    return 0;
+}
+
+/*
+ * Check whether the kernel has each gated call: ENOSYS means that it lacks the call,
+ * and EINVAL that it has it; any other result is a mismatch, and the call then
+ * counts as available. Print one line for each, in order.
+ */
+static void check_availability(void)
+{
+    for (int index = 0; index < GATED_CALLS; index++) {
+        errno = 0;
+        long result = check_call((enum gated_call)index);
+        int error = errno;
+        gated_available[index] = !(result < 0 && error == ENOSYS);
+        if (gated_available[index]) {
+            check(gated_names[index], CHECKED_PATH, result, error, EINVAL);
+        }
+    }
+    for (int index = 0; index < GATED_CALLS; index++) {
+        printf("coverage: %s: %s\n", gated_available[index] ? "available" : "unavailable",
+               gated_names[index]);
+    }
+    fflush(stdout);
+}
+
+/*
+ * File systems, file attributes, file handles and watches: statfs and fstatfs,
+ * file_getattr and file_setattr, name_to_handle_at, inotify_add_watch and
+ * fanotify_mark, each on files made through out/linux/made-link.
+ */
+static void linux_file_systems_and_watches(void)
+{
+    struct file_attr_argument attributes;
+    struct handle_argument handle;
+    int mount_id = 0;
+    int fd;
+
+    make("statfs");
+    EXPECT(0, "statfs", MADE "/statfs", syscall(SYS_statfs, MADE "/statfs", &stat_buffer));
+    EXPECT(ENOENT, "statfs", OUT "/statfs-missing",
+           syscall(SYS_statfs, OUT "/statfs-missing", &stat_buffer));
+    fd = make_fd("fstatfs");
+    EXPECT(0, "fstatfs", MADE "/fstatfs", syscall(SYS_fstatfs, fd, &stat_buffer));
+    close_fd(fd);
+
+    /* The group of file_getattr, only where the kernel has it. */
+    memset(&attributes, 0, sizeof attributes);
+    if (gated_available[GATED_FILE_GETATTR]) {
+        make("file_getattr");
+        EXPECT(0, "file_getattr", MADE "/file_getattr",
+               syscall(SYS_file_getattr, AT_FDCWD, MADE "/file_getattr", &attributes,
+                       sizeof attributes, 0));
+        fd = make_fd("file_getattr-empty");
+        EXPECT(0, "file_getattr", MADE "/file_getattr-empty",
+               syscall(SYS_file_getattr, fd, "", &attributes, sizeof attributes, AT_EMPTY_PATH));
+        close_fd(fd);
+        EXPECT(ENOENT, "file_getattr", OUT "/file_getattr-missing",
+               syscall(SYS_file_getattr, AT_FDCWD, OUT "/file_getattr-missing", &attributes,
+                       sizeof attributes, 0));
+    }
+
+    /*
+     * The group of file_setattr, which sets only the attributes that file_getattr
+     * read through the link, only where the kernel has both calls.
+     */
+    if (gated_available[GATED_FILE_GETATTR] && gated_available[GATED_FILE_SETATTR]) {
+        make("file_setattr");
+        EXPECT(0, "file_getattr", MADE_LINK "/file_setattr",
+               syscall(SYS_file_getattr, AT_FDCWD, MADE_LINK "/file_setattr", &attributes,
+                       sizeof attributes, 0));
+        EXPECT(0, "file_setattr", MADE "/file_setattr",
+               syscall(SYS_file_setattr, AT_FDCWD, MADE "/file_setattr", &attributes,
+                       sizeof attributes, 0));
+        EXPECT(ENOENT, "file_setattr", OUT "/file_setattr-missing",
+               syscall(SYS_file_setattr, AT_FDCWD, OUT "/file_setattr-missing", &attributes,
+                       sizeof attributes, 0));
+    }
+
+    make("name_to_handle_at");
+    handle.bytes = sizeof handle.handle;
+    EXPECT(0, "name_to_handle_at", MADE "/name_to_handle_at",
+           syscall(SYS_name_to_handle_at, AT_FDCWD, MADE "/name_to_handle_at", &handle,
+                   &mount_id, 0));
+    handle.bytes = sizeof handle.handle;
+    EXPECT(ENOENT, "name_to_handle_at", OUT "/name_to_handle_at-missing",
+           syscall(SYS_name_to_handle_at, AT_FDCWD, OUT "/name_to_handle_at-missing", &handle,
+                   &mount_id, 0));
+
+    /* Watches, through an inotify instance and a fanotify group of the program's own. */
+    int watcher = (int)EXPECT(0, "inotify_init1", "(none)",
+                              syscall(SYS_inotify_init1, O_CLOEXEC));
+    make("inotify");
+    EXPECT(0, "inotify_add_watch", MADE "/inotify",
+           syscall(SYS_inotify_add_watch, watcher, MADE "/inotify", INOTIFY_OPEN));
+    EXPECT(ENOENT, "inotify_add_watch", OUT "/inotify-missing",
+           syscall(SYS_inotify_add_watch, watcher, OUT "/inotify-missing", INOTIFY_OPEN));
+    close_fd(watcher);
+    int group = (int)EXPECT(0, "fanotify_init", "(none)",
+                            syscall(SYS_fanotify_init, FANOTIFY_CLASS, O_RDONLY | O_CLOEXEC));
+    make("fanotify");
+    EXPECT(0, "fanotify_mark", MADE "/fanotify",
+           syscall(SYS_fanotify_mark, group, FANOTIFY_MARK_ADD, (uint64_t)FANOTIFY_OPEN,
+                   AT_FDCWD, MADE "/fanotify"));
+    EXPECT(ENOENT, "fanotify_mark", OUT "/fanotify-missing",
+           syscall(SYS_fanotify_mark, group, FANOTIFY_MARK_ADD, (uint64_t)FANOTIFY_OPEN,
+                   AT_FDCWD, OUT "/fanotify-missing"));
+    close_fd(group);
+}
+
+/*
+ * Reading and listing extended attributes: getxattr, lgetxattr, fgetxattr and
+ * getxattrat, listxattr, llistxattr, flistxattr and listxattrat, each on a file whose
+ * attribute was set through out/linux/made-link; getxattr also through a link to
+ * such a file, and with ENODATA and ERANGE, which record the xattr kind.
+ */
+static void linux_attribute_reads(void)
+{
+    struct xattr_args_argument arguments = xattr_args(attribute_buffer, sizeof attribute_buffer);
+    int fd;
+
+    make_with_attribute("getxattr");
+    EXPECT(0, "getxattr", MADE "/getxattr",
+           syscall(SYS_getxattr, MADE "/getxattr", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    EXPECT(ENOENT, "getxattr", OUT "/getxattr-missing",
+           syscall(SYS_getxattr, OUT "/getxattr-missing", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    make("getxattr-nodata");
+    EXPECT(ENODATA, "getxattr", MADE "/getxattr-nodata",
+           syscall(SYS_getxattr, MADE "/getxattr-nodata", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    make_with_attribute("getxattr-range");
+    EXPECT(ERANGE, "getxattr", MADE "/getxattr-range",
+           syscall(SYS_getxattr, MADE "/getxattr-range", ATTRIBUTE, attribute_buffer, 1));
+    EXPECT(0, "symlinkat", MADE_LINK "/getxattr-link",
+           syscall(SYS_symlinkat, "getxattr", AT_FDCWD, MADE_LINK "/getxattr-link"));
+    EXPECT(0, "getxattr", MADE "/getxattr-link",
+           syscall(SYS_getxattr, MADE "/getxattr-link", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+
+    make_with_attribute("lgetxattr");
+    EXPECT(0, "lgetxattr", MADE "/lgetxattr",
+           syscall(SYS_lgetxattr, MADE "/lgetxattr", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    EXPECT(ENOENT, "lgetxattr", OUT "/lgetxattr-missing",
+           syscall(SYS_lgetxattr, OUT "/lgetxattr-missing", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+
+    fd = make_fd("fgetxattr");
+    set_attribute("fgetxattr");
+    EXPECT(0, "fgetxattr", MADE "/fgetxattr",
+           syscall(SYS_fgetxattr, fd, ATTRIBUTE, attribute_buffer, sizeof attribute_buffer));
+    close_fd(fd);
+
+    /* The group of getxattrat, only where the kernel has it. */
+    if (gated_available[GATED_GETXATTRAT]) {
+        make_with_attribute("getxattrat");
+        EXPECT(0, "getxattrat", MADE "/getxattrat",
+               syscall(SYS_getxattrat, AT_FDCWD, MADE "/getxattrat", 0, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        make_with_attribute("getxattrat-at");
+        EXPECT(0, "getxattrat", "getxattrat-at",
+               syscall(SYS_getxattrat, made_fd, "getxattrat-at", 0, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        fd = make_fd("getxattrat-empty");
+        set_attribute("getxattrat-empty");
+        EXPECT(0, "getxattrat", MADE "/getxattrat-empty",
+               syscall(SYS_getxattrat, fd, "", AT_EMPTY_PATH, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        close_fd(fd);
+        EXPECT(ENOENT, "getxattrat", OUT "/getxattrat-missing",
+               syscall(SYS_getxattrat, AT_FDCWD, OUT "/getxattrat-missing", 0, ATTRIBUTE,
+                       &arguments, sizeof arguments));
+    }
+
+    make_with_attribute("listxattr");
+    EXPECT(0, "listxattr", MADE "/listxattr",
+           syscall(SYS_listxattr, MADE "/listxattr", attribute_buffer, sizeof attribute_buffer));
+    EXPECT(ENOENT, "listxattr", OUT "/listxattr-missing",
+           syscall(SYS_listxattr, OUT "/listxattr-missing", attribute_buffer,
+                   sizeof attribute_buffer));
+    make_with_attribute("llistxattr");
+    EXPECT(0, "llistxattr", MADE "/llistxattr",
+           syscall(SYS_llistxattr, MADE "/llistxattr", attribute_buffer,
+                   sizeof attribute_buffer));
+    EXPECT(ENOENT, "llistxattr", OUT "/llistxattr-missing",
+           syscall(SYS_llistxattr, OUT "/llistxattr-missing", attribute_buffer,
+                   sizeof attribute_buffer));
+    fd = make_fd("flistxattr");
+    set_attribute("flistxattr");
+    EXPECT(0, "flistxattr", MADE "/flistxattr",
+           syscall(SYS_flistxattr, fd, attribute_buffer, sizeof attribute_buffer));
+    close_fd(fd);
+    /* The group of listxattrat, only where the kernel has it. */
+    if (gated_available[GATED_LISTXATTRAT]) {
+        make_with_attribute("listxattrat");
+        EXPECT(0, "listxattrat", MADE "/listxattrat",
+               syscall(SYS_listxattrat, AT_FDCWD, MADE "/listxattrat", 0, attribute_buffer,
+                       sizeof attribute_buffer));
+        EXPECT(ENOENT, "listxattrat", OUT "/listxattrat-missing",
+               syscall(SYS_listxattrat, AT_FDCWD, OUT "/listxattrat-missing", 0,
+                       attribute_buffer, sizeof attribute_buffer));
+    }
+}
+
+/*
+ * Changing extended attributes, the mode with fchmodat2, and the allocation with
+ * fallocate: setxattr, lsetxattr, fsetxattr and setxattrat set ATTRIBUTE on files
+ * made through out/linux/made-link, and removexattr, lremovexattr, fremovexattr and
+ * removexattrat remove it from files on which it was set through the link.
+ */
+static void linux_attribute_changes(void)
+{
+    size_t length = strlen(ATTRIBUTE_VALUE);
+    struct xattr_args_argument arguments = xattr_args(ATTRIBUTE_VALUE, length);
+    int fd;
+
+    make("setxattr");
+    EXPECT(0, "setxattr", MADE "/setxattr",
+           syscall(SYS_setxattr, MADE "/setxattr", ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    EXPECT(ENOENT, "setxattr", OUT "/setxattr-missing",
+           syscall(SYS_setxattr, OUT "/setxattr-missing", ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    make("lsetxattr");
+    EXPECT(0, "lsetxattr", MADE "/lsetxattr",
+           syscall(SYS_lsetxattr, MADE "/lsetxattr", ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    EXPECT(ENOENT, "lsetxattr", OUT "/lsetxattr-missing",
+           syscall(SYS_lsetxattr, OUT "/lsetxattr-missing", ATTRIBUTE, ATTRIBUTE_VALUE, length,
+                   0));
+    fd = make_fd("fsetxattr");
+    EXPECT(0, "fsetxattr", MADE "/fsetxattr",
+           syscall(SYS_fsetxattr, fd, ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    close_fd(fd);
+    /* The group of setxattrat, only where the kernel has it. */
+    if (gated_available[GATED_SETXATTRAT]) {
+        make("setxattrat");
+        EXPECT(0, "setxattrat", MADE "/setxattrat",
+               syscall(SYS_setxattrat, AT_FDCWD, MADE "/setxattrat", 0, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        EXPECT(ENOENT, "setxattrat", OUT "/setxattrat-missing",
+               syscall(SYS_setxattrat, AT_FDCWD, OUT "/setxattrat-missing", 0, ATTRIBUTE,
+                       &arguments, sizeof arguments));
+    }
+
+    make_with_attribute("removexattr");
+    EXPECT(0, "removexattr", MADE "/removexattr",
+           syscall(SYS_removexattr, MADE "/removexattr", ATTRIBUTE));
+    EXPECT(ENOENT, "removexattr", OUT "/removexattr-missing",
+           syscall(SYS_removexattr, OUT "/removexattr-missing", ATTRIBUTE));
+    make_with_attribute("lremovexattr");
+    EXPECT(0, "lremovexattr", MADE "/lremovexattr",
+           syscall(SYS_lremovexattr, MADE "/lremovexattr", ATTRIBUTE));
+    EXPECT(ENOENT, "lremovexattr", OUT "/lremovexattr-missing",
+           syscall(SYS_lremovexattr, OUT "/lremovexattr-missing", ATTRIBUTE));
+    fd = make_fd("fremovexattr");
+    set_attribute("fremovexattr");
+    EXPECT(0, "fremovexattr", MADE "/fremovexattr", syscall(SYS_fremovexattr, fd, ATTRIBUTE));
+    close_fd(fd);
+    /* The group of removexattrat, only where the kernel has it. */
+    if (gated_available[GATED_REMOVEXATTRAT]) {
+        make_with_attribute("removexattrat");
+        EXPECT(0, "removexattrat", MADE "/removexattrat",
+               syscall(SYS_removexattrat, AT_FDCWD, MADE "/removexattrat", 0, ATTRIBUTE));
+        EXPECT(ENOENT, "removexattrat", OUT "/removexattrat-missing",
+               syscall(SYS_removexattrat, AT_FDCWD, OUT "/removexattrat-missing", 0,
+                       ATTRIBUTE));
+    }
+
+    make("fchmodat2");
+    EXPECT(0, "fchmodat2", MADE "/fchmodat2",
+           syscall(SYS_fchmodat2, AT_FDCWD, MADE "/fchmodat2", 0600, 0));
+    fd = make_fd("fchmodat2-empty");
+    EXPECT(0, "fchmodat2", MADE "/fchmodat2-empty",
+           syscall(SYS_fchmodat2, fd, "", 0600, AT_EMPTY_PATH));
+    close_fd(fd);
+    EXPECT(ENOENT, "fchmodat2", OUT "/fchmodat2-missing",
+           syscall(SYS_fchmodat2, AT_FDCWD, OUT "/fchmodat2-missing", 0600, 0));
+
+    fd = make_fd("fallocate");
+    EXPECT(0, "fallocate", MADE "/fallocate", syscall(SYS_fallocate, fd, 0, 0, 4096));
+    close_fd(fd);
+}
+
+/*
+ * The Linux section: every tracked system call, made through syscall(), after the
+ * check of the gated calls, whose groups it makes only where the kernel has them.
+ */
 static void linux_section(void)
 {
+    check_availability();
     EXPECT(0, "mkdirat", OUT, syscall(SYS_mkdirat, AT_FDCWD, OUT, 0777));
     EXPECT(0, "mkdirat", MADE, syscall(SYS_mkdirat, AT_FDCWD, MADE, 0777));
     EXPECT(0, "symlinkat", MADE_LINK, syscall(SYS_symlinkat, "made", AT_FDCWD, MADE_LINK));
@@ -1067,6 +1534,9 @@ static void linux_section(void)
     linux_listings_and_processes();
     linux_names();
     linux_changes();
+    linux_file_systems_and_watches();
+    linux_attribute_reads();
+    linux_attribute_changes();
 
 #ifdef SYS_io_uring_setup
     /* io_uring would bypass the tracer, so it is not available. */

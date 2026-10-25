@@ -160,6 +160,15 @@ impl Tracer for FakeTracer {
         *runs = runs.saturating_add(1);
         script(request)
     }
+
+    /// These tests read no extended attributes, so there are none.
+    fn extended_attributes(
+        &self,
+        _path: &std::path::Path,
+        _follow: bool,
+    ) -> std::io::Result<kizz_trace::ExtendedAttributes> {
+        Ok(kizz_trace::ExtendedAttributes::new())
+    }
 }
 
 /// Echoes nothing.

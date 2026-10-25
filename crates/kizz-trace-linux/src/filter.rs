@@ -37,9 +37,31 @@ impl TrackedSystemCall {
     }
 }
 
+/// The `x86_64` numbers of the tracked system calls that the `libc` crate does not
+/// define, from the kernel's `x86_64` table, `arch/x86/entry/syscalls/syscall_64.tbl`.
+pub(crate) mod numbers {
+    use libc::c_long;
+
+    /// `fchmodat2`, number 452 in the kernel's `x86_64` table.
+    pub(crate) const SYS_FCHMODAT2: c_long = 452;
+    /// `setxattrat`, number 463 in the kernel's `x86_64` table.
+    pub(crate) const SYS_SETXATTRAT: c_long = 463;
+    /// `getxattrat`, number 464 in the kernel's `x86_64` table.
+    pub(crate) const SYS_GETXATTRAT: c_long = 464;
+    /// `listxattrat`, number 465 in the kernel's `x86_64` table.
+    pub(crate) const SYS_LISTXATTRAT: c_long = 465;
+    /// `removexattrat`, number 466 in the kernel's `x86_64` table.
+    pub(crate) const SYS_REMOVEXATTRAT: c_long = 466;
+    /// `file_getattr`, number 468 in the kernel's `x86_64` table.
+    pub(crate) const SYS_FILE_GETATTR: c_long = 468;
+    /// `file_setattr`, number 469 in the kernel's `x86_64` table.
+    pub(crate) const SYS_FILE_SETATTR: c_long = 469;
+}
+
 /// Every system call the filter stops for, in the order of the spec's list:
-/// opening files, metadata and existence, links, directory listings, programs, the
-/// working directory, changes, and changes through a descriptor.
+/// opening files, metadata and existence, file systems, watches, extended
+/// attributes, links, directory listings, programs, the working directory, changes,
+/// and changes through a descriptor.
 pub const TRACKED_SYSTEM_CALLS: &[TrackedSystemCall] = &[
     // Opening files.
     TrackedSystemCall::new("open", libc::SYS_open),
@@ -54,6 +76,31 @@ pub const TRACKED_SYSTEM_CALLS: &[TrackedSystemCall] = &[
     TrackedSystemCall::new("access", libc::SYS_access),
     TrackedSystemCall::new("faccessat", libc::SYS_faccessat),
     TrackedSystemCall::new("faccessat2", libc::SYS_faccessat2),
+    TrackedSystemCall::new("file_getattr", numbers::SYS_FILE_GETATTR),
+    TrackedSystemCall::new("name_to_handle_at", libc::SYS_name_to_handle_at),
+    // File systems.
+    TrackedSystemCall::new("statfs", libc::SYS_statfs),
+    TrackedSystemCall::new("fstatfs", libc::SYS_fstatfs),
+    // Watches.
+    TrackedSystemCall::new("inotify_add_watch", libc::SYS_inotify_add_watch),
+    TrackedSystemCall::new("fanotify_mark", libc::SYS_fanotify_mark),
+    // Extended attributes.
+    TrackedSystemCall::new("getxattr", libc::SYS_getxattr),
+    TrackedSystemCall::new("lgetxattr", libc::SYS_lgetxattr),
+    TrackedSystemCall::new("fgetxattr", libc::SYS_fgetxattr),
+    TrackedSystemCall::new("getxattrat", numbers::SYS_GETXATTRAT),
+    TrackedSystemCall::new("listxattr", libc::SYS_listxattr),
+    TrackedSystemCall::new("llistxattr", libc::SYS_llistxattr),
+    TrackedSystemCall::new("flistxattr", libc::SYS_flistxattr),
+    TrackedSystemCall::new("listxattrat", numbers::SYS_LISTXATTRAT),
+    TrackedSystemCall::new("setxattr", libc::SYS_setxattr),
+    TrackedSystemCall::new("lsetxattr", libc::SYS_lsetxattr),
+    TrackedSystemCall::new("fsetxattr", libc::SYS_fsetxattr),
+    TrackedSystemCall::new("setxattrat", numbers::SYS_SETXATTRAT),
+    TrackedSystemCall::new("removexattr", libc::SYS_removexattr),
+    TrackedSystemCall::new("lremovexattr", libc::SYS_lremovexattr),
+    TrackedSystemCall::new("fremovexattr", libc::SYS_fremovexattr),
+    TrackedSystemCall::new("removexattrat", numbers::SYS_REMOVEXATTRAT),
     // Links.
     TrackedSystemCall::new("readlink", libc::SYS_readlink),
     TrackedSystemCall::new("readlinkat", libc::SYS_readlinkat),
@@ -84,6 +131,7 @@ pub const TRACKED_SYSTEM_CALLS: &[TrackedSystemCall] = &[
     TrackedSystemCall::new("truncate", libc::SYS_truncate),
     TrackedSystemCall::new("chmod", libc::SYS_chmod),
     TrackedSystemCall::new("fchmodat", libc::SYS_fchmodat),
+    TrackedSystemCall::new("fchmodat2", numbers::SYS_FCHMODAT2),
     TrackedSystemCall::new("chown", libc::SYS_chown),
     TrackedSystemCall::new("lchown", libc::SYS_lchown),
     TrackedSystemCall::new("fchownat", libc::SYS_fchownat),
@@ -91,10 +139,12 @@ pub const TRACKED_SYSTEM_CALLS: &[TrackedSystemCall] = &[
     TrackedSystemCall::new("utimes", libc::SYS_utimes),
     TrackedSystemCall::new("utimensat", libc::SYS_utimensat),
     TrackedSystemCall::new("futimesat", libc::SYS_futimesat),
+    TrackedSystemCall::new("file_setattr", numbers::SYS_FILE_SETATTR),
     // Changes through a descriptor, resolved to the path behind it.
     TrackedSystemCall::new("ftruncate", libc::SYS_ftruncate),
     TrackedSystemCall::new("fchmod", libc::SYS_fchmod),
     TrackedSystemCall::new("fchown", libc::SYS_fchown),
+    TrackedSystemCall::new("fallocate", libc::SYS_fallocate),
 ];
 
 /// The filter's return data for a tracked system call.
@@ -265,6 +315,7 @@ mod tests {
         u32::try_from(nr).unwrap()
     }
 
+    /// The tracked calls are the spec's 71, in the order of its list.
     #[test]
     fn tracked_set_is_the_spec_list() {
         let names: Vec<&str> = TRACKED_SYSTEM_CALLS.iter().map(|call| call.name).collect();
@@ -280,6 +331,28 @@ mod tests {
             "access",
             "faccessat",
             "faccessat2",
+            "file_getattr",
+            "name_to_handle_at",
+            "statfs",
+            "fstatfs",
+            "inotify_add_watch",
+            "fanotify_mark",
+            "getxattr",
+            "lgetxattr",
+            "fgetxattr",
+            "getxattrat",
+            "listxattr",
+            "llistxattr",
+            "flistxattr",
+            "listxattrat",
+            "setxattr",
+            "lsetxattr",
+            "fsetxattr",
+            "setxattrat",
+            "removexattr",
+            "lremovexattr",
+            "fremovexattr",
+            "removexattrat",
             "readlink",
             "readlinkat",
             "link",
@@ -305,6 +378,7 @@ mod tests {
             "truncate",
             "chmod",
             "fchmodat",
+            "fchmodat2",
             "chown",
             "lchown",
             "fchownat",
@@ -312,10 +386,13 @@ mod tests {
             "utimes",
             "utimensat",
             "futimesat",
+            "file_setattr",
             "ftruncate",
             "fchmod",
             "fchown",
+            "fallocate",
         ]);
+        assert_eq!(names.len(), 71);
     }
 
     #[test]
@@ -337,6 +414,22 @@ mod tests {
             ("statx", 332),
             ("openat2", 437),
             ("faccessat2", 439),
+            ("statfs", 137),
+            ("fstatfs", 138),
+            ("getxattr", 191),
+            ("removexattr", 197),
+            ("fremovexattr", 199),
+            ("inotify_add_watch", 254),
+            ("fallocate", 285),
+            ("fanotify_mark", 301),
+            ("name_to_handle_at", 303),
+            ("fchmodat2", 452),
+            ("setxattrat", 463),
+            ("getxattrat", 464),
+            ("listxattrat", 465),
+            ("removexattrat", 466),
+            ("file_getattr", 468),
+            ("file_setattr", 469),
         ];
         for (name, nr) in known {
             let call = TRACKED_SYSTEM_CALLS

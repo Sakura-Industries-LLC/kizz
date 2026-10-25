@@ -19,11 +19,11 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, BuildId, Capture, ContentHash, DATABASE_DIR, EntryCounts, FileMeta, Inventory,
-    LastWriter, LearnedOrder, Observation, Owner, PathKey, PathState, PositionKey, ProgramPath,
-    RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey,
-    StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Times,
-    Verdict, WrittenBy, path_prefix,
+    AccessBits, Attribute, Attributes, BuildId, Capture, ContentHash, DATABASE_DIR, EntryCounts,
+    FileMeta, Inventory, LastWriter, LearnedOrder, Observation, Owner, PathKey, PathState,
+    PositionKey, ProgramPath, RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion,
+    StepExit, StepKey, StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId,
+    TaskRecord, Times, Verdict, WrittenBy, path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -55,7 +55,7 @@ fn step_record(n: u8) -> StepRecord {
         observations: vec![
             Observation {
                 path: PathBuf::from(format!("/w/{n}/input")),
-                access: AccessBits(AccessBits::READ),
+                access: AccessBits(AccessBits::READ | AccessBits::XATTR),
                 tracked: false,
                 state: PathState::File {
                     meta: FileMeta {
@@ -72,6 +72,13 @@ fn step_record(n: u8) -> StepRecord {
                     },
                     hash: Some(ContentHash([n; 32])),
                 },
+                attributes: Some(Attributes {
+                    own: Some(vec![Attribute {
+                        name: format!("user.{n}").into_bytes(),
+                        hash: ContentHash([n; 32]),
+                    }]),
+                    pointee: None,
+                }),
             },
             Observation {
                 path: PathBuf::from(format!("/w/{n}")),
@@ -89,6 +96,7 @@ fn step_record(n: u8) -> StepRecord {
                         ctime_nanos: -1,
                     },
                 },
+                attributes: None,
             },
         ],
         ignored: u64::from(n),

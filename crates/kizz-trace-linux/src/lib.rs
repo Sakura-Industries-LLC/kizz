@@ -27,6 +27,11 @@
 //! the descriptor that an opening call returned, and through the path for the
 //! program of an `exec` and each interpreter and loader that the kernel loaded.
 //!
+//! [`LinuxTracer`] also answers the attribute query of the tracer interface: it
+//! reads the extended attributes of a path with `listxattr` and `getxattr`, or
+//! `llistxattr` and `lgetxattr` without following a final symbolic link, and a file
+//! system that keeps none (`EOPNOTSUPP`) has none.
+//!
 //! When a request is cancelled, the tracer interrupts the tree: it sends `SIGINT`
 //! once to every live process. It follows the tree as before for
 //! [`CANCEL_GRACE_PERIOD`], and returns as soon as the whole tree has exited; when
@@ -49,6 +54,7 @@ mod sys;
 use std::{
     collections::BTreeSet,
     io,
+    path::Path,
     sync::mpsc::{self, RecvTimeoutError},
     thread::{self, ScopedJoinHandle},
     time::Duration,
@@ -56,8 +62,8 @@ use std::{
 
 pub use filter::{TRACKED_SYSTEM_CALLS, TrackedSystemCall};
 use kizz_trace::{
-    Accesses, Cancellation, EchoSink, FirstReads, OutputStream, RunRequest, RunResult, TraceError,
-    Tracer,
+    Accesses, Cancellation, EchoSink, ExtendedAttributes, FirstReads, OutputStream, RunRequest,
+    RunResult, TraceError, Tracer,
 };
 
 use crate::{
@@ -315,5 +321,13 @@ impl Tracer for LinuxTracer {
             incomplete,
             first_reads,
         })
+    }
+
+    fn extended_attributes(
+        &self,
+        path: &Path,
+        follow: bool,
+    ) -> io::Result<ExtendedAttributes> {
+        sys::extended_attributes(path, follow)
     }
 }

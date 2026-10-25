@@ -32,14 +32,14 @@ use kizz_core::{
     observe::listing, parse_tasks, step_key,
 };
 use kizz_store::{
-    AccessBits, Change, ContentHash, Difference, DirEntry, EntryKind, FileMeta, Listing,
-    NotCachedReason, Observation, Owner, PathState, RunReason, StepExit, StepKey, StepRecord,
-    Store, Times,
+    AccessBits, Attribute, Attributes, Change, ContentHash, Difference, DirEntry, EntryKind,
+    FileMeta, Listing, NotCachedReason, Observation, Owner, PathState, RunReason, StepExit,
+    StepKey, StepRecord, Store, Times,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    FirstReads, IncompleteReason, OutputStream, RunRequest, RunResult, Termination, TraceError,
-    Tracer,
+    ExtendedAttributes, FirstReads, IncompleteReason, OutputStream, RunRequest, RunResult,
+    Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -50,12 +50,16 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type Script = dyn Fn(&RunRequest) -> Result<RunResult, TraceError> + Send + Sync;
 
 /// A tracer that runs nothing and follows a script that performs file operations
-/// on real files and reports them.
+/// on real files and reports them, and whose attribute query answers with the
+/// extended attributes that a test sets.
 struct FakeTracer {
     /// What each run does.
     script: Box<Script>,
     /// Every request received, in order.
     requests: Mutex<Vec<RunRequest>>,
+    /// The extended attributes of each path, by the path and whether a final link
+    /// is followed; the query finds none for any other path that exists.
+    attributes: Mutex<BTreeMap<(PathBuf, bool), ExtendedAttributes>>,
 }
 
 impl FakeTracer {
@@ -66,7 +70,26 @@ impl FakeTracer {
         Self {
             script: Box::new(script),
             requests: Mutex::new(Vec::new()),
+            attributes: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Set the extended attributes of `path`, with or without following a final
+    /// link, to `pairs` of a name and a value.
+    fn set_attributes(
+        &self,
+        path: &Path,
+        follow: bool,
+        pairs: &[(&str, &str)],
+    ) {
+        let attributes = pairs
+            .iter()
+            .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+            .collect();
+        self.attributes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((path.to_path_buf(), follow), attributes);
     }
 
     /// A tracer whose runs exit with status 0 and report reading `paths`.
@@ -109,6 +132,23 @@ impl Tracer for FakeTracer {
             .unwrap_or_else(PoisonError::into_inner)
             .push(request.clone());
         (self.script)(request)
+    }
+
+    fn extended_attributes(
+        &self,
+        path: &Path,
+        follow: bool,
+    ) -> io::Result<ExtendedAttributes> {
+        let set = self
+            .attributes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(path.to_path_buf(), follow))
+            .cloned();
+        match set {
+            Some(attributes) => Ok(attributes),
+            None => fs::symlink_metadata(path).map(|_| ExtendedAttributes::new()),
+        }
     }
 }
 
@@ -1976,5 +2016,106 @@ fn switching_the_timestamps_option_does_not_reuse_a_refreshed_record() -> TestRe
     let back = fixture.build(&tracer, &[&plain])?;
     assert!(back.cached(0)?);
     assert_eq!(tracer.runs(), 2);
+    Ok(())
+}
+
+/// The attribute `name` with the hash of `value`, as a record holds it.
+fn attribute(
+    name: &str,
+    value: &str,
+) -> Attribute {
+    Attribute {
+        name: name.as_bytes().to_vec(),
+        hash: ContentHash(*blake3::hash(value.as_bytes()).as_bytes()),
+    }
+}
+
+/// A step whose command read the extended attributes of a file, of a directory, or
+/// of what a link points to records them, through the fake attribute query, and
+/// stays cached while they do not change; when one appears, disappears, or
+/// changes value, the step runs again, and the reason names the attribute.
+#[test]
+fn a_step_runs_again_when_an_extended_attribute_it_read_changes() -> TestResult {
+    let fixture = Fixture::new()?;
+    let file = fixture.write_old("file.txt", "content")?;
+    let dir = fixture.path("dir");
+    fs::create_dir(&dir)?;
+    fixture.write_old("target.txt", "pointee")?;
+    let link = fixture.path("link");
+    symlink("target.txt", &link)?;
+    let (read_file, read_dir, read_link) = (file.clone(), dir.clone(), link.clone());
+    let tracer = FakeTracer::new(move |request| {
+        let path = match verb(request) {
+            "file" => read_file.clone(),
+            "dir" => read_dir.clone(),
+            _ => read_link.clone(),
+        };
+        finished(
+            request,
+            &[(path, AccessKind::Xattr)],
+            Termination::Exited(0),
+        )
+    });
+    tracer.set_attributes(&file, false, &[("user.a", "1")]);
+    tracer.set_attributes(&dir, false, &[("user.kept", "k"), ("user.gone", "g")]);
+    tracer.set_attributes(&link, false, &[]);
+    tracer.set_attributes(&link, true, &[("user.origin", "x")]);
+    let steps = [
+        fixture.step(&["tool", "file"])?,
+        fixture.step(&["tool", "dir"])?,
+        fixture.step(&["tool", "link"])?,
+    ];
+    let all: Vec<&StepSpec> = steps.iter().collect();
+    fixture.build(&tracer, &all)?;
+    let record = fixture.record(&steps[2])?.ok_or("no record")?;
+    let observed = observation(&record, &link)?;
+    assert!(observed.access.contains(AccessBits::XATTR));
+    assert_eq!(
+        observed.attributes,
+        Some(Attributes {
+            own: Some(Vec::new()),
+            pointee: Some(vec![attribute("user.origin", "x")]),
+        })
+    );
+    let hit = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(hit.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 3);
+
+    tracer.set_attributes(&file, false, &[("user.a", "1"), ("user.new", "n")]);
+    tracer.set_attributes(&dir, false, &[("user.kept", "k")]);
+    tracer.set_attributes(&link, true, &[("user.origin", "y")]);
+    let built = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(!built.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 6);
+    let expected = [
+        (&file, Change::Attributes {
+            appeared: vec![attribute("user.new", "n")],
+            disappeared: Vec::new(),
+            changed: Vec::new(),
+        }),
+        (&dir, Change::Attributes {
+            appeared: Vec::new(),
+            disappeared: vec![attribute("user.gone", "g")],
+            changed: Vec::new(),
+        }),
+        (&link, Change::Attributes {
+            appeared: Vec::new(),
+            disappeared: Vec::new(),
+            changed: vec![attribute("user.origin", "y")],
+        }),
+    ];
+    for (step, (path, change)) in steps.iter().zip(expected) {
+        let record = fixture.record(step)?.ok_or("no record")?;
+        assert_eq!(differences(&record), [difference(path.clone(), change)]);
+    }
+    let again = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(again.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 6);
     Ok(())
 }

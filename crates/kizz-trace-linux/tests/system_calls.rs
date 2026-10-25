@@ -13,12 +13,22 @@
 //! helper mode: [`helper_process`] does nothing in a normal test run, and does the
 //! work of its mode when the tracer starts the executable with the helper variable
 //! set in the request's explicit environment.
+//!
+//! The calls that a kernel may lack because a newer Linux added them,
+//! [`GATED_CALLS`], are checked only where the kernel has them: the test first
+//! makes each in its own process, which no tracer follows, with arguments that
+//! cannot succeed, and `ENOSYS` means that the kernel lacks it. The helper then
+//! skips each call that the kernel lacks, the test requires that nothing is
+//! recorded at its path, and it writes a notice that names the call to its
+//! standard error. Every other call is required on every kernel.
 
 use std::{
     collections::BTreeMap,
     error::Error,
     ffi::{CString, OsStr, OsString},
-    fs, io, mem,
+    fs,
+    io::{self, Write as _},
+    mem,
     os::unix::{
         ffi::OsStrExt as _,
         fs::{PermissionsExt as _, symlink},
@@ -41,6 +51,21 @@ use libc::{c_int, c_long};
 const HELPER_VARIABLE: &str = "KIZZ_TRACE_TEST_HELPER";
 /// The search path of the shell commands in these tests.
 const SEARCH_PATH: &str = "/usr/bin:/bin";
+/// The variable that names, joined with `,`, the gated calls that the kernel has,
+/// which the helper of [`every_tracked_system_call_is_decoded_in_a_real_process`]
+/// makes.
+const AVAILABLE_VARIABLE: &str = "KIZZ_TRACE_TEST_AVAILABLE";
+/// The tracked calls that a kernel may lack because a newer Linux added them, in
+/// the order of [`TRACKED_SYSTEM_CALLS`]: Linux 6.17 added `file_getattr` and
+/// `file_setattr`, and Linux 6.13 the `xattrat` calls.
+const GATED_CALLS: [&str; 6] = [
+    "file_getattr",
+    "getxattrat",
+    "listxattrat",
+    "setxattrat",
+    "removexattrat",
+    "file_setattr",
+];
 
 /// The result of a test helper.
 type Outcome<T> = Result<T, Box<dyn Error>>;
@@ -363,6 +388,57 @@ fn zeroed(
     address
 }
 
+/// The address of a copy of `bytes`, which the kernel may also write, that stays
+/// alive in `strings`.
+fn filled(
+    strings: &mut Strings,
+    bytes: &[u8],
+) -> c_long {
+    let mut buffer = bytes.to_vec();
+    let address = address(buffer.as_mut_ptr().cast_const());
+    strings.buffers.push(buffer);
+    address
+}
+
+/// Make the system call `name` with `arguments`, which must fail with `errno`.
+fn sys_fails(
+    name: &str,
+    arguments: &[c_long],
+    errno: c_int,
+) -> Outcome<()> {
+    match raw(number(name)?, arguments) {
+        Ok(_) => Err(format!("{name} succeeded").into()),
+        Err(error) if error.raw_os_error() == Some(errno) => Ok(()),
+        Err(error) => Err(format!("{name} failed with another error: {error}").into()),
+    }
+}
+
+/// Set the extended attribute `name` of the file at `path` to `value`, in the test
+/// process, before the traced helper runs.
+fn set_attribute(
+    path: &Path,
+    name: &str,
+    value: &[u8],
+) -> Outcome<()> {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let name = CString::new(name)?;
+    // SAFETY: `path` and `name` are NUL-terminated strings, and `value` holds
+    // `value.len()` bytes, which the kernel only reads.
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 /// Fork a child that makes the system calls `calls`, each a name and its
 /// arguments, padded with zeros, and wait for it to exit with code 0. The child
 /// makes only system calls, on data prepared before the fork; the last call must
@@ -423,7 +499,212 @@ fn helper_every_call() -> Outcome<()> {
     links_and_listings(&mut s, sub)?;
     working_directory(&mut s)?;
     changes(&mut s, sub)?;
+    file_systems_and_watches(&mut s)?;
+    extended_attributes(&mut s)?;
     programs(&mut s, sub)
+}
+
+/// The size of `struct file_attr`, which `file_getattr` and `file_setattr` take:
+/// `FILE_ATTR_SIZE_VER0` in the kernel's `include/uapi/linux/fs.h`.
+const FILE_ATTR_SIZE: usize = 24;
+/// The most bytes of a file handle, `MAX_HANDLE_SZ`.
+const MAX_HANDLE_SIZE: u32 = 128;
+/// The size of a `struct file_handle` with room for [`MAX_HANDLE_SIZE`] bytes: its
+/// two 4-byte fields, then the handle.
+const HANDLE_BUFFER_SIZE: usize = 136;
+/// The size of `struct xattr_args`, which the `xattrat` calls take:
+/// `XATTR_ARGS_SIZE_VER0` in the kernel's `include/uapi/linux/xattr.h`.
+const XATTR_ARGS_SIZE: c_long = 16;
+/// The attribute that the tests set and read.
+const ATTRIBUTE: &str = "user.kizz";
+/// The value of [`ATTRIBUTE`].
+const ATTRIBUTE_VALUE: &[u8] = b"value";
+/// `FAN_CLASS_NOTIF | FAN_REPORT_FID`, the class of a fanotify group that an
+/// unprivileged process may create since Linux 5.13.
+const FANOTIFY_CLASS: c_int = 0x0200;
+/// `FAN_MARK_ADD`, from the kernel's `include/uapi/linux/fanotify.h`.
+const FAN_MARK_ADD: c_long = 0x1;
+/// `FAN_OPEN`, from the kernel's `include/uapi/linux/fanotify.h`.
+const FAN_OPEN: c_long = 0x20;
+
+/// The bytes of a `struct xattr_args` whose value is at `value` with `size` bytes.
+fn xattr_args(
+    value: c_long,
+    size: u32,
+) -> Vec<u8> {
+    let mut bytes = u64::try_from(value)
+        .unwrap_or_default()
+        .to_ne_bytes()
+        .to_vec();
+    bytes.extend_from_slice(&size.to_ne_bytes());
+    bytes.extend_from_slice(&0_u32.to_ne_bytes());
+    bytes
+}
+
+/// Whether the test found that the kernel has the gated call `name`, as
+/// [`AVAILABLE_VARIABLE`] in the helper's environment names it.
+fn helper_may_make(name: &str) -> bool {
+    std::env::var(AVAILABLE_VARIABLE)
+        .is_ok_and(|names| names.split(',').any(|available| available == name))
+}
+
+/// Check file systems, file attributes and file handles, and watch paths through
+/// an inotify instance and a fanotify group that the helper creates. The gated
+/// calls are made only where the kernel has them, and `file_setattr` only where it
+/// also has `file_getattr`.
+fn file_systems_and_watches(s: &mut Strings) -> Outcome<()> {
+    let cwd = cwd();
+    let figures = zeroed(s, mem::size_of::<libc::statfs>());
+    sys("statfs", &[s.text("statfs.p")?, figures])?;
+    let behind = c_long::from(open("fstatfs.link", libc::O_RDONLY)?);
+    sys("fstatfs", &[behind, figures])?;
+    let attributes = zeroed(s, FILE_ATTR_SIZE);
+    let attributes_size = c_long::try_from(FILE_ATTR_SIZE)?;
+    if helper_may_make("file_getattr") {
+        sys("file_getattr", &[
+            cwd,
+            s.text("file_getattr.p")?,
+            attributes,
+            attributes_size,
+            0,
+        ])?;
+    }
+    // `file_setattr` sets only the attributes that `file_getattr` read.
+    if helper_may_make("file_getattr") && helper_may_make("file_setattr") {
+        let set = s.text("file_setattr.f")?;
+        sys("file_getattr", &[cwd, set, attributes, attributes_size, 0])?;
+        sys("file_setattr", &[cwd, set, attributes, attributes_size, 0])?;
+    }
+    let mut handle = MAX_HANDLE_SIZE.to_ne_bytes().to_vec();
+    handle.resize(HANDLE_BUFFER_SIZE, 0);
+    let handle = filled(s, &handle);
+    let mount = zeroed(s, mem::size_of::<c_int>());
+    sys("name_to_handle_at", &[
+        cwd,
+        s.text("name_to_handle_at.p")?,
+        handle,
+        mount,
+        0,
+    ])?;
+    // SAFETY: `inotify_init1` has no memory-safety requirements.
+    let inotify = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if inotify < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mask = c_long::from(libc::IN_OPEN);
+    sys("inotify_add_watch", &[
+        c_long::from(inotify),
+        s.text("inotify.p")?,
+        mask,
+    ])?;
+    // SAFETY: `fanotify_init` has no memory-safety requirements.
+    let group = unsafe {
+        libc::fanotify_init(
+            FANOTIFY_CLASS.cast_unsigned(),
+            libc::O_RDONLY.cast_unsigned(),
+        )
+    };
+    if group < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    sys("fanotify_mark", &[
+        c_long::from(group),
+        FAN_MARK_ADD,
+        FAN_OPEN,
+        cwd,
+        s.text("fanotify.p")?,
+    ])?;
+    sys_missing("statfs", &[s.text("statfs.missing")?, figures])
+}
+
+/// Read, list, set and remove extended attributes, by path, through descriptors
+/// opened by symbolic links, and relative to the working directory, and read
+/// attributes in ways that fail with `ENODATA`, `ERANGE` and `ENOENT`. The
+/// `xattrat` calls are made only where the kernel has them.
+fn extended_attributes(s: &mut Strings) -> Outcome<()> {
+    let cwd = cwd();
+    let name = s.text(ATTRIBUTE)?;
+    let buffer = zeroed(s, 256);
+    let size = 256;
+    sys("getxattr", &[s.text("getxattr.f")?, name, buffer, size])?;
+    sys("lgetxattr", &[s.text("lgetxattr.f")?, name, buffer, size])?;
+    let read = c_long::from(open("fgetxattr.link", libc::O_RDONLY)?);
+    sys("fgetxattr", &[read, name, buffer, size])?;
+    if helper_may_make("getxattrat") {
+        let get = filled(s, &xattr_args(buffer, 256));
+        sys("getxattrat", &[
+            cwd,
+            s.text("getxattrat.f")?,
+            0,
+            name,
+            get,
+            XATTR_ARGS_SIZE,
+        ])?;
+    }
+    sys("listxattr", &[s.text("listxattr.f")?, buffer, size])?;
+    sys("llistxattr", &[s.text("llistxattr.f")?, buffer, size])?;
+    let listed = c_long::from(open("flistxattr.link", libc::O_RDONLY)?);
+    sys("flistxattr", &[listed, buffer, size])?;
+    if helper_may_make("listxattrat") {
+        sys("listxattrat", &[
+            cwd,
+            s.text("listxattrat.f")?,
+            0,
+            buffer,
+            size,
+        ])?;
+    }
+    let none = s.text("user.none")?;
+    sys_fails(
+        "getxattr",
+        &[s.text("getxattr.nodata")?, none, buffer, size],
+        libc::ENODATA,
+    )?;
+    sys_fails(
+        "getxattr",
+        &[s.text("getxattr.range")?, name, buffer, 1],
+        libc::ERANGE,
+    )?;
+    sys_missing("getxattr", &[
+        s.text("getxattr.missing")?,
+        name,
+        buffer,
+        size,
+    ])?;
+    let value = filled(s, ATTRIBUTE_VALUE);
+    let length = c_long::try_from(ATTRIBUTE_VALUE.len())?;
+    sys("setxattr", &[s.text("setxattr.f")?, name, value, length, 0])?;
+    sys("lsetxattr", &[
+        s.text("lsetxattr.f")?,
+        name,
+        value,
+        length,
+        0,
+    ])?;
+    let written = c_long::from(open("fsetxattr.link", libc::O_RDONLY)?);
+    sys("fsetxattr", &[written, name, value, length, 0])?;
+    if helper_may_make("setxattrat") {
+        let set = filled(s, &xattr_args(value, u32::try_from(length)?));
+        sys("setxattrat", &[
+            cwd,
+            s.text("setxattrat.f")?,
+            0,
+            name,
+            set,
+            XATTR_ARGS_SIZE,
+        ])?;
+    }
+    sys("removexattr", &[s.text("removexattr.f")?, name])?;
+    sys("lremovexattr", &[s.text("lremovexattr.f")?, name])?;
+    let removed = c_long::from(open("fremovexattr.link", libc::O_RDONLY)?);
+    sys("fremovexattr", &[removed, name])?;
+    if helper_may_make("removexattrat") {
+        sys("removexattrat", &[cwd, s.text("removexattrat.f")?, 0, name])?;
+    }
+    sys("fchmodat2", &[cwd, s.text("fchmodat2.f")?, 0o644, 0])?;
+    let allocated = c_long::from(open("fallocate.link", libc::O_WRONLY)?);
+    sys("fallocate", &[allocated, 0, 0, 16])?;
+    Ok(())
 }
 
 /// Open files.
@@ -1312,6 +1593,54 @@ const EVERY_CALL_FIXTURES: &[&str] = &[
     "fchmod.link -> fchmod.f",
     "fchown.f",
     "fchown.link -> fchown.f",
+    "statfs.p",
+    "fstatfs.f",
+    "fstatfs.link -> fstatfs.f",
+    "file_getattr.p",
+    "file_setattr.f",
+    "name_to_handle_at.p",
+    "inotify.p",
+    "fanotify.p",
+    "getxattr.f",
+    "lgetxattr.f",
+    "fgetxattr.f",
+    "fgetxattr.link -> fgetxattr.f",
+    "getxattrat.f",
+    "listxattr.f",
+    "llistxattr.f",
+    "flistxattr.f",
+    "flistxattr.link -> flistxattr.f",
+    "listxattrat.f",
+    "getxattr.nodata",
+    "getxattr.range",
+    "setxattr.f",
+    "lsetxattr.f",
+    "fsetxattr.f",
+    "fsetxattr.link -> fsetxattr.f",
+    "setxattrat.f",
+    "removexattr.f",
+    "lremovexattr.f",
+    "fremovexattr.f",
+    "fremovexattr.link -> fremovexattr.f",
+    "removexattrat.f",
+    "fchmodat2.f",
+    "fallocate.f",
+    "fallocate.link -> fallocate.f",
+];
+
+/// The fixtures of [`every_tracked_system_call_is_decoded_in_a_real_process`] that
+/// have the attribute [`ATTRIBUTE`] before the helper runs, for the calls that
+/// read or remove it.
+const ATTRIBUTE_FIXTURES: &[&str] = &[
+    "getxattr.f",
+    "lgetxattr.f",
+    "fgetxattr.f",
+    "getxattrat.f",
+    "getxattr.range",
+    "removexattr.f",
+    "lremovexattr.f",
+    "fremovexattr.f",
+    "removexattrat.f",
 ];
 
 /// Only a read.
@@ -1322,6 +1651,8 @@ const PROBE: &[AccessKind] = &[AccessKind::Probe];
 const LIST: &[AccessKind] = &[AccessKind::List];
 /// Only a write.
 const WRITE: &[AccessKind] = &[AccessKind::Write];
+/// Only extended attributes read or listed.
+const XATTR: &[AccessKind] = &[AccessKind::Xattr];
 
 /// The exact access kinds that [`helper_every_call`] gives each workspace path.
 const EVERY_CALL_ACCESSES: &[(&str, &[AccessKind])] = &[
@@ -1388,23 +1719,168 @@ const EVERY_CALL_ACCESSES: &[(&str, &[AccessKind])] = &[
     ("fchmod.f", WRITE),
     ("fchown.link", READ),
     ("fchown.f", WRITE),
+    ("statfs.p", PROBE),
+    ("statfs.missing", PROBE),
+    ("fstatfs.link", READ),
+    ("fstatfs.f", PROBE),
+    ("file_getattr.p", PROBE),
+    ("file_setattr.f", &[AccessKind::Probe, AccessKind::Write]),
+    ("name_to_handle_at.p", PROBE),
+    ("inotify.p", PROBE),
+    ("fanotify.p", PROBE),
+    ("getxattr.f", XATTR),
+    ("lgetxattr.f", XATTR),
+    ("fgetxattr.link", READ),
+    ("fgetxattr.f", XATTR),
+    ("getxattrat.f", XATTR),
+    ("listxattr.f", XATTR),
+    ("llistxattr.f", XATTR),
+    ("flistxattr.link", READ),
+    ("flistxattr.f", XATTR),
+    ("listxattrat.f", XATTR),
+    ("getxattr.nodata", XATTR),
+    ("getxattr.range", XATTR),
+    ("getxattr.missing", PROBE),
+    ("setxattr.f", WRITE),
+    ("lsetxattr.f", WRITE),
+    ("fsetxattr.link", READ),
+    ("fsetxattr.f", WRITE),
+    ("setxattrat.f", WRITE),
+    ("removexattr.f", WRITE),
+    ("lremovexattr.f", WRITE),
+    ("fremovexattr.link", READ),
+    ("fremovexattr.f", WRITE),
+    ("removexattrat.f", WRITE),
+    ("fchmodat2.f", WRITE),
+    ("fallocate.link", WRITE),
+    ("fallocate.f", WRITE),
     ("execve.missing", PROBE),
     ("sub/execveat.missing", PROBE),
 ];
 
+/// The paths of [`EVERY_CALL_ACCESSES`] that only gated calls touch, each with the
+/// gated calls that the helper needs to touch it: `file_setattr.f` needs
+/// `file_getattr` too, because `file_setattr` sets only what `file_getattr` read.
+const GATED_PATHS: &[(&str, &[&str])] = &[
+    ("file_getattr.p", &["file_getattr"]),
+    ("file_setattr.f", &["file_getattr", "file_setattr"]),
+    ("getxattrat.f", &["getxattrat"]),
+    ("listxattrat.f", &["listxattrat"]),
+    ("setxattrat.f", &["setxattrat"]),
+    ("removexattrat.f", &["removexattrat"]),
+];
+
+/// Whether the kernel has the gated call `name`: make it once in this process,
+/// which no tracer follows, on `/`, with arguments that the kernel rejects with
+/// `EINVAL` before it looks the path up, a structure size of 0 for `getxattrat`,
+/// `setxattrat`, `file_getattr` and `file_setattr` and a flag that the call does
+/// not accept for `listxattrat` and `removexattrat`. `ENOSYS` means that the
+/// kernel lacks the call, `EINVAL` that it has it, and any other result is an
+/// error.
+fn kernel_has(name: &str) -> Outcome<bool> {
+    let mut s = Strings::default();
+    let path = s.text("/")?;
+    let attribute = s.text(ATTRIBUTE)?;
+    let place = zeroed(&mut s, 64);
+    let cwd = cwd();
+    let unaccepted = flag(libc::AT_REMOVEDIR);
+    let arguments: [c_long; 5] = match name {
+        "file_getattr" | "file_setattr" => [cwd, path, place, 0, 0],
+        "getxattrat" | "setxattrat" => [cwd, path, 0, attribute, place],
+        "listxattrat" => [cwd, path, unaccepted, place, 64],
+        "removexattrat" => [cwd, path, unaccepted, attribute, 0],
+        _ => return Err(format!("{name} is not a gated call").into()),
+    };
+    match raw(number(name)?, &arguments) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(true),
+        Err(error) => Err(format!("the check of {name} failed with {error}").into()),
+        Ok(_) => Err(format!("the check of {name} succeeded").into()),
+    }
+}
+
+/// The gated calls that the kernel has, by [`kernel_has`], in order.
+fn available_gated_calls() -> Outcome<Vec<&'static str>> {
+    let mut available = Vec::new();
+    for name in GATED_CALLS {
+        if kernel_has(name)? {
+            available.push(name);
+        }
+    }
+    Ok(available)
+}
+
+/// The notice that names `test` and each gated call that `available` lacks, or
+/// `None` when it lacks none.
+fn unavailable_notice(
+    test: &str,
+    available: &[&str],
+) -> Option<String> {
+    let missing: Vec<&str> = GATED_CALLS
+        .iter()
+        .copied()
+        .filter(|name| !available.contains(name))
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "NOTICE: {test}: the kernel lacks {}, so the test required that nothing was \
+             recorded at their paths instead of checking their accesses",
+            missing.join(", ")
+        )
+    })
+}
+
+/// The notice names the test and each gated call that the kernel lacks, in order,
+/// and there is none when the kernel has them all.
+#[test]
+fn the_notice_names_the_test_and_each_unavailable_call() {
+    assert_eq!(unavailable_notice("t", &GATED_CALLS), None);
+    assert_eq!(
+        unavailable_notice("t", &["file_getattr", "listxattrat", "setxattrat"]),
+        Some(
+            "NOTICE: t: the kernel lacks getxattrat, removexattrat, file_setattr, so the test \
+             required that nothing was recorded at their paths instead of checking their \
+             accesses"
+                .to_owned()
+        )
+    );
+}
+
+/// Every tracked system call, made by a real process on fixtures that only it
+/// touches, records the exact kinds of its rule, and a failed call the kinds of
+/// its failure. A gated call that the kernel lacks is skipped: nothing may be
+/// recorded at its path, and a notice to the standard error of the test process,
+/// through [`io::stderr`], which the test harness does not capture, names it.
 #[test]
 fn every_tracked_system_call_is_decoded_in_a_real_process() {
+    let available = available_gated_calls().unwrap();
+    if let Some(notice) = unavailable_notice(
+        "every_tracked_system_call_is_decoded_in_a_real_process",
+        &available,
+    ) {
+        writeln!(io::stderr(), "{notice}").unwrap();
+    }
     let workspace = Workspace::new().unwrap();
     workspace.create(EVERY_CALL_FIXTURES).unwrap();
-    let result = run_successfully(&helper("every_call", &workspace.root).unwrap()).unwrap();
+    for fixture in ATTRIBUTE_FIXTURES {
+        set_attribute(&workspace.path(fixture), ATTRIBUTE, ATTRIBUTE_VALUE).unwrap();
+    }
+    let mut request = helper("every_call", &workspace.root).unwrap();
+    request.env.insert(
+        OsString::from(AVAILABLE_VARIABLE),
+        OsString::from(available.join(",")),
+    );
+    let result = run_successfully(&request).unwrap();
     let mut wrong = Vec::new();
     for (path, expected) in EVERY_CALL_ACCESSES {
+        let made = GATED_PATHS
+            .iter()
+            .find(|(gated, _)| gated == path)
+            .is_none_or(|(_, needs)| needs.iter().all(|name| available.contains(name)));
+        let expected = made.then(|| kinds(expected));
         let actual = workspace.kinds(&result, path).unwrap();
-        if actual != Some(kinds(expected)) {
-            wrong.push(format!(
-                "{path}: expected {}, got {actual:?}",
-                kinds(expected)
-            ));
+        if actual != expected {
+            wrong.push(format!("{path}: expected {expected:?}, got {actual:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -1729,4 +2205,33 @@ fn a_script_that_runs_reports_its_own_first_read() {
         result.first_reads.get(&interpreter).copied(),
         FileMetadata::at(Path::new("/bin/sh"))
     );
+}
+
+/// The Linux tracer answers the attribute query of the tracer interface: through a
+/// symbolic link it reads the attributes of the file when it follows the link and
+/// not otherwise, and a missing path fails with `NotFound`.
+#[test]
+fn the_linux_tracer_answers_the_attribute_query() {
+    let workspace = Workspace::new().unwrap();
+    workspace.create(&["file", "link -> file"]).unwrap();
+    set_attribute(&workspace.path("file"), ATTRIBUTE, ATTRIBUTE_VALUE).unwrap();
+    let tracer: &dyn Tracer = &LinuxTracer::new();
+    let link = workspace.path("link");
+    let followed = tracer.extended_attributes(&link, true).unwrap();
+    assert_eq!(
+        followed.get(ATTRIBUTE.as_bytes()).map(Vec::as_slice),
+        Some(ATTRIBUTE_VALUE)
+    );
+    assert_eq!(
+        tracer
+            .extended_attributes(&workspace.path("file"), false)
+            .unwrap(),
+        followed
+    );
+    let own = tracer.extended_attributes(&link, false).unwrap();
+    assert!(!own.contains_key(ATTRIBUTE.as_bytes()), "{own:?}");
+    let missing = tracer
+        .extended_attributes(&workspace.path("missing"), false)
+        .unwrap_err();
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
 }
