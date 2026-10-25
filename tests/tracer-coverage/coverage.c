@@ -23,7 +23,8 @@
  *
  * Run with a mode and the task directory as its arguments, the program is a child
  * that a process of the run started with exec, and it makes only the calls of that
- * mode on paths of its own.
+ * mode on paths of its own. Run as the interpreter of a fixture script, with the
+ * argument `interpreted` first, it makes no call and exits with 0.
  *
  * Linux names some paths through out/linux/made-link, a symbolic link to
  * out/linux/made: a file created through the link is recorded under the link's
@@ -55,6 +56,13 @@
 
 /* The line that the program prints when every call returned what it expected. */
 #define SUCCESS_LINE "coverage: every call returned what it expected"
+
+/*
+ * The mode in which the program, run as the interpreter of the fixture script
+ * in/linux/interp/inner at the end of the chain from in/linux/interp/outer,
+ * makes no call and exits with 0.
+ */
+#define INTERPRETED "interpreted"
 
 /* Serializes the counters and the output of the threads. */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -334,6 +342,8 @@ static void core(void)
 #define MADE "out/linux/made"
 /* A symbolic link to MADE, through which files are created. */
 #define MADE_LINK "out/linux/made-link"
+/* The fixture's #! scripts. */
+#define INTERP "in/linux/interp"
 
 /* A descriptor of in/linux/at. */
 static int in_fd = -1;
@@ -461,6 +471,23 @@ static void copy_program(const char *link, const char *path)
     }
     close_fd(from);
     close_fd(to);
+}
+
+/*
+ * Run the fixture script `path` with execve in a child, from the task directory,
+ * and check that the script exits with 0 when `expected` is 0, or else that
+ * execve fails with `expected`.
+ */
+static void run_script(const char *path, int expected)
+{
+    char *arguments[] = {(char *)path, NULL};
+    char *environment[] = {NULL};
+    pid_t pid = start_child(path);
+    if (pid == 0) {
+        EXPECT(expected, "execve", path, syscall(SYS_execve, path, arguments, environment));
+        _exit(expected != 0 && mismatches == 0 ? 0 : 1);
+    }
+    wait_child(path, pid);
 }
 
 /* Opening files: open, openat, openat2 and creat. */
@@ -772,6 +799,15 @@ static void linux_listings_and_processes(void)
                    environment, 0));
 #endif
 
+    /*
+     * #! scripts: the kernel runs in/linux/interp/outer through its interpreter
+     * in/linux/interp/middle, a script whose interpreter in/linux/interp/inner is
+     * a script whose interpreter is the program in the mode INTERPRETED;
+     * in/linux/interp/broken names a missing interpreter.
+     */
+    run_script(INTERP "/outer", 0);
+    run_script(INTERP "/broken", ENOENT);
+
     /* chdir, then a relative path, in a child. */
     pid = start_child("chdir");
     if (pid == 0) {
@@ -1049,6 +1085,9 @@ static void child(const char *mode)
 
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && strcmp(argv[1], INTERPRETED) == 0) {
+        return 0;
+    }
     if (argc == 3) {
         snprintf(task_dir, sizeof task_dir, "%s", argv[2]);
         child(argv[1]);

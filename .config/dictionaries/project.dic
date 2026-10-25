@@ -1,5 +1,7 @@
 ACCMODE
 arrayref
+binfmt
+binprm
 bpaf
 cachyos
 CBOR
@@ -30,10 +32,12 @@ ENOEXEC
 ENOSYS
 ENOTDIR
 envp
+EOVERFLOW
 EPERM
 ERESTART
 ERESTARTSYS
 ESRCH
+ETXTBSY
 eventfd
 execv
 execve
@@ -48,6 +52,7 @@ fchown
 fchownat
 fcntl
 FDCWD
+filesz
 fopen
 fprog
 fstat
@@ -76,6 +81,7 @@ hermeticity
 idents
 idtype
 IFIFO
+interp
 iovec
 JSET
 kizz
@@ -96,10 +102,14 @@ newfstatat
 nlink
 nocapture
 NOCTTY
+NONBLOCK
 nsec
 openat
 opendir
 openpt
+phentsize
+phnum
+phoff
 pids
 pipefail
 pointee

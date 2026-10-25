@@ -26,7 +26,10 @@
 #
 # Each SOURCE is a call that touches the path in the run, as ORIGIN:NAME:OUTCOME:KINDS.
 # ORIGIN is sys, for a tracked system call that coverage.c makes through syscall(); libc, for a function of
-# the C library; or kizz, for kizz's own start of the program with a traced execve.
+# the C library; kizz, for kizz's own start of the program with a traced execve; or kernel, for a file that the
+# kernel loads to run a program without a system call of its own: interpreter, the interpreter that the #! line
+# of a script that a process runs names, and interpreter_of_interpreter, the interpreter of an interpreter that
+# is a script itself, at any depth.
 # OUTCOME is ok, or the error the call failed with; KINDS are the kinds the call adds.
 # A call that succeeds adds the kinds of "What is recorded", as the Linux tracer decodes them since Step 4:
 # opening for reading reads, opening for writing, creating or truncating writes, and O_DIRECTORY or O_PATH
@@ -38,8 +41,9 @@
 # recorded under the link's name; the call that a group tests then works on the path under out/linux/made,
 # or on a descriptor that names it, so it is that path's only source.
 
-# The program, which kizz starts with execve and the portable core's child runs again with execv.
-coverage exec file+hash all kizz:execve:ok:exec libc:execv:ok:exec
+# The program, which kizz starts with execve, the portable core's child runs again with execv, and the kernel
+# runs as the interpreter of the script in/linux/interp/inner.
+coverage exec file+hash all kizz:execve:ok:exec libc:execv:ok:exec kernel:interpreter_of_interpreter:ok:exec
 
 # Portable core: the output directories; out must not exist, and a second mkdir of out/core fails with EEXIST.
 out write dir all libc:mkdir:ok:write
@@ -236,6 +240,16 @@ out/linux/execveat-copy-link read+write symlink:../../coverage:file+hash linux s
 out/linux/execveat-copy probe+write+exec file+hash linux sys:openat:ok:write sys:openat:ok:probe sys:execveat:ok:exec
 in/linux/child-execveat-empty.txt read file+hash linux sys:openat:ok:read
 in/linux/execveat-missing probe absent linux sys:execveat:ENOENT:probe
+
+# #! scripts: a child runs in/linux/interp/outer with execve, and the kernel runs it through its interpreter
+# in/linux/interp/middle, a script whose interpreter in/linux/interp/inner is a script whose interpreter is the
+# program; another child runs in/linux/interp/broken, whose interpreter in/linux/interp/missing does not exist,
+# so execve fails with ENOENT.
+in/linux/interp/outer exec file+hash linux sys:execve:ok:exec
+in/linux/interp/middle exec file+hash linux kernel:interpreter:ok:exec
+in/linux/interp/inner exec file+hash linux kernel:interpreter_of_interpreter:ok:exec
+in/linux/interp/broken probe file linux sys:execve:ENOENT:probe
+in/linux/interp/missing probe absent linux kernel:interpreter:ENOENT:probe
 
 # chdir and fchdir: children enter a directory, by name or by a descriptor that openat opened through a link
 # to it, and read a relative path there; a missing directory fails with ENOENT.

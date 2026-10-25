@@ -17,9 +17,12 @@
 use std::{
     collections::BTreeMap,
     error::Error,
-    ffi::{CString, OsString},
+    ffi::{CString, OsStr, OsString},
     fs, io, mem,
-    os::unix::{ffi::OsStrExt as _, fs::symlink},
+    os::unix::{
+        ffi::OsStrExt as _,
+        fs::{PermissionsExt as _, symlink},
+    },
     path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
@@ -194,6 +197,7 @@ fn helper_process() {
         "in_root_traversal" => helper_in_root_traversal().unwrap(),
         "in_root_parent" => helper_in_root_parent(true).unwrap(),
         "in_root_parent_control" => helper_in_root_parent(false).unwrap(),
+        "unknown_format" => helper_unknown_format().unwrap(),
         other => panic!("unknown helper mode {other}"),
     }
 }
@@ -974,6 +978,182 @@ fn a_missing_program_is_reported_with_its_probe() {
     };
     assert_eq!(
         accesses.get(&AbsolutePath::new(&program).unwrap()),
+        Some(kinds(&[AccessKind::Probe]))
+    );
+}
+
+/// Write the executable file `relative` in `workspace` with `content`.
+fn write_executable(
+    workspace: &Workspace,
+    relative: &str,
+    content: &str,
+) -> Outcome<PathBuf> {
+    let path = workspace.path(relative);
+    fs::write(&path, content)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+/// Run a request that runs a file the test just wrote, again while starting it
+/// fails with `ETXTBSY`: a child that another test forks may hold a copy of the
+/// descriptor that wrote the file until that child runs its own program.
+fn run_written(request: &RunRequest) -> Result<RunResult, TraceError> {
+    let mut tries = 0_u32;
+    loop {
+        match run(request) {
+            Err(TraceError::StartFailed { ref source, .. })
+                if source.raw_os_error() == Some(libc::ETXTBSY) && tries < 500 =>
+            {
+                tries = tries.saturating_add(1);
+                thread::sleep(Duration::from_millis(10));
+            },
+            other => return other,
+        }
+    }
+}
+
+/// The little-endian field of `size` bytes, at most eight, at `offset` in `bytes`.
+fn field(
+    bytes: &[u8],
+    offset: usize,
+    size: usize,
+) -> Outcome<usize> {
+    let end = offset.checked_add(size).ok_or("the field overflows")?;
+    let slice = bytes.get(offset..end).ok_or("the file is too short")?;
+    let mut word = [0_u8; 8];
+    word.get_mut(..size)
+        .ok_or("the field is too wide")?
+        .copy_from_slice(slice);
+    Ok(usize::try_from(u64::from_le_bytes(word))?)
+}
+
+/// The loader that the 64-bit ELF executable at `path` names in its `PT_INTERP`
+/// program header, read by the test itself.
+fn elf_loader(path: &Path) -> Outcome<PathBuf> {
+    let bytes = fs::read(path)?;
+    let start = field(&bytes, 32, 8)?;
+    let size = field(&bytes, 54, 2)?;
+    let count = field(&bytes, 56, 2)?;
+    for index in 0..count {
+        let header = index
+            .checked_mul(size)
+            .and_then(|offset| offset.checked_add(start))
+            .ok_or("the program headers overflow")?;
+        if field(&bytes, header, 4)? != 3 {
+            continue;
+        }
+        let offset = field(&bytes, header.checked_add(8).ok_or("overflow")?, 8)?;
+        let length = field(&bytes, header.checked_add(32).ok_or("overflow")?, 8)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or("the loader path overflows")?;
+        let name = bytes.get(offset..end).ok_or("the loader path is cut")?;
+        let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+        return Ok(PathBuf::from(OsStr::from_bytes(name)));
+    }
+    Err(format!("{} has no PT_INTERP program header", path.display()).into())
+}
+
+/// Assert that `result` records `path` with the exec kind.
+fn assert_executed(
+    result: &RunResult,
+    path: &Path,
+) {
+    let kinds = AbsolutePath::new(path)
+        .ok()
+        .and_then(|path| result.accesses.get(&path));
+    assert!(
+        kinds.is_some_and(|kinds| kinds.contains(AccessKind::Exec)),
+        "{}: {kinds:?}",
+        path.display()
+    );
+}
+
+/// A real chain of two scripts records both, `/bin/sh` and its loader with the
+/// exec kind, from the `exec` alone.
+#[test]
+fn a_chain_of_scripts_records_each_interpreter_and_the_loader_from_the_exec_alone() {
+    let workspace = Workspace::new().unwrap();
+    // The first script names the second by a path relative to the working
+    // directory, and the second names `/bin/sh`, which runs it and exits.
+    let outer = write_executable(&workspace, "outer", "#!inner first\n").unwrap();
+    let inner = write_executable(&workspace, "inner", "#! /bin/sh\nexit 0\n").unwrap();
+    let result = run_written(&request(&outer, &["outer"], &workspace.root).unwrap()).unwrap();
+    assert_eq!(result.termination, Termination::Exited(0));
+    assert!(result.is_complete(), "{:?}", result.incomplete);
+    let shell = Path::new("/bin/sh");
+    let loader = elf_loader(shell).unwrap();
+    for path in [&outer, &inner, shell, &loader] {
+        assert_executed(&result, path);
+    }
+    // The first script is only run, never read by a process: its interpreter
+    // reaches the tracer from the `exec` alone.
+    assert_eq!(
+        workspace.kinds(&result, "outer").unwrap(),
+        Some(kinds(&[AccessKind::Exec]))
+    );
+}
+
+/// A real dynamically linked program records its loader with the exec kind.
+#[test]
+fn a_dynamically_linked_program_records_its_loader() {
+    let workspace = Workspace::new().unwrap();
+    let program = Path::new("/bin/true");
+    let loader = elf_loader(program).unwrap();
+    let result = run_successfully(&request(program, &["true"], &workspace.root).unwrap()).unwrap();
+    assert_executed(&result, program);
+    assert_executed(&result, &loader);
+}
+
+/// A real script whose interpreter is missing records both the script and the
+/// interpreter as probed.
+#[test]
+fn a_script_whose_interpreter_is_missing_records_the_interpreter_as_probed() {
+    let workspace = Workspace::new().unwrap();
+    let script = write_executable(&workspace, "broken", "#!missing-interpreter\n").unwrap();
+    let error = run_written(&request(&script, &["broken"], &workspace.root).unwrap()).unwrap_err();
+    let TraceError::ProgramNotFound { accesses, .. } = error else {
+        panic!("expected a missing interpreter, got {error:?}");
+    };
+    let probe = Some(kinds(&[AccessKind::Probe]));
+    for path in ["broken", "missing-interpreter"] {
+        assert_eq!(
+            accesses.get(&AbsolutePath::new(workspace.path(path)).unwrap()),
+            probe,
+            "{path}"
+        );
+    }
+}
+
+/// Run the file `data` in the working directory, again while it is busy, and
+/// check that it fails with `ENOEXEC`.
+fn helper_unknown_format() -> Outcome<()> {
+    let path = CString::new("data")?;
+    let argv = [path.as_ptr(), ptr::null()];
+    let envp = [ptr::null()];
+    loop {
+        // SAFETY: `path` is a NUL-terminated string, and `argv` and `envp` are
+        // null-terminated arrays of such strings.
+        unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENOEXEC) => return Ok(()),
+            Some(libc::ETXTBSY) => thread::sleep(Duration::from_millis(10)),
+            _ => return Err(format!("running data failed with {error}").into()),
+        }
+    }
+}
+
+/// A real file of no known format fails with `ENOEXEC`, is recorded as probed,
+/// and leaves the run complete.
+#[test]
+fn a_file_of_no_known_format_fails_with_enoexec_and_records_a_probe() {
+    let workspace = Workspace::new().unwrap();
+    write_executable(&workspace, "data", "plain data, not a program\n").unwrap();
+    // The run is complete: a program that fails to run is not followed.
+    let result = run_successfully(&helper("unknown_format", &workspace.root).unwrap()).unwrap();
+    assert_eq!(
+        workspace.kinds(&result, "data").unwrap(),
         Some(kinds(&[AccessKind::Probe]))
     );
 }

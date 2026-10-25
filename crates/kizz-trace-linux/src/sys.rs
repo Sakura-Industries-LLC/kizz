@@ -13,7 +13,10 @@ use std::{
     fs, io, mem,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{ffi::OsStringExt as _, fs::MetadataExt as _},
+        unix::{
+            ffi::OsStringExt as _,
+            fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _},
+        },
     },
     path::Path,
     ptr,
@@ -192,6 +195,46 @@ impl decode::Inspect for Thread {
         path: &Path,
     ) -> io::Result<Vec<u8>> {
         read_link(path)
+    }
+
+    fn read_file(
+        &self,
+        path: &Path,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> io::Result<usize> {
+        // Only a regular file is opened, and without blocking or taking a
+        // controlling terminal, because opening a FIFO or a device can wait or act.
+        let not_regular = || io::Error::new(io::ErrorKind::InvalidInput, "not a regular file");
+        if !fs::metadata(path)?.is_file() {
+            return Err(not_regular());
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(not_regular());
+        }
+        let mut filled = 0_usize;
+        while let Some(rest) = buffer.get_mut(filled..)
+            && !rest.is_empty()
+        {
+            let at = u64::try_from(filled)
+                .ok()
+                .and_then(|filled| offset.checked_add(filled))
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            let read = match file.read_at(rest, at) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if read == 0 {
+                break;
+            }
+            filled = filled.saturating_add(read);
+        }
+        Ok(filled)
     }
 }
 

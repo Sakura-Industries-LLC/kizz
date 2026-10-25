@@ -36,6 +36,18 @@
 //! kernel stops, such as one that is not a directory, and records each symbolic
 //! link it followed. When the call succeeds, the descriptor it returns names the
 //! object it opened, and a different name there makes the trace incomplete.
+//!
+//! At the exit of `execve` and `execveat`, [`Call::loaded`] also records what the
+//! kernel loads to run the program without another system call, as it records the
+//! program's own path: the interpreter that a `#!` line names, the interpreters of
+//! interpreters that are scripts themselves, as deep as the kernel follows them, and
+//! the loader that an `x86_64` ELF executable names in its `PT_INTERP` program
+//! header. The tracer reads the start of each file as the kernel does, and resolves
+//! a relative interpreter or loader path against the working directory that the
+//! thread had when it entered the call. A program that ran although the tracer
+//! could not read it, or whose last file is neither a `#!` script nor an `x86_64`
+//! ELF executable, makes the trace incomplete, because a handler such as
+//! `binfmt_misc` may have run it with an interpreter that the tracer cannot see.
 
 use std::{
     ffi::OsStr,
@@ -70,6 +82,54 @@ const MAX_SYMBOLIC_LINKS: usize = 40;
 const OPEN_HOW_SIZE: usize = 24;
 /// The offset of `resolve` in `struct open_how`.
 const OPEN_HOW_RESOLVE: usize = 16;
+/// How many bytes of a program the kernel reads to tell its format, and in which
+/// it looks for a `#!` line: `BINPRM_BUF_SIZE`.
+const HEADER_SIZE: usize = 256;
+/// The index of the last byte of [`HEADER_SIZE`], which the kernel's `#!` parser
+/// never takes as part of the line.
+const HEADER_LAST: usize = 255;
+/// The deepest file whose format the kernel reads in one `exec`: the program is at
+/// depth 0, each interpreter one deeper, and `exec_binprm` fails with `ELOOP`
+/// beyond this depth, after opening one more interpreter.
+const LAST_HANDLER_DEPTH: usize = 5;
+/// The magic bytes that start an ELF file.
+const ELF_MAGIC: &[u8] = b"\x7fELF";
+/// The offset of the class byte in an ELF header.
+const ELF_CLASS: usize = 4;
+/// The class byte of a 64-bit ELF file.
+const ELF_CLASS_64: u8 = 2;
+/// The offset of the byte order byte in an ELF header.
+const ELF_DATA: usize = 5;
+/// The byte order byte of a little-endian ELF file.
+const ELF_DATA_LITTLE: u8 = 1;
+/// The size of a 64-bit ELF header.
+const ELF_HEADER_SIZE: usize = 64;
+/// The offset of `e_type` in a 64-bit ELF header.
+const ELF_TYPE: usize = 16;
+/// The `e_type` of an executable that is loaded at a fixed address.
+const ELF_TYPE_EXEC: u16 = 2;
+/// The `e_type` of a position-independent executable or shared object.
+const ELF_TYPE_DYN: u16 = 3;
+/// The offset of `e_machine` in a 64-bit ELF header.
+const ELF_MACHINE: usize = 18;
+/// The `e_machine` of `x86_64`: `EM_X86_64`.
+const ELF_MACHINE_X86_64: u16 = 62;
+/// The offset of `e_phoff`, where the program headers start, in a 64-bit ELF header.
+const ELF_PROGRAM_HEADERS: usize = 32;
+/// The offset of `e_phentsize` in a 64-bit ELF header.
+const ELF_PROGRAM_HEADER_SIZE: usize = 54;
+/// The offset of `e_phnum` in a 64-bit ELF header.
+const ELF_PROGRAM_HEADER_COUNT: usize = 56;
+/// The size of a 64-bit program header, the only `e_phentsize` the kernel accepts.
+const PROGRAM_HEADER_SIZE: usize = 56;
+/// The most bytes of program headers the kernel reads: one page.
+const PROGRAM_HEADERS_LIMIT: usize = 4096;
+/// The `p_type` of the program header that names the loader.
+const PT_INTERP: u32 = 3;
+/// The offset of `p_offset` in a 64-bit program header.
+const PROGRAM_HEADER_OFFSET: usize = 8;
+/// The offset of `p_filesz` in a 64-bit program header.
+const PROGRAM_HEADER_FILE_SIZE: usize = 32;
 
 /// A file system object, as `stat` identifies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +224,21 @@ pub(crate) trait Inspect {
         &self,
         path: &Path,
     ) -> io::Result<Vec<u8>>;
+
+    /// Read the regular file at `path`, following symbolic links, from `offset`
+    /// into `buffer`, and return the number of bytes read, which is less than the
+    /// buffer only at the end of the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of opening or reading the file, or an error for a path
+    /// that does not name a regular file, which is never opened.
+    fn read_file(
+        &self,
+        path: &Path,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> io::Result<usize>;
 }
 
 /// When an empty or null path argument names the directory descriptor itself.
@@ -477,6 +552,54 @@ pub(crate) struct Call {
     /// The index in `operands` of the object that a rooted `openat2` lookup was
     /// repeated to find, which the descriptor it returns names.
     reached: Option<usize>,
+    /// For `execve` and `execveat`, the working directory the thread had when it
+    /// entered the call, against which the kernel resolves a relative interpreter
+    /// or loader path; `None` for every other call.
+    directory: Option<Directory>,
+    /// Why the tracer could not follow the program that the call ran, which makes
+    /// the trace incomplete.
+    unfollowed: Option<String>,
+}
+
+/// The working directory against which the kernel resolves a relative interpreter
+/// or loader path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Directory {
+    /// The directory at this path.
+    Path(AbsolutePath),
+    /// A directory that was removed, in which every lookup fails, or that names no
+    /// path.
+    Removed,
+    /// A directory that could not be read, with the reason.
+    Unknown(String),
+}
+
+impl Directory {
+    /// The path of the interpreter or loader `name`, resolved as the kernel's
+    /// `open_exec` resolves it: an absolute path as it is, and a relative one
+    /// against this working directory, or `None` when the directory was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns why a relative path cannot be resolved: the directory is unknown.
+    fn resolve(
+        &self,
+        name: &[u8],
+    ) -> Result<Option<AbsolutePath>, String> {
+        if name.starts_with(b"/") {
+            return Ok(AbsolutePath::new(OsStr::from_bytes(name)).ok());
+        }
+        match self {
+            Self::Path(base) => Ok(Some(base.join(OsStr::from_bytes(name)))),
+            Self::Removed => Ok(None),
+            Self::Unknown(problem) => {
+                Err(format!(
+                    "it names the relative path {}, and {problem}",
+                    String::from_utf8_lossy(name)
+                ))
+            },
+        }
+    }
 }
 
 impl Call {
@@ -531,9 +654,49 @@ impl Call {
         }
     }
 
+    /// Record what the kernel loads to run the program of an `execve` or
+    /// `execveat` that returned `result`, or whose result was never seen, with the
+    /// kinds of the program's own path, so [`Call::finish`] records them as it
+    /// records that path. Any other call is left as it is.
+    ///
+    /// The tracer reads the program's files as the kernel does: a `#!` line names
+    /// an interpreter, which is read the same way as deep as the kernel follows
+    /// interpreters, and an `x86_64` ELF executable names its loader in a
+    /// `PT_INTERP` program header. When the call succeeded, a file that the tracer
+    /// cannot read, or whose format it does not know, makes the trace incomplete;
+    /// when it failed, or its result is unknown, the program never ran, and only
+    /// the paths that were found are recorded.
+    pub(crate) fn loaded(
+        &mut self,
+        result: Option<i64>,
+        inspect: &(impl Inspect + ?Sized),
+    ) {
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        let ran = result.is_some_and(|result| !(LOWEST_ERROR_RESULT..0).contains(&result));
+        let Some((program, kinds)) = self.operands.first().cloned() else {
+            if ran && self.problem.is_none() {
+                self.unfollowed = Some(format!(
+                    "{} ran a program whose path the tracer cannot tell, so it cannot read it",
+                    self.name
+                ));
+            }
+            return;
+        };
+        let mut loads = Vec::new();
+        let failure = follow_program(inspect, &directory, &program, &mut loads).err();
+        self.operands
+            .extend(loads.into_iter().map(|path| (path, kinds)));
+        if ran && let Some(detail) = failure {
+            self.unfollowed = Some(format!("{} ran {program}, but {detail}", self.name));
+        }
+    }
+
     /// Record the paths of the call, now that it returned `result`, or `None` when
     /// its result was never seen, and return a description of what could not be
-    /// decoded when that makes the trace incomplete.
+    /// decoded, or of a program that ran but that [`Call::loaded`] could not
+    /// follow, when that makes the trace incomplete.
     ///
     /// A call that failed records a probe for each path. That includes a call that a
     /// signal interrupted, which returns `EINTR`, or one of the kernel's internal
@@ -568,9 +731,277 @@ impl Call {
             };
             accesses.record_kinds(path, recorded);
         }
-        self.problem
-            .map(|problem| format!("could not decode {}: {problem}", self.name))
+        if let Some(problem) = self.problem {
+            return Some(format!("could not decode {}: {problem}", self.name));
+        }
+        self.unfollowed
     }
+}
+
+/// What the kernel finds at the start of a file that it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Format {
+    /// A `#!` script, with the interpreter path that its first line names.
+    Script(Vec<u8>),
+    /// An `x86_64` ELF executable, with the fields of its header that locate its
+    /// program headers.
+    Elf(ElfHeader),
+    /// Neither, which the kernel runs only through another handler, such as
+    /// `binfmt_misc`, or not at all.
+    Unknown,
+}
+
+/// The fields of a 64-bit ELF header that locate its program headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ElfHeader {
+    /// Where the program headers start in the file: `e_phoff`.
+    offset: u64,
+    /// The size of one program header: `e_phentsize`.
+    entry_size: u16,
+    /// How many program headers there are: `e_phnum`.
+    count: u16,
+}
+
+/// The little-endian `u16` at `offset` in `bytes`.
+fn u16_at(
+    bytes: &[u8],
+    offset: usize,
+) -> Option<u16> {
+    bytes
+        .get(offset..)
+        .and_then(<[u8]>::first_chunk::<2>)
+        .map(|field| u16::from_le_bytes(*field))
+}
+
+/// The little-endian `u32` at `offset` in `bytes`.
+fn u32_at(
+    bytes: &[u8],
+    offset: usize,
+) -> Option<u32> {
+    bytes
+        .get(offset..)
+        .and_then(<[u8]>::first_chunk::<4>)
+        .map(|field| u32::from_le_bytes(*field))
+}
+
+/// The little-endian `u64` at `offset` in `bytes`.
+fn u64_at(
+    bytes: &[u8],
+    offset: usize,
+) -> Option<u64> {
+    bytes
+        .get(offset..)
+        .and_then(<[u8]>::first_chunk::<8>)
+        .map(|field| u64::from_le_bytes(*field))
+}
+
+/// The interpreter path that the `#!` line at the start of `header` names, parsed
+/// as the kernel's `load_script` parses it, or `None` when the kernel finds none,
+/// or finds an empty one, which it fails to look up.
+///
+/// The kernel looks only at the first [`HEADER_SIZE`] bytes, padded with NUL bytes.
+/// The line ends at the first newline before any NUL byte. Without one, the line
+/// is cut at the end of the buffer, unless the buffer holds only spaces and tabs
+/// after `#!`, or the text after them has no space, tab or NUL byte, which means
+/// that the interpreter path itself was cut. Spaces and tabs at the end of the
+/// line are dropped, and the interpreter is the text after the spaces and tabs
+/// that follow `#!`, up to the next space, tab or NUL byte; any text after that
+/// is an argument, which the kernel does not load.
+fn script_interpreter(header: &[u8]) -> Option<Vec<u8>> {
+    let mut buffer = [0_u8; HEADER_SIZE];
+    for (slot, byte) in buffer.iter_mut().zip(header) {
+        *slot = *byte;
+    }
+    if !buffer.starts_with(b"#!") {
+        return None;
+    }
+    let byte = |index: usize| buffer.get(index).copied().unwrap_or_default();
+    let blank = |index: usize| matches!(byte(index), b' ' | b'\t');
+    let terminator = |index: usize| blank(index) || byte(index) == 0;
+    let newline = buffer
+        .iter()
+        .position(|value| matches!(*value, b'\n' | 0))
+        .filter(|index| byte(*index) == b'\n');
+    let mut end = if let Some(newline) = newline {
+        newline
+    } else {
+        let start = (2..HEADER_LAST).find(|index| !blank(*index))?;
+        (start..HEADER_LAST).find(|index| terminator(*index))?;
+        HEADER_LAST
+    };
+    while let Some(before) = end.checked_sub(1)
+        && blank(before)
+    {
+        end = before;
+    }
+    let start = (2..end).find(|index| !blank(*index))?;
+    let stop = (start..end).find(|index| terminator(*index)).unwrap_or(end);
+    buffer
+        .get(start..stop)
+        .filter(|name| !name.is_empty())
+        .map(<[u8]>::to_vec)
+}
+
+/// The header of the `x86_64` ELF executable that `header` starts, or `None` when
+/// it starts no such file: a 64-bit, little-endian ELF executable or shared object
+/// for `x86_64`, with its whole ELF header.
+fn elf_header(header: &[u8]) -> Option<ElfHeader> {
+    let executable = header.len() >= ELF_HEADER_SIZE
+        && header.starts_with(ELF_MAGIC)
+        && header.get(ELF_CLASS) == Some(&ELF_CLASS_64)
+        && header.get(ELF_DATA) == Some(&ELF_DATA_LITTLE)
+        && matches!(u16_at(header, ELF_TYPE), Some(ELF_TYPE_EXEC | ELF_TYPE_DYN))
+        && u16_at(header, ELF_MACHINE) == Some(ELF_MACHINE_X86_64);
+    if !executable {
+        return None;
+    }
+    Some(ElfHeader {
+        offset: u64_at(header, ELF_PROGRAM_HEADERS)?,
+        entry_size: u16_at(header, ELF_PROGRAM_HEADER_SIZE)?,
+        count: u16_at(header, ELF_PROGRAM_HEADER_COUNT)?,
+    })
+}
+
+/// The format of the file whose first bytes are `header`.
+fn format(header: &[u8]) -> Format {
+    if let Some(interpreter) = script_interpreter(header) {
+        Format::Script(interpreter)
+    } else if let Some(elf) = elf_header(header) {
+        Format::Elf(elf)
+    } else {
+        Format::Unknown
+    }
+}
+
+/// Read exactly `length` bytes of the file `file` from `offset`.
+///
+/// # Errors
+///
+/// Returns a description of a file that cannot be read, or that ends sooner.
+fn read_exactly(
+    inspect: &(impl Inspect + ?Sized),
+    file: &AbsolutePath,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = vec![0_u8; length];
+    let read = inspect
+        .read_file(file.as_path(), offset, &mut bytes)
+        .map_err(|error| format!("could not read {file}: {error}"))?;
+    if read != length {
+        return Err(format!(
+            "{file} ends before the {length} bytes at offset {offset}"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The loader path that the first `PT_INTERP` program header of the `x86_64` ELF
+/// executable `file`, whose header is `elf`, names, read as the kernel's
+/// `load_elf_binary` reads it, or `None` when it has no such header.
+///
+/// # Errors
+///
+/// Returns a description of program headers that the kernel would reject or that
+/// the tracer cannot read.
+fn elf_loader(
+    inspect: &(impl Inspect + ?Sized),
+    file: &AbsolutePath,
+    elf: ElfHeader,
+) -> Result<Option<Vec<u8>>, String> {
+    let size = usize::from(elf.count)
+        .checked_mul(PROGRAM_HEADER_SIZE)
+        .filter(|size| (1..=PROGRAM_HEADERS_LIMIT).contains(size));
+    let (PROGRAM_HEADER_SIZE, Some(size)) = (usize::from(elf.entry_size), size) else {
+        return Err(format!(
+            "{file} has {} program headers of {} bytes, which the kernel does not load",
+            elf.count, elf.entry_size
+        ));
+    };
+    let headers = read_exactly(inspect, file, elf.offset, size)?;
+    for header in headers.as_chunks::<PROGRAM_HEADER_SIZE>().0 {
+        if u32_at(header, 0) != Some(PT_INTERP) {
+            continue;
+        }
+        let (Some(offset), Some(length)) = (
+            u64_at(header, PROGRAM_HEADER_OFFSET),
+            u64_at(header, PROGRAM_HEADER_FILE_SIZE)
+                .and_then(|length| usize::try_from(length).ok())
+                .filter(|length| (2..=PATH_MAX).contains(length)),
+        ) else {
+            return Err(format!(
+                "the PT_INTERP header of {file} has a size that the kernel does not load"
+            ));
+        };
+        let path = read_exactly(inspect, file, offset, length)?;
+        if path.last() != Some(&0) {
+            return Err(format!(
+                "the PT_INTERP path of {file} does not end with a NUL byte"
+            ));
+        }
+        let name = path.split(|byte| *byte == 0).next().unwrap_or_default();
+        return Ok(Some(name.to_vec()));
+    }
+    Ok(None)
+}
+
+/// Follow the program at `program` as the kernel runs it, and push onto `loads`
+/// every path that the kernel loads besides it, in order: each interpreter that a
+/// `#!` line names, resolved against `directory`, and the loader of the last file
+/// when that is an `x86_64` ELF executable with a `PT_INTERP` header.
+///
+/// # Errors
+///
+/// Returns what kept the tracer from following the program to its end: a file that
+/// it cannot read, a file whose format it does not know, an ELF executable whose
+/// program headers it cannot read, a relative path it cannot resolve, or more
+/// interpreters than the kernel follows. The paths found until then are pushed.
+fn follow_program(
+    inspect: &(impl Inspect + ?Sized),
+    directory: &Directory,
+    program: &AbsolutePath,
+    loads: &mut Vec<AbsolutePath>,
+) -> Result<(), String> {
+    let mut file = program.clone();
+    for _depth in 0..=LAST_HANDLER_DEPTH {
+        let mut header = vec![0_u8; HEADER_SIZE];
+        let read = inspect
+            .read_file(file.as_path(), 0, &mut header)
+            .map_err(|error| format!("the tracer could not read {file}: {error}"))?;
+        header.truncate(read);
+        match format(&header) {
+            Format::Script(name) => {
+                let Some(interpreter) = directory.resolve(&name).map_err(|problem| {
+                    format!("the interpreter of {file} is unknown: {problem}")
+                })?
+                else {
+                    return Ok(());
+                };
+                loads.push(interpreter.clone());
+                file = interpreter;
+            },
+            Format::Elf(elf) => {
+                let loader = match elf_loader(inspect, &file, elf)? {
+                    Some(name) => {
+                        directory.resolve(&name).map_err(|problem| {
+                            format!("the loader of {file} is unknown: {problem}")
+                        })?
+                    },
+                    None => None,
+                };
+                loads.extend(loader);
+                return Ok(());
+            },
+            Format::Unknown => {
+                return Err(format!(
+                    "{file} is neither a `#!` script nor an x86_64 ELF executable"
+                ));
+            },
+        }
+    }
+    Err(format!(
+        "its interpreters are nested deeper than the kernel follows, down to {file}"
+    ))
 }
 
 /// The `int` in the low 32 bits of a register, as the kernel reads an `int`
@@ -1121,6 +1552,9 @@ pub(crate) fn system_call(number: c_long) -> Option<&'static SystemCall> {
 
 /// Decode the tracked call `number` with `arguments` at its entry, reading what it
 /// needs from the stopped thread. Return `None` when the call is not tracked.
+///
+/// For `execve` and `execveat`, the thread's working directory is kept too, so that
+/// [`Call::loaded`] can resolve a relative interpreter or loader path at the exit.
 pub(crate) fn enter(
     number: c_long,
     arguments: Arguments,
@@ -1135,10 +1569,19 @@ pub(crate) fn enter(
             operands: Vec::new(),
             problem: None,
             reached: None,
+            directory: None,
+            unfollowed: None,
         },
     };
     for rule in system_call.rules {
         decoder.rule(*rule);
+    }
+    if matches!(number, libc::SYS_execve | libc::SYS_execveat) {
+        decoder.call.directory = Some(match decoder.base(libc::AT_FDCWD) {
+            Ok(Some(path)) => Directory::Path(path),
+            Ok(None) => Directory::Removed,
+            Err(problem) => Directory::Unknown(problem),
+        });
     }
     Some(decoder.call)
 }
@@ -1274,6 +1717,9 @@ mod tests {
         /// A directory that the tracer cannot search: checking a path beneath it
         /// fails with `EACCES`.
         locked: &'static str,
+        /// The content of each file that [`Inspect::read_file`] reads, by path, or
+        /// `None` for a file that the tracer cannot read.
+        contents: BTreeMap<String, Option<Vec<u8>>>,
     }
 
     /// The bytes of a `struct open_how` with `flags` and `resolve`.
@@ -1372,6 +1818,7 @@ mod tests {
                 files,
                 directories,
                 locked: "/dir/locked",
+                contents: BTreeMap::new(),
             }
         }
 
@@ -1473,6 +1920,25 @@ mod tests {
             target
                 .map(|target| target.as_bytes().to_vec())
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))
+        }
+
+        fn read_file(
+            &self,
+            path: &Path,
+            offset: u64,
+            buffer: &mut [u8],
+        ) -> io::Result<usize> {
+            let contents = path
+                .to_str()
+                .and_then(|path| self.contents.get(path))
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?
+                .as_ref()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EACCES))?;
+            let start = usize::try_from(offset).unwrap().min(contents.len());
+            let available = &contents[start..];
+            let count = available.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&available[..count]);
+            Ok(count)
         }
     }
 
@@ -2201,5 +2667,436 @@ mod tests {
         assert_eq!(int(0xFFFF_FFFF_0000_0003), 3);
         assert_eq!(int(reg(libc::AT_FDCWD)), libc::AT_FDCWD);
         assert_eq!(reg(libc::AT_EMPTY_PATH), EMPTY_PATH);
+    }
+
+    /// The address of the program path of the `exec` tests.
+    const PROGRAM: u64 = 0x2_0000;
+
+    /// The fake thread, whose memory holds `program` at [`PROGRAM`], in a file
+    /// system that holds the readable `files`, each with its content.
+    fn with_files(
+        program: &str,
+        files: &[(&str, Vec<u8>)],
+    ) -> Fake {
+        let mut fake = Fake::new();
+        fake.memory
+            .insert(PROGRAM, format!("{program}\0").into_bytes());
+        for (path, content) in files {
+            fake.contents
+                .insert((*path).to_owned(), Some(content.clone()));
+        }
+        fake
+    }
+
+    /// The accesses and incomplete-trace report of an `exec` call `name` with
+    /// `arguments` in `fake` that returns `result`, with what the kernel loaded.
+    fn exec_in(
+        fake: &Fake,
+        name: &str,
+        arguments: &[u64],
+        result: Option<i64>,
+    ) -> (Vec<(String, String)>, Option<String>) {
+        let mut call = decode(fake, name, arguments);
+        call.loaded(result, fake);
+        let mut accesses = Accesses::new();
+        let problem = call.finish(result, &mut accesses);
+        let paths = accesses
+            .iter()
+            .map(|(path, kinds)| (path.to_string(), kinds.to_string()))
+            .collect();
+        (paths, problem)
+    }
+
+    /// The accesses and report of `execve` of the program at [`PROGRAM`] in
+    /// `fake` that returns `result`.
+    fn execve(
+        fake: &Fake,
+        result: Option<i64>,
+    ) -> (Vec<(String, String)>, Option<String>) {
+        exec_in(fake, "execve", &[PROGRAM, 0, 0], result)
+    }
+
+    /// A file that starts with `text`.
+    fn text(text: &str) -> Vec<u8> {
+        text.as_bytes().to_vec()
+    }
+
+    /// A 64-bit ELF executable with the class byte `class` for the machine
+    /// `machine`, whose program headers are a `PT_LOAD` header and, with
+    /// `loader`, a `PT_INTERP` header that names it.
+    fn elf(
+        class: u8,
+        machine: u16,
+        loader: Option<&str>,
+    ) -> Vec<u8> {
+        let count: u16 = if loader.is_some() { 2 } else { 1 };
+        let mut bytes = vec![0_u8; ELF_HEADER_SIZE];
+        bytes[..4].copy_from_slice(ELF_MAGIC);
+        bytes[ELF_CLASS] = class;
+        bytes[ELF_DATA] = ELF_DATA_LITTLE;
+        bytes[6] = 1;
+        bytes[ELF_TYPE..ELF_TYPE + 2].copy_from_slice(&ELF_TYPE_DYN.to_le_bytes());
+        bytes[ELF_MACHINE..ELF_MACHINE + 2].copy_from_slice(&machine.to_le_bytes());
+        bytes[ELF_PROGRAM_HEADERS..ELF_PROGRAM_HEADERS + 8].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[ELF_PROGRAM_HEADER_SIZE..ELF_PROGRAM_HEADER_SIZE + 2]
+            .copy_from_slice(&56_u16.to_le_bytes());
+        bytes[ELF_PROGRAM_HEADER_COUNT..ELF_PROGRAM_HEADER_COUNT + 2]
+            .copy_from_slice(&count.to_le_bytes());
+        let mut load = vec![0_u8; PROGRAM_HEADER_SIZE];
+        load[..4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes.extend(load);
+        if let Some(loader) = loader {
+            let offset = u64::try_from(ELF_HEADER_SIZE + 2 * PROGRAM_HEADER_SIZE).unwrap();
+            let size = u64::try_from(loader.len().checked_add(1).unwrap()).unwrap();
+            let mut interp = vec![0_u8; PROGRAM_HEADER_SIZE];
+            interp[..4].copy_from_slice(&PT_INTERP.to_le_bytes());
+            interp[PROGRAM_HEADER_OFFSET..PROGRAM_HEADER_OFFSET + 8]
+                .copy_from_slice(&offset.to_le_bytes());
+            interp[PROGRAM_HEADER_FILE_SIZE..PROGRAM_HEADER_FILE_SIZE + 8]
+                .copy_from_slice(&size.to_le_bytes());
+            bytes.extend(interp);
+            bytes.extend(loader.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    /// A dynamically linked `x86_64` executable whose loader is `loader`.
+    fn dynamic(loader: &str) -> Vec<u8> {
+        elf(ELF_CLASS_64, ELF_MACHINE_X86_64, Some(loader))
+    }
+
+    /// The interpreter that the `#!` line of `header` names, as text.
+    fn interpreter(header: &[u8]) -> Option<String> {
+        script_interpreter(header).map(|name| String::from_utf8(name).unwrap())
+    }
+
+    /// The interpreter of a `#!` line is found as the kernel finds it, within
+    /// the bytes that the kernel reads, and nothing else is taken for one.
+    #[test]
+    fn script_lines_are_parsed_as_the_kernel_parses_them() {
+        let named = |name: &str| Some(name.to_owned());
+        assert_eq!(interpreter(b"#!/bin/sh\necho\n"), named("/bin/sh"));
+        // Spaces and tabs before and after the interpreter, and an argument.
+        assert_eq!(interpreter(b"#! \t/bin/sh \t\n"), named("/bin/sh"));
+        assert_eq!(
+            interpreter(b"#!/usr/bin/env python3 -u\n"),
+            named("/usr/bin/env")
+        );
+        assert_eq!(interpreter(b"#!/bin/sh\t-e\n"), named("/bin/sh"));
+        // A relative path, as written.
+        assert_eq!(interpreter(b"#!rel/interp arg\n"), named("rel/interp"));
+        // A file without a newline, and a NUL byte that ends the line.
+        assert_eq!(interpreter(b"#!/bin/sh"), named("/bin/sh"));
+        assert_eq!(interpreter(b"#!/bin/sh\0\n"), named("/bin/sh"));
+        // No interpreter.
+        for header in [&b"#!\n"[..], b"#!  \t \n", b"#!", b"#! \0/bin/sh\n"] {
+            assert_eq!(interpreter(header), None, "{header:?}");
+        }
+        // Not a `#!` line.
+        for header in [&b"#/bin/sh\n"[..], b" #!/bin/sh\n", b"", b"#"] {
+            assert_eq!(interpreter(header), None, "{header:?}");
+        }
+        // More than the kernel reads: an interpreter path that runs past the end
+        // of the buffer was cut, so the kernel finds none, but an argument that
+        // does only loses its end.
+        let long_name = format!("#!/{}\n", "a".repeat(300));
+        assert_eq!(interpreter(long_name.as_bytes()), None);
+        let blanks = format!("#!{}/bin/sh\n", " ".repeat(300));
+        assert_eq!(interpreter(blanks.as_bytes()), None);
+        let long_argument = format!("#!/bin/sh {}\n", "x".repeat(300));
+        assert_eq!(interpreter(long_argument.as_bytes()), named("/bin/sh"));
+        // A newline beyond what the kernel reads does not count.
+        let late_newline = format!("#!/{}/sh\n", "a".repeat(260));
+        assert_eq!(interpreter(late_newline.as_bytes()), None);
+        // A name that ends exactly where the kernel stops reading is cut too.
+        let exact = format!("#!{}", "b".repeat(HEADER_SIZE - 2));
+        assert_eq!(interpreter(exact.as_bytes()), None);
+    }
+
+    /// Only a complete little-endian 64-bit `x86_64` executable has its program
+    /// headers read.
+    #[test]
+    fn elf_headers_are_recognized_only_for_x86_64_executables() {
+        let header = |bytes: Vec<u8>| elf_header(&bytes);
+        let static_program = header(elf(ELF_CLASS_64, ELF_MACHINE_X86_64, None)).unwrap();
+        assert_eq!(static_program, ElfHeader {
+            offset: 64,
+            entry_size: 56,
+            count: 1,
+        });
+        assert_eq!(
+            header(elf(ELF_CLASS_64, ELF_MACHINE_X86_64, Some("/ld.so")))
+                .unwrap()
+                .count,
+            2
+        );
+        // A 32-bit ELF and an aarch64 ELF are not x86_64 executables.
+        assert_eq!(header(elf(1, ELF_MACHINE_X86_64, None)), None);
+        assert_eq!(header(elf(1, 3, None)), None);
+        assert_eq!(header(elf(ELF_CLASS_64, 183, None)), None);
+        // A truncated header, a big-endian one and an object file are not either.
+        let full = elf(ELF_CLASS_64, ELF_MACHINE_X86_64, None);
+        assert_eq!(elf_header(&full[..40]), None);
+        assert_eq!(elf_header(&full[..ELF_HEADER_SIZE - 1]), None);
+        let mut big_endian = full.clone();
+        big_endian[ELF_DATA] = 2;
+        assert_eq!(elf_header(&big_endian), None);
+        let mut relocatable = full;
+        relocatable[ELF_TYPE] = 1;
+        assert_eq!(elf_header(&relocatable), None);
+    }
+
+    /// A script run through a script records both scripts, the executable at
+    /// the end of the chain and its loader, as run or as probed by the result.
+    #[test]
+    fn a_chain_of_scripts_records_each_interpreter_and_the_loader() {
+        // A script whose interpreter is a script, whose relative interpreter is
+        // resolved against the working directory, and is a dynamic executable.
+        let fake = with_files("/p/outer", &[
+            ("/p/outer", text("#!/p/inner first\necho\n")),
+            ("/p/inner", text("#! \tbin/program second\n")),
+            ("/work/bin/program", dynamic("/lib64/ld.so")),
+        ]);
+        assert_eq!(
+            execve(&fake, Some(0)),
+            (
+                expect(&[
+                    ("/lib64/ld.so", "exec"),
+                    ("/p/inner", "exec"),
+                    ("/p/outer", "exec"),
+                    ("/work/bin/program", "exec")
+                ]),
+                None
+            )
+        );
+        // A failed run probes each path, and one whose result is unknown may have
+        // run them.
+        assert_eq!(
+            execve(&fake, failed(libc::E2BIG)),
+            (
+                expect(&[
+                    ("/lib64/ld.so", "probe"),
+                    ("/p/inner", "probe"),
+                    ("/p/outer", "probe"),
+                    ("/work/bin/program", "probe")
+                ]),
+                None
+            )
+        );
+        assert_eq!(
+            execve(&fake, None),
+            (
+                expect(&[
+                    ("/lib64/ld.so", "probe+exec"),
+                    ("/p/inner", "probe+exec"),
+                    ("/p/outer", "probe+exec"),
+                    ("/work/bin/program", "probe+exec")
+                ]),
+                None
+            )
+        );
+    }
+
+    /// A dynamically linked executable records its loader, a static one none,
+    /// whether it is run by path or through a descriptor.
+    #[test]
+    fn elf_executables_record_their_loader_if_they_have_one() {
+        let fake = with_files("/p/dynamic", &[("/p/dynamic", dynamic("/lib64/ld.so"))]);
+        assert_eq!(
+            execve(&fake, Some(0)),
+            (
+                expect(&[("/lib64/ld.so", "exec"), ("/p/dynamic", "exec")]),
+                None
+            )
+        );
+        // A relative loader path is resolved against the working directory.
+        let fake = with_files("/p/dynamic", &[("/p/dynamic", dynamic("ld/rel.so"))]);
+        assert_eq!(
+            execve(&fake, Some(0)),
+            (
+                expect(&[("/p/dynamic", "exec"), ("/work/ld/rel.so", "exec")]),
+                None
+            )
+        );
+        // A static executable has no loader.
+        let fake = with_files("/p/static", &[(
+            "/p/static",
+            elf(ELF_CLASS_64, ELF_MACHINE_X86_64, None),
+        )]);
+        assert_eq!(
+            execve(&fake, Some(0)),
+            (expect(&[("/p/static", "exec")]), None)
+        );
+        // `execveat` on a descriptor reads the file behind it.
+        let fake = with_files("/dir/file", &[("/dir/file", dynamic("/lib64/ld.so"))]);
+        assert_eq!(
+            exec_in(&fake, "execveat", &[FILE, EMPTY, 0, 0, EMPTY_PATH], Some(0)),
+            (
+                expect(&[("/dir/file", "exec"), ("/lib64/ld.so", "exec")]),
+                None
+            )
+        );
+    }
+
+    /// A `#!` interpreter that does not exist, at any depth, is recorded as
+    /// probed when the `exec` fails.
+    #[test]
+    fn a_missing_interpreter_is_probed() {
+        let fake = with_files("/p/broken", &[("/p/broken", text("#!/p/missing\n"))]);
+        assert_eq!(
+            execve(&fake, failed(libc::ENOENT)),
+            (
+                expect(&[("/p/broken", "probe"), ("/p/missing", "probe")]),
+                None
+            )
+        );
+        // A missing interpreter of an interpreter too.
+        let fake = with_files("/p/outer", &[
+            ("/p/outer", text("#!/p/inner\n")),
+            ("/p/inner", text("#!missing\n")),
+        ]);
+        assert_eq!(
+            execve(&fake, failed(libc::ENOENT)),
+            (
+                expect(&[
+                    ("/p/inner", "probe"),
+                    ("/p/outer", "probe"),
+                    ("/work/missing", "probe")
+                ]),
+                None
+            )
+        );
+    }
+
+    /// Interpreters are read only as deep as the kernel reads them, and a run
+    /// deeper than that cannot be followed.
+    #[test]
+    fn interpreters_are_followed_as_deep_as_the_kernel_follows_them() {
+        // The program and five interpreters are read; the sixth interpreter is
+        // only looked up, before the kernel fails with `ELOOP`.
+        let names: Vec<String> = (0..=8).map(|index| format!("/p/s{index}")).collect();
+        let files: Vec<(String, Vec<u8>)> = names
+            .windows(2)
+            .map(|pair| (pair[0].clone(), text(&format!("#!{}\n", pair[1]))))
+            .collect();
+        let borrowed: Vec<(&str, Vec<u8>)> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.clone()))
+            .collect();
+        let fake = with_files("/p/s0", &borrowed);
+        let (paths, problem) = execve(&fake, failed(libc::ELOOP));
+        let expected: Vec<(String, String)> = (0..=6)
+            .map(|index| (format!("/p/s{index}"), "probe".to_owned()))
+            .collect();
+        assert_eq!((paths, problem), (expected, None));
+        // A run that the kernel reports as successful cannot be followed.
+        let (_, problem) = execve(&fake, Some(0));
+        assert!(problem.unwrap().contains("deeper than the kernel follows"));
+    }
+
+    /// A program that is neither a script nor an `x86_64` executable makes a
+    /// successful run incomplete, and a failed one only probes it.
+    #[test]
+    fn programs_of_unknown_formats_make_a_successful_run_incomplete() {
+        let truncated = elf(ELF_CLASS_64, ELF_MACHINE_X86_64, None)[..40].to_vec();
+        let unknown = [
+            ("32-bit", elf(1, 3, Some("/lib/ld-linux.so.2"))),
+            (
+                "aarch64",
+                elf(ELF_CLASS_64, 183, Some("/lib/ld-aarch64.so")),
+            ),
+            ("truncated", truncated),
+            ("text", text("plain text\n")),
+            ("no interpreter", text("#!\n")),
+            ("empty", Vec::new()),
+        ];
+        for (label, content) in unknown {
+            let fake = with_files("/p/program", &[("/p/program", content)]);
+            // The kernel runs such a file only through another handler, such as
+            // `binfmt_misc`, whose interpreter the tracer cannot see.
+            let (paths, problem) = execve(&fake, Some(0));
+            assert_eq!(paths, expect(&[("/p/program", "exec")]), "{label}");
+            let problem = problem.unwrap();
+            assert!(
+                problem.contains("/p/program") && problem.contains("neither"),
+                "{label}: {problem}"
+            );
+            // Without such a handler, it fails with `ENOEXEC` and ran nothing.
+            assert_eq!(
+                execve(&fake, failed(libc::ENOEXEC)),
+                (expect(&[("/p/program", "probe")]), None),
+                "{label}"
+            );
+        }
+        // The last file of a chain counts, not the program.
+        let fake = with_files("/p/script", &[
+            ("/p/script", text("#!/p/data\n")),
+            ("/p/data", text("data\n")),
+        ]);
+        let (paths, problem) = execve(&fake, Some(0));
+        assert_eq!(paths, expect(&[("/p/data", "exec"), ("/p/script", "exec")]));
+        let problem = problem.unwrap();
+        assert!(
+            problem.contains("/p/script") && problem.contains("/p/data is neither"),
+            "{problem}"
+        );
+    }
+
+    /// A program, interpreter or loader that the tracer cannot read or name
+    /// makes a successful run incomplete.
+    #[test]
+    fn programs_the_tracer_cannot_read_make_a_successful_run_incomplete() {
+        // A program that can be run but not read, and an interpreter that is not
+        // found by the tracer although the kernel ran it.
+        let mut fake = with_files("/p/hidden", &[]);
+        fake.contents.insert("/p/hidden".to_owned(), None);
+        let (paths, problem) = execve(&fake, Some(0));
+        assert_eq!(paths, expect(&[("/p/hidden", "exec")]));
+        assert!(problem.unwrap().contains("could not read /p/hidden"));
+        assert_eq!(
+            execve(&fake, failed(libc::EACCES)),
+            (expect(&[("/p/hidden", "probe")]), None)
+        );
+        let fake = with_files("/p/script", &[("/p/script", text("#!/p/gone\n"))]);
+        let (paths, problem) = execve(&fake, Some(0));
+        assert_eq!(paths, expect(&[("/p/gone", "exec"), ("/p/script", "exec")]));
+        assert!(problem.unwrap().contains("could not read /p/gone"));
+        // Program headers that the tracer cannot read, and a loader path without
+        // its NUL byte.
+        let mut cut = dynamic("/lib64/ld.so");
+        cut.truncate(ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE);
+        let mut unterminated = dynamic("/lib64/ld.so");
+        unterminated.pop();
+        unterminated.push(b'x');
+        for content in [cut, unterminated] {
+            let fake = with_files("/p/elf", &[("/p/elf", content)]);
+            let (paths, problem) = execve(&fake, Some(0));
+            assert_eq!(paths, expect(&[("/p/elf", "exec")]));
+            assert!(problem.unwrap().contains("/p/elf"));
+        }
+        // A program behind a descriptor that names no path.
+        let fake = with_files("/p/unused", &[]);
+        let (paths, problem) =
+            exec_in(&fake, "execveat", &[PIPE, EMPTY, 0, 0, EMPTY_PATH], Some(0));
+        assert_eq!(paths, expect(&[]));
+        assert!(problem.unwrap().contains("cannot tell"));
+        // A relative interpreter of a thread whose working directory is unknown.
+        let mut fake = with_files("/p/script", &[("/p/script", text("#!rel\n"))]);
+        fake.links.remove(&libc::AT_FDCWD);
+        let (paths, problem) = execve(&fake, Some(0));
+        assert_eq!(paths, expect(&[("/p/script", "exec")]));
+        assert!(problem.unwrap().contains("working directory"));
+    }
+
+    /// A call that is not an `exec` records only its own access, never the
+    /// interpreter of the file it opens.
+    #[test]
+    fn calls_other_than_exec_load_nothing() {
+        let fake = with_files("/p/outer", &[("/work/rel", text("#!/p/inner\n"))]);
+        assert_eq!(
+            exec_in(&fake, "open", &[REL, reg(libc::O_RDONLY)], Some(3)),
+            (expect(&[("/work/rel", "read")]), None)
+        );
     }
 }

@@ -365,13 +365,16 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Record the paths of a tracked call that returned `result`, or whose result
-    /// was never seen.
+    /// Record the paths of a tracked call of the thread `pid` that returned
+    /// `result`, or whose result was never seen, with what the kernel loaded to run
+    /// the program of an `exec`.
     fn finish(
         &mut self,
-        call: decode::Call,
+        pid: pid_t,
+        mut call: decode::Call,
         result: Option<i64>,
     ) {
+        call.loaded(result, &sys::Thread(pid));
         if let Some(detail) = call.finish(result, &mut self.outcome.accesses) {
             self.incomplete(IncompleteReason::Other { detail });
         }
@@ -441,7 +444,7 @@ impl<'a> Tree<'a> {
         }
         if let Some(call) = tracee.and_then(|tracee| tracee.pending) {
             // The thread ended inside the call, which may have taken effect.
-            self.finish(call, None);
+            self.finish(pid, call, None);
         }
         if pid == self.root {
             self.outcome.termination = Some(if libc::WIFEXITED(status) {
@@ -531,7 +534,7 @@ impl<'a> Tree<'a> {
                 .map(|registers| i64::from_ne_bytes(registers.rax.to_ne_bytes()));
             // A descriptor the call returned names the object it actually opened.
             call.opened(result, &sys::Thread(pid));
-            self.finish(call, result);
+            self.finish(pid, call, result);
         }
         unless_vanished(sys::resume(pid, 0))
     }
@@ -576,7 +579,7 @@ impl<'a> Tree<'a> {
         if let Some(earlier) = earlier {
             // A call whose exit was never seen; it cannot happen when every stop
             // is handled, and is recorded as one whose result is unknown.
-            self.finish(earlier, None);
+            self.finish(pid, earlier, None);
         }
     }
 
@@ -648,7 +651,7 @@ impl<'a> Tree<'a> {
                         None => call,
                     };
                     if let Some(ended) = ended {
-                        self.finish(ended, None);
+                        self.finish(pid, ended, None);
                     }
                 }
             },

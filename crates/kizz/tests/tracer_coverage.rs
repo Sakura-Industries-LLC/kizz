@@ -16,20 +16,24 @@
 //! the one step record with the entries of `expected.txt` for the platform it runs on.
 //! Every run of `kizz` gets a temporary cache and an explicit environment of only
 //! `KIZZ_CACHE_DIR` and `PATH`. Paths outside the copy, such as those of the dynamic
-//! loader and the C library, are not compared.
+//! loader and the C library, are not compared with the expectation file, but the
+//! loader that the program's `PT_INTERP` header names must be recorded with the exec
+//! kind.
 //!
 //! The other tests check `expected.txt` itself: that it is consistent, and that each
 //! tracked system call that `architecture.md` lists, the same list as
 //! [`TRACKED_SYSTEM_CALLS`], has an entry for its success and, for a call that takes a
 //! path, one for its failure with `ENOENT`, on which a tracer that missed the call
-//! would record something else. Unit tests cover the parser and the comparison.
+//! would record something else. The same holds for the kernel's implicit loads of
+//! [`IMPLICIT_LOADS`]. Unit tests cover the parser and the comparison.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    ffi::OsStr,
     fmt::{self, Write as _},
     fs,
-    os::unix::fs::symlink,
+    os::unix::{ffi::OsStrExt as _, fs::symlink},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -75,6 +79,16 @@ const DESCRIPTOR_CALLS: [&str; 6] = [
     "ftruncate",
     "fchmod",
     "fchown",
+];
+
+/// The implicit loads of the kernel that the coverage check requires, each as the
+/// name of its `kernel` source and an outcome: the interpreter of a script that a
+/// process runs, the interpreter of that interpreter, which is a script itself,
+/// and a missing interpreter.
+const IMPLICIT_LOADS: [(&str, &str); 3] = [
+    ("interpreter", "ok"),
+    ("interpreter_of_interpreter", "ok"),
+    ("interpreter", "ENOENT"),
 ];
 
 /// An access kind, as "What is recorded" names it.
@@ -365,6 +379,9 @@ enum Origin {
     Libc,
     /// Kizz's own start of the program, a traced `execve`.
     Kizz,
+    /// A file that the kernel loads to run a program, without a system call of its
+    /// own: an interpreter that a `#!` line names, or an ELF loader.
+    Kernel,
 }
 
 /// One call that touches an entry's path.
@@ -393,6 +410,14 @@ impl Source {
     ) -> bool {
         self.origin == Origin::Sys && self.name == name
     }
+
+    /// Whether this is the implicit load `name` of the kernel.
+    fn is_implicit_load(
+        &self,
+        name: &str,
+    ) -> bool {
+        self.origin == Origin::Kernel && self.name == name
+    }
 }
 
 impl FromStr for Source {
@@ -409,6 +434,7 @@ impl FromStr for Source {
             "sys" => Origin::Sys,
             "libc" => Origin::Libc,
             "kizz" => Origin::Kizz,
+            "kernel" => Origin::Kernel,
             _ => return Err(format!("unknown origin `{origin}` in `{text}`")),
         };
         let valid_name = !name.is_empty()
@@ -521,8 +547,9 @@ fn parse_expectations(text: &str) -> Result<Vec<Entry>, Vec<String>> {
 
 /// The problems of `entries` as a whole, given the names of the tracked system
 /// calls: an entry's kinds that are not the union of its sources' kinds, a system
-/// call that is not tracked, a failed call that adds more than a probe, a start by
-/// kizz that is not a successful `execve`, and a path listed twice for a platform.
+/// call that is not tracked, an implicit load that is not known, a failed call
+/// that adds more than a probe, a start by kizz that is not a successful `execve`,
+/// and a path listed twice for a platform.
 fn consistency_problems(
     entries: &[Entry],
     tracked: &[&str],
@@ -535,6 +562,14 @@ fn consistency_problems(
             if source.origin == Origin::Sys && !tracked.contains(&source.name.as_str()) {
                 problems.push(format!(
                     "line {}: {} is not a tracked system call",
+                    entry.line, source.name
+                ));
+            }
+            if source.origin == Origin::Kernel
+                && !IMPLICIT_LOADS.iter().any(|(name, _)| *name == source.name)
+            {
+                problems.push(format!(
+                    "line {}: {} is not a known implicit load",
                     entry.line, source.name
                 ));
             }
@@ -571,18 +606,18 @@ fn consistency_problems(
     problems
 }
 
-/// Whether a tracer that missed the system call `name` would record `entry`
-/// differently: the call is its only source, or adds a kind that no other source
-/// adds.
+/// Whether a tracer that missed the sources that `missed` selects would record
+/// `entry` differently: they are its only sources, or add a kind that no other
+/// source adds.
 fn detects(
     entry: &Entry,
-    name: &str,
+    missed: impl Fn(&Source) -> bool,
 ) -> bool {
     let mut own = Kinds::default();
     let mut others = Kinds::default();
     let mut has_others = false;
     for source in &entry.sources {
-        if source.is_system_call(name) {
+        if missed(source) {
             own.extend(&source.kinds);
         } else {
             others.extend(&source.kinds);
@@ -595,7 +630,8 @@ fn detects(
 /// The problems of the coverage of `tracked` by `entries`, which are the entries for
 /// one platform: a call without an entry on which it succeeded, or for a call that
 /// takes a path, failed with `ENOENT`, and that would be recorded differently
-/// without it.
+/// without it; and an implicit load of [`IMPLICIT_LOADS`] without an entry with
+/// its outcome that would be recorded differently without it.
 fn coverage_problems(
     entries: &[&Entry],
     tracked: &[&str],
@@ -612,13 +648,24 @@ fn coverage_problems(
                     .sources
                     .iter()
                     .any(|source| source.is_system_call(name) && source.outcome == outcome)
-                    && detects(entry, name)
+                    && detects(entry, |source| source.is_system_call(name))
             });
             if !detected {
                 problems.push(format!(
                     "{name} has no entry with outcome {outcome} that only it explains"
                 ));
             }
+        }
+    }
+    for (name, outcome) in IMPLICIT_LOADS {
+        let selects = |source: &Source| source.is_implicit_load(name) && source.outcome == outcome;
+        let detected = entries
+            .iter()
+            .any(|entry| entry.sources.iter().any(selects) && detects(entry, selects));
+        if !detected {
+            problems.push(format!(
+                "the implicit load {name} has no entry with outcome {outcome} that only it explains"
+            ));
         }
     }
     problems
@@ -995,6 +1042,7 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     if let Some(record) = &record {
         let differences = compare(&expected_here(&entries), &recorded_under(record, &copy));
         problems.extend(differences.iter().map(ToString::to_string));
+        problems.extend(loader_problems(record, &copy));
         writeln!(report, "program output:\n{}", output_of(record))?;
     }
     for run in &runs {
@@ -1007,6 +1055,80 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
         problems.join("\n")
     );
     Ok(())
+}
+
+/// The little-endian field of `size` bytes, at most eight, at `offset` in `bytes`.
+fn field(
+    bytes: &[u8],
+    offset: usize,
+    size: usize,
+) -> TestResult<usize> {
+    let end = offset.checked_add(size).ok_or("the field overflows")?;
+    let slice = bytes.get(offset..end).ok_or("the file is too short")?;
+    let mut word = [0_u8; 8];
+    word.get_mut(..size)
+        .ok_or("the field is too wide")?
+        .copy_from_slice(slice);
+    Ok(usize::try_from(u64::from_le_bytes(word))?)
+}
+
+/// The loader that the 64-bit ELF executable at `path` names in its `PT_INTERP`
+/// program header, or `None` when it has none.
+fn elf_loader(path: &Path) -> TestResult<Option<PathBuf>> {
+    let bytes = fs::read(path)?;
+    if !bytes.starts_with(b"\x7fELF") || bytes.get(4) != Some(&2) {
+        return Err(format!("{} is not a 64-bit ELF file", path.display()).into());
+    }
+    let start = field(&bytes, 32, 8)?;
+    let size = field(&bytes, 54, 2)?;
+    let count = field(&bytes, 56, 2)?;
+    for index in 0..count {
+        let header = index
+            .checked_mul(size)
+            .and_then(|offset| offset.checked_add(start))
+            .ok_or("the program headers overflow")?;
+        if field(&bytes, header, 4)? != 3 {
+            continue;
+        }
+        let offset = field(&bytes, header.checked_add(8).ok_or("overflow")?, 8)?;
+        let length = field(&bytes, header.checked_add(32).ok_or("overflow")?, 8)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or("the loader path overflows")?;
+        let name = bytes.get(offset..end).ok_or("the loader path is cut")?;
+        let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+        return Ok(Some(PathBuf::from(OsStr::from_bytes(name))));
+    }
+    Ok(None)
+}
+
+/// The problems of the loader of the program in `copy`, the task directory: `cc`
+/// links dynamically by default, so the program must have a `PT_INTERP` header,
+/// and `record` must hold the loader it names, outside the copy, with the exec
+/// kind.
+fn loader_problems(
+    record: &StepRecord,
+    copy: &Path,
+) -> Vec<String> {
+    let loader = match elf_loader(&copy.join("coverage")) {
+        Ok(Some(loader)) => loader,
+        Ok(None) => return vec!["the program has no PT_INTERP program header".to_owned()],
+        Err(error) => return vec![format!("could not read the program's loader: {error}")],
+    };
+    let mut problems = Vec::new();
+    if loader.starts_with(copy) {
+        problems.push(format!("the loader {} is in the copy", loader.display()));
+    }
+    let executed = record.observations.iter().any(|observation| {
+        observation.path == loader && observation.access.contains(AccessBits::EXEC)
+    });
+    if !executed {
+        problems.push(format!(
+            "the loader {} is not recorded with the exec kind",
+            loader.display()
+        ));
+    }
+    problems
 }
 
 /// The list of tracked system calls in `architecture.md` has the names of
@@ -1119,8 +1241,9 @@ fn the_parser_reports_every_error() {
 }
 
 /// The consistency check finds kinds that are not the union of the sources' kinds,
-/// untracked system calls, failed calls that add more than a probe, and a path
-/// listed twice for overlapping platforms, but not for disjoint ones.
+/// untracked system calls, unknown implicit loads, failed calls and loads that add
+/// more than a probe, and a path listed twice for overlapping platforms, but not
+/// for disjoint ones.
 #[test]
 fn the_consistency_check_finds_each_problem() {
     let text = "a read+write file all sys:openat:ok:read\n\
@@ -1130,7 +1253,10 @@ fn the_consistency_check_finds_each_problem() {
                 d probe file linux-x86_64 sys:stat:ok:probe\n\
                 e probe file linux-x86_64 sys:stat:ok:probe\n\
                 e probe file linux-aarch64 sys:statx:ok:probe\n\
-                f exec file+hash all kizz:execveat:ok:exec\n";
+                f exec file+hash all kizz:execveat:ok:exec\n\
+                g exec file+hash linux kernel:loader:ok:exec\n\
+                h exec absent linux kernel:interpreter:ENOENT:exec\n\
+                i exec file+hash linux kernel:interpreter_of_interpreter:ok:exec\n";
     let entries = parse_expectations(text).unwrap();
     let problems = consistency_problems(&entries, &["openat", "stat", "statx"]);
     assert_eq!(problems, vec![
@@ -1139,6 +1265,8 @@ fn the_consistency_check_finds_each_problem() {
         "line 3: the failed call openat adds read, not a probe",
         "line 3: c has the kinds probe, but its sources add read",
         "line 8: kizz starts a program only with a successful execve",
+        "line 9: loader is not a known implicit load",
+        "line 10: the failed call interpreter adds exec, not a probe",
         "lines 4 and 5: d is listed twice for a platform",
     ]);
 }
@@ -1146,6 +1274,7 @@ fn the_consistency_check_finds_each_problem() {
 /// The coverage check requires, for each call, an entry on which it succeeded and,
 /// for a call with a path, one on which it failed with `ENOENT`, each of which it
 /// alone explains: as the only source, or with a kind that no other source adds.
+/// It requires the same of each implicit load of the kernel, with its outcome.
 #[test]
 fn the_coverage_check_requires_entries_that_only_the_call_explains() {
     let text = "a probe+write dir linux sys:mkdirat:ok:write sys:mkdirat:EEXIST:probe \
@@ -1153,7 +1282,11 @@ fn the_coverage_check_requires_entries_that_only_the_call_explains() {
                 b probe absent linux sys:mkdirat:ENOENT:probe\n\
                 c probe file linux sys:openat:ok:probe sys:stat:ok:probe\n\
                 d probe absent linux sys:openat:ENOENT:probe sys:stat:ENOENT:probe\n\
-                e list dir linux sys:getdents64:ok:list\n";
+                e list dir linux sys:getdents64:ok:list\n\
+                f exec file+hash linux kernel:interpreter:ok:exec\n\
+                g exec file+hash linux kizz:execve:ok:exec \
+                kernel:interpreter_of_interpreter:ok:exec\n\
+                h probe absent linux kernel:interpreter:ENOENT:probe\n";
     let entries = parse_expectations(text).unwrap();
     let all: Vec<&Entry> = entries.iter().collect();
     let problems = coverage_problems(&all, &["mkdirat", "openat", "getdents64", "fchmod"]);
@@ -1161,7 +1294,15 @@ fn the_coverage_check_requires_entries_that_only_the_call_explains() {
         "openat has no entry with outcome ok that only it explains",
         "openat has no entry with outcome ENOENT that only it explains",
         "fchmod has no entry with outcome ok that only it explains",
+        "the implicit load interpreter_of_interpreter has no entry with outcome ok that only it \
+         explains",
     ]);
+    // An interpreter of an interpreter that only that load explains.
+    let text = format!("{text}i exec file+hash linux kernel:interpreter_of_interpreter:ok:exec\n");
+    let entries = parse_expectations(&text).unwrap();
+    let all: Vec<&Entry> = entries.iter().collect();
+    let problems = coverage_problems(&all, &["mkdirat", "getdents64"]);
+    assert_eq!(problems, Vec::<String>::new());
 }
 
 /// The list of tracked calls is read from the bullets under its heading, with the

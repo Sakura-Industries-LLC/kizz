@@ -396,6 +396,13 @@ Nothing in the core changes when the tracer does.
   Seccomp alone cannot read path arguments or see results, so `ptrace` reads the path at entry and the result at exit.
 * It follows the whole process tree, including threads, forks and `exec`,
   and the traced processes are killed if kizz dies (`PTRACE_O_EXITKILL`).
+* At each `exec` it also records what the kernel loads without another system call: the interpreter on a `#!` line,
+  the interpreters of interpreters that are scripts themselves,
+  and the loader that an ELF executable names in its `PT_INTERP` program header.
+  A relative interpreter path is resolved against the working directory, as the kernel resolves it.
+  These paths get the exec kind when the `exec` succeeds, and a probe when it fails.
+* A program that runs although the tracer cannot read it, or that is neither a `#!` script nor an ELF executable
+  for the machine, marks the run as incompletely traced, since a handler such as `binfmt_misc` may run it.
 * It resolves relative paths against the calling thread's working directory or the directory descriptor the call used.
 * It records successful and failed calls alike; a lookup that fails with `ENOENT` is a dependency.
 * `io_uring_setup` fails with `ENOSYS`, so programs fall back to ordinary system calls,
@@ -429,7 +436,7 @@ For each step, kizz records every path the command touched, combining the kinds 
 * probe: existence or metadata was checked, including lookups that found nothing
 * list: a directory's entries were read
 * write: the path was created, modified, renamed, removed or had its metadata changed
-* exec: the path was run as a program
+* exec: the path was run as a program, or the kernel loaded it to run one, as a `#!` interpreter or an ELF loader
 
 When the command finishes, kizz records the state of every touched path, concurrently.
 The next cache check compares the current state with that recorded state, so a file a step writes and then reads,
@@ -1013,6 +1020,8 @@ Depends on phases 7 and 8.
   A cached `coverage-test` task runs the program.
 * `coverage.c` is plain C that makes every tracked system call, in several variants.
   It checks the result of every call, and calls that only some platforms have are compiled only there.
+  It also runs `#!` scripts from the fixture, one of them through an interpreter that is a script itself,
+  and one whose interpreter is missing.
 * The expectation file lists each path under the task directory that the run must record.
   Each entry gives the path's access kinds, its state, the calls that touch it and its platforms.
 * An end-to-end test copies the fixture to a temporary directory and runs `kizz build coverage-build` there.
@@ -1023,6 +1032,7 @@ Acceptance, end to end with the real tracer and a temporary cache:
 
 * The program reports that every call returned what it expected.
 * Each expected path for the platform is recorded with exactly its access kinds and state.
+* The loader that the program's `PT_INTERP` header names is recorded with the exec kind.
 * No other path under the task directory is recorded.
 * Each tracked system call has an expected entry that a tracer missing that call would record differently.
 
