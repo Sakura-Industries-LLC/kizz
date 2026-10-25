@@ -194,6 +194,7 @@ impl Fixture {
             always: false,
             ignore: vec!["*.tmp".to_owned()],
             track: Vec::new(),
+            timestamps: false,
             expect: None,
         })
     }

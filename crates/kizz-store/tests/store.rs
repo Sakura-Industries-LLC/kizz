@@ -22,8 +22,8 @@ use kizz_store::{
     AccessBits, BuildId, Capture, ContentHash, DATABASE_DIR, EntryCounts, FileMeta, Inventory,
     LastWriter, LearnedOrder, Observation, Owner, PathKey, PathState, PositionKey, ProgramPath,
     RecordedOutput, RunReason, SCHEMA_VERSION, SchemaKey, SchemaVersion, StepExit, StepKey,
-    StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Verdict,
-    WrittenBy, path_prefix,
+    StepPosition, StepRecord, StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Times,
+    Verdict, WrittenBy, path_prefix,
 };
 
 /// The variable that selects the helper mode of this test executable.
@@ -47,6 +47,7 @@ fn step_record(n: u8) -> StepRecord {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: n % 2 == 1,
             expect: None,
             occurrence: u32::from(n),
         },
@@ -83,6 +84,10 @@ fn step_record(n: u8) -> StepRecord {
                         gid: 100,
                     },
                     listing: None,
+                    times: Times {
+                        mtime_nanos: i64::from(n),
+                        ctime_nanos: -1,
+                    },
                 },
             },
         ],

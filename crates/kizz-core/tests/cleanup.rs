@@ -76,6 +76,7 @@ fn step(
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
             occurrence: 0,
         },

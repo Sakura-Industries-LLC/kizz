@@ -37,6 +37,7 @@ pub use records::{
 pub use step::{
     AccessBits, Capture, Change, ContentHash, Difference, DirEntry, EntryKind, FileMeta, Listing,
     MAX_LISTED_NAMES, NotCachedReason, Observation, Owner, PERMISSION_BITS, PathState, ProgramPath,
-    RecordedOutput, RunReason, SpecialKind, StepExit, StepRecord, StepSpecRecord, permission_bits,
+    RecordedOutput, RunReason, SpecialKind, StepExit, StepRecord, StepSpecRecord, Times,
+    permission_bits,
 };
 pub use store::{DATABASE_DIR, EntryCounts, Inventory, SCHEMA_VERSION, Store, StoreError, Txn};

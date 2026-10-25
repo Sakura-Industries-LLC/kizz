@@ -5,7 +5,8 @@
 //! Golden-output tests of explanations: every reason kind, every kind of last
 //! writer, environment values hidden without `--verbose` and shown with it, a step
 //! that writes a file and also reads it, the warning for consecutive builds, the
-//! one-line reasons, permission and owner changes, and the report of `kizz why`.
+//! one-line reasons, permission and owner changes, timestamp changes and the
+//! `timestamps` option, and the report of `kizz why`.
 //!
 //! Each test builds a project directory and a cache in temporary directories. A
 //! build is one [`Engine`] on a store opened in the cache, and each task runs through
@@ -27,10 +28,12 @@
 use std::{
     collections::BTreeMap,
     error::Error,
-    fs, io,
+    fs::{self, File, FileTimes},
+    io,
     os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use kizz_core::{
@@ -253,6 +256,7 @@ impl Fixture {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
         })
     }
@@ -757,6 +761,116 @@ fn permission_and_owner_changes_name_their_old_and_new_values() -> TestResult {
         format!("`mode.txt` changed (owner changed from {other} to {current})")
     );
     assert_eq!(fixture.why(false)?, why_for_one_changed_input(&input));
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// Set the modification time of `path` to `millis` milliseconds after the Unix
+/// epoch, which also gives it a new change time, and return its change time in
+/// nanoseconds since the epoch.
+fn set_modified(
+    path: &Path,
+    millis: u64,
+) -> TestResult<i64> {
+    let then = UNIX_EPOCH
+        .checked_add(Duration::from_millis(millis))
+        .ok_or("time out of range")?;
+    File::open(path)?.set_times(FileTimes::new().set_modified(then))?;
+    let metadata = fs::metadata(path)?;
+    Ok(metadata
+        .ctime()
+        .checked_mul(1_000_000_000)
+        .and_then(|nanos| nanos.checked_add(metadata.ctime_nsec()))
+        .ok_or("change time out of range")?)
+}
+
+/// A time in nanoseconds since the Unix epoch as explanations show it: seconds with
+/// nine decimals.
+fn seconds(nanos: i64) -> String {
+    format!(
+        "{}.{:09}",
+        nanos.div_euclid(1_000_000_000),
+        nanos.rem_euclid(1_000_000_000)
+    )
+}
+
+/// With `timestamps = True`, a new modification time with the same bytes names the
+/// old and new times, and the change time when it changed too, in the full reasons,
+/// in the one-line reason of `kizz build`, and in `kizz why`; switching the option
+/// off names the option, with its old and new values, in all three.
+#[test]
+fn timestamp_changes_and_the_timestamps_option_are_explained() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("mode.txt", "same")?;
+    let path = fixture.path("mode.txt");
+    let old_ctime = set_modified(&path, 1_700_000_000_000)?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let mut stamped = fixture.step(&["tool", "read:mode.txt"])?;
+    stamped.timestamps = true;
+    fixture.build(&tracer, &[(&task, &[&stamped])])?;
+    assert_eq!(
+        fixture
+            .build(&tracer, &[(&task, &[&stamped])])?
+            .verdict(0, 0)?,
+        &Verdict::Cached
+    );
+
+    let new_ctime = set_modified(&path, 1_700_000_001_500)?;
+    let built = fixture.build(&tracer, &[(&task, &[&stamped])])?;
+    let modification = "timestamps changed: modification time from 1700000000.000000000 to \
+                        1700000001.500000000";
+    let change = if new_ctime == old_ctime {
+        modification.to_owned()
+    } else {
+        format!(
+            "{modification}, change time from {} to {}",
+            seconds(old_ctime),
+            seconds(new_ctime)
+        )
+    };
+    let input = format!("`mode.txt`: {change}; last written by something outside kizz");
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        format!("`mode.txt` changed ({change})")
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_input(&input));
+
+    let plain = fixture.step(&["tool", "read:mode.txt"])?;
+    let built = fixture.build(&tracer, &[(&task, &[&plain])])?;
+    let option = "the `timestamps` option changed from True to False";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {option}")])
+    );
+    assert_eq!(fixture.render(false).one_line(built.verdict(0, 0)?), option);
+    assert_eq!(
+        fixture.why(false)?,
+        format!(
+            "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool read:mode.txt`
+    ran because:
+      {option}
+    untracked /proc and /sys accesses: none
+    ignored accesses: 0
+"
+        )
+    );
+
+    // Switching back finds the record of the step key with the option, which
+    // nothing changed since.
+    let built = fixture.build(&tracer, &[(&task, &[&stamped])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
     assert_eq!(tracer.runs(), 3);
     Ok(())
 }

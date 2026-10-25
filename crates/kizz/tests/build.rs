@@ -18,14 +18,15 @@ use std::{
     fs,
     io::{self, BufRead as _, BufReader, Lines},
     os::unix::{
-        fs::{PermissionsExt as _, symlink},
+        fs::{MetadataExt as _, PermissionsExt as _, symlink},
         process::CommandExt as _,
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
+    time::SystemTime,
 };
 
-use kizz_store::{LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store};
+use kizz_store::{Change, LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store, Times};
 use tempfile::TempDir;
 
 /// The result of a test or a test helper.
@@ -802,6 +803,101 @@ fn a_script_that_loses_its_execute_bits_runs_again_and_fails() -> TestResult {
         assert!(third.stderr.contains(expected), "{expected:?}: {third:?}");
     }
     assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// The modification and change times of `path`.
+fn times(path: &Path) -> TestResult<Times> {
+    let metadata = fs::metadata(path)?;
+    let nanos = |seconds: i64, nanoseconds: i64| {
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanoseconds))
+            .ok_or("time out of range")
+    };
+    Ok(Times {
+        mtime_nanos: nanos(metadata.mtime(), metadata.mtime_nsec())?,
+        ctime_nanos: nanos(metadata.ctime(), metadata.ctime_nsec())?,
+    })
+}
+
+/// Give `path` the current time as its modification time, as `touch` does.
+fn touch(path: &Path) -> TestResult {
+    fs::File::open(path)?.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))?;
+    Ok(())
+}
+
+/// `run("sh", "-c", "cat in.txt > out.txt", timestamps = True)` runs again after
+/// `touch in.txt`, with the old and new times of `in.txt` as its reason, and the
+/// same task without the option stays cached.
+#[test]
+fn a_command_run_with_timestamps_runs_again_after_touch() -> TestResult {
+    let copy = "sh -c cat in.txt > out.txt";
+    for timestamps in [true, false] {
+        let project = Project::new()?;
+        project.write("in.txt", "input\n")?;
+        let option = if timestamps {
+            ", timestamps = True"
+        } else {
+            ""
+        };
+        project.kizz_md("", &[(
+            "Copy",
+            &format!("run(\"sh\", \"-c\", \"cat in.txt > out.txt\"{option})"),
+        )])?;
+        let first = project.run("", &["build", "ci"])?;
+        assert_eq!(first.status, Some(0), "{first:?}");
+        assert_eq!(
+            first.stdout,
+            text(&[
+                &ran(copy, "kizz.md:3 (Copy)", NEVER_RUN),
+                &pass(2),
+                "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+            ])
+        );
+        let cached =
+            text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"]);
+        let second = project.run("", &["build", "ci"])?;
+        assert_eq!(
+            (second.status, &second.stdout),
+            (Some(0), &cached),
+            "{second:?}"
+        );
+
+        let input = project.root.join("in.txt");
+        let old = times(&input)?;
+        touch(&input)?;
+        let new = times(&input)?;
+        assert_ne!(old, new);
+        let third = project.run("", &["build", "ci"])?;
+        assert_eq!(third.status, Some(0), "{third:?}");
+        if timestamps {
+            let change = Change::Timestamps { old, new };
+            assert_eq!(
+                third.stdout,
+                text(&[
+                    &ran(
+                        copy,
+                        "kizz.md:3 (Copy)",
+                        &format!("`in.txt` changed ({change})")
+                    ),
+                    &pass(2),
+                    "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+                ])
+            );
+            assert!(change.to_string().starts_with("timestamps changed: "));
+        } else {
+            assert_eq!(third.stdout, cached, "{third:?}");
+        }
+        assert_eq!(fs::read_to_string(project.root.join("out.txt"))?, "input\n");
+        let fourth = project.run("", &["build", "ci"])?;
+        assert_eq!(
+            (fourth.status, &fourth.stdout),
+            (Some(0), &cached),
+            "{fourth:?}"
+        );
+        assert!(!project.has_lock_file());
+    }
     Ok(())
 }
 

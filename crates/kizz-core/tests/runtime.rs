@@ -347,7 +347,8 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
     let task = fixture.block(
         "run(\"prog\")\nrun(\"prog\", \"a b\", \"c\", stdin = \"input\", env = {\"A\": \"1\", \
          \"B\": None}, cwd = \"sub/dir\", capture = \"merged\", stream = True, always = True, \
-         ignore = [\"*.log\", \"tmp/**\"], track = [\"/proc/cpuinfo\"], expect = [0, 2])\nrun(\"prog\", \
+         ignore = [\"*.log\", \"tmp/**\"], track = [\"/proc/cpuinfo\"], timestamps = True, expect = \
+         [0, 2])\nrun(\"prog\", \
          cwd = \"/elsewhere\")\n",
     )?;
     let dir = AbsolutePath::new(fixture.path())?;
@@ -364,6 +365,7 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             always: false,
             ignore: vec![],
             track: vec![],
+            timestamps: false,
             expect: None,
         },
         StepSpec {
@@ -376,6 +378,7 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             always: true,
             ignore: vec!["*.log".to_owned(), "tmp/**".to_owned()],
             track: vec!["/proc/cpuinfo".to_owned()],
+            timestamps: true,
             expect: Some(vec![0, 2]),
         },
         StepSpec {
@@ -388,6 +391,7 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             always: false,
             ignore: vec![],
             track: vec![],
+            timestamps: false,
             expect: None,
         },
     ]);
@@ -395,7 +399,8 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
 }
 
 /// Invalid `run()` calls fail the task: no program, an unknown capture mode, an
-/// unknown parameter, and a step the executor cannot run.
+/// unknown parameter, a `timestamps` value that is not a boolean, and a step the
+/// executor cannot run.
 #[test]
 fn invalid_run_calls_fail_the_task() -> TestResult {
     let fixture = Fixture::new()?;
@@ -406,6 +411,10 @@ fn invalid_run_calls_fail_the_task() -> TestResult {
             "capture must be \"split\" or \"merged\"",
         ),
         ("run(\"p\", shell = True)\n", "shell"),
+        (
+            "run(\"p\", timestamps = \"yes\")\n",
+            "Type of parameter `timestamps` doesn't match, expected `bool`",
+        ),
         ("run(\"missing\")\n", "run(): no such program: missing"),
     ] {
         let executor = FakeExecutor::scripted(|step| {
@@ -417,6 +426,22 @@ fn invalid_run_calls_fail_the_task() -> TestResult {
         let message = program_message(run(fixture.block(source)?, &executor)?.0)?;
         assert!(message.contains(expected), "{expected:?} in {message}");
     }
+    Ok(())
+}
+
+/// `timestamps = "yes"` fails the task with Starlark's argument check, which names
+/// the parameter, before any step runs.
+#[test]
+fn a_timestamps_value_that_is_not_a_boolean_fails_the_task() -> TestResult {
+    let fixture = Fixture::new()?;
+    let executor = FakeExecutor::new();
+    let task = fixture.block("run(\"p\", timestamps = \"yes\")\n")?;
+    let message = program_message(run(task, &executor)?.0)?;
+    assert!(
+        message.contains("Type of parameter `timestamps` doesn't match, expected `bool`"),
+        "{message}"
+    );
+    assert_eq!(executor.steps(), []);
     Ok(())
 }
 

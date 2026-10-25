@@ -1240,6 +1240,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
             occurrence: 0,
         },
@@ -1253,6 +1254,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
                 mode: 0o040_755,
                 owner,
                 listing: None,
+                times: meta.times(),
             }),
             observation(
                 "/t/a/../b",

@@ -217,6 +217,7 @@ impl Fixture {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
         })
     }

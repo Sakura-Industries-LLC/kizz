@@ -57,7 +57,7 @@ These decisions came out of the review of the original outline.
 | Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. |
 | Tool awareness | None. Tool caches are tracked at file level like any other files. A tool that makes itself uncacheable is uncacheable, and kizz reports exactly why, for example that a command keeps writing a file and consuming it as an input. Users may ignore a file, glob, or regular expression, or a set of them; kizz never adds such exceptions itself. Users drive exceptions, not dependencies. |
 | Inputs | Anything read during the build is an input. To exclude a file, stop the tool from reading it, or add an exception. Kizz itself stays oblivious. |
-| Change detection | Different size: changed. Same size and same metadata: unchanged. Same size but different metadata: maybe changed, so compare hashes. A different type, permission bits or owner is always a change, whatever the content. |
+| Change detection | Different size: changed. Same size and same metadata: unchanged. Same size but different metadata: maybe changed, so compare hashes. A different type, permission bits or owner is always a change, whatever the content. A command run with `timestamps = True` also counts a different timestamp as a change. |
 | Hashing | Only files that are read are hashed. For any other file, such as one that was only checked, kizz records that it was touched and its metadata only. |
 | `/proc` and `/sys` | Reads are recorded, so it is known they happened, but they do not invalidate the cache. A command option lists specific `/proc` or `/sys` files whose reads do invalidate, so the user decides whether they are meaningful. |
 | Concurrency | Concurrent caches, and ripgrep-style concurrent scanning wherever possible to find files, dependencies and so on. |
@@ -246,6 +246,7 @@ result = run(
     always = False,     # run on every build, even when cached
     ignore = [],        # user exceptions: paths not recorded as dependencies of this step
     track = [],         # /proc and /sys files whose content counts as an input of this step
+    timestamps = False, # also compare the timestamps of what the step read, ran, listed or checked
     expect = None,      # None: never fail the task on exit status; or a list of acceptable exit codes
 )
 ```
@@ -260,6 +261,9 @@ result = run(
 * The result has `rc` (the exit code, or `None` when a signal killed the process), `signal`,
   `stdout` and `stderr` (with `split`), `output` (with `merged`), and `cached` (whether the result came from the cache).
 * Output is decoded as UTF-8 for the program, with invalid bytes replaced; the cache stores the raw bytes.
+* With `timestamps = True`, a new timestamp of a file or directory that the step used runs it again,
+  even when the content is the same, for tools such as `tar` and `zip` that store timestamps.
+  See [Cache check](#cache-check).
 
 ### Exit codes and failure
 
@@ -438,7 +442,7 @@ or a temporary file it creates and removes, needs no special handling.
   inode, device, mode (its type and permission bits) and owner (user and group), plus a BLAKE3 hash of its content.
 * Any other regular file, such as one that was only checked or only written: that the command touched it, and the same metadata.
   Kizz never hashes it.
-* Directory: its mode and owner.
+* Directory: its mode, owner, and modification and change times.
   When listed, also a hash of its sorted entry names and types, plus the names themselves when there are not too many
   (up to 1,000), so explanations can name what appeared or disappeared.
 * Symbolic link: the link target, plus the state of what it points to.
@@ -532,6 +536,7 @@ A step's key is a BLAKE3 hash, derived with a versioned context string, of a CBO
 * the capture mode
 * the ignore patterns
 * the `track` patterns
+* whether `timestamps` is set
 * the occurrence number, which counts identical commands earlier in the same task run,
   so a command repeated in a task gets one cache entry per repetition
 
@@ -539,6 +544,7 @@ The encoding is deterministic: definite lengths, fields in a fixed order and map
 so the same step always produces the same key.
 
 `always`, `stream` and `expect` are not in the key, because they change what kizz does with a step, not what the command does.
+`timestamps` is in the key, because a record made without it keeps the timestamps of its latest cache hit.
 
 ### Cache check
 
@@ -567,6 +573,13 @@ Untracked paths under `/proc` and `/sys` are never compared.
 
 Programs cannot set the change time, so a tool that restores modification times
 (`tar`, `rsync -t` or `cp -p`) still trips the metadata check.
+
+With `run(..., timestamps = True)`, the bytes do not decide alone.
+A different modification or change time of a file or directory that the step read, ran, listed or checked is a change,
+found without hashing.
+A new or removed hard link changes a file's change time, so it also runs such a step again.
+Access times are never compared, because reading a file changes them.
+Neither are the times of a symbolic link itself.
 
 During a build, file states and hashes are held in a concurrent in-memory cache,
 so a file that many steps depend on is hashed once per build.
@@ -631,9 +644,9 @@ These are the reasons:
 * the arguments changed: old and new, word by word
 * the environment changed: which variables were added, removed or changed,
   with values shown only with `--verbose`, because values can be secrets
-* the working directory, `stdin`, capture mode, ignore patterns or `track` patterns changed
+* the working directory, `stdin`, capture mode, ignore patterns, `track` patterns or `timestamps` changed
 * inputs changed: every changed path, what changed about it
-  (it appeared or disappeared, or its content, size, type, permissions, owner, directory entries
+  (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, directory entries
   or link target changed),
   and who last wrote it: this command on its previous run, another task's command or program in this build,
   a command or task program of an earlier build, or something outside kizz

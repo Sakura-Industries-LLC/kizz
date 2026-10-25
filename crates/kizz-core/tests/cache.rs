@@ -33,7 +33,7 @@ use kizz_core::{
 };
 use kizz_store::{
     AccessBits, Change, ContentHash, Difference, FileMeta, NotCachedReason, Observation, Owner,
-    PathState, RunReason, StepExit, StepKey, StepRecord, Store,
+    PathState, RunReason, StepExit, StepKey, StepRecord, Store, Times,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -300,6 +300,7 @@ impl Fixture {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
         })
     }
@@ -1648,5 +1649,193 @@ fn a_listed_or_checked_directory_runs_its_step_again_after_chmod() -> TestResult
         assert!(again.cached(0)? && again.cached(1)?);
     }
     assert_eq!(tracer.runs(), 4);
+    Ok(())
+}
+
+/// Set the modification time of `path`, a file or a directory, to `seconds` seconds
+/// ago, which also gives it a new change time.
+fn set_modified(
+    path: &Path,
+    seconds: u64,
+) -> TestResult {
+    let then = SystemTime::now()
+        .checked_sub(Duration::from_secs(seconds))
+        .ok_or("time out of range")?;
+    File::open(path)?.set_times(FileTimes::new().set_modified(then))?;
+    Ok(())
+}
+
+/// The modification and change times that `state`, a regular file's or a
+/// directory's, records.
+fn recorded_times(state: &PathState) -> TestResult<Times> {
+    match state {
+        PathState::File { meta, .. } => Ok(meta.times()),
+        PathState::Directory { times, .. } => Ok(*times),
+        other => Err(format!("no times in {other:?}").into()),
+    }
+}
+
+/// The current modification and change times of `path`.
+fn current_times(path: &Path) -> TestResult<Times> {
+    let metadata = fs::metadata(path)?;
+    let nanos = |seconds: i64, nanoseconds: i64| {
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanoseconds))
+            .ok_or("time out of range")
+    };
+    Ok(Times {
+        mtime_nanos: nanos(metadata.mtime(), metadata.mtime_nsec())?,
+        ctime_nanos: nanos(metadata.ctime(), metadata.ctime_nsec())?,
+    })
+}
+
+/// `step` with the `timestamps` option set.
+fn stamped(step: &StepSpec) -> StepSpec {
+    StepSpec {
+        timestamps: true,
+        ..step.clone()
+    }
+}
+
+/// With `timestamps = True`, a read file whose modification time changes while its
+/// bytes stay the same runs the step, without hashing, with a reason that names the
+/// old and new times. The same step without the option is a hit that stores the new
+/// metadata, and the two have different step keys.
+#[test]
+fn with_timestamps_a_new_modification_time_with_the_same_bytes_runs_the_step() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "same bytes")?;
+    let tracer = FakeTracer::reading(vec![input.clone()]);
+    let plain = fixture.step(&["tool"])?;
+    let stamped = stamped(&plain);
+    assert_ne!(
+        step_key(PROGRAM, &plain, 0)?,
+        step_key(PROGRAM, &stamped, 0)?
+    );
+    fixture.build(&tracer, &[&plain, &stamped])?;
+    let hit = fixture.build(&tracer, &[&plain, &stamped])?;
+    assert!(hit.cached(0)? && hit.cached(1)?);
+    assert_eq!(tracer.runs(), 2);
+
+    let record = fixture.record(&stamped)?.ok_or("no record")?;
+    let old = recorded_times(&observation(&record, &input)?.state)?;
+    set_modified(&input, 7_200)?;
+    let new = current_times(&input)?;
+    assert_ne!(old.mtime_nanos, new.mtime_nanos);
+
+    // The step with the option checks first, finds the times changed without
+    // hashing, and runs; the step without it hashes the file and is a hit.
+    let built = fixture.build(&tracer, &[&stamped, &plain])?;
+    assert!(!built.cached(0)?);
+    assert!(built.cached(1)?);
+    assert_eq!(tracer.runs(), 3);
+    let record = fixture.record(&stamped)?.ok_or("no record")?;
+    assert_eq!(differences(&record), [difference(
+        input.clone(),
+        Change::Timestamps { old, new }
+    )]);
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    let record = fixture.record(&plain)?.ok_or("no record")?;
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    assert_eq!(record.reason, RunReason::NeverRun);
+
+    let again = fixture.build(&tracer, &[&plain, &stamped])?;
+    assert!(again.cached(0)? && again.cached(1)?);
+    assert_eq!(again.hashed, 0);
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// With `timestamps = True`, a listed directory and a directory that was only
+/// checked each run their step when their modification time changes, with the
+/// times as the reason; without the option, both are hits.
+#[test]
+fn with_timestamps_a_listed_or_checked_directory_runs_when_its_time_changes() -> TestResult {
+    let fixture = Fixture::new()?;
+    let listed = fixture.path("listed");
+    let checked = fixture.path("checked");
+    for dir in [&listed, &checked] {
+        fs::create_dir(dir)?;
+    }
+    let (list, probe) = (listed.clone(), checked.clone());
+    let tracer = FakeTracer::new(move |request| {
+        let accesses = match verb(request) {
+            "list" => [(list.clone(), AccessKind::List)],
+            _ => [(probe.clone(), AccessKind::Probe)],
+        };
+        finished(request, &accesses, Termination::Exited(0))
+    });
+    let lists = fixture.step(&["tool", "list"])?;
+    let checks = fixture.step(&["tool", "check"])?;
+    let (stamped_lists, stamped_checks) = (stamped(&lists), stamped(&checks));
+    let all = [&lists, &checks, &stamped_lists, &stamped_checks];
+    fixture.build(&tracer, &all)?;
+    let hit = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(hit.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 4);
+
+    for (dir, step, index) in [(&listed, &stamped_lists, 2), (&checked, &stamped_checks, 3)] {
+        let record = fixture.record(step)?.ok_or("no record")?;
+        let old = recorded_times(&observation(&record, dir)?.state)?;
+        set_modified(dir, 7_200)?;
+        let new = current_times(dir)?;
+        assert_ne!(old.mtime_nanos, new.mtime_nanos);
+        let built = fixture.build(&tracer, &all)?;
+        for other in 0..all.len() {
+            assert_eq!(
+                built.cached(other)?,
+                other != index,
+                "{} step {other}",
+                dir.display()
+            );
+        }
+        let record = fixture.record(step)?.ok_or("no record")?;
+        assert_eq!(differences(&record), [difference(
+            dir.clone(),
+            Change::Timestamps { old, new }
+        )]);
+        assert_eq!(recorded_times(&observation(&record, dir)?.state)?, new);
+        let again = fixture.build(&tracer, &all)?;
+        for other in 0..all.len() {
+            assert!(again.cached(other)?, "{} step {other}", dir.display());
+        }
+    }
+    assert_eq!(tracer.runs(), 6);
+    Ok(())
+}
+
+/// A step without the option refreshes a touched file's metadata on a hit; the same
+/// step switched to the option does not reuse that record, under its own key, and
+/// runs, and switching back is a hit on the first record.
+#[test]
+fn switching_the_timestamps_option_does_not_reuse_a_refreshed_record() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "same bytes")?;
+    let tracer = FakeTracer::reading(vec![input.clone()]);
+    let plain = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&plain])?;
+    set_modified(&input, 7_200)?;
+    let touched = fixture.build(&tracer, &[&plain])?;
+    assert!(touched.cached(0)?);
+    assert_eq!(touched.hashed, 1);
+    let refreshed = fixture.record(&plain)?.ok_or("no record")?;
+    assert_eq!(observation(&refreshed, &input)?.state, read_state(&input)?);
+
+    let stamped = stamped(&plain);
+    let switched = fixture.build(&tracer, &[&stamped])?;
+    assert!(!switched.cached(0)?);
+    assert_eq!(tracer.runs(), 2);
+    let record = fixture.record(&stamped)?.ok_or("no record")?;
+    assert!(record.spec.timestamps);
+    assert_eq!(record.reason, RunReason::NeverRun);
+    assert_eq!(fixture.records()?.len(), 2);
+    assert!(!refreshed.spec.timestamps);
+
+    let back = fixture.build(&tracer, &[&plain])?;
+    assert!(back.cached(0)?);
+    assert_eq!(tracer.runs(), 2);
     Ok(())
 }

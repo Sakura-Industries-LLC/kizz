@@ -544,6 +544,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
         ignore: UnpackListOrTuple<String>,
         #[starlark(require = named, default = UnpackListOrTuple::default())]
         track: UnpackListOrTuple<String>,
+        #[starlark(require = named, default = false)] timestamps: bool,
         #[starlark(require = named, default = NoneOr::None)] expect: NoneOr<UnpackListOrTuple<i32>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
@@ -590,6 +591,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             always,
             ignore: ignore.items,
             track: track.items,
+            timestamps,
             expect: expect.into_option().map(|codes| codes.items),
         };
         let outcome = state

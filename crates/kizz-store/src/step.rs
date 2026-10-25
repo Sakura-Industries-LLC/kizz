@@ -177,6 +177,10 @@ pub struct StepSpecRecord {
     /// The number of identical commands earlier in the same task run.
     #[n(11)]
     pub occurrence: u32,
+    /// Whether a different modification or change time of a file or directory that
+    /// the step read, ran, listed, or checked is a change.
+    #[n(12)]
+    pub timestamps: bool,
 }
 
 /// The combined kinds of access a step made to one path, one bit per kind.
@@ -239,6 +243,33 @@ impl fmt::Display for Owner {
     }
 }
 
+/// The modification and change times of a regular file or a directory, in
+/// nanoseconds since the Unix epoch. Access times are never recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct Times {
+    /// The modification time.
+    #[n(0)]
+    pub mtime_nanos: i64,
+    /// The change time.
+    #[n(1)]
+    pub ctime_nanos: i64,
+}
+
+/// Write a time in nanoseconds since the Unix epoch as seconds with nine decimals.
+fn write_time(
+    f: &mut fmt::Formatter<'_>,
+    nanos: i64,
+) -> fmt::Result {
+    let sign = if nanos < 0 { "-" } else { "" };
+    let magnitude = nanos.unsigned_abs();
+    write!(
+        f,
+        "{sign}{}.{:09}",
+        magnitude / 1_000_000_000,
+        magnitude % 1_000_000_000
+    )
+}
+
 /// The metadata of a regular file that a cache check compares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct FileMeta {
@@ -263,6 +294,17 @@ pub struct FileMeta {
     /// The owner.
     #[n(6)]
     pub owner: Owner,
+}
+
+impl FileMeta {
+    /// The modification and change times.
+    #[must_use]
+    pub const fn times(&self) -> Times {
+        Times {
+            mtime_nanos: self.mtime_nanos,
+            ctime_nanos: self.ctime_nanos,
+        }
+    }
 }
 
 /// The type of a directory entry, as the listing reports it, without following
@@ -378,7 +420,8 @@ pub enum PathState {
         #[n(1)]
         hash: Option<ContentHash>,
     },
-    /// A directory: its mode and owner, and its sorted entries when it was listed.
+    /// A directory: its mode, owner, and times, and its sorted entries when it was
+    /// listed.
     #[n(2)]
     Directory {
         /// The mode: the file type and permission bits.
@@ -390,6 +433,9 @@ pub enum PathState {
         /// The listing, when the directory was listed.
         #[n(2)]
         listing: Option<Listing>,
+        /// The modification and change times.
+        #[n(3)]
+        times: Times,
     },
     /// A symbolic link: its target, and the state of what it points to.
     #[n(3)]
@@ -525,6 +571,17 @@ pub enum Change {
         #[n(1)]
         new: Owner,
     },
+    /// A regular file's or a directory's modification or change time changed, found
+    /// without hashing, for a step run with `timestamps`.
+    #[n(10)]
+    Timestamps {
+        /// The recorded times.
+        #[n(0)]
+        old: Times,
+        /// The current times.
+        #[n(1)]
+        new: Times,
+    },
     /// A regular file's size changed, found without hashing.
     #[n(3)]
     Size {
@@ -571,6 +628,7 @@ impl fmt::Display for Change {
                 write!(f, "permissions changed from {old:04o} to {new:04o}")
             },
             Self::Owner { old, new } => write!(f, "owner changed from {old} to {new}"),
+            Self::Timestamps { old, new } => write_timestamps(f, old, new),
             Self::Size { old, new } => write!(f, "size changed from {old} to {new} bytes"),
             Self::Content => f.write_str("content changed"),
             Self::Metadata => f.write_str("metadata changed"),
@@ -585,6 +643,34 @@ impl fmt::Display for Change {
             },
         }
     }
+}
+
+/// Write a timestamp change: each time that differs, old and new, or both times
+/// when neither differs.
+fn write_timestamps(
+    f: &mut fmt::Formatter<'_>,
+    old: &Times,
+    new: &Times,
+) -> fmt::Result {
+    let mtime = old.mtime_nanos != new.mtime_nanos;
+    let ctime = old.ctime_nanos != new.ctime_nanos;
+    f.write_str("timestamps changed: ")?;
+    if mtime || !ctime {
+        f.write_str("modification time from ")?;
+        write_time(f, old.mtime_nanos)?;
+        f.write_str(" to ")?;
+        write_time(f, new.mtime_nanos)?;
+    }
+    if mtime && ctime {
+        f.write_str(", ")?;
+    }
+    if ctime || !mtime {
+        f.write_str("change time from ")?;
+        write_time(f, old.ctime_nanos)?;
+        f.write_str(" to ")?;
+        write_time(f, new.ctime_nanos)?;
+    }
+    Ok(())
 }
 
 /// One recorded path that a cache check found changed.
@@ -828,6 +914,10 @@ mod tests {
                 mode: 0o041_777,
                 owner: Owner { uid: 0, gid: 0 },
                 listing: None,
+                times: Times {
+                    mtime_nanos: -3,
+                    ctime_nanos: 4,
+                },
             },
             PathState::Directory {
                 mode: 0o040_750,
@@ -842,6 +932,10 @@ mod tests {
                         kind: EntryKind::Symlink,
                     }]),
                 }),
+                times: Times {
+                    mtime_nanos: 5,
+                    ctime_nanos: 6,
+                },
             },
             PathState::Symlink {
                 target: PathBuf::from("../x"),
@@ -874,6 +968,7 @@ mod tests {
                 always: false,
                 ignore: vec!["re:x".to_owned()],
                 track: vec!["/proc/cpuinfo".to_owned()],
+                timestamps: true,
                 expect: Some(vec![0, 1]),
                 occurrence: 2,
             },
@@ -936,6 +1031,16 @@ mod tests {
                     gid: 1_000,
                 },
                 new: Owner { uid: 0, gid: 0 },
+            },
+            Change::Timestamps {
+                old: Times {
+                    mtime_nanos: 1,
+                    ctime_nanos: -2,
+                },
+                new: Times {
+                    mtime_nanos: 3,
+                    ctime_nanos: 4,
+                },
             },
             Change::Size { old: 1, new: 2 },
             Change::Content,
@@ -1020,6 +1125,36 @@ mod tests {
                 assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
             }
         }
+    }
+
+    /// A timestamp change names each time that changed, old and new, in seconds
+    /// with nine decimals.
+    #[test]
+    fn timestamp_changes_display() {
+        let times = |mtime_nanos, ctime_nanos| {
+            Times {
+                mtime_nanos,
+                ctime_nanos,
+            }
+        };
+        let shown: Vec<String> = [
+            (
+                times(1_700_000_000_000_000_000, 1_700_000_000_000_000_000),
+                times(1_700_000_001_500_000_000, 1_700_000_000_000_000_000),
+            ),
+            (times(1, 2), times(1, -1_000_000_001)),
+            (times(0, 0), times(1, 2)),
+        ]
+        .into_iter()
+        .map(|(old, new)| Change::Timestamps { old, new }.to_string())
+        .collect();
+        assert_eq!(shown, [
+            "timestamps changed: modification time from 1700000000.000000000 to \
+             1700000001.500000000",
+            "timestamps changed: change time from 0.000000002 to -1.000000001",
+            "timestamps changed: modification time from 0.000000000 to 0.000000001, change \
+             time from 0.000000000 to 0.000000002",
+        ]);
     }
 
     #[test]
@@ -1109,8 +1244,8 @@ mod tests {
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
         // A definite-length array of thirteen fields, then the specification as a
-        // definite-length array of twelve.
-        assert_eq!(bytes.get(..2), Some(&[0x8D, 0x8C][..]));
+        // definite-length array of thirteen.
+        assert_eq!(bytes.get(..2), Some(&[0x8D, 0x8D][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
@@ -1156,10 +1291,10 @@ mod tests {
     }
 
     /// File states carry the owner as the last field of their metadata, directory
-    /// states carry their mode and owner whether or not they were listed, and both
-    /// encode deterministically and round-trip.
+    /// states carry their mode, owner, and times whether or not they were listed,
+    /// and both encode deterministically and round-trip.
     #[test]
-    fn file_and_directory_states_carry_mode_and_owner() {
+    fn file_and_directory_states_carry_mode_owner_and_times() {
         let owner = Owner {
             uid: 1_000,
             gid: 100,
@@ -1179,6 +1314,14 @@ mod tests {
         // A definite-length array of seven fields, ending with the owner.
         assert_eq!(meta_bytes.first(), Some(&0x87));
         assert!(meta_bytes.ends_with(&owner_bytes));
+        let times = meta.times();
+        assert_eq!(times, Times {
+            mtime_nanos: 1,
+            ctime_nanos: 2,
+        });
+        let times_bytes = minicbor::to_vec(times).unwrap();
+        // A definite-length array of the modification and change times.
+        assert_eq!(times_bytes, [0x82, 0x01, 0x02]);
 
         let file = PathState::File {
             meta,
@@ -1188,6 +1331,7 @@ mod tests {
             mode: 0o041_777,
             owner,
             listing: None,
+            times,
         };
         let listed = PathState::Directory {
             mode: 0o040_755,
@@ -1196,28 +1340,66 @@ mod tests {
                 hash: ContentHash([2; 32]),
                 entries: Some(Vec::new()),
             }),
+            times,
         };
         for state in [file, checked.clone(), listed] {
             let first = minicbor::to_vec(&state).unwrap();
             assert_eq!(first, minicbor::to_vec(&state).unwrap());
             assert_eq!(minicbor::decode::<PathState>(&first).unwrap(), state);
         }
-        // The mode and the owner each reach the bytes of a directory state.
+        // The mode, the owner, and each time reach the bytes of a directory state,
+        // whose times are its last field.
         let other_owner = PathState::Directory {
             mode: 0o041_777,
             owner: Owner { uid: 0, gid: 100 },
             listing: None,
+            times,
         };
         let other_mode = PathState::Directory {
             mode: 0o040_777,
             owner,
             listing: None,
+            times,
+        };
+        let later_modification = PathState::Directory {
+            mode: 0o041_777,
+            owner,
+            listing: None,
+            times: Times {
+                mtime_nanos: 7,
+                ..times
+            },
+        };
+        let later_change = PathState::Directory {
+            mode: 0o041_777,
+            owner,
+            listing: None,
+            times: Times {
+                ctime_nanos: 7,
+                ..times
+            },
         };
         let checked = minicbor::to_vec(&checked).unwrap();
-        assert_ne!(checked, minicbor::to_vec(&other_owner).unwrap());
-        assert_ne!(checked, minicbor::to_vec(&other_mode).unwrap());
+        assert!(checked.ends_with(&times_bytes));
+        for other in [other_owner, other_mode, later_modification, later_change] {
+            assert_ne!(checked, minicbor::to_vec(&other).unwrap());
+        }
         assert_eq!(permission_bits(meta.mode), 0o4755);
         assert_eq!(PERMISSION_BITS, 0o7777);
+    }
+
+    /// The `timestamps` option is the last field of the specification's encoding,
+    /// and both values round-trip.
+    #[test]
+    fn the_timestamps_option_encodes_deterministically_and_round_trips() {
+        for timestamps in [false, true] {
+            let mut spec = record().spec;
+            spec.timestamps = timestamps;
+            let first = minicbor::to_vec(&spec).unwrap();
+            assert_eq!(first, minicbor::to_vec(&spec).unwrap());
+            assert_eq!(first.last(), Some(if timestamps { &0xF5 } else { &0xF4 }));
+            assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
+        }
     }
 
     #[test]

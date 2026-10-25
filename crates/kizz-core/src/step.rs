@@ -37,6 +37,10 @@ pub struct StepSpec {
     pub ignore: Vec<String>,
     /// The `/proc` and `/sys` files whose content counts as an input.
     pub track: Vec<String>,
+    /// Whether a different modification or change time of a file or directory that
+    /// the step read, ran, listed, or checked is a change, even when the content is
+    /// the same.
+    pub timestamps: bool,
     /// The acceptable exit codes, or `None` when the exit status never fails the
     /// task.
     pub expect: Option<Vec<i32>>,

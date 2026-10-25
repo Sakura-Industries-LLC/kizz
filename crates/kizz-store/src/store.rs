@@ -56,8 +56,11 @@ const WIPED_DIR: &str = "db.wiped";
 /// with its position, or the task program, and explanations name a task program
 /// that last wrote a changed input. Version 9 added the owner, as user and group
 /// numbers, to every regular-file state, the mode and owner to every directory
-/// state, and the permission and owner changes that a cache check finds.
-pub const SCHEMA_VERSION: u32 = 9;
+/// state, and the permission and owner changes that a cache check finds. Version 10
+/// added the `timestamps` option to the step specification, the modification and
+/// change times to every directory state, and the timestamp change that a cache
+/// check finds.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -613,10 +616,11 @@ mod tests {
         assert!(message.contains("/cache/db"), "{message}");
     }
 
-    /// Version 9 stores owners and directory modes, one more than version 8, whose
-    /// file states had no owner and whose directory states only a listing.
+    /// Version 10 stores the `timestamps` option and directory times, one more than
+    /// version 9, whose specifications had no `timestamps` and whose directory
+    /// states only a mode, an owner, and a listing.
     #[test]
-    fn schema_version_9_has_owners_and_directory_modes() {
-        assert_eq!(SCHEMA_VERSION, 9);
+    fn schema_version_10_has_timestamps_and_directory_times() {
+        assert_eq!(SCHEMA_VERSION, 10);
     }
 }

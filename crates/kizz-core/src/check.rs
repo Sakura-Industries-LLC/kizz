@@ -24,6 +24,14 @@
 //!   the owner included, is a change.
 //! * A directory's mode and owner are always compared. A listed directory is listed again
 //!   and compared by its listing hash.
+//! * For a step run with `timestamps`, a regular file that was read or run, or a
+//!   directory that was read, listed, or checked, whose modification or change time
+//!   differs has changed, found without hashing, after its permission bits and owner and,
+//!   for a file, its size. A file that was only checked or written already compares its
+//!   times with the rest of its metadata. Access times are never compared, and neither
+//!   are the times of a symbolic link itself: its pointee follows the rule. Without
+//!   `timestamps`, the bytes decide for a file that was read, and directory times are
+//!   never compared.
 //! * A symbolic link is compared by its target, then by the state of what it points to.
 //! * Devices, FIFOs, and sockets are compared by type.
 //! * Untracked paths under `/proc` and `/sys` are never compared. Tracked ones are read
@@ -41,7 +49,8 @@ use std::{
 };
 
 use kizz_store::{
-    Change, ContentHash, Difference, FileMeta, Observation, Owner, PathState, permission_bits,
+    AccessBits, Change, ContentHash, Difference, FileMeta, Observation, Owner, PathState, Times,
+    permission_bits,
 };
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
@@ -95,23 +104,42 @@ struct Context<'a> {
     /// Recorded modification times at or after this time, in nanoseconds since the
     /// Unix epoch, cannot prove a file unchanged.
     racy_from: i64,
+    /// Whether the step was run with `timestamps`.
+    timestamps: bool,
     /// The build's file states and hashes.
     states: &'a FileStates,
 }
 
+/// Whether a step run with `timestamps` compares the times of a path it touched
+/// with `access`: one it read, ran, listed, or checked, and not one it only wrote.
+const fn uses(access: AccessBits) -> bool {
+    (access.0 & !AccessBits::WRITE) != 0
+}
+
+/// The timestamp change from `old` to `new`, or `None` when they match.
+fn times_change(
+    old: Times,
+    new: Times,
+) -> Option<Change> {
+    (old != new).then_some(Change::Timestamps { old, new })
+}
+
 /// Compare every observation in `observations`, recorded with the record written at
 /// `recorded_at_nanos`, with the file system, concurrently, hashing through
-/// `states`.
+/// `states`. With `timestamps`, the times of what the step read, ran, listed, or
+/// checked are compared too.
 #[must_use]
 pub fn check(
     observations: &[Observation],
     recorded_at_nanos: u64,
+    timestamps: bool,
     states: &FileStates,
 ) -> Checked {
     let context = Context {
         racy_from: i64::try_from(recorded_at_nanos)
             .unwrap_or(i64::MAX)
             .saturating_sub(RACY_WINDOW_NANOS),
+        timestamps,
         states,
     };
     let compared: Vec<Compared> = observations
@@ -122,7 +150,10 @@ pub fn check(
                 &observation.state,
                 false,
                 observation.tracked,
-                context,
+                Context {
+                    timestamps: context.timestamps && uses(observation.access),
+                    ..context
+                },
             )
         })
         .collect();
@@ -183,9 +214,15 @@ fn compare(
             mode,
             owner,
             listing,
+            times,
         } if file_type.is_dir() => {
             if let Some(change) =
                 access_change(*mode, *owner, metadata.mode(), observe::owner(&metadata))
+            {
+                return Compared::Changed(change);
+            }
+            if context.timestamps
+                && let Some(change) = times_change(*times, observe::times(&metadata))
             {
                 return Compared::Changed(change);
             }
@@ -273,7 +310,8 @@ fn access_change(
 
 /// Compare a regular file at `path`, recorded with `meta` and, when it was read,
 /// `hash`, with its current `metadata`. Its permission bits and owner come first,
-/// so a refresh of its metadata never hides a change of either.
+/// so a refresh of its metadata never hides a change of either; with `timestamps`,
+/// the times of a file that was read come next, after its size, and before any hash.
 fn compare_file(
     path: &Path,
     meta: &FileMeta,
@@ -287,6 +325,12 @@ fn compare_file(
         return Compared::Changed(change);
     }
     if tracked {
+        if hash.is_some()
+            && context.timestamps
+            && let Some(change) = times_change(meta.times(), current.times())
+        {
+            return Compared::Changed(change);
+        }
         return match context.states.hash_uncached(path) {
             Ok(now) if Some(&now) == hash => Compared::Same,
             Ok(_) => Compared::Changed(Change::Content),
@@ -306,6 +350,11 @@ fn compare_file(
             Compared::Changed(Change::Metadata)
         };
     };
+    if context.timestamps
+        && let Some(change) = times_change(meta.times(), current.times())
+    {
+        return Compared::Changed(change);
+    }
     let racy = meta.mtime_nanos >= context.racy_from;
     if current == *meta && !racy {
         return Compared::Same;
@@ -340,7 +389,7 @@ mod tests {
     use kizz_trace::{AccessKind, AccessKinds};
 
     use super::*;
-    use crate::observe::path_state;
+    use crate::observe::{access_bits, path_state};
 
     /// A temporary directory with helpers to record and check observations.
     struct Dir {
@@ -388,7 +437,7 @@ mod tests {
             Observation {
                 state: path_state(&path, AccessKinds::only(kind), false, &self.states),
                 path,
-                access: AccessBits::default(),
+                access: access_bits(AccessKinds::only(kind)),
                 tracked: false,
             }
         }
@@ -441,7 +490,7 @@ mod tests {
         ];
         assert_eq!(dir.states.files_hashed(), 1);
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert!(checked.is_hit(), "{checked:?}");
         assert!(!checked.refresh);
         assert_eq!(checked.observations, observations);
@@ -455,12 +504,12 @@ mod tests {
         let observations = vec![dir.observe("read", AccessKind::Read)];
         fs::write(dir.path("read"), "longer content").unwrap();
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert_eq!(changes(&checked), [Change::Size { old: 7, new: 14 }]);
         assert_eq!(states.files_hashed(), 0);
 
         fs::write(dir.path("read"), "CONTENT").unwrap();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert_eq!(changes(&checked), [Change::Content]);
         assert_eq!(states.files_hashed(), 1);
     }
@@ -472,7 +521,7 @@ mod tests {
         let observations = vec![dir.observe("read", AccessKind::Read)];
         fs::write(dir.path("read"), "content").unwrap();
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert!(checked.is_hit());
         assert!(checked.refresh);
         assert_eq!(states.files_hashed(), 1);
@@ -492,7 +541,7 @@ mod tests {
         fs::write(dir.path("fresh"), "content").unwrap();
         let observations = vec![dir.observe("fresh", AccessKind::Read)];
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert!(checked.is_hit());
         assert!(checked.refresh);
         assert_eq!(checked.observations, observations);
@@ -507,13 +556,13 @@ mod tests {
         let observations = vec![dir.observe("checked", AccessKind::Probe)];
         set_modified(&dir.path("checked"), 7_200);
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert_eq!(changes(&checked), [Change::Metadata]);
         fs::write(dir.path("checked"), "longer content").unwrap();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert_eq!(changes(&checked), [Change::Size { old: 7, new: 14 }]);
         fs::set_permissions(dir.path("checked"), fs::Permissions::from_mode(0o600)).unwrap();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert_eq!(changes(&checked), [Change::Permissions {
             old: 0o644,
             new: 0o600,
@@ -521,7 +570,8 @@ mod tests {
         assert_eq!(states.files_hashed(), 0);
     }
 
-    /// Set the modification time of `path` to `seconds` seconds ago.
+    /// Set the modification time of `path`, a file or a directory, to `seconds`
+    /// seconds ago.
     fn set_modified(
         path: &Path,
         seconds: u64,
@@ -529,12 +579,123 @@ mod tests {
         let then = SystemTime::now()
             .checked_sub(Duration::from_secs(seconds))
             .unwrap();
-        File::options()
-            .write(true)
-            .open(path)
+        File::open(path)
             .unwrap()
             .set_times(FileTimes::new().set_modified(then))
             .unwrap();
+    }
+
+    /// The recorded times of `observation`, a regular file, a directory, or a link to
+    /// either.
+    fn recorded_times(observation: &Observation) -> Times {
+        match &observation.state {
+            PathState::File { meta, .. } => meta.times(),
+            PathState::Directory { times, .. } => *times,
+            PathState::Symlink { pointee, .. } => {
+                recorded_times(&Observation {
+                    state: (**pointee).clone(),
+                    ..observation.clone()
+                })
+            },
+            other => panic!("no times in {other:?}"),
+        }
+    }
+
+    /// The timestamp change from what `observation` recorded to the current times of
+    /// `path`, following symbolic links.
+    fn timestamps_change(
+        observation: &Observation,
+        path: &Path,
+    ) -> Change {
+        Change::Timestamps {
+            old: recorded_times(observation),
+            new: observe::times(&fs::metadata(path).unwrap()),
+        }
+    }
+
+    #[test]
+    fn timestamps_are_compared_without_hashing_only_with_the_option() {
+        let dir = Dir::new();
+        dir.write_old("read", "content");
+        dir.write_old("checked", "content");
+        fs::create_dir(dir.path("listed")).unwrap();
+        fs::create_dir(dir.path("opened")).unwrap();
+        fs::create_dir(dir.path("written")).unwrap();
+        symlink("read", dir.path("link")).unwrap();
+        let observations = vec![
+            dir.observe("checked", AccessKind::Probe),
+            dir.observe("link", AccessKind::Read),
+            dir.observe("listed", AccessKind::List),
+            dir.observe("opened", AccessKind::Probe),
+            dir.observe("read", AccessKind::Read),
+            dir.observe("written", AccessKind::Write),
+        ];
+        for name in ["read", "checked", "listed", "opened", "written"] {
+            set_modified(&dir.path(name), 7_200);
+        }
+
+        // Without the option, the bytes decide for a read file, which is hashed, once
+        // through the link and once by its own path, and refreshed; directory times are
+        // never compared; a checked file compares all of its metadata, as before.
+        let states = FileStates::new();
+        let checked = check(&observations, now(), false, &states);
+        assert_eq!(changes(&checked), [Change::Metadata]);
+        assert!(checked.refresh);
+        assert_eq!(states.files_hashed(), 2);
+
+        // With it, every time that changed is the change, found without hashing; a
+        // directory that was only written is not compared by its times.
+        let states = FileStates::new();
+        let checked = check(&observations, now(), true, &states);
+        assert_eq!(changes(&checked), [
+            Change::Metadata,
+            timestamps_change(&observations[1], &dir.path("read")),
+            timestamps_change(&observations[2], &dir.path("listed")),
+            timestamps_change(&observations[3], &dir.path("opened")),
+            timestamps_change(&observations[4], &dir.path("read")),
+        ]);
+        assert!(!checked.refresh);
+        assert_eq!(states.files_hashed(), 0);
+    }
+
+    #[test]
+    fn with_the_option_unchanged_times_and_a_new_link_are_a_hit() {
+        let dir = Dir::new();
+        dir.write_old("read", "content");
+        fs::create_dir(dir.path("listed")).unwrap();
+        symlink("read", dir.path("link")).unwrap();
+        let observations = vec![
+            dir.observe("link", AccessKind::Read),
+            dir.observe("listed", AccessKind::List),
+            dir.observe("read", AccessKind::Read),
+        ];
+        // A link made again has new times of its own, which are never compared.
+        fs::remove_file(dir.path("link")).unwrap();
+        symlink("read", dir.path("link")).unwrap();
+        let states = FileStates::new();
+        let checked = check(&observations, now(), true, &states);
+        assert!(checked.is_hit(), "{checked:?}");
+        assert!(!checked.refresh);
+        assert_eq!(states.files_hashed(), 0);
+    }
+
+    #[test]
+    fn with_the_option_a_size_or_permission_change_comes_before_the_times() {
+        let dir = Dir::new();
+        dir.write_old("read", "content");
+        fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o644)).unwrap();
+        let observations = vec![dir.observe("read", AccessKind::Read)];
+        fs::write(dir.path("read"), "longer content").unwrap();
+        let states = FileStates::new();
+        let checked = check(&observations, now(), true, &states);
+        assert_eq!(changes(&checked), [Change::Size { old: 7, new: 14 }]);
+        fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o600)).unwrap();
+        let checked = check(&observations, now(), true, &states);
+        assert_eq!(changes(&checked), [Change::Permissions {
+            old: 0o644,
+            new: 0o600,
+        }]);
+        assert_eq!(states.files_hashed(), 0);
     }
 
     /// The owner every observation of `observations` records, replaced by one that
@@ -574,7 +735,7 @@ mod tests {
             fs::set_permissions(dir.path(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert_eq!(changes(&checked), [
             Change::Permissions {
                 old: 0o755,
@@ -602,7 +763,7 @@ mod tests {
         set_modified(&dir.path("read"), 7_200);
         fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o600)).unwrap();
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         assert_eq!(changes(&checked), [Change::Permissions {
             old: 0o644,
             new: 0o600,
@@ -632,7 +793,7 @@ mod tests {
         };
         let recorded = other_owner(&mut observations);
         let states = FileStates::new();
-        let checked = check(&observations, now(), &states);
+        let checked = check(&observations, now(), false, &states);
         let owner = Change::Owner {
             old: recorded,
             new: current,
@@ -707,7 +868,7 @@ mod tests {
         fs::remove_file(dir.path("gone")).unwrap();
         fs::remove_file(dir.path("retyped")).unwrap();
         fs::create_dir(dir.path("retyped")).unwrap();
-        let checked = check(&observations, now(), &FileStates::new());
+        let checked = check(&observations, now(), false, &FileStates::new());
         assert_eq!(changes(&checked), [
             Change::Appeared,
             Change::Disappeared,
@@ -718,7 +879,7 @@ mod tests {
 
         fs::remove_file(dir.path("link")).unwrap();
         symlink("appears", dir.path("link")).unwrap();
-        let checked = check(&observations[2..3], now(), &FileStates::new());
+        let checked = check(&observations[2..3], now(), false, &FileStates::new());
         assert_eq!(changes(&checked), [Change::LinkTarget {
             old: PathBuf::from("gone"),
             new: PathBuf::from("appears"),
@@ -741,7 +902,7 @@ mod tests {
                 kind: SpecialKind::CharDevice,
             },
         };
-        let checked = check(&[observation, special], now(), &FileStates::new());
+        let checked = check(&[observation, special], now(), false, &FileStates::new());
         assert!(checked.is_hit(), "{checked:?}");
     }
 }

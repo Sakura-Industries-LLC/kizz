@@ -14,8 +14,8 @@
 //! * the arguments changed: old and new, word by word;
 //! * the environment changed: the variables added, removed, or changed, with their
 //!   values, which only `--verbose` shows;
-//! * the working directory, `stdin`, capture mode, ignore patterns, or `track` patterns
-//!   changed;
+//! * the working directory, `stdin`, capture mode, ignore patterns, `track` patterns, or
+//!   `timestamps` changed;
 //! * inputs changed: every changed path, what changed about it, and who last wrote it;
 //! * the command is marked `always`;
 //! * the previous run could not be cached, and why.
@@ -267,6 +267,16 @@ pub enum Reason {
         #[n(1)]
         new: Vec<String>,
     },
+    /// The `timestamps` option changed.
+    #[n(12)]
+    TimestampsChanged {
+        /// The old value.
+        #[n(0)]
+        old: bool,
+        /// The new value.
+        #[n(1)]
+        new: bool,
+    },
     /// Recorded inputs changed.
     #[n(9)]
     InputsChanged {
@@ -422,6 +432,10 @@ mod tests {
             Reason::TrackChanged {
                 old: vec!["/proc/x".to_owned()],
                 new: Vec::new(),
+            },
+            Reason::TimestampsChanged {
+                old: false,
+                new: true,
             },
             Reason::InputsChanged {
                 inputs: vec![

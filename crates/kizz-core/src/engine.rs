@@ -779,6 +779,7 @@ impl TaskSteps<'_> {
             let checked = check(
                 &run.observations,
                 run.recorded_at_nanos,
+                step.timestamps,
                 &self.engine.states,
             );
             return Ok(if checked.is_hit() {
@@ -800,6 +801,7 @@ impl TaskSteps<'_> {
         let checked = check(
             &record.observations,
             record.recorded_at_nanos,
+            record.spec.timestamps,
             &self.engine.states,
         );
         if let Some(why) = record.not_cached {
@@ -1213,6 +1215,7 @@ impl TaskSteps<'_> {
             always: step.always,
             ignore: step.ignore.clone(),
             track: step.track.clone(),
+            timestamps: step.timestamps,
             expect: step.expect.clone(),
             occurrence,
         }

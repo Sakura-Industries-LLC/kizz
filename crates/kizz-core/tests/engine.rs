@@ -32,7 +32,7 @@ use kizz_core::{
 use kizz_store::{
     AccessBits, Capture, ContentHash, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
     Owner, PathState, ProgramPath, RecordedOutput, RunReason, SpecialKind, StepExit, StepKey,
-    StepRecord, Store,
+    StepRecord, Store, Times,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -253,6 +253,7 @@ impl Fixture {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
         }
     }
@@ -308,25 +309,38 @@ fn content_hash(path: &Path) -> TestResult<ContentHash> {
     Ok(ContentHash(*blake3::hash(&fs::read(path)?).as_bytes()))
 }
 
+/// The modification and change times of the file or directory whose metadata is
+/// `metadata`.
+fn times(metadata: &fs::Metadata) -> TestResult<Times> {
+    Ok(Times {
+        mtime_nanos: metadata
+            .mtime()
+            .checked_mul(1_000_000_000)
+            .and_then(|nanos| nanos.checked_add(metadata.mtime_nsec()))
+            .ok_or("modification time out of range")?,
+        ctime_nanos: metadata
+            .ctime()
+            .checked_mul(1_000_000_000)
+            .and_then(|nanos| nanos.checked_add(metadata.ctime_nsec()))
+            .ok_or("change time out of range")?,
+    })
+}
+
 /// The state that a regular file at `path` should have, hashed or not.
 fn file_state(
     path: &Path,
     hashed: bool,
 ) -> TestResult<PathState> {
     let metadata = fs::metadata(path)?;
+    let Times {
+        mtime_nanos,
+        ctime_nanos,
+    } = times(&metadata)?;
     Ok(PathState::File {
         meta: FileMeta {
             size: metadata.size(),
-            mtime_nanos: metadata
-                .mtime()
-                .checked_mul(1_000_000_000)
-                .and_then(|nanos| nanos.checked_add(metadata.mtime_nsec()))
-                .ok_or("modification time out of range")?,
-            ctime_nanos: metadata
-                .ctime()
-                .checked_mul(1_000_000_000)
-                .and_then(|nanos| nanos.checked_add(metadata.ctime_nsec()))
-                .ok_or("change time out of range")?,
+            mtime_nanos,
+            ctime_nanos,
             inode: metadata.ino(),
             device: metadata.dev(),
             mode: metadata.mode(),
@@ -355,11 +369,13 @@ fn unlisted_dir_state(path: &Path) -> TestResult<PathState> {
         mode: metadata.mode(),
         owner: owner(&metadata),
         listing: None,
+        times: times(&metadata)?,
     })
 }
 
 /// The same specification always gives the same key, each value that "Step keys"
-/// lists changes it, and `always`, `stream`, and `expect` do not.
+/// lists changes it, `timestamps` included, and `always`, `stream`, and `expect` do
+/// not.
 #[test]
 fn step_keys_cover_exactly_the_listed_values() -> TestResult {
     let fixture = Fixture::new()?;
@@ -404,6 +420,9 @@ fn step_keys_cover_exactly_the_listed_values() -> TestResult {
     let mut variant = base.clone();
     variant.track.push("/proc/cpuinfo".to_owned());
     changed.insert("track patterns", key(PROGRAM, &variant, 0));
+    let mut variant = base.clone();
+    variant.timestamps = true;
+    changed.insert("timestamps", key(PROGRAM, &variant, 0));
     changed.insert("occurrence", key(PROGRAM, &base, 1));
 
     let distinct: BTreeSet<StepKey> = changed.values().copied().collect();
@@ -1166,6 +1185,7 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
     step.expect = Some(vec![0, 3]);
     step.ignore.push("*.tmp".to_owned());
     step.track.push("/proc/cpuinfo".to_owned());
+    step.timestamps = true;
 
     let before = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let key = {
@@ -1198,6 +1218,7 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
     assert!(spec.stream && !spec.always);
     assert_eq!(spec.ignore, ["*.tmp"]);
     assert_eq!(spec.track, ["/proc/cpuinfo"]);
+    assert!(spec.timestamps);
     assert_eq!(spec.expect, Some(vec![0, 3]));
     assert_eq!(spec.occurrence, 0);
     assert_eq!(stored.program, Some(ProgramPath(fixture.path("bin/tool"))));

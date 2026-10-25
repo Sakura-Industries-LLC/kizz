@@ -60,6 +60,11 @@ const fn capture(mode: Capture) -> &'static str {
     }
 }
 
+/// A boolean as a task program writes it: `True` or `False`.
+const fn starlark_bool(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
+}
+
 /// `stdin` text as verbose output shows it, or `/dev/null` for none.
 fn stdin_text(text: Option<&str>) -> String {
     text.map_or_else(|| "/dev/null".to_owned(), |text| format!("{text:?}"))
@@ -407,6 +412,13 @@ impl Render {
                     patterns(new)
                 )
             },
+            Reason::TimestampsChanged { old, new } => {
+                format!(
+                    "the `timestamps` option changed from {} to {}",
+                    starlark_bool(*old),
+                    starlark_bool(*new)
+                )
+            },
             Reason::InputsChanged { inputs } => self.inputs_short(inputs),
             Reason::Always => "marked `always`".to_owned(),
             Reason::NotCached { why, inputs } => {
@@ -471,6 +483,7 @@ impl Render {
             | Reason::CaptureChanged { .. }
             | Reason::IgnoreChanged { .. }
             | Reason::TrackChanged { .. }
+            | Reason::TimestampsChanged { .. }
             | Reason::Always => vec![self.reason_line(reason)],
         }
     }

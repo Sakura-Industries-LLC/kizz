@@ -13,8 +13,9 @@
 //!   mode, and owner, plus a BLAKE3 hash of the content only when the file was read or
 //!   run, hashed with several threads for large files, through the build's
 //!   [`FileStates`], so a file is hashed once per build;
-//! * directories: mode and owner, and when they were listed, also a hash of the sorted
-//!   entry names and types, plus the entries when there are at most [`MAX_LISTED_NAMES`];
+//! * directories: mode, owner, and modification and change times, and when they were
+//!   listed, also a hash of the sorted entry names and types, plus the entries when there
+//!   are at most [`MAX_LISTED_NAMES`];
 //! * symbolic links: the target, plus the state of what the link points to;
 //! * devices, FIFOs, and sockets: type only.
 //!
@@ -43,7 +44,7 @@ use std::{
 
 use kizz_store::{
     AccessBits, ContentHash, DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
-    Owner, PathState, SpecialKind,
+    Owner, PathState, SpecialKind, Times,
 };
 use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
@@ -393,6 +394,7 @@ fn state_of(
             mode: metadata.mode(),
             owner: owner(metadata),
             listing,
+            times: times(metadata),
         }
     } else {
         PathState::Special {
@@ -426,12 +428,25 @@ const fn nanos(
         .saturating_add(nanoseconds)
 }
 
-/// The metadata of a regular file that a cache check compares.
-pub(crate) fn file_meta(metadata: &Metadata) -> FileMeta {
-    FileMeta {
-        size: metadata.size(),
+/// The modification and change times of a regular file or a directory whose
+/// metadata is `metadata`.
+pub(crate) fn times(metadata: &Metadata) -> Times {
+    Times {
         mtime_nanos: nanos(metadata.mtime(), metadata.mtime_nsec()),
         ctime_nanos: nanos(metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+/// The metadata of a regular file that a cache check compares.
+pub(crate) fn file_meta(metadata: &Metadata) -> FileMeta {
+    let Times {
+        mtime_nanos,
+        ctime_nanos,
+    } = times(metadata);
+    FileMeta {
+        size: metadata.size(),
+        mtime_nanos,
+        ctime_nanos,
         inode: metadata.ino(),
         device: metadata.dev(),
         mode: metadata.mode(),
