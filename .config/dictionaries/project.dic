@@ -389,6 +389,7 @@ uncacheable
 uninit
 unlinkat
 unlockpt
+unrunnable
 untrackable
 uprobe
 uring

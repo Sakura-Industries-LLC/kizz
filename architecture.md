@@ -932,13 +932,98 @@ The workspace lints forbid code that panics, and `clippy.toml` bans the library 
 * Every other call that can panic, such as a `RefCell` borrow or `split_at`, uses a form that cannot.
 * The workspace lints and `clippy.toml` ban each kind of call that can panic, so that new code cannot bring one back.
 
+## Observation reports
+
+An observation report says what its commands touched, organized by process, for people and for programs.
+`kizz execute` writes one for the command it runs, and `kizz run --output` one for the commands of its task.
+It aggregates what the tracer saw: each path appears once in its scope, with every access kind and outcome it had.
+
+* Each command has its arguments, its program, its working directory and its outcome.
+* The outcome is `exited`, `signaled`, `not_found`, `not_executable`, `start_failed` or `failed`.
+  `exited` gives the exit code, `signaled` the signal number, and the others an error message.
+  `not_found` and `not_executable` mean a missing or unrunnable program, and `start_failed` another failure to start.
+  `failed` means that kizz or its tracer failed, and the report then says that the trace is incomplete.
+* A command that came from the cache is listed as cached, without observations.
+* The report says whether each command was traced completely, and lists every reason that one was not.
+  A reason is a non-native system call, an untraceable call, an unknown system call, a tracer failure or another tracer reason.
+  An unknown system call makes the report incomplete, although a build may cache the run with `--cache-unknown-syscalls`.
+* Every observation is reported, `/proc` and `/sys` included; ignore patterns and other rules of builds do not apply.
+* The totals count the commands, the cached commands, the processes, the programs that are not inherited and the paths.
+  They also count the paths of each access kind and the connections.
+
+A report is hierarchical unless `--compact` is given, and both forms come from the same observations.
+
+* A hierarchical report lists each command's processes in the order they started, each under the process that created it.
+* Each process has its number, its process ID, its parent's number, its status, and its programs in order.
+* Each program has its path, its arguments and whether it is inherited, then its observations and connections.
+* A compact report combines the observations of every process of every command into one set, with each path once.
+* The combined observations of a hierarchical report are exactly those of the compact report of the same run.
+* Paths are sorted, and commands, processes and programs keep their order.
+* When kizz started no process for a command, its tree holds one process without a process ID or status.
+  Its program is the name that kizz looked up, with the locations the lookup checked.
+
+A report is text unless `--json` is given.
+
+* Text is for reading: a header with the completeness and the totals, then each command and its processes.
+  Text groups each program's paths by access kind, and gives each path's outcomes after it.
+* JSON is for programs: it names its format, `kizz-execute`, and its version, 1.
+  A new field may appear without a new version, but a field that changes its meaning or disappears raises the version.
+  JSON is indented by two spaces and ends with a newline.
+* Paths and arguments that are not valid UTF-8 appear with each invalid sequence replaced by U+FFFD, in both forms.
+
+### Observation report fields
+
+The top-level object has these fields, in this order:
+
+* `format`: `kizz-execute`
+* `version`: 1
+* `mode`: `hierarchical` or `compact`
+* `complete`: whether every command that ran was traced completely
+* `totals`: the totals, an object
+* `commands`: the commands, in the order they ran
+* `task_program`: for `kizz run`, the task program's own accesses; otherwise `null`
+* `observations`: in a compact report only, every observation of the report
+* `connections`: in a compact report only, every connection of the report
+
+`totals` has `commands`, `cached`, `processes`, `programs`, `paths` and `connections`, each a count.
+Its `kinds` object counts the paths of each access kind: `read`, `probe`, `list`, `write`, `exec` and `xattr`.
+
+A command has these fields, in this order:
+
+* `argv`: the arguments, starting with the program as given
+* `program`: the absolute path of the program, or `null` when the lookup found none
+* `cwd`: the working directory
+* `cached`: whether the result came from the cache
+* `outcome`: an object whose `kind` is the outcome, with `code` for `exited`, `signal` for `signaled`, and `error` otherwise
+* `complete`: whether the command was traced completely, or `null` when it came from the cache
+* `incomplete`: the reasons that it was not, each an object
+* `processes`: in a hierarchical report only, the processes in the order they started
+
+A reason has a `kind`: `non_native_system_call`, `untraceable_system_call`, `unknown_system_call`, `tracer_failed` or `other`.
+Its `detail` describes it; `number` is an unknown call's number, and `process` its process in a hierarchical report.
+
+A process has these fields, in this order:
+
+* `id`: its number, unique in the report and counting from 1 across every command
+* `pid`: its process ID, or `null` when kizz started no process
+* `parent`: the number of the process that created it, or `null`
+* `exit`: how it ended, or `null` if the tracer did not see it end
+  It is an object whose `kind` is `exited`, with `code`, or `signaled`, with `signal`.
+* `programs`: its programs, in order
+
+A program has `path`, `args`, `inherited`, `observations` and `connections`.
+An observation has `path` and `access`, an object that maps each access kind of the path to its outcomes.
+An outcome is `ok`, an error name such as `ENOENT`, `errno` followed by a number, or `unknown`, and `ok` comes first.
+A connection has a `kind`, `ip`, `unix` or `abstract`, and an `address`, a `path` or a `name` to match.
+`task_program` has `task`, the task as output names it, and, in a hierarchical report, `observations`.
+
 ## Crates and module boundaries
 
 ```text
 crates/
   kizz/              the binary: command line (bpaf), terminal output (console), banner (build-info)
   kizz-core/         the engine, with no Linux code: discovery, Markdown, Starlark runtime, step keys,
-                     cache checks, explanations and ordering
+                     cache checks, explanations, ordering and observation reports
   kizz-store/        the cache location, the lock file, and the SurrealKV store of typed records
   kizz-threads/      the one place that starts threads, waiting and retrying while the system cannot start one
   kizz-trace/        the tracer interface: the run request, the result, the process tree, access kinds,

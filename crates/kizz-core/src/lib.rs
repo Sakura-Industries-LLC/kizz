@@ -5,10 +5,10 @@
 //! The kizz build engine.
 //!
 //! This crate holds discovery, Markdown parsing, the Starlark runtime, step keys,
-//! cache checks, explanations, and ordering. It contains no Linux-specific code: it
-//! runs commands only through the tracer interface of `kizz_trace`, reads extended
-//! attributes only through that interface's attribute query, and keeps its records
-//! in `kizz_store`, so its tests use a fake tracer.
+//! cache checks, explanations, ordering, and observation reports. It contains no
+//! Linux-specific code: it runs commands only through the tracer interface of
+//! `kizz_trace`, reads extended attributes only through that interface's attribute
+//! query, and keeps its records in `kizz_store`, so its tests use a fake tracer.
 //!
 //! * [`discovery`]: every `kizz.md` under the current directory, in the default order.
 //! * [`tasks`]: the task blocks of a `kizz.md`.
@@ -38,6 +38,8 @@
 //!   self-inflicted reason.
 //! * [`render`]: the one-line and full reasons as output shows them.
 //! * [`why`](mod@why): the report of `kizz why`, read from the cache.
+//! * [`report`]: observation reports, built from the tracer's process trees and the
+//!   commands' outcomes, and written as text or JSON, hierarchical or compact.
 //! * [`build`](mod@build): building the selected tasks in passes, in the default or
 //!   learned order, until a pass does no work, with failure handling and the pass limit.
 //! * [`cleanup`]: the entries `kizz cache clean` removes because their files are gone,
@@ -66,6 +68,7 @@ pub mod patterns;
 pub mod pool;
 pub mod project;
 pub mod render;
+pub mod report;
 pub mod runtime;
 pub mod states;
 pub mod step;
@@ -98,6 +101,10 @@ pub use patterns::{PathPatterns, PatternError, REGEX_PREFIX};
 pub use pool::{MAX_WORKERS, PoolError, WorkerPool};
 pub use project::{ConfigError, LoadError, Project, load};
 pub use render::{CACHED, Render, access_kinds};
+pub use report::{
+    CommandInput, CommandOutcome, Execution, JSON_FIELDS, JsonField, Report, ReportFormat,
+    ReportMode, TaskProgramInput,
+};
 pub use runtime::{
     PrintSink, ProgramHash, ProgramLoad, ProgramParts, TaskFailure, TaskInfo, TaskProgram, TaskRun,
     UncheckedExit, UnexpectedExit,
