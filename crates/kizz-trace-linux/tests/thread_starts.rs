@@ -85,6 +85,7 @@ fn request(capture: CaptureMode) -> Outcome<RunRequest> {
         capture,
         echo: false,
         tree: false,
+        terminal: false,
     })
 }
 

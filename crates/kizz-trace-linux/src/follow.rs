@@ -43,6 +43,31 @@
 //! handles them: Linux refuses every request for a thread that stopped at an
 //! `exec` under an ID it took over until that stop is collected.
 //!
+//! A stop signal, such as `SIGSTOP`, or `SIGTSTP` from a terminal's Ctrl-Z, that
+//! the loop delivers puts the thread's process into a group stop, which reports
+//! the stop once more, with no signal information. The loop resumes a thread from
+//! a group stop at once, with no signal, so the process runs on. A tracer that
+//! attaches with `PTRACE_TRACEME` cannot keep a group stop and still learn when
+//! `SIGCONT` ends it; only `PTRACE_SEIZE` with `PTRACE_LISTEN` can, which would
+//! change how every traced process starts. So the limit stands: a Ctrl-Z stops the
+//! tracer's process, which keeps the default action of `SIGTSTP`, `SIGTTIN` and
+//! `SIGTTOU`, and each traced process then waits at its next stop for the loop,
+//! while a stop signal sent to one traced process alone does not keep it stopped.
+//!
+//! # Forwarded signals
+//!
+//! Until the request is cancelled, the watchdog also takes the signals that the
+//! caller forwards, every few milliseconds, and delivers each once: to the first
+//! process until the loop has collected its end, and afterwards to every live
+//! process ([`signal_first`]). The live set knows the first process by its
+//! identity, not by its ID: a later process of the tree that Linux gives the first
+//! process's ID is a live process like any other. The loop then delivers such a
+//! signal as any other. A request that the caller forwards nothing to receives no
+//! signal from the tracer until it is cancelled.
+//!
+//! The command's termination is likewise the first process's own end, never the
+//! end of a later process under its ID, as the loop's handling of exits says.
+//!
 //! # Which IDs are signaled
 //!
 //! Linux gives a released process or thread ID to the next process or thread it
@@ -130,7 +155,7 @@
 //! the tracing thread from its wait.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map},
+    collections::{BTreeMap, BTreeSet, btree_map, btree_set},
     ffi::OsString,
     io, mem,
     sync::{
@@ -155,10 +180,91 @@ use crate::{
 /// `PTRACE_O_TRACESYSGOOD`: `SIGTRAP` with the high bit set.
 const SYSTEM_CALL_STOP: c_int = libc::SIGTRAP | 0x80;
 
-/// The process IDs of the live processes of a traced tree, shared with the
-/// cancellation watchdog. It never holds the ID of a thread that does not lead its
-/// process.
-pub(crate) type LiveProcesses = Mutex<BTreeSet<pid_t>>;
+/// The live processes of a traced tree, by process ID, which the loop shares with
+/// the cancellation watchdog in [`LiveProcesses`]. It never holds the ID of a
+/// thread that does not lead its process.
+///
+/// It also knows the tree's first process by its identity, not by its number:
+/// from the time the first process enters the set until the loop collects its end.
+/// Linux may then give the first process's ID to a later process of the tree,
+/// which enters the set under that ID but is never the first process.
+#[derive(Debug, Default)]
+pub(crate) struct Live {
+    /// The process IDs of the live processes.
+    processes: BTreeSet<pid_t>,
+    /// The process ID of the first process while the loop has not collected its
+    /// end, and `None` before it enters the set and once its end is collected.
+    first: Option<pid_t>,
+}
+
+impl Live {
+    /// Bring the tree's first process, `pid`, into the set, as its first process.
+    fn enter_first(
+        &mut self,
+        pid: pid_t,
+    ) {
+        self.processes.insert(pid);
+        self.first = Some(pid);
+    }
+
+    /// Bring the process `pid`, a later process of the tree, into the set; it is
+    /// never the first process, even under the first process's former ID.
+    fn enter(
+        &mut self,
+        pid: pid_t,
+    ) {
+        self.processes.insert(pid);
+    }
+
+    /// Note that the loop collected the end of the process `pid`: it leaves the
+    /// set, and when it is the first process, the set knows no first process from
+    /// now on, so a later process under the same ID is never taken for it.
+    fn ended(
+        &mut self,
+        pid: pid_t,
+    ) {
+        self.processes.remove(&pid);
+        if self.first == Some(pid) {
+            self.first = None;
+        }
+    }
+
+    /// The process ID of the first process, while the loop has not collected its
+    /// end.
+    const fn first(&self) -> Option<pid_t> {
+        self.first
+    }
+
+    /// The process IDs of the live processes, in order.
+    fn iter(&self) -> btree_set::Iter<'_, pid_t> {
+        self.processes.iter()
+    }
+
+    /// Forget every process, the first process included, once the loop has
+    /// collected every thread of the tree.
+    fn clear(&mut self) {
+        self.processes.clear();
+        self.first = None;
+    }
+
+    /// Whether the process `pid` is live.
+    #[cfg(test)]
+    fn contains(
+        &self,
+        pid: pid_t,
+    ) -> bool {
+        self.processes.contains(&pid)
+    }
+
+    /// Whether no process is live.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.processes.is_empty()
+    }
+}
+
+/// The live processes of a traced tree, shared with the cancellation watchdog.
+pub(crate) type LiveProcesses = Mutex<Live>;
 
 /// What the live set holds, as a lock error names it.
 const LIVE_SET: &str = "the live processes of the traced tree";
@@ -171,7 +277,7 @@ const LIVE_SET: &str = "the live processes of the traced tree";
 ///
 /// An error that names the set when it stays locked for
 /// [`kizz_threads::LOCK_PATIENCE`].
-pub(crate) fn lock(live: &LiveProcesses) -> io::Result<MutexGuard<'_, BTreeSet<pid_t>>> {
+pub(crate) fn lock(live: &LiveProcesses) -> io::Result<MutexGuard<'_, Live>> {
     lock_within(live, kizz_threads::LOCK_PATIENCE)
 }
 
@@ -183,7 +289,7 @@ pub(crate) fn lock(live: &LiveProcesses) -> io::Result<MutexGuard<'_, BTreeSet<p
 fn lock_within(
     live: &LiveProcesses,
     patience: Duration,
-) -> io::Result<MutexGuard<'_, BTreeSet<pid_t>>> {
+) -> io::Result<MutexGuard<'_, Live>> {
     kizz_threads::lock_within(live, LIVE_SET, patience).map_err(io::Error::other)
 }
 
@@ -273,6 +379,40 @@ pub(crate) fn signal_all(
     for &pid in lock_within(live, patience)?.iter() {
         // A process that already exited needs no signal.
         drop(sys::kill(pid, signal));
+    }
+    Ok(())
+}
+
+/// Deliver a forwarded `signal` once: to the tree's first process while the live
+/// set knows it, and otherwise to every live process, waiting at most `patience`
+/// for the live set.
+///
+/// The set knows the first process by its identity, from the time it enters the
+/// set until the loop collects its end (see [`Live`]), never by an ID that a
+/// later process of the tree may hold again: once the first process's end is
+/// collected, the signal goes to every live process, also to a later process
+/// under the first process's former ID, as to any other.
+///
+/// The set stays locked while the signal is sent, so, as with [`signal_all`], the
+/// loop cannot collect the exit of a process in between, and every ID signaled
+/// still names a process of the tree.
+///
+/// # Errors
+///
+/// The error of a set that stays locked for `patience`, when no signal is sent.
+pub(crate) fn signal_first(
+    live: &LiveProcesses,
+    signal: c_int,
+    patience: Duration,
+) -> io::Result<()> {
+    let set = lock_within(live, patience)?;
+    if let Some(first) = set.first() {
+        // A process that already exited needs no signal.
+        drop(sys::kill(first, signal));
+    } else {
+        for &pid in set.iter() {
+            drop(sys::kill(pid, signal));
+        }
     }
     Ok(())
 }
@@ -376,8 +516,12 @@ impl Tracee {
 
 /// The state of the loop.
 struct Tree<'a> {
-    /// The first process, whose end is the command's termination.
+    /// The first process's ID, under which its end is the command's termination.
     root: pid_t,
+    /// Whether the loop has handled the first process's own end. Linux may then
+    /// give its ID to a later process of the tree, whose end under that ID is
+    /// never the command's termination.
+    root_ended: bool,
     /// Every traced thread that has not exited.
     tracees: BTreeMap<pid_t, Tracee>,
     /// The threads that exited before the loop saw the event that created them, so
@@ -440,7 +584,9 @@ fn stays_in_place(status: c_int) -> bool {
 ///
 /// An exit is collected while the live set is locked. When the thread leads its
 /// process, the process has ended and leaves the set at the same time; any other
-/// thread's ID was never in the set.
+/// thread's ID was never in the set. When that process is the first process, the
+/// set stops knowing it as the first process at the same time, so the watchdog
+/// never takes a later process under its ID for it.
 fn take(
     live: &LiveProcesses,
     pid: pid_t,
@@ -456,7 +602,7 @@ fn take(
     if let Some(status) = status
         && ended(status)
     {
-        live.remove(&pid);
+        live.ended(pid);
     }
     Ok(status)
 }
@@ -480,15 +626,17 @@ fn next_change(
 }
 
 impl<'a> Tree<'a> {
-    /// The state of a tree whose first process is `root`, already resumed.
+    /// The state of a tree whose first process is `root`, already resumed, which
+    /// enters the live set as its first process.
     fn new(
         root: pid_t,
         live: &'a LiveProcesses,
         escalation: &'a Escalation,
     ) -> io::Result<Self> {
-        lock(live)?.insert(root);
+        lock(live)?.enter_first(root);
         Ok(Self {
             root,
+            root_ended: false,
             tracees: BTreeMap::from([(root, Tracee::new(false, true))]),
             exited_unannounced: BTreeSet::new(),
             live,
@@ -532,7 +680,8 @@ impl<'a> Tree<'a> {
     }
 
     /// Start following a thread, unless it is already followed. A thread that
-    /// leads its process brings the process into the live set.
+    /// leads its process brings the process into the live set, never as the first
+    /// process, even under the first process's former ID.
     fn adopt(
         &mut self,
         pid: pid_t,
@@ -542,7 +691,7 @@ impl<'a> Tree<'a> {
         if let btree_map::Entry::Vacant(entry) = self.tracees.entry(pid) {
             entry.insert(tracee);
             if leader {
-                lock(self.live)?.insert(pid);
+                lock(self.live)?.enter(pid);
             }
         }
         Ok(())
@@ -668,6 +817,13 @@ impl<'a> Tree<'a> {
     }
 
     /// Handle the exit of a thread.
+    ///
+    /// The command's termination is the first process's own end, by its identity:
+    /// the first exit under the first process's ID that the loop handles, which
+    /// Linux reports only once every other thread of that process has exited.
+    /// Linux may then give the ID to a later process of the tree, whose end never
+    /// sets or replaces the termination, with or without the process tree; with
+    /// it, that process keeps its own status, as every process does.
     fn exited(
         &mut self,
         pid: pid_t,
@@ -682,8 +838,12 @@ impl<'a> Tree<'a> {
             // The thread ended inside the call, which may have taken effect.
             self.finish(pid, pending, None);
         }
+        let first = pid == self.root && !self.root_ended;
+        if first {
+            self.root_ended = true;
+        }
         // Without the process tree, only the first process's status is kept.
-        if self.processes.is_none() && pid != self.root {
+        if self.processes.is_none() && !first {
             return;
         }
         let termination = if libc::WIFEXITED(status) {
@@ -694,7 +854,7 @@ impl<'a> Tree<'a> {
         if let Some(processes) = self.processes.as_mut() {
             processes.exited(pid, termination);
         }
-        if pid == self.root {
+        if first {
             self.outcome.termination = Some(termination);
         }
     }
@@ -757,7 +917,9 @@ impl<'a> Tree<'a> {
         match sys::has_signal_info(pid) {
             // A signal-delivery stop: deliver the signal.
             Ok(true) => self.resume(pid, signal),
-            // A group stop: let the thread continue.
+            // A group stop: let the thread continue, since with `PTRACE_TRACEME`
+            // the loop could not learn when `SIGCONT` ends the stop (see the
+            // module's "Signals").
             Ok(false) => self.resume(pid, 0),
             Err(error) => unless_vanished(Err(error)),
         }
@@ -1120,8 +1282,8 @@ pub(crate) fn follow(
 }
 
 /// Put `root`, the first process of a started tree that the loop does not follow
-/// yet, in the live set, so an interrupt for a request that is already cancelled
-/// reaches it.
+/// yet, in the live set as its first process, so an interrupt for a request that
+/// is already cancelled, and a forwarded signal, reach it.
 ///
 /// # Errors
 ///
@@ -1147,7 +1309,7 @@ fn track_root_within(
     root: pid_t,
     patience: Duration,
 ) -> io::Result<()> {
-    lock_within(live, patience)?.insert(root);
+    lock_within(live, patience)?.enter_first(root);
     Ok(())
 }
 
@@ -1165,11 +1327,11 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         ffi::OsString,
         fs,
-        io::{Read as _, Write as _},
+        io::{BufRead as _, BufReader, Read as _, Write as _},
         os::fd::OwnedFd,
         panic,
         path::Path,
-        process::Command,
+        process::{Child, Command, Stdio},
         ptr,
         sync::mpsc,
         thread,
@@ -1196,6 +1358,9 @@ mod tests {
     /// How long a test lets the live set stay locked before a lock of it fails, in
     /// place of [`kizz_threads::LOCK_PATIENCE`].
     const LIVE_SET_PATIENCE: Duration = Duration::from_millis(50);
+    /// How long a test waits for a second delivery of a signal that must arrive
+    /// once, or for a delivery that must not arrive.
+    const SETTLE: Duration = Duration::from_millis(300);
 
     /// Suspend the calling thread for good.
     fn pause_forever() -> ! {
@@ -1343,6 +1508,7 @@ mod tests {
             capture: CaptureMode::Split,
             echo: false,
             tree: false,
+            terminal: false,
         }
     }
 
@@ -1473,7 +1639,13 @@ mod tests {
         let filter = filter::program().unwrap();
         let (child_stdio, tracer_stdio) = capture::pipes(request).unwrap();
         let (report, report_write) = sys::pipe().unwrap();
-        let started = spawn::start(request, &program, &filter, &child_stdio, report_write);
+        let started = spawn::start(
+            request,
+            &program,
+            &filter,
+            child_stdio.as_ref(),
+            report_write,
+        );
         drop(child_stdio);
         let (root, handle) = match started {
             Ok(Started::Running(root, handle)) => (root, handle),
@@ -1780,7 +1952,7 @@ mod tests {
         );
         // The ID is released, and the loop has not seen that yet; the watchdog
         // would signal exactly the process.
-        assert_eq!(*lock(&live).unwrap(), BTreeSet::from([root]));
+        assert_eq!(lock(&live).unwrap().processes, BTreeSet::from([root]));
         let signal = match handover {
             Handover::Event => {
                 escalation.escalate();
@@ -2003,8 +2175,11 @@ mod tests {
         let created = message_pid(sys::event_message(creator).unwrap()).unwrap();
         tree.handle(creator, status).unwrap();
         assert!(tree.tracees.contains_key(&created));
-        assert!(!lock(&live).unwrap().contains(&created));
-        assert_eq!(*lock(&live).unwrap(), BTreeSet::from([traced.root]));
+        assert!(!lock(&live).unwrap().contains(created));
+        assert_eq!(
+            lock(&live).unwrap().processes,
+            BTreeSet::from([traced.root])
+        );
         assert_only_processes_are_live(&tree, &live);
         escalation.escalate();
         kill_all(&live).unwrap();
@@ -2227,14 +2402,15 @@ mod tests {
         assert_eq!(after, all_ended());
     }
 
-    /// A first process that enters the live set is in it, and stays alive until
-    /// the tracing thread ends.
+    /// A first process that enters the live set is in it, as the set's first
+    /// process, and stays alive until the tracing thread ends.
     #[test]
     fn a_first_process_that_enters_the_live_set_lives_until_the_tracing_thread_ends() {
         let (alive, after) = end_tracing_thread("fork", Ending::Returns, |root| {
             let live = LiveProcesses::default();
             track_root_within(&live, root, LIVE_SET_PATIENCE).unwrap();
-            assert_eq!(*lock(&live).unwrap(), BTreeSet::from([root]));
+            assert_eq!(lock(&live).unwrap().processes, BTreeSet::from([root]));
+            assert_eq!(lock(&live).unwrap().first(), Some(root));
             !has_exited(root)
         });
         assert!(alive, "the first process did not live");
@@ -2400,5 +2576,186 @@ mod tests {
         );
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
+    }
+
+    /// A child of the test that counts the `SIGTERM`s it receives: a shell that
+    /// writes `TERM` to its standard output for each one, after it wrote `ready`
+    /// once its trap was set. Dropping it kills and collects the child.
+    struct CountingChild {
+        /// The shell, a child of the test that the test alone collects.
+        child: Child,
+        /// Its process ID.
+        pid: pid_t,
+        /// The lines that it writes, after `ready`.
+        lines: mpsc::Receiver<String>,
+    }
+
+    impl CountingChild {
+        /// Start the child, with an explicit environment, and wait until its trap
+        /// is set.
+        fn start() -> Self {
+            let mut child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap 'echo TERM' TERM; echo ready; while :; do sleep 0.01; done",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = pid_t::try_from(child.id()).unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (sender, lines) = mpsc::channel();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let counting = Self { child, pid, lines };
+            assert_eq!(
+                counting.lines.recv_timeout(PATIENCE).as_deref(),
+                Ok("ready"),
+                "the child did not set its trap"
+            );
+            counting
+        }
+
+        /// Assert that the child receives exactly `count` more `SIGTERM`s: each
+        /// one within the test's patience, and no other within [`SETTLE`].
+        fn assert_received(
+            &self,
+            count: usize,
+            who: &str,
+        ) {
+            for _ in 0..count {
+                assert_eq!(
+                    self.lines.recv_timeout(PATIENCE).as_deref(),
+                    Ok("TERM"),
+                    "{who} did not receive the signal"
+                );
+            }
+            assert_eq!(
+                self.lines.recv_timeout(SETTLE).ok(),
+                None,
+                "{who} received one signal too many"
+            );
+        }
+    }
+
+    impl Drop for CountingChild {
+        /// Kill and collect the child, which the test has not collected before.
+        fn drop(&mut self) {
+            drop(self.child.kill());
+            drop(self.child.wait());
+        }
+    }
+
+    /// A forwarded signal goes to the first process while the live set knows it,
+    /// and no other process; once the loop has collected the first process's end,
+    /// it goes once to every live process, also to a later process of the tree
+    /// under the first process's former ID, which the live set never takes for the
+    /// first process (Audit 1's P1).
+    ///
+    /// The test replays the live set's notes as the loop makes them, at the start,
+    /// when it adopts a process, and when it collects an end, with two children of
+    /// its own, one under the ID that the first process had. So it needs no real
+    /// reuse of an ID, and it signals only its own live children, which it has not
+    /// collected.
+    #[test]
+    fn a_forwarded_signal_never_takes_a_later_process_under_the_first_id_for_the_first() {
+        let first = CountingChild::start();
+        let other = CountingChild::start();
+        let live = LiveProcesses::default();
+        track_root_within(&live, first.pid, LIVE_SET_PATIENCE).unwrap();
+        lock(&live).unwrap().enter(other.pid);
+        signal_first(&live, libc::SIGTERM, LIVE_SET_PATIENCE).unwrap();
+        first.assert_received(1, "the first process");
+        other.assert_received(0, "another process, while the first lives,");
+        // The loop collects the first process's end, and Linux gives its ID to a
+        // later process of the tree, which the loop adopts.
+        lock(&live).unwrap().ended(first.pid);
+        lock(&live).unwrap().enter(first.pid);
+        assert_eq!(lock(&live).unwrap().first(), None);
+        assert_eq!(
+            lock(&live).unwrap().processes,
+            BTreeSet::from([first.pid, other.pid])
+        );
+        signal_first(&live, libc::SIGTERM, LIVE_SET_PATIENCE).unwrap();
+        first.assert_received(1, "the later process under the first process's ID");
+        other.assert_received(1, "another process, after the first ended,");
+    }
+
+    /// The run's exit status is the first process's own end, and the end of a later
+    /// process of the tree under the same ID never sets or replaces it, with or
+    /// without the process tree; with it, each of the two processes keeps its own
+    /// status (Audit 1's P3).
+    ///
+    /// The test replays, through the loop's handling of creation events and exits,
+    /// and the live set's notes as the loop collects each end, a first process that
+    /// forks a child and exits with code 3, and a later process that the child
+    /// forks under the first process's ID, which `SIGKILL` ends. So it needs no
+    /// real reuse of an ID.
+    #[test]
+    fn a_later_process_under_the_first_id_never_sets_the_exit_status_of_the_run() {
+        // IDs above Linux's largest process ID, 2^22, so they name no process; the
+        // loop's handling of a fork event and of an exit makes no system call.
+        const FIRST: pid_t = 5_000_001;
+        const CHILD: pid_t = 5_000_002;
+        // The wait status of an exit with code 3, which the second byte holds.
+        const EXITED_3: c_int = 0x0300;
+        // The wait status of an end by `SIGKILL`, which the low bits hold.
+        const KILLED: c_int = libc::SIGKILL;
+        // The wait status of an exit with code 0.
+        const EXITED_0: c_int = 0;
+        for keep_tree in [false, true] {
+            let live = LiveProcesses::default();
+            let escalation = Escalation::new().unwrap();
+            let mut tree = Tree::new(FIRST, &live, &escalation).unwrap();
+            if keep_tree {
+                tree.keep_processes(&helper("none"));
+            }
+            tree.created(FIRST, CHILD, libc::PTRACE_EVENT_FORK).unwrap();
+            lock(&live).unwrap().ended(FIRST);
+            tree.handle(FIRST, EXITED_3).unwrap();
+            tree.created(CHILD, FIRST, libc::PTRACE_EVENT_FORK).unwrap();
+            assert_eq!(lock(&live).unwrap().first(), None);
+            lock(&live).unwrap().ended(FIRST);
+            tree.handle(FIRST, KILLED).unwrap();
+            lock(&live).unwrap().ended(CHILD);
+            tree.handle(CHILD, EXITED_0).unwrap();
+            assert!(lock(&live).unwrap().is_empty());
+            assert_eq!(
+                tree.outcome.termination,
+                Some(Termination::Exited(3)),
+                "with the process tree: {keep_tree}"
+            );
+            let Some(processes) = tree.processes.take() else {
+                assert!(!keep_tree, "the loop kept no process tree");
+                continue;
+            };
+            assert!(
+                keep_tree,
+                "the loop kept a process tree it was not asked for"
+            );
+            let shape: Vec<(u32, Option<u32>, Option<Termination>)> = processes
+                .into_tree()
+                .processes
+                .iter()
+                .map(|process| (process.number, process.pid, process.status))
+                .collect();
+            assert_eq!(shape, [
+                (1, Some(5_000_001), Some(Termination::Exited(3))),
+                (2, Some(5_000_002), Some(Termination::Exited(0))),
+                (
+                    3,
+                    Some(5_000_001),
+                    Some(Termination::Signaled(libc::SIGKILL))
+                ),
+            ]);
+        }
     }
 }

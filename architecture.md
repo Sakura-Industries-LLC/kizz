@@ -404,6 +404,7 @@ def go_build(package, output, version):
 
 The core never starts a process itself and knows nothing about system calls.
 It asks a tracer to run one command with an exact program, arguments, environment, working directory and `stdin`.
+A request can instead let the command keep kizz's standard streams and process group, and the caller can forward signals to it.
 The tracer returns the exit status, the captured output, and every path the process tree touched, with how it touched it.
 A request can also ask for the process tree, which [Processes and outcomes](#processes-and-outcomes) describes.
 Through the same interface, the core reads what the standard library cannot: the extended attributes of a path,
@@ -420,6 +421,14 @@ Nothing in the core changes when the tracer does.
   Seccomp alone cannot read path arguments or see results, so `ptrace` reads the path at entry and the result at exit.
 * It follows the whole process tree, including threads, forks and `exec`,
   and the traced processes are killed if kizz dies (`PTRACE_O_EXITKILL`).
+* A command of a build runs in a process group of its own, with pipes or `/dev/null` as its standard streams.
+  A terminal's Ctrl-C then reaches only kizz, which interrupts the command exactly once.
+* A command that keeps the terminal, as `kizz execute` runs it, uses kizz's standard input, output and error directly.
+  It stays in kizz's process group and session, so the terminal's input and signals reach it as they would without kizz.
+  Kizz captures none of its output.
+* Every command starts with an empty signal mask and the default action for `SIGPIPE`, which kizz itself ignores.
+* A signal that kizz forwards goes to the command's first process while it lives, and then to each process still running.
+* The tracer resumes a process that a stop signal stopped, since it cannot tell when `SIGCONT` would end the stop.
 * At each `exec` it also records what the kernel loads without another system call: the interpreter on a `#!` line,
   the interpreters of interpreters that are scripts themselves,
   and the loader that an ELF executable names in its `PT_INTERP` program header.
@@ -429,6 +438,10 @@ Nothing in the core changes when the tracer does.
   for the machine, marks the run as incompletely traced, since a handler such as `binfmt_misc` may run it.
 * It resolves relative paths against the calling thread's working directory or the directory descriptor the call used.
 * It records successful and failed calls alike; a lookup that fails with `ENOENT` is a dependency.
+* An `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` and without `O_NONBLOCK` that fails with `EAGAIN` records nothing.
+  Linux gives that error when a rename or mount anywhere on the machine races with a `..` step, and abandons the lookup.
+  The caller may repeat the call, and each repeated call is recorded like any other.
+  With `O_NONBLOCK`, the error can also mean that a lease refused a file that the lookup found, so it is recorded as usual.
 * `io_uring_setup` fails with `ENOSYS`, so programs fall back to ordinary system calls,
   because `io_uring` operations would bypass the filter.
 * System calls made through a non-native interface (32-bit `int 0x80` or x32) mark the run as incompletely traced:
@@ -1261,6 +1274,8 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * `kizz-trace-linux` tests trace real processes, so they need `ptrace` and seccomp to be allowed where the tests run.
 * `kizz-core` tests use a fake tracer that performs scripted file operations and reports them.
 * The tracer's bookkeeping of processes has unit tests that replay forks, threads, `exec` calls, exits and reused IDs.
+* `kizz-trace-linux` tests run commands in both ways and check their process group, streams and forwarded signals.
+* Tests repeat an `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` at once while it fails with `EAGAIN`, up to 100 attempts.
 * End-to-end tests run the `kizz` binary on fixture trees with `KIZZ_CACHE_DIR` set to a temporary directory.
 * Tests make thread starts fail on purpose, through a test switch that release builds lack, to check the retries and errors.
 * Explanations have golden-output tests.

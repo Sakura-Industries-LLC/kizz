@@ -87,6 +87,12 @@
  * on the machine. Each Unix socket that a send call sends to is a datagram socket
  * of its own, bound to its own path, so the path of each call has that call as its
  * only probe.
+ *
+ * The Linux section makes each openat2 with RESOLVE_IN_ROOT through
+ * repeat_while_raced, which repeats it at once while it fails with EAGAIN, up to 100
+ * attempts in all: Linux gives that error when a rename or mount anywhere on the
+ * machine races with a .. step of the lookup, and the tracer records nothing for it.
+ * Before those calls, the program checks the repeat with scripted attempts.
  */
 
 #define _GNU_SOURCE
@@ -519,6 +525,117 @@ struct open_how_argument {
 #define RESOLVE_IN_ROOT 0x10
 #endif
 
+#ifdef SYS_openat2
+/* The most attempts that repeat_while_raced makes of one call. */
+#define RACE_ATTEMPTS 100
+
+/*
+ * Make `attempt` with `argument` at once, and again at once while it fails with
+ * EAGAIN, at most RACE_ATTEMPTS times in all. Store the number of attempts made in
+ * `made` unless it is NULL, and return the last result, with errno as the last
+ * attempt left it.
+ *
+ * Linux fails an openat2 with RESOLVE_IN_ROOT or RESOLVE_BENEATH with EAGAIN when a
+ * rename or mount anywhere on the machine races with a .. step of its lookup, and
+ * openat2(2) lets the caller repeat the call. The tracer records nothing for such a
+ * failure, so a repeated call leaves exactly what one call without the race would
+ * have recorded, and expected.txt holds whether or not a call was repeated.
+ */
+static long repeat_while_raced(long (*attempt)(void *), void *argument, int *made)
+{
+    long result;
+    int attempts = 0;
+    do {
+        errno = 0;
+        result = attempt(argument);
+        attempts++;
+    } while (result < 0 && errno == EAGAIN && attempts < RACE_ATTEMPTS);
+    if (made != NULL) {
+        *made = attempts;
+    }
+    return result;
+}
+
+/* The arguments of an openat2 that scoped_openat2 makes. */
+struct scoped_open {
+    /* The directory descriptor, the root of the lookup. */
+    int dirfd;
+    /* The path to look up. */
+    const char *path;
+    /* The flags and resolution, with RESOLVE_IN_ROOT. */
+    struct open_how_argument *how;
+};
+
+/* Make the openat2 that `argument`, a struct scoped_open, describes, once. */
+static long scoped_openat2(void *argument)
+{
+    const struct scoped_open *call = argument;
+    return syscall(SYS_openat2, call->dirfd, call->path, call->how, sizeof *call->how);
+}
+
+/* A scripted attempt of repeat_while_raced, in place of a system call. */
+struct scripted_attempt {
+    /* How many attempts fail with EAGAIN before the last result. */
+    int raced;
+    /* The result after those: 0 for success, or -1 with `error`. */
+    long last;
+    /* The error number of a last result of -1. */
+    int error;
+    /* The number of attempts made so far. */
+    int made;
+};
+
+/* Make one scripted attempt of `argument`, a struct scripted_attempt. */
+static long scripted(void *argument)
+{
+    struct scripted_attempt *script = argument;
+    script->made++;
+    if (script->made <= script->raced) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (script->last < 0) {
+        errno = script->error;
+    }
+    return script->last;
+}
+
+/*
+ * Check repeat_while_raced with scripted attempts, so that a broken repeat makes
+ * the program report a mismatch: EAGAIN once and then a success gives the success
+ * after 2 attempts, and 99 times and then a success after exactly 100; EAGAIN on
+ * every attempt gives EAGAIN after exactly 100 attempts, with no further attempt;
+ * and ENOENT, or a success, return after 1 attempt. Each result and each number of
+ * attempts is counted through check, and the checks touch no path.
+ */
+static void check_repeat_while_raced(void)
+{
+    static const struct {
+        const char *name;
+        int raced;
+        long last;
+        int error;
+        int expected;
+        int attempts;
+    } cases[] = {
+        {"EAGAIN once, then success", 1, 0, 0, 0, 2},
+        {"EAGAIN 99 times, then success", 99, 0, 0, 0, 100},
+        {"EAGAIN always", 1000, 0, 0, EAGAIN, 100},
+        {"ENOENT", 0, -1, ENOENT, ENOENT, 1},
+        {"success", 0, 0, 0, 0, 1},
+    };
+    for (size_t item = 0; item < sizeof cases / sizeof cases[0]; item++) {
+        struct scripted_attempt script = {cases[item].raced, cases[item].last, cases[item].error,
+                                          0};
+        int made = 0;
+        EXPECT(cases[item].expected, "repeat_while_raced", cases[item].name,
+               repeat_while_raced(scripted, &script, &made));
+        int counted = made == cases[item].attempts && script.made == cases[item].attempts;
+        check("repeat_while_raced attempts", cases[item].name, counted ? 0 : -1, 0, 0);
+    }
+}
+#endif
+
 /* A buffer large enough for every kernel stat structure. */
 static union {
     struct stat status;
@@ -721,12 +838,15 @@ static void linux_open(void)
                            syscall(SYS_openat, AT_FDCWD, "in/linux/root",
                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     struct open_how_argument in_root = {O_RDONLY | O_CLOEXEC, 0, RESOLVE_IN_ROOT};
+    check_repeat_while_raced();
+    struct scoped_open escape = {root, "escape-link", &in_root};
     fd = (int)EXPECT(0, "openat2", "escape-link",
-                     syscall(SYS_openat2, root, "escape-link", &in_root, sizeof in_root));
+                     repeat_while_raced(scoped_openat2, &escape, NULL));
     read_some("escape-link", fd);
     close_fd(fd);
+    struct scoped_open inner = {root, "/inner.txt", &in_root};
     fd = (int)EXPECT(0, "openat2", "/inner.txt",
-                     syscall(SYS_openat2, root, "/inner.txt", &in_root, sizeof in_root));
+                     repeat_while_raced(scoped_openat2, &inner, NULL));
     read_some("/inner.txt", fd);
     close_fd(fd);
     close_fd(root);

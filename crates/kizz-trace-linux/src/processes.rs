@@ -774,6 +774,7 @@ mod tests {
             capture: CaptureMode::Split,
             echo: false,
             tree: true,
+            terminal: false,
         };
         let mut processes = Processes::new(100, request.program.clone(), request.args.clone());
         let attempt = processes.current(100).unwrap();

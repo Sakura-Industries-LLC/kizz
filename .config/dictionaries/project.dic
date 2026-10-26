@@ -203,6 +203,7 @@ getpid
 getpwuid
 GETREGS
 getrlimit
+getsid
 GETSIGINFO
 gettid
 getxattr
@@ -333,7 +334,9 @@ setxattr
 setxattrat
 sigaction
 sigaddset
+SIGALRM
 SIGCHLD
+SIGCONT
 sigemptyset
 SIGHAND
 sighandler
@@ -346,6 +349,9 @@ SIGSEGV
 sigset
 SIGSTOP
 SIGTRAP
+SIGTSTP
+SIGTTIN
+SIGTTOU
 SIGURG
 SIGUSR
 sockaddr
@@ -377,6 +383,7 @@ TRACESYSGOOD
 TRACEVFORK
 trimpath
 TRUNC
+TSTP
 uapi
 uncacheable
 uninit

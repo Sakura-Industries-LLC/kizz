@@ -10,6 +10,10 @@
 //! error a pipe each. Merged capture gives both one pipe, so the kernel keeps the
 //! exact order of the writes. A thread reads each output pipe until every process
 //! that holds it has exited, and echoes each chunk live when the request asks.
+//!
+//! A request whose command keeps the terminal ([`RunRequest::terminal`]) connects
+//! nothing: the command uses the standard streams of the tracer's process, no
+//! thread feeds or reads them, and its captured output stays empty.
 
 use std::{
     fs::File,
@@ -33,12 +37,20 @@ pub(crate) struct TracerStdio {
     pub outputs: Vec<(OutputStream, File)>,
 }
 
-/// Create the pipes of `request`: the child's ends and the tracer's ends.
+/// Create the pipes of `request`: the child's ends, or `None` for a command that
+/// keeps the terminal and connects nothing, and the tracer's ends, which are then
+/// empty.
 ///
 /// # Errors
 ///
 /// Returns the error of creating a pipe or opening `/dev/null`.
-pub(crate) fn pipes(request: &RunRequest) -> io::Result<(ChildStdio, TracerStdio)> {
+pub(crate) fn pipes(request: &RunRequest) -> io::Result<(Option<ChildStdio>, TracerStdio)> {
+    if request.terminal {
+        return Ok((None, TracerStdio {
+            stdin: None,
+            outputs: Vec::new(),
+        }));
+    }
     let (child_stdin, stdin) = if request.stdin.is_some() {
         let (read, write) = sys::pipe()?;
         (read, Some(File::from(write)))
@@ -61,11 +73,11 @@ pub(crate) fn pipes(request: &RunRequest) -> io::Result<(ChildStdio, TracerStdio
         },
     };
     Ok((
-        ChildStdio {
+        Some(ChildStdio {
             stdin: child_stdin,
             stdout: child_stdout,
             stderr: child_stderr,
-        },
+        }),
         TracerStdio { stdin, outputs },
     ))
 }

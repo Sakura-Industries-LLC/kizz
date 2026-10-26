@@ -274,6 +274,7 @@ fn request(
         capture,
         echo,
         tree: false,
+        terminal: false,
     })
 }
 

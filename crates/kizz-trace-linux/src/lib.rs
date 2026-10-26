@@ -21,7 +21,12 @@
 //! descriptors and flags from the stopped thread before the call runs, and its
 //! result after it returns, and reports every path the tree touched as an absolute
 //! path with its combined access kinds. Successful and failed calls are recorded
-//! alike: a failed call, including a lookup that found nothing, is a probe.
+//! alike: a failed call, including a lookup that found nothing, is a probe. An
+//! `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` and without `O_NONBLOCK`
+//! that fails with `EAGAIN` records nothing, though: Linux gives that error when a
+//! rename or mount anywhere on the machine races with a `..` step, and abandons the
+//! lookup, so the caller may repeat the call, and each repeated call is recorded
+//! like any other.
 //!
 //! A process that makes one of [`UNTRACEABLE_SYSTEM_CALLS`], which can change what a
 //! path means or use a path in a way that the tracer does not record, marks the run
@@ -75,9 +80,37 @@
 //! [`CANCEL_GRACE_PERIOD`], and returns as soon as the whole tree has exited; when
 //! the grace period ends first, it kills whatever remains with `SIGKILL`. A
 //! cancelled run may therefore end with an exit code that the program chose after
-//! it handled the interrupt. The program runs in a process group of its own, so an
-//! interrupt that a terminal sends to the tracer's process group never reaches it
-//! directly: it receives the interrupt exactly once, from the tracer.
+//! it handled the interrupt. The program of a build runs in a process group of its
+//! own, with pipes or `/dev/null` as its standard streams, so an interrupt that a
+//! terminal sends to the tracer's process group never reaches it directly: it
+//! receives the interrupt exactly once, from the tracer.
+//!
+//! A request that keeps the terminal ([`RunRequest::terminal`]), as `kizz execute`
+//! makes, connects nothing: the program uses the standard input, output and error
+//! of the tracer's process directly, and stays in that process's process group and
+//! session, so a terminal's input and signals, Ctrl-C included, reach it as they
+//! would without kizz. Nothing is captured or echoed, no thread feeds or reads its
+//! streams, and the result's output is empty, in the shape of the request's capture
+//! mode. In both ways the program starts with an empty signal mask and `SIGPIPE`
+//! at its default action, and inherits every other disposition, so a signal that
+//! the tracer's process ignores stays ignored in it.
+//!
+//! The caller forwards a signal with [`Cancellation::forward`]; until the request
+//! is cancelled, the watchdog delivers each one once, to the first process until
+//! the tracer has collected its end, and afterwards to each live process of the
+//! tree, signaling only the process IDs of the live set. The tracer knows the
+//! first process by its identity, not by its process ID, which Linux may give to a
+//! later process of the tree once the first is collected. A signal sent to the
+//! whole process group of a program that keeps the terminal reaches it directly,
+//! and once more when the caller forwards it, since neither can tell it from one
+//! sent to the caller alone.
+//!
+//! The tracer resumes a process that a stop signal stopped, because with
+//! `PTRACE_TRACEME` it cannot learn when `SIGCONT` would end the stop. A terminal's
+//! Ctrl-Z therefore stops the tracer's process, which keeps the default action of
+//! `SIGTSTP`, `SIGTTIN` and `SIGTTOU`, and each traced process waits at its next
+//! stop for the tracer, while a stop signal sent to one traced process alone does
+//! not keep it stopped.
 //!
 //! Each run starts its threads through `kizz_threads`, which waits and retries while
 //! the system cannot start a thread for the moment, and never panics: the thread
@@ -129,9 +162,9 @@ pub use filter::{
 use kizz_threads::ScopedJoinHandle;
 use kizz_trace::{
     Accesses, Cancellation, EchoSink, ExtendedAttributes, FirstReads, MachineState, OutputStream,
-    RunRequest, RunResult, TraceError, Tracer,
+    RunRequest, RunResult, Signal, TraceError, Tracer,
 };
-use libc::{pid_t, sock_filter};
+use libc::{c_int, pid_t, sock_filter};
 
 use crate::{
     capture::TracerStdio,
@@ -139,7 +172,8 @@ use crate::{
     spawn::{ChildStdio, Program, Started},
 };
 
-/// How often the cancellation watchdog checks the cancellation flag.
+/// How often the cancellation watchdog checks the cancellation flag and, until the
+/// request is cancelled, takes and delivers the signals that the caller forwarded.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// How long a cancelled tree may run after its interrupt, the `SIGINT` that every
@@ -207,8 +241,44 @@ const fn reader_thread(stream: OutputStream) -> (&'static str, &'static str) {
     }
 }
 
-/// Interrupt the tree when the request is cancelled, and kill whatever remains of
-/// it when the grace period ends, until `done` is dropped.
+/// The signal number of a forwarded [`Signal`].
+const fn signal_number(signal: Signal) -> c_int {
+    match signal {
+        Signal::Hangup => libc::SIGHUP,
+        Signal::Terminate => libc::SIGTERM,
+    }
+}
+
+/// Deliver every signal forwarded through `cancel` since the last call to the tree,
+/// under the rules of [`follow::signal_first`]: to its first process until the loop
+/// has collected that process's end, which the live set knows by identity, and
+/// afterwards to every live process, waiting at most `patience` for the live set.
+///
+/// # Errors
+///
+/// The error of a live set that stays locked, when the signal is not sent.
+fn forward(
+    live: &LiveProcesses,
+    cancel: &Cancellation,
+    patience: Duration,
+) -> io::Result<()> {
+    for signal in cancel.take_forwarded() {
+        follow::signal_first(live, signal_number(signal), patience)?;
+    }
+    Ok(())
+}
+
+/// Forward the signals that the caller forwards through `cancel` to the tree whose
+/// live processes `live` holds until the request is cancelled; then interrupt the
+/// tree, and kill whatever remains of it when the grace period ends, until `done`
+/// is dropped.
+///
+/// Every [`CANCEL_POLL_INTERVAL`] until cancellation, the watchdog takes the
+/// forwarded signals and delivers each once, under the rules of
+/// [`follow::signal_first`]: to the first process until the loop has collected its
+/// end, and afterwards to every live process, also to a later process that Linux
+/// gave the first process's ID. Once the request is cancelled, it forwards nothing
+/// more.
 ///
 /// On cancellation the watchdog sends `SIGINT` once to every live process. During
 /// [`CANCEL_GRACE_PERIOD`] the event loop follows the tree as it does without
@@ -250,6 +320,9 @@ fn watch(
         }
     };
     while !cancel.is_cancelled() {
+        if let Err(error) = forward(live, cancel, patience) {
+            return end(error);
+        }
         match done.recv_timeout(CANCEL_POLL_INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {},
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -288,8 +361,9 @@ struct Launch<'a> {
     /// The seccomp-bpf filter that the child installs.
     filter: &'a [sock_filter],
     /// The child's ends of its standard streams, which kizz closes once the child
-    /// has them, or when the program never starts.
-    stdio: ChildStdio,
+    /// has them, or when the program never starts; `None` for a command that keeps
+    /// the terminal.
+    stdio: Option<ChildStdio>,
     /// The write end of the failure pipe.
     report: OwnedFd,
 }
@@ -345,7 +419,7 @@ fn trace(
         request,
         launch.program,
         launch.filter,
-        &launch.stdio,
+        launch.stdio.as_ref(),
         launch.report,
     )?;
     drop(launch.stdio);

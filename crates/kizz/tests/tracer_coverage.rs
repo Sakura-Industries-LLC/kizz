@@ -2829,6 +2829,7 @@ fn coverage_request(
         capture: CaptureMode::Merged,
         echo: false,
         tree: true,
+        terminal: false,
     })
 }
 

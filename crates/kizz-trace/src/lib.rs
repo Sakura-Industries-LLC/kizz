@@ -43,6 +43,33 @@
 //! and builds never set it, so a build's tracer does no more work than before, and
 //! a failed start carries the tree in its [`TraceError`] only when it is set.
 //!
+//! A request runs in one of two ways. A command of a build runs in a process
+//! group of its own, with pipes or `/dev/null` as its standard streams, so its
+//! output is captured and a terminal's Ctrl-C reaches only kizz, which interrupts
+//! the command exactly once through [`Cancellation`]. A command that keeps the
+//! terminal, which a request asks for with [`RunRequest::terminal`], as
+//! `kizz execute` does, uses the standard input, output and error of the process
+//! that runs the tracer, and stays in that process's process group and session, so
+//! a terminal's input and signals reach it as they would without kizz; nothing of
+//! its output is captured. In both ways the command starts with an empty signal
+//! mask and the default action for `SIGPIPE`, and every other disposition is
+//! inherited, so a signal that kizz ignores stays ignored in the command.
+//!
+//! The caller can forward a termination [`Signal`] to a running request with
+//! [`Cancellation::forward`], which the tracer delivers once: to the command's first
+//! process while it lives, and afterwards to each live process of the tree. A
+//! signal sent to the whole process group of a command that keeps the terminal
+//! reaches it directly, and once more if the caller forwards it, since the caller
+//! cannot tell it from a signal sent to the caller alone.
+//!
+//! A tracer may not keep a traced process stopped: the Linux tracer resumes a
+//! process that a stop signal stopped, because with `PTRACE_TRACEME` it cannot learn
+//! when `SIGCONT` would end the stop. A terminal's Ctrl-Z therefore stops kizz
+//! itself, which keeps the default action of `SIGTSTP`, `SIGTTIN` and `SIGTTOU`,
+//! and each traced process then waits at its next traced system call or signal
+//! until kizz goes on; a stop signal sent to one traced process alone does not keep
+//! it stopped.
+//!
 //! Through the same interface, the engine reads what the standard library cannot:
 //! the extended attributes of a path, with [`Tracer::extended_attributes`], the
 //! [`MachineState`] that a command starts with, with [`Tracer::machine_state`], and
@@ -68,7 +95,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
@@ -646,7 +673,10 @@ impl<'a> IntoIterator for &'a FirstReads {
 
 /// How a command's standard output and standard error are captured.
 ///
-/// Output is always captured; the mode only decides how.
+/// Output is always captured for a request that does not keep the terminal; the
+/// mode only decides how. A request that keeps the terminal
+/// ([`RunRequest::terminal`]) captures nothing, and its output is only the empty
+/// output in the shape of the mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CaptureMode {
     /// Standard output and standard error are captured separately.
@@ -670,7 +700,10 @@ pub struct RunRequest {
     pub env: BTreeMap<OsString, OsString>,
     /// The absolute working directory of the process.
     pub cwd: AbsolutePath,
-    /// The content written to standard input, or `None` to connect `/dev/null`.
+    /// The content written to standard input, or `None` to connect `/dev/null`;
+    /// a request that keeps the terminal ([`RunRequest::terminal`]) connects
+    /// neither, and its command reads the standard input of the process that runs
+    /// the tracer.
     pub stdin: Option<Vec<u8>>,
     /// How standard output and standard error are captured.
     pub capture: CaptureMode,
@@ -682,6 +715,16 @@ pub struct RunRequest {
     /// tracer does not read the arguments of `exec` calls or keep each program's
     /// observations for them.
     pub tree: bool,
+    /// Whether the command keeps the terminal: it uses the standard input, output
+    /// and error of the process that runs the tracer, and stays in that process's
+    /// process group and session, so a terminal's input and signals reach it as they
+    /// would without kizz. Nothing is captured or echoed, the result's output is
+    /// empty, and [`RunRequest::stdin`], [`RunRequest::capture`] and
+    /// [`RunRequest::echo`] mean nothing: the output stays in the empty shape of the
+    /// capture mode. Off unless set: builds never set it, so a command of a build
+    /// runs in a process group of its own, with pipes or `/dev/null` as its
+    /// standard streams, and a terminal's Ctrl-C reaches only kizz.
+    pub terminal: bool,
 }
 
 /// The stream a chunk of live output came from.
@@ -745,22 +788,80 @@ impl EchoSink for StdioEcho {
     }
 }
 
-/// A shared flag that cancels a running request.
+/// A termination signal that the caller can forward to a running request, with
+/// [`Cancellation::forward`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Signal {
+    /// The hangup signal, `SIGHUP`.
+    Hangup,
+    /// The termination signal, `SIGTERM`.
+    Terminate,
+}
+
+impl Signal {
+    /// Every signal that can be forwarded, in the order the tracer delivers those
+    /// that are pending together.
+    pub const ALL: [Self; 2] = [Self::Hangup, Self::Terminate];
+
+    /// The bit of the signal in the pending set of a [`Cancellation`].
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Hangup => 0b01,
+            Self::Terminate => 0b10,
+        }
+    }
+}
+
+impl fmt::Display for Signal {
+    /// The signal's name, `SIGHUP` or `SIGTERM`.
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.write_str(match self {
+            Self::Hangup => "SIGHUP",
+            Self::Terminate => "SIGTERM",
+        })
+    }
+}
+
+/// A shared handle that cancels a running request, or forwards signals to it.
 ///
-/// Clones share the flag, so the engine keeps one clone and hands another to the
+/// Clones share the handle, so the engine keeps one clone and hands another to the
 /// tracer. When the flag is set, the tracer interrupts the request's process tree,
 /// kills whatever remains of it after a grace period, and returns its result once
 /// the whole tree has exited. The result reports how the command ended: by a
 /// signal, or with an exit code that the command chose after it handled the
 /// interrupt.
+///
+/// The caller can also forward a [`Signal`] with [`Cancellation::forward`], as
+/// `kizz execute` forwards the `SIGTERM` and `SIGHUP` that kizz receives. A tracer
+/// takes each forwarded signal with [`Cancellation::take_forwarded`] while the
+/// request runs, and delivers it once: to the command's first process while that
+/// process lives, and afterwards to each live process of the tree. A signal that
+/// is forwarded again before the tracer takes it is delivered once, as a pending
+/// signal of the operating system is, and one forwarded while no request runs
+/// waits for the next request that holds a clone. Once the request is cancelled,
+/// the tracer forwards nothing more. Builds never forward a signal.
+///
+/// A signal sent to the whole process group of a command that keeps the terminal
+/// ([`RunRequest::terminal`]) reaches the command directly, and once more when the
+/// caller, which received it too, forwards it: neither the caller nor the tracer can
+/// tell such a signal from one sent to the caller alone.
+///
+/// The handle uses only atomic operations, so the caller can forward a signal
+/// from anywhere, a signal handler included.
 #[derive(Debug, Clone, Default)]
 pub struct Cancellation {
     /// Whether cancellation was requested.
     cancelled: Arc<AtomicBool>,
+    /// The forwarded signals that the tracer has not taken yet, one bit for each
+    /// [`Signal`], as `Signal::bit` assigns them.
+    forwarded: Arc<AtomicU8>,
 }
 
 impl Cancellation {
-    /// A flag that is not set.
+    /// A flag that is not set, with no signal forwarded.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -775,6 +876,26 @@ impl Cancellation {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Forward `signal` to the request that holds a clone of this handle, for its
+    /// tracer to deliver once, as the type's documentation says.
+    pub fn forward(
+        &self,
+        signal: Signal,
+    ) {
+        self.forwarded.fetch_or(signal.bit(), Ordering::SeqCst);
+    }
+
+    /// Take every signal forwarded since the last call, in the order of
+    /// [`Signal::ALL`], so each one is delivered once.
+    #[must_use]
+    pub fn take_forwarded(&self) -> Vec<Signal> {
+        let pending = self.forwarded.swap(0, Ordering::SeqCst);
+        Signal::ALL
+            .into_iter()
+            .filter(|signal| pending & signal.bit() != 0)
+            .collect()
     }
 }
 
@@ -1517,7 +1638,12 @@ pub trait Tracer: Send + Sync {
     /// `cancel` is set while the command runs, the tracer interrupts the whole
     /// process tree, kills whatever remains of it after a grace period, and returns
     /// the result once the tree has exited; the command may then have ended by a
-    /// signal or with an exit code.
+    /// signal or with an exit code. A signal that the caller forwards through
+    /// `cancel` with [`Cancellation::forward`] while the command runs goes once to
+    /// the command's first process while it lives, and afterwards to each live
+    /// process of the tree; a fake tracer may ignore it. When
+    /// [`RunRequest::terminal`] is set, the command keeps the terminal and the
+    /// result's output is empty.
     ///
     /// # Errors
     ///
@@ -1592,7 +1718,7 @@ mod tests {
         AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
         Connection, EchoSink, ExtendedAttributes, FileMetadata, FirstReads, IncompleteReason,
         MachineState, NotAbsoluteError, Observations, Outcome, Process, ProcessTree, Program,
-        RunRequest, RunResult, Termination, TraceError, Tracer, unnamed_error,
+        RunRequest, RunResult, Signal, Termination, TraceError, Tracer, unnamed_error,
     };
 
     /// Build an absolute path for a test.
@@ -1748,6 +1874,44 @@ mod tests {
         assert!(!clone.is_cancelled());
         cancel.cancel();
         assert!(clone.is_cancelled());
+    }
+
+    /// A forwarded signal is taken once, through any clone, and a signal forwarded
+    /// twice before it is taken is taken once, in the order of `Signal::ALL`.
+    #[test]
+    fn forwarded_signals_are_taken_once() {
+        let cancel = Cancellation::new();
+        let tracer = cancel.clone();
+        assert_eq!(tracer.take_forwarded(), Vec::new());
+        cancel.forward(Signal::Terminate);
+        assert_eq!(tracer.take_forwarded(), vec![Signal::Terminate]);
+        assert_eq!(tracer.take_forwarded(), Vec::new());
+        cancel.forward(Signal::Terminate);
+        cancel.forward(Signal::Hangup);
+        cancel.forward(Signal::Terminate);
+        assert_eq!(tracer.take_forwarded(), vec![
+            Signal::Hangup,
+            Signal::Terminate
+        ]);
+        assert_eq!(cancel.take_forwarded(), Vec::new());
+    }
+
+    /// Forwarding a signal does not cancel, and cancelling forwards no signal.
+    #[test]
+    fn forwarding_and_cancellation_are_apart() {
+        let cancel = Cancellation::new();
+        cancel.forward(Signal::Hangup);
+        assert!(!cancel.is_cancelled());
+        assert_eq!(cancel.take_forwarded(), vec![Signal::Hangup]);
+        cancel.cancel();
+        assert_eq!(cancel.take_forwarded(), Vec::new());
+    }
+
+    /// A forwarded signal is named as the operating system names it.
+    #[test]
+    fn signals_are_named() {
+        assert_eq!(Signal::Hangup.to_string(), "SIGHUP");
+        assert_eq!(Signal::Terminate.to_string(), "SIGTERM");
     }
 
     /// A termination reports either an exit code or a signal.
@@ -1987,6 +2151,7 @@ mod tests {
             capture: CaptureMode::Split,
             echo: false,
             tree: true,
+            terminal: false,
         }
     }
 

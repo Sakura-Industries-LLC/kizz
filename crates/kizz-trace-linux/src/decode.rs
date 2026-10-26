@@ -85,6 +85,16 @@
 //! passes, which name the program that it starts with [`Call::program`]. Without
 //! the process tree, as in a build, no outcome is built and no error is named.
 //!
+//! An `openat2` whose resolution holds `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH`, and
+//! whose flags lack `O_NONBLOCK`, records nothing when it fails with `EAGAIN`, with
+//! or without the process tree. Linux gives that error when a rename or mount
+//! anywhere on the machine races with a `..` step of the lookup, and abandons the
+//! lookup, so what it would record depends on the race, not on the paths; the
+//! caller may repeat the call, and each repeated call records like any other.
+//! With `O_NONBLOCK`, the error can also mean that a lease refused a file that the
+//! lookup found, so it records a probe as usual, and so does the `EAGAIN` of any
+//! other call.
+//!
 //! Decoding never panics ("Kizz never panics"): the bytes of a file that the
 //! kernel loads are read into a buffer reserved with `Vec::try_reserve_exact`, so
 //! a size that cannot be allocated is an error of the decoding, and the program
@@ -127,6 +137,9 @@ const LOWEST_ERROR_RESULT: i64 = -4095;
 /// The `RESOLVE_IN_ROOT` flag of `openat2`: the directory descriptor is the root
 /// of the lookup.
 const RESOLVE_IN_ROOT: u64 = 0x10;
+/// The `RESOLVE_BENEATH` flag of `openat2`: the lookup fails rather than leave
+/// the directory descriptor's directory.
+const RESOLVE_BENEATH: u64 = 0x08;
 /// The `FAN_MARK_FLUSH` flag of `fanotify_mark`, from the kernel's
 /// `include/uapi/linux/fanotify.h`: the call removes marks and names no path.
 const FAN_MARK_FLUSH: u64 = 0x80;
@@ -818,6 +831,11 @@ pub(crate) struct Call {
     /// The destinations that the call connects or sends to, which
     /// [`Call::connections`] gives at its exit.
     connections: Vec<Connection>,
+    /// Whether the call is an `openat2` with `RESOLVE_IN_ROOT` or
+    /// `RESOLVE_BENEATH` and without `O_NONBLOCK`, for which `EAGAIN` means that
+    /// Linux abandoned the lookup over a race, so [`Call::finish_observed`]
+    /// records nothing for that failure.
+    race_abandons: bool,
 }
 
 /// The files whose metadata a call gives when it succeeds, as reads or runs that
@@ -1051,6 +1069,18 @@ impl Call {
     /// Without them, as for a build, the outcome is never built, so its error name
     /// is neither looked up nor allocated, and the call costs what it did before
     /// the process tree existed.
+    ///
+    /// An `openat2` whose resolution holds `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH`,
+    /// and whose flags lack `O_NONBLOCK`, records nothing when it fails with
+    /// `EAGAIN`: no path in `accesses`, and nothing in `observations`, whose outcome
+    /// is not built either. Linux gives that error when a rename or mount anywhere
+    /// on the machine raced with a `..` step of the lookup, and abandons the lookup,
+    /// so the result depends on the race rather than on the paths, and the caller
+    /// may repeat the call, whose every attempt records like any other call. With
+    /// `O_NONBLOCK` the same error can also be a lease that refused a file that the
+    /// lookup found, so it records a probe as usual. The rule changes only what
+    /// the call records: what could not be decoded still makes the trace
+    /// incomplete.
     pub(crate) fn finish_observed(
         self,
         result: Option<i64>,
@@ -1073,20 +1103,25 @@ impl Call {
                 .into_iter()
                 .any(|code| i64::from(code) == errno)
         });
-        let mut observed = observations.map(|observations| (observations, Self::outcome(result)));
-        for (path, kinds) in self.operands {
-            let recorded = match (result, errno) {
-                (Some(_), Some(_)) if answered && kinds.contains(AccessKind::Xattr) => {
-                    AccessKinds::only(AccessKind::Xattr)
-                },
-                (Some(_), Some(_)) => AccessKinds::only(AccessKind::Probe),
-                (Some(_), None) => kinds,
-                (None, _) => kinds.with(AccessKind::Probe),
-            };
-            if let Some((observations, outcome)) = observed.as_mut() {
-                observations.record_kinds(path.clone(), recorded, outcome);
+        // A scoped `openat2` that Linux abandoned over a race records nothing.
+        let abandoned = self.race_abandons && errno == Some(i64::from(libc::EAGAIN));
+        if !abandoned {
+            let mut observed =
+                observations.map(|observations| (observations, Self::outcome(result)));
+            for (path, kinds) in self.operands {
+                let recorded = match (result, errno) {
+                    (Some(_), Some(_)) if answered && kinds.contains(AccessKind::Xattr) => {
+                        AccessKinds::only(AccessKind::Xattr)
+                    },
+                    (Some(_), Some(_)) => AccessKinds::only(AccessKind::Probe),
+                    (Some(_), None) => kinds,
+                    (None, _) => kinds.with(AccessKind::Probe),
+                };
+                if let Some((observations, outcome)) = observed.as_mut() {
+                    observations.record_kinds(path.clone(), recorded, outcome);
+                }
+                accesses.record_kinds(path, recorded);
             }
-            accesses.record_kinds(path, recorded);
         }
         if let Some(problem) = self.problem {
             return Some(format!("could not decode {}: {problem}", self.name));
@@ -1952,7 +1987,9 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
     }
 
     /// Decode `openat2`, whose flags and resolution are in the `struct open_how`
-    /// that its third argument points to.
+    /// that its third argument points to, and note whether an `EAGAIN` would mean
+    /// that Linux abandoned its scoped lookup over a race, as
+    /// [`Call::finish_observed`] explains.
     fn open_how(&mut self) {
         let mut how = [0_u8; OPEN_HOW_SIZE];
         let filled = match read_memory(self.inspect, self.argument(2), &mut how, false) {
@@ -1972,6 +2009,10 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
             self.problem("could not read the open_how of openat2".to_owned());
             return;
         };
+        // A scoped lookup without `O_NONBLOCK` fails with `EAGAIN` only when Linux
+        // abandoned it over a race, which records nothing.
+        self.call.race_abandons = resolve & (RESOLVE_IN_ROOT | RESOLVE_BENEATH) != 0
+            && flags & flag(libc::O_NONBLOCK) == 0;
         let lookup = if resolve & RESOLVE_IN_ROOT == 0 {
             Lookup::Ordinary
         } else {
@@ -2299,6 +2340,7 @@ pub(crate) fn enter(
             unfollowed: None,
             first_read: FirstRead::Nothing,
             connections: Vec::new(),
+            race_abandons: false,
         },
         open_flags: None,
     };
@@ -2411,6 +2453,11 @@ mod tests {
     /// The address of a `struct open_how` for `O_TMPFILE | O_RDWR`, with
     /// `RESOLVE_IN_ROOT`.
     const HOW_TMPFILE: u64 = 0x5400;
+    /// The address of a `struct open_how` for reading, with `RESOLVE_BENEATH`.
+    const HOW_BENEATH: u64 = 0x5500;
+    /// The address of a `struct open_how` for reading without blocking, with
+    /// `RESOLVE_IN_ROOT`.
+    const HOW_NONBLOCK: u64 = 0x5600;
     /// The address of a path that starts two bytes before a page boundary.
     const CROSSING: u64 = 0x6FFE;
     /// The address of the relative path `./a//b/../c/.`.
@@ -2553,6 +2600,11 @@ mod tests {
                 (
                     HOW_TMPFILE,
                     open_how(libc::O_TMPFILE | libc::O_RDWR, RESOLVE_IN_ROOT),
+                ),
+                (HOW_BENEATH, open_how(libc::O_RDONLY, RESOLVE_BENEATH)),
+                (
+                    HOW_NONBLOCK,
+                    open_how(libc::O_RDONLY | libc::O_NONBLOCK, RESOLVE_IN_ROOT),
                 ),
                 (CROSSING, b"cross\0".to_vec()),
                 (DOTTED, b"./a//b/../c/.\0".to_vec()),
@@ -3048,6 +3100,106 @@ mod tests {
             succeed("openat2", &[DIR, SUB_UP, HOW_PLAIN, 24]),
             expect(&[("/dir/abs/../rel", "read")])
         );
+    }
+
+    /// An `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` and without
+    /// `O_NONBLOCK` records nothing when it fails with `EAGAIN`, because Linux
+    /// abandoned its lookup over a race and the caller may repeat it; every other
+    /// result of such a call, and the `EAGAIN` of any other call, records as usual,
+    /// with and without observations.
+    #[test]
+    fn scoped_openat2_records_nothing_when_a_race_abandons_it() {
+        let fake = Fake::new();
+        let in_root = [DIR, SUB_UP, HOW, 24];
+        // `RESOLVE_IN_ROOT` through the directory `abs` and a `..`.
+        assert_eq!(
+            finish("openat2", &in_root, failed(libc::EAGAIN)),
+            (expect(&[]), None)
+        );
+        assert_eq!(
+            observe_in(&fake, "openat2", &in_root, failed(libc::EAGAIN)),
+            observed(&[])
+        );
+        assert_eq!(
+            finish("openat2", &in_root, failed(libc::ENOENT)),
+            (
+                expect(&[("/dir/abs", "probe"), ("/dir/rel", "probe")]),
+                None
+            )
+        );
+        assert_eq!(
+            observe_in(&fake, "openat2", &in_root, failed(libc::ENOENT)),
+            observed(&[
+                ("/dir/abs", "probe", "ENOENT"),
+                ("/dir/rel", "probe", "ENOENT")
+            ])
+        );
+        assert_eq!(
+            finish("openat2", &in_root, Some(3)),
+            (
+                expect(&[("/dir/abs", "probe"), ("/dir/rel", "write")]),
+                None
+            )
+        );
+        assert_eq!(
+            observe_in(&fake, "openat2", &in_root, Some(3)),
+            observed(&[("/dir/abs", "probe", "ok"), ("/dir/rel", "write", "ok")])
+        );
+        // `RESOLVE_BENEATH`, whose path is looked up as written.
+        let beneath = [DIR, SUB_UP, HOW_BENEATH, 24];
+        assert_eq!(
+            finish("openat2", &beneath, failed(libc::EAGAIN)),
+            (expect(&[]), None)
+        );
+        assert_eq!(
+            observe_in(&fake, "openat2", &beneath, failed(libc::EAGAIN)),
+            observed(&[])
+        );
+        for (errno, name) in [(libc::ENOENT, "ENOENT"), (libc::EXDEV, "EXDEV")] {
+            assert_eq!(
+                finish("openat2", &beneath, failed(errno)),
+                (expect(&[("/dir/abs/../rel", "probe")]), None),
+                "{name}"
+            );
+            assert_eq!(
+                observe_in(&fake, "openat2", &beneath, failed(errno)),
+                observed(&[("/dir/abs/../rel", "probe", name)]),
+                "{name}"
+            );
+        }
+        // With `O_NONBLOCK`, `EAGAIN` may be a lease that refused the file that
+        // the lookup found, so it records a probe of each path.
+        let without_blocking = [DIR, SUB_UP, HOW_NONBLOCK, 24];
+        assert_eq!(
+            finish("openat2", &without_blocking, failed(libc::EAGAIN)),
+            (
+                expect(&[("/dir/abs", "probe"), ("/dir/rel", "probe")]),
+                None
+            )
+        );
+        assert_eq!(
+            observe_in(&fake, "openat2", &without_blocking, failed(libc::EAGAIN)),
+            observed(&[
+                ("/dir/abs", "probe", "EAGAIN"),
+                ("/dir/rel", "probe", "EAGAIN")
+            ])
+        );
+        // An `openat2` without a `RESOLVE_*` flag, and an `openat`, record a probe.
+        for (name, arguments) in [
+            ("openat2", &[DIR, SUB_UP, HOW_PLAIN, 24][..]),
+            ("openat", &[DIR, SUB_UP, reg(libc::O_RDONLY)][..]),
+        ] {
+            assert_eq!(
+                finish(name, arguments, failed(libc::EAGAIN)),
+                (expect(&[("/dir/abs/../rel", "probe")]), None),
+                "{name}"
+            );
+            assert_eq!(
+                observe_in(&fake, name, arguments, failed(libc::EAGAIN)),
+                observed(&[("/dir/abs/../rel", "probe", "EAGAIN")]),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -5490,15 +5642,17 @@ mod tests {
     /// outcome, so no error name is looked up, and it records the same accesses
     /// and gives the same reason as with observations, which build one outcome
     /// per call that records its paths: for a success, failures, an attribute
-    /// answer, a result never seen, a call that could not be decoded, and one whose
-    /// error says the kernel refused that input, which records nothing either way.
+    /// answer, a result never seen, a call that could not be decoded, one whose
+    /// error says the kernel refused that input, which records nothing either way,
+    /// and a scoped `openat2` that a race abandoned, which records nothing either
+    /// way, with or without something it could not decode.
     #[test]
     fn calls_without_observations_build_no_outcome() {
         /// A call's name, arguments and result, the outcomes that recording it with
         /// observations builds, and whether it makes the trace incomplete.
         type Case = (&'static str, &'static [u64], Option<i64>, usize, bool);
         let fake = Fake::new();
-        let cases: [Case; 7] = [
+        let cases: [Case; 9] = [
             ("openat", &[CWD, REL, 0], Some(3), 1, false),
             ("openat", &[CWD, REL, 0], failed(libc::ENOENT), 1, false),
             ("openat", &[CWD, REL, 0], failed(libc::EINTR), 1, false),
@@ -5506,6 +5660,22 @@ mod tests {
             ("getxattr", &[REL], failed(libc::ENODATA), 1, false),
             ("rename", &[REL, UNMAPPED], Some(0), 1, true),
             ("rename", &[REL, UNMAPPED], failed(libc::EFAULT), 0, false),
+            // A scoped `openat2` that Linux abandoned over a race records nothing
+            // and builds no outcome, but what it could not decode still counts.
+            (
+                "openat2",
+                &[DIR, SUB_UP, HOW, 24],
+                failed(libc::EAGAIN),
+                0,
+                false,
+            ),
+            (
+                "openat2",
+                &[DIR, LOCKED, HOW, 24],
+                failed(libc::EAGAIN),
+                0,
+                true,
+            ),
         ];
         for (name, arguments, result, observed, incomplete) in cases {
             let before = outcomes_built();

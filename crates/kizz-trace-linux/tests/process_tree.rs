@@ -109,6 +109,7 @@ fn request(
         capture: CaptureMode::Split,
         echo: false,
         tree: true,
+        terminal: false,
     })
 }
 

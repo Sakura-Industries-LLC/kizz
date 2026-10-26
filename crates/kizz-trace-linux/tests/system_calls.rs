@@ -188,6 +188,7 @@ fn request(
         capture: CaptureMode::Split,
         echo: false,
         tree: false,
+        terminal: false,
     })
 }
 
@@ -1120,6 +1121,95 @@ fn helper_deleted_suffix() -> Outcome<()> {
 /// The `RESOLVE_IN_ROOT` flag of `openat2`.
 const RESOLVE_IN_ROOT: u64 = 0x10;
 
+/// The most attempts that [`repeat_while_raced`] makes of one call.
+const RACE_ATTEMPTS: usize = 100;
+
+/// Make `attempt` at once, and again at once while it fails with `EAGAIN`, at
+/// most [`RACE_ATTEMPTS`] times in all, and return its last result with the
+/// number of attempts made; it never panics.
+///
+/// Linux fails an `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` with
+/// `EAGAIN` when a rename or mount anywhere on the machine races with a `..` step
+/// of its lookup, and openat2(2) lets the caller repeat the call. The tracer
+/// records nothing for such a failure, so a repeated call leaves exactly what one
+/// call without the race would have recorded.
+fn repeat_while_raced<T>(mut attempt: impl FnMut() -> io::Result<T>) -> (io::Result<T>, usize) {
+    let mut attempts: usize = 1;
+    loop {
+        let result = attempt();
+        let raced = matches!(&result, Err(error) if error.raw_os_error() == Some(libc::EAGAIN));
+        if !raced || attempts >= RACE_ATTEMPTS {
+            return (result, attempts);
+        }
+        attempts = attempts.saturating_add(1);
+    }
+}
+
+/// Make an `openat2` with `RESOLVE_IN_ROOT` and `arguments` through
+/// [`repeat_while_raced`], which must succeed with `None` and fail with `errno`
+/// with `Some(errno)`, and fail otherwise, with an error that names `EAGAIN` and
+/// the number of attempts when every attempt failed with it.
+fn scoped_openat2(
+    arguments: &[c_long],
+    expected: Option<c_int>,
+) -> Outcome<()> {
+    let openat2 = number("openat2")?;
+    let (result, attempts) = repeat_while_raced(|| raw(openat2, arguments));
+    match (result, expected) {
+        (Err(error), _) if error.raw_os_error() == Some(libc::EAGAIN) => {
+            Err(format!("openat2 failed with EAGAIN on all {attempts} attempts: {error}").into())
+        },
+        (Ok(_), None) => Ok(()),
+        (Err(error), Some(errno)) if error.raw_os_error() == Some(errno) => Ok(()),
+        (Ok(_), Some(_)) => Err("openat2 succeeded".into()),
+        (Err(error), _) => Err(format!("openat2 failed: {error}").into()),
+    }
+}
+
+/// The result of a scripted attempt of [`repeat_while_raced`] that fails with
+/// `errno`.
+fn scripted_failure(errno: c_int) -> io::Result<c_long> {
+    Err(io::Error::from_raw_os_error(errno))
+}
+
+/// Run [`repeat_while_raced`] on scripted attempts that fail with `EAGAIN` the
+/// first `raced` times and then give `last`, and return the error number or the
+/// value of its result, with the attempts it reported and those it made.
+fn repeat_scripted(
+    raced: usize,
+    last: io::Result<c_long>,
+) -> (Result<c_long, Option<c_int>>, usize, usize) {
+    let mut made: usize = 0;
+    let mut last = Some(last);
+    let (result, attempts) = repeat_while_raced(|| {
+        made = made.saturating_add(1);
+        if made <= raced {
+            return scripted_failure(libc::EAGAIN);
+        }
+        last.take()
+            .unwrap_or_else(|| scripted_failure(libc::EBADMSG))
+    });
+    (result.map_err(|error| error.raw_os_error()), attempts, made)
+}
+
+/// [`repeat_while_raced`] repeats an attempt at once while it fails with
+/// `EAGAIN`, up to 100 attempts in all, and returns any other result after the
+/// attempt that gave it, with scripted attempts and no tracing.
+#[test]
+fn repeat_while_raced_repeats_only_eagain_up_to_100_attempts() {
+    assert_eq!(repeat_scripted(1, Ok(3)), (Ok(3), 2, 2));
+    assert_eq!(repeat_scripted(99, Ok(3)), (Ok(3), 100, 100));
+    assert_eq!(
+        repeat_scripted(usize::MAX, Ok(3)),
+        (Err(Some(libc::EAGAIN)), 100, 100)
+    );
+    assert_eq!(
+        repeat_scripted(0, scripted_failure(libc::ENOENT)),
+        (Err(Some(libc::ENOENT)), 1, 1)
+    );
+    assert_eq!(repeat_scripted(0, Ok(3)), (Ok(3), 1, 1));
+}
+
 /// Open files with `openat2` and `RESOLVE_IN_ROOT` in the directory `root`, from
 /// the fixtures of [`openat2_in_root_reports_the_objects_it_reaches`], and once
 /// without it.
@@ -1140,9 +1230,12 @@ fn helper_in_root() -> Outcome<()> {
         "abs.link/inner.txt",
         "final.link",
     ] {
-        sys("openat2", &[root, s.text(path)?, rooted, size])?;
+        scoped_openat2(&[root, s.text(path)?, rooted, size], None)?;
     }
-    sys_missing("openat2", &[root, s.text("../missing")?, rooted, size])?;
+    scoped_openat2(
+        &[root, s.text("../missing")?, rooted, size],
+        Some(libc::ENOENT),
+    )?;
     let plain = OpenHow {
         flags: 0,
         mode: 0,
@@ -1155,19 +1248,6 @@ fn helper_in_root() -> Outcome<()> {
         size,
     ])?;
     Ok(())
-}
-
-/// Make the system call `name` with `arguments`, which must fail with `errno`.
-fn sys_failing(
-    name: &str,
-    arguments: &[c_long],
-    errno: c_int,
-) -> Outcome<()> {
-    match raw(number(name)?, arguments) {
-        Ok(_) => Err(format!("{name} succeeded").into()),
-        Err(error) if error.raw_os_error() == Some(errno) => Ok(()),
-        Err(error) => Err(format!("{name} failed otherwise: {error}").into()),
-    }
 }
 
 /// Open paths with `openat2` and `RESOLVE_IN_ROOT` in the directory `root`, from
@@ -1184,10 +1264,9 @@ fn helper_in_root_traversal() -> Outcome<()> {
         resolve: RESOLVE_IN_ROOT,
     };
     for path in ["plain/../other", "plain/."] {
-        sys_failing(
-            "openat2",
+        scoped_openat2(
             &[root, s.text(path)?, address(&raw const read), size],
-            libc::ENOTDIR,
+            Some(libc::ENOTDIR),
         )?;
     }
     let no_follow = OpenHow {
@@ -1195,12 +1274,10 @@ fn helper_in_root_traversal() -> Outcome<()> {
         mode: 0,
         resolve: RESOLVE_IN_ROOT,
     };
-    sys("openat2", &[
-        root,
-        s.text("link/.")?,
-        address(&raw const no_follow),
-        size,
-    ])?;
+    scoped_openat2(
+        &[root, s.text("link/.")?, address(&raw const no_follow), size],
+        None,
+    )?;
     Ok(())
 }
 
@@ -1227,12 +1304,14 @@ fn helper_in_root_parent(lookup: bool) -> Outcome<()> {
     if !lookup {
         return Ok(());
     }
-    sys("openat2", &[ok, s.text("dir/../file")?, how, size])?;
-    sys_missing("openat2", &[gone, s.text("dir/../file")?, how, size])?;
-    sys_failing(
-        "openat2",
+    scoped_openat2(&[ok, s.text("dir/../file")?, how, size], None)?;
+    scoped_openat2(
+        &[gone, s.text("dir/../file")?, how, size],
+        Some(libc::ENOENT),
+    )?;
+    scoped_openat2(
         &[flat, s.text("dir/../file")?, how, size],
-        libc::ENOTDIR,
+        Some(libc::ENOTDIR),
     )?;
     Ok(())
 }

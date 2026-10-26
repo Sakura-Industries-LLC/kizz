@@ -941,6 +941,7 @@ fn run_request(
         capture: step.capture,
         echo: step.stream,
         tree: false,
+        terminal: false,
     }
 }
 
