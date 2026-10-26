@@ -84,6 +84,12 @@
 //! `execve` and `execveat`, [`argument_vector`] reads the arguments that the call
 //! passes, which name the program that it starts with [`Call::program`]. Without
 //! the process tree, as in a build, no outcome is built and no error is named.
+//!
+//! Decoding never panics ("Kizz never panics"): the bytes of a file that the
+//! kernel loads are read into a buffer reserved with `Vec::try_reserve_exact`, so
+//! a size that cannot be allocated is an error of the decoding, and the program
+//! headers of an ELF file are taken one by one with `slice::get`, never with
+//! `as_chunks`, which panics on a chunk size of zero.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -1339,7 +1345,11 @@ fn read_exactly(
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, String> {
-    let mut bytes = vec![0_u8; length];
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|error| format!("could not read {length} bytes of {file}: {error}"))?;
+    bytes.resize(length, 0_u8);
     let read = inspect
         .read_file(file.as_path(), offset, &mut bytes)
         .map_err(|error| format!("could not read {file}: {error}"))?;
@@ -1373,8 +1383,14 @@ fn elf_loader(
             elf.count, elf.entry_size
         ));
     };
-    let headers = read_exactly(inspect, file, elf.offset, size)?;
-    for header in headers.as_chunks::<PROGRAM_HEADER_SIZE>().0 {
+    let table = read_exactly(inspect, file, elf.offset, size)?;
+    // Each header in turn, taken with `slice::get`, where `as_chunks` would panic on
+    // a chunk size of zero.
+    let headers = (0..usize::from(elf.count)).filter_map(|index| {
+        let start = index.saturating_mul(PROGRAM_HEADER_SIZE);
+        table.get(start..start.saturating_add(PROGRAM_HEADER_SIZE))
+    });
+    for header in headers {
         if u32_at(header, 0) != Some(PT_INTERP) {
             continue;
         }
@@ -2058,8 +2074,13 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
             return;
         }
         let length = length.min(SOCKADDR_STORAGE_SIZE);
-        let mut bytes = vec![0_u8; length];
-        match read_memory(self.inspect, address, &mut bytes, false) {
+        // A fixed buffer of the largest size, cut with `get_mut`, which cannot panic,
+        // where `vec![0; length]` panics on a length that overflows.
+        let mut storage = [0_u8; SOCKADDR_STORAGE_SIZE];
+        let Some(bytes) = storage.get_mut(..length) else {
+            return;
+        };
+        match read_memory(self.inspect, address, bytes, false) {
             Ok(filled) if filled == length => {},
             Ok(_) => {
                 self.problem(format!("could not read the socket address at {address:#x}"));
@@ -2070,7 +2091,7 @@ impl<I: Inspect + ?Sized> Decoder<'_, I> {
                 return;
             },
         }
-        let connection = match socket_name(&bytes) {
+        let connection = match socket_name(bytes) {
             None => return,
             Some(SocketName::Ip(destination)) => Connection::Ip(destination),
             Some(SocketName::Abstract(name)) => Connection::UnixAbstract(name),
@@ -2354,6 +2375,11 @@ pub(crate) fn untraceable(
 
 /// Unit tests of the decoding of every tracked call, with a fake thread.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},

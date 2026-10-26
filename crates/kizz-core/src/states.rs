@@ -144,6 +144,11 @@ fn hash_file(
 
 /// Unit tests for the cache of file states and hashes.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::fs;
 

@@ -451,6 +451,11 @@ pub(crate) fn program() -> Result<Vec<sock_filter>, TryFromIntError> {
 
 /// Unit tests that pin the filter's system-call set and run its program.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{collections::BTreeSet, mem};
 

@@ -44,8 +44,14 @@
 //!   and the entries `kizz cache reset` wipes for the tasks under a path.
 //! * [`pool`]: the worker pool that runs a command's parallel work, whose threads start
 //!   through `kizz_threads`, so `rayon`'s global pool never starts.
+//!
+//! State that one thread changes through shared references lives in a `Cell`, which
+//! the private `cells` module takes out, changes and puts back, where a `RefCell`
+//! borrow would panic while the cell is borrowed; state that threads share is locked
+//! with `kizz_threads::lock`, where `Mutex::lock` may panic ("Kizz never panics").
 
 pub mod build;
+mod cells;
 pub mod check;
 pub mod cleanup;
 pub mod discovery;

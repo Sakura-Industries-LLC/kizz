@@ -716,6 +716,11 @@ pub trait EchoSink: Send + Sync {
 
 /// Echoes live output to the terminal: standard error to standard error, and
 /// everything else to standard output.
+///
+/// It writes with `Write::write_all` and `Write::flush` on the locked stream, which
+/// return the error of a write that fails, such as one to a closed pipe, where the
+/// `print!` macros would panic ("Kizz never panics"); the tracer drops that error,
+/// so the run goes on and its captured output stays complete.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdioEcho;
 
@@ -1570,6 +1575,11 @@ pub trait Tracer: Send + Sync {
 
 /// Unit tests for the logic of the tracer interface.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},

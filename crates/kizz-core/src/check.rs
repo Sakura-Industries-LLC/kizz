@@ -524,6 +524,11 @@ fn compare_file(
 
 /// Unit tests for the comparison rules.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{
         fs::{File, FileTimes},

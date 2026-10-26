@@ -62,14 +62,26 @@
 //! [`WorkerPool`], whose workers start the same way; a pool that cannot start is an
 //! error with the same status. A thread of a command's tracer that cannot start fails
 //! that command's step, and so its task.
+//!
+//! Other calls that could panic ("Kizz never panics"): the delivery of Ctrl-C is
+//! made only for a signal that `signal_hook` accepts, which `Signals::new` would
+//! otherwise answer with a panic, and its thread looks for signals with
+//! `Signals::pending`, never with `Signals::forever`, whose iterator panics when
+//! reading the delivery fails. What the build printed so far lives in `Cell`s, never
+//! in `RefCell`s, whose borrows panic. Engine state that stays locked when the
+//! warnings are read is an error that kizz prints once, and the build then exits
+//! with [`USAGE_ERROR`] instead of success. Every line goes through the `ui`
+//! helpers, which drop a write that fails.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     env,
+    ffi::c_int,
     path::{Path, PathBuf},
     process::ExitCode,
     thread,
+    time::Duration,
 };
 
 use kizz_core::{
@@ -81,11 +93,11 @@ use kizz_store::{
     CacheLock, LockDetails, NotCachedReason, StepKey, StepRecord, Store, TaskId, Verdict,
     cache_dir_from_env, connections_text, system_call_numbers,
 };
-use kizz_threads::StartError;
+use kizz_threads::{LockError, StartError};
 use kizz_trace::{AbsolutePath, Cancellation, StdioEcho};
 use kizz_trace_linux::LinuxTracer;
 use signal_hook::{
-    consts::SIGINT,
+    consts::{FORBIDDEN, SIGINT},
     iterator::{Handle, Signals},
 };
 
@@ -151,7 +163,7 @@ pub(crate) fn run(
     // interrupt to the running command, which runs in a process group of its own,
     // so a terminal's Ctrl-C reaches it only this way; another Ctrl-C sets the same
     // flag again and sends nothing more.
-    let signals = match Signals::new([SIGINT]) {
+    let signals = match interrupt_signals(SIGINT) {
         Ok(signals) => signals,
         Err(error) => {
             drop(lock);
@@ -179,6 +191,32 @@ pub(crate) fn run(
     ExitCode::from(status)
 }
 
+/// The largest signal number, plus one, that `signal_hook`'s delivery accepts: its
+/// `Handle::add_signal` panics at or above it.
+const SIGNAL_LIMIT: c_int = 128;
+
+/// How long the thread that handles Ctrl-C sleeps between its looks for signals.
+const SIGNAL_POLL: Duration = Duration::from_millis(20);
+
+/// A delivery of `signal`, or the error of a signal that cannot be handled.
+///
+/// `Signals::new` "panics" "if the given signal is forbidden" or "if the signal
+/// number is negative or larger than internal limit" (`signal_hook`'s documentation
+/// of `Handle::add_signal`, whose restrictions `Signals::new` shares), so this
+/// refuses such a signal first, with an error, and calls `Signals::new` only for
+/// one that it accepts ("Kizz never panics").
+///
+/// # Errors
+///
+/// A message for a signal that `signal_hook` would panic on, or the error of
+/// `Signals::new`.
+fn interrupt_signals(signal: c_int) -> Result<Signals, String> {
+    if signal <= 0 || signal >= SIGNAL_LIMIT || FORBIDDEN.contains(&signal) {
+        return Err(format!("signal {signal} cannot be handled"));
+    }
+    Signals::new([signal]).map_err(|error| error.to_string())
+}
+
 /// Run `work` while a thread cancels `cancel` at each signal that `signals`
 /// delivers, and return what `work` returns.
 ///
@@ -186,11 +224,12 @@ pub(crate) fn run(
 /// system cannot start a thread for the moment. When it still cannot start, `work`
 /// never runs and is dropped, and the error names the thread and the system's error.
 ///
-/// The thread waits for signals until the delivery is closed, and the scope that
-/// runs it waits for it before it returns, also when `work` panics. A
-/// [`CloseOnDrop`] therefore closes the delivery whichever way `work` ends: a panic
-/// in the build then ends kizz with the panic instead of leaving it waiting for the
-/// signal thread for good.
+/// The thread looks for signals with `Signals::pending`, which never blocks and
+/// cannot panic, every [`SIGNAL_POLL`], until the delivery is closed; it does not
+/// use `Signals::forever` or `Signals::wait`, whose code panics with "Unexpected
+/// error" when reading the delivery fails. The scope that runs it waits for it
+/// before it returns, also when `work` panics. A [`CloseOnDrop`] therefore closes
+/// the delivery whichever way `work` ends, and the thread ends at its next look.
 fn with_interrupts<T>(
     signals: Signals,
     cancel: &Cancellation,
@@ -206,8 +245,11 @@ fn with_interrupts<T>(
             "the thread that handles Ctrl-C",
             move || {
                 let mut signals = signals;
-                for _signal in signals.forever() {
-                    watcher.cancel();
+                while !signals.is_closed() {
+                    for _signal in signals.pending() {
+                        watcher.cancel();
+                    }
+                    thread::sleep(SIGNAL_POLL);
                 }
             },
         )?;
@@ -215,7 +257,7 @@ fn with_interrupts<T>(
     })
 }
 
-/// Closes a signal delivery when dropped, which ends the thread that waits for its
+/// Closes a signal delivery when dropped, which ends the thread that looks for its
 /// signals; dropped at the end of [`with_interrupts`]'s scope, and while a panic
 /// unwinds out of it, before the scope waits for that thread.
 struct CloseOnDrop(Handle);
@@ -318,15 +360,16 @@ fn build_selected(
         options,
         engine: &engine,
         store,
-        seen: RefCell::new(BTreeSet::new()),
+        seen: Cell::new(BTreeSet::new()),
         pass_ran: Cell::new(false),
         pass_changed: Cell::new(false),
         repeated_shown: Cell::new(0),
-        incomplete_shown: RefCell::new(BTreeSet::new()),
-        changed_shown: RefCell::new(BTreeSet::new()),
-        unknown_shown: RefCell::new(BTreeSet::new()),
-        connections_shown: RefCell::new(BTreeSet::new()),
-        warnings: RefCell::new(warnings),
+        incomplete_shown: Cell::new(BTreeSet::new()),
+        changed_shown: Cell::new(BTreeSet::new()),
+        unknown_shown: Cell::new(BTreeSet::new()),
+        connections_shown: Cell::new(BTreeSet::new()),
+        warnings: Cell::new(warnings),
+        unreadable: Cell::new(None),
     };
     let status = match build(&engine, &tasks, &caller, &output, &output) {
         Ok(report) => output.finish(&report),
@@ -335,7 +378,7 @@ fn build_selected(
             USAGE_ERROR
         },
     };
-    ui::print_warning_summary(&output.warnings.borrow());
+    ui::print_warning_summary(&output.warnings.take());
     status
 }
 
@@ -462,7 +505,33 @@ fn step_id(
     (task_id(task), decision.position, decision.command.clone())
 }
 
+/// Change the value in `cell` with `change`, and return what `change` returns: the
+/// value is taken out, changed and put back with `Cell::take` and `Cell::set`,
+/// which cannot fail, where a `RefCell` borrow would panic while the cell is
+/// borrowed ("Kizz never panics"). No `change` here reaches its own cell.
+fn update<T: Default, R>(
+    cell: &Cell<T>,
+    change: impl FnOnce(&mut T) -> R,
+) -> R {
+    let mut value = cell.take();
+    let result = change(&mut value);
+    cell.set(value);
+    result
+}
+
+/// Whether `key` is new to the set in `cell`, which then holds it.
+fn first_time<K: Ord>(
+    cell: &Cell<BTreeSet<K>>,
+    key: K,
+) -> bool {
+    update(cell, |keys| keys.insert(key))
+}
+
 /// What the build printed so far, and how it prints.
+///
+/// The state that the build's callbacks change through `&self` lives in `Cell`s,
+/// changed with [`update`], never in `RefCell`s, whose borrows panic while the cell
+/// is borrowed ("Kizz never panics").
 struct Output<'a> {
     /// How paths, tasks, and reasons read.
     render: Render,
@@ -474,7 +543,7 @@ struct Output<'a> {
     /// The store of the build, for the commands of results that were not cached.
     store: &'a Store,
     /// Every step the build reached so far.
-    seen: RefCell<BTreeSet<StepId>>,
+    seen: Cell<BTreeSet<StepId>>,
     /// Whether a command ran in the current pass.
     pass_ran: Cell<bool>,
     /// Whether a task program changed a file in the current pass.
@@ -483,17 +552,20 @@ struct Output<'a> {
     /// printed.
     repeated_shown: Cell<usize>,
     /// The incompletely traced steps already warned about.
-    incomplete_shown: RefCell<BTreeSet<StepKey>>,
+    incomplete_shown: Cell<BTreeSet<StepKey>>,
     /// The steps already warned about because something other than the command
     /// changed a file it read while it ran.
-    changed_shown: RefCell<BTreeSet<StepKey>>,
+    changed_shown: Cell<BTreeSet<StepKey>>,
     /// The steps already warned about because their command made system calls that
     /// the tracer does not know.
-    unknown_shown: RefCell<BTreeSet<StepKey>>,
+    unknown_shown: Cell<BTreeSet<StepKey>>,
     /// The steps already warned about because their command made connections.
-    connections_shown: RefCell<BTreeSet<StepKey>>,
+    connections_shown: Cell<BTreeSet<StepKey>>,
     /// Every warning printed, for the final summary.
-    warnings: RefCell<Vec<String>>,
+    warnings: Cell<Vec<String>>,
+    /// The first error of engine state that stayed locked when the warnings were
+    /// read, if any.
+    unreadable: Cell<Option<LockError>>,
 }
 
 impl PrintSink for Output<'_> {
@@ -531,10 +603,7 @@ impl BuildEvents for Output<'_> {
         self.pass_changed
             .set(self.pass_changed.get() || result.changed_files());
         for decision in &result.decisions {
-            let first = self
-                .seen
-                .borrow_mut()
-                .insert(step_id(&result.task, decision));
+            let first = first_time(&self.seen, step_id(&result.task, decision));
             self.print_step(&task, decision, first);
         }
         // A failure is shown when it is new: in the first pass, or when the task ran
@@ -545,7 +614,10 @@ impl BuildEvents for Output<'_> {
         {
             ui::print_task_failure(&task, &failure.to_string());
         }
-        self.check_warnings();
+        if let Err(error) = self.check_warnings() {
+            // Only the first such error of the build is printed.
+            self.unreadable(&error);
+        }
     }
 }
 
@@ -593,16 +665,21 @@ impl Output<'_> {
     /// calls that the tracer does not know, and runs that made connections, each
     /// step once per build. Unchecked exits warn only once the build settles, in
     /// [`Output::finish`].
-    fn check_warnings(&self) {
-        let repeated = self.engine.warnings();
+    ///
+    /// # Errors
+    ///
+    /// The [`LockError`] of engine state that stayed locked, after the warnings that
+    /// could be read.
+    fn check_warnings(&self) -> Result<(), LockError> {
+        let repeated = self.engine.warnings()?;
         for warning in repeated.iter().skip(self.repeated_shown.get()) {
             self.warn(self.render.repeated(warning));
         }
         self.repeated_shown.set(repeated.len());
-        for (key, why) in self.engine.not_cached() {
+        for (key, why) in self.engine.not_cached()? {
             match why {
                 NotCachedReason::Incomplete { detail } => {
-                    if self.incomplete_shown.borrow_mut().insert(key) {
+                    if first_time(&self.incomplete_shown, key) {
                         self.warn(self.incomplete(&key, &detail));
                     }
                 },
@@ -614,7 +691,7 @@ impl Output<'_> {
                         .filter(|file| !file.written)
                         .map(|file| file.path.as_path())
                         .collect();
-                    if !outside.is_empty() && self.changed_shown.borrow_mut().insert(key) {
+                    if !outside.is_empty() && first_time(&self.changed_shown, key) {
                         self.warn(self.changed_outside(&key, &outside));
                     }
                 },
@@ -625,16 +702,17 @@ impl Output<'_> {
                 | NotCachedReason::UnknownSystemCalls { .. } => {},
             }
         }
-        for calls in self.engine.unknown_system_calls() {
-            if self.unknown_shown.borrow_mut().insert(calls.key) {
+        for calls in self.engine.unknown_system_calls()? {
+            if first_time(&self.unknown_shown, calls.key) {
                 self.warn(self.unknown_calls(&calls));
             }
         }
-        for made in self.engine.connections() {
-            if self.connections_shown.borrow_mut().insert(made.key) {
+        for made in self.engine.connections()? {
+            if first_time(&self.connections_shown, made.key) {
                 self.warn(self.connected(&made));
             }
         }
+        Ok(())
     }
 
     /// The command of the step `key` as warnings name it: its arguments and its
@@ -775,7 +853,30 @@ impl Output<'_> {
         message: String,
     ) {
         ui::print_warning(&message);
-        self.warnings.borrow_mut().push(message);
+        update(&self.warnings, |warnings| warnings.push(message));
+    }
+
+    /// Print, once, the error of engine state that stayed locked, so the build's
+    /// warnings cannot be read, and keep it, so the build exits with
+    /// [`USAGE_ERROR`] at the end instead of success; return whether this call
+    /// printed it, which only the first error of a build does.
+    fn unreadable(
+        &self,
+        error: &LockError,
+    ) -> bool {
+        update(&self.unreadable, |unreadable| {
+            if unreadable.is_some() {
+                return false;
+            }
+            ui::print_error(&format!("cannot read the build's warnings: {error}"));
+            *unreadable = Some(error.clone());
+            true
+        })
+    }
+
+    /// Whether engine state stayed locked at some check, so warnings may be missing.
+    fn had_unreadable(&self) -> bool {
+        update(&self.unreadable, |unreadable| unreadable.is_some())
     }
 
     /// Print the unchecked exits that stand, then how the build ended and its
@@ -835,7 +936,11 @@ impl Output<'_> {
             "{verdict}: {tasks}{failed}, {passes}; {} ran, {cached} cached",
             ui::count(ran, "command")
         ));
-        status
+        if self.had_unreadable() {
+            worse(status)
+        } else {
+            status
+        }
     }
 
     /// Print why a build that reached its pass limit `limit` did not settle: the
@@ -910,28 +1015,97 @@ fn command_counts(report: &BuildReport) -> (usize, usize) {
     (ran, reached.difference(&ran_steps).count())
 }
 
-/// Unit tests for counting the commands of a build and for the line at the start
-/// of a pass.
+/// Unit tests for counting the commands of a build, for the line at the start of a
+/// pass, for the thread that handles Ctrl-C, and for the cells of the output.
 #[cfg(test)]
 #[allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: a plain std thread bounds how long a test waits"
+    reason = "test code: a plain std thread bounds how long a test waits, and the tests \
+              assert"
 )]
 mod tests {
     use std::{
+        cell::Cell,
+        collections::BTreeSet,
         panic::{self, AssertUnwindSafe},
+        path::PathBuf,
         sync::mpsc,
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use kizz_core::{BuildOutcome, BuildReport, Pass, StepDecision, TaskInfo, TaskResult};
-    use kizz_store::{Explanation, Reason, Verdict};
-    use kizz_threads::testing::{Failure, fail_starts_named};
-    use kizz_trace::{AbsolutePath, Cancellation};
-    use signal_hook::{consts::SIGUSR2, iterator::Signals};
+    use kizz_core::{
+        BuildEvents as _, BuildOutcome, BuildReport, Engine, Pass, Render, StepDecision, TaskInfo,
+        TaskResult, WorkerPool,
+    };
+    use kizz_store::{Explanation, Reason, Store, Verdict};
+    use kizz_threads::{
+        LOCK_PATIENCE,
+        testing::{Failure, fail_starts_named},
+    };
+    use kizz_trace::{AbsolutePath, Cancellation, StdioEcho};
+    use kizz_trace_linux::LinuxTracer;
+    use signal_hook::{
+        consts::{SIGKILL, SIGSEGV, SIGUSR1, SIGUSR2},
+        iterator::Signals,
+        low_level,
+    };
 
-    use super::{command_counts, pass_line, with_interrupts};
+    use super::{
+        EngineOptions, Options, Output, SIGNAL_LIMIT, USAGE_ERROR, command_counts, first_time,
+        interrupt_signals, pass_line, update, with_interrupts,
+    };
+
+    /// A signal that `signal_hook` would panic on is an error before any
+    /// registration: a forbidden signal, zero, a negative number, and a number at
+    /// its limit; an ordinary signal gives a delivery.
+    #[test]
+    fn a_signal_that_would_panic_is_refused_with_an_error() {
+        for signal in [SIGKILL, SIGSEGV, 0, -1, SIGNAL_LIMIT] {
+            let error = interrupt_signals(signal).unwrap_err();
+            assert_eq!(error, format!("signal {signal} cannot be handled"));
+        }
+        assert!(interrupt_signals(SIGUSR2).is_ok());
+    }
+
+    /// A signal that arrives while the build runs cancels it: the thread that
+    /// handles Ctrl-C looks for signals with `Signals::pending`, which cannot panic.
+    #[test]
+    fn a_signal_during_the_build_cancels_it() {
+        let signals = interrupt_signals(SIGUSR1).unwrap();
+        let cancel = Cancellation::new();
+        let seen = with_interrupts(signals, &cancel, || {
+            low_level::raise(SIGUSR1).unwrap();
+            let deadline = Instant::now().checked_add(PATIENCE).unwrap();
+            while !cancel.is_cancelled() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            cancel.is_cancelled()
+        })
+        .unwrap();
+        assert!(seen, "the signal did not cancel the build");
+    }
+
+    /// A change through a cell stays in it and returns its result, and a key is
+    /// new only the first time.
+    #[test]
+    fn cells_change_in_place_without_a_borrow() {
+        let cell = Cell::new(vec![1]);
+        assert_eq!(
+            update(&cell, |values| {
+                values.push(2);
+                values.len()
+            }),
+            2
+        );
+        assert_eq!(cell.take(), [1, 2]);
+        let seen = Cell::new(BTreeSet::new());
+        assert!(first_time(&seen, "a"));
+        assert!(!first_time(&seen, "a"));
+        assert!(first_time(&seen, "b"));
+        assert_eq!(seen.take(), BTreeSet::from(["a", "b"]));
+    }
 
     /// A task run whose steps have the verdicts `verdicts`, ran when `true`.
     fn result(verdicts: &[bool]) -> TaskResult {
@@ -1071,6 +1245,101 @@ mod tests {
                 "could not start the thread that handles Ctrl-C after 11 attempts in 22.3 seconds"
             ),
             "{error}"
+        );
+    }
+
+    /// The short patience of the engine in the tests, in place of
+    /// [`LOCK_PATIENCE`], so state that stays locked fails at once.
+    const TEST_PATIENCE: Duration = Duration::from_millis(50);
+
+    /// The output of a build of `engine`, which prints only the commands that run.
+    fn output<'a>(
+        engine: &'a Engine<'a>,
+        store: &'a Store,
+    ) -> Output<'a> {
+        Output {
+            render: Render {
+                base: PathBuf::from("/w"),
+                home: None,
+                verbose: false,
+            },
+            options: Options {
+                explain: false,
+                verbose: false,
+                engine: EngineOptions {
+                    cache_unknown_syscalls: false,
+                    fail_unchecked: false,
+                },
+            },
+            engine,
+            store,
+            seen: Cell::new(BTreeSet::new()),
+            pass_ran: Cell::new(false),
+            pass_changed: Cell::new(false),
+            repeated_shown: Cell::new(0),
+            incomplete_shown: Cell::new(BTreeSet::new()),
+            changed_shown: Cell::new(BTreeSet::new()),
+            unknown_shown: Cell::new(BTreeSet::new()),
+            connections_shown: Cell::new(BTreeSet::new()),
+            warnings: Cell::new(Vec::new()),
+            unreadable: Cell::new(None),
+        }
+    }
+
+    /// When the engine's state stays locked as a finished task's warnings are
+    /// read, the reading is an error that names the state; the build prints it
+    /// once, keeps the first error, and exits with [`USAGE_ERROR`] instead of
+    /// success. A build whose warnings were read exits with 0. The engine waits
+    /// only the tests' short patience, so the test takes a fraction of a second.
+    #[test]
+    fn warnings_that_stay_locked_are_printed_once_and_fail_the_build() {
+        let started = Instant::now();
+        let cache = tempfile::tempdir().unwrap();
+        let store = Store::open(cache.path()).unwrap();
+        let pool = WorkerPool::new().unwrap();
+        let tracer = LinuxTracer::new();
+        let engine = Engine::new(
+            &tracer,
+            &store,
+            &StdioEcho,
+            Cancellation::new(),
+            None,
+            &pool,
+        )
+        .with_lock_patience(TEST_PATIENCE);
+        let report = BuildReport {
+            order: Vec::new(),
+            passes: Vec::new(),
+            outcome: BuildOutcome::Succeeded,
+        };
+
+        let readable = output(&engine, &store);
+        readable.task_finished(1, &result(&[]));
+        assert!(!readable.had_unreadable());
+        assert_eq!(readable.finish(&report), 0);
+
+        let locked = output(&engine, &store);
+        let held = engine.hold_warnings().unwrap();
+        let error = locked.check_warnings().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("could not lock the build's warnings for repeated reasons"),
+            "{error}"
+        );
+        assert!(locked.unreadable(&error), "the first error was not printed");
+        assert!(!locked.unreadable(&error), "the error was printed again");
+        // A task that finishes while the state is still locked meets the error
+        // again, which is neither printed nor kept.
+        locked.task_finished(1, &result(&[]));
+        drop(held);
+        assert!(locked.had_unreadable());
+        assert_eq!(locked.finish(&report), USAGE_ERROR);
+        assert_eq!(locked.unreadable.take(), Some(error));
+        assert!(
+            started.elapsed() < LOCK_PATIENCE,
+            "the test waited {:?}",
+            started.elapsed()
         );
     }
 }

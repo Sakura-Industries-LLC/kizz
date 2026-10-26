@@ -134,6 +134,11 @@ pub struct Selected<'tasks> {
 
 /// Unit tests for target names, expressions, and selection.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::path::PathBuf;
 

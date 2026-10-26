@@ -16,6 +16,14 @@
 //! that the step ran its program, and its machine query answers with the state that
 //! the test scripts, which it can change between builds.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::BTreeSet,
     error::Error,

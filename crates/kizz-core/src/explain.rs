@@ -512,6 +512,11 @@ pub fn carried_from(
 
 /// Unit tests for the comparison of specifications and the carried inputs.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use kizz_store::{Capture, Change, Explanation};
 

@@ -95,6 +95,11 @@ impl WorkerPool {
 
 /// Unit tests of building the pool, with the failures of `kizz_threads::testing`.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use kizz_threads::testing::{Failure, fail_starts};
     use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};

@@ -25,9 +25,6 @@ pub const TASK_FAILED: u8 = 1;
 /// The exit status of a build interrupted with Ctrl-C.
 pub const INTERRUPTED: u8 = 130;
 
-/// The width that parse errors and help are wrapped to.
-const MESSAGE_WIDTH: usize = 100;
-
 /// The error `kizz build --parallel` prints.
 pub const PARALLEL_NOT_IMPLEMENTED: &str = "parallel execution is not implemented yet; \
                                             `kizz build` runs one task at a time with \
@@ -124,14 +121,16 @@ fn stub(
 /// status.
 ///
 /// Help and version requests exit with status 0, and every command-line error
-/// exits with [`USAGE_ERROR`].
+/// exits with [`USAGE_ERROR`]. Their message is written through the `ui` module,
+/// which drops a write that fails, such as one to a closed pipe, where `bpaf`'s
+/// `ParseFailure::print_message` would panic in the `print!` macros.
 #[must_use]
 pub fn run() -> ExitCode {
     match cli().run_inner(Args::current_args()) {
         Ok(parsed) => parsed.exec(),
         Err(failure) => {
             let status = parse_failure_status(&failure);
-            failure.print_message(MESSAGE_WIDTH);
+            ui::print_parse_failure(&failure);
             ExitCode::from(status)
         },
     }
@@ -297,6 +296,11 @@ impl FromStr for ColorMode {
 
 /// Unit tests for command-line parsing.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::path::PathBuf;
 

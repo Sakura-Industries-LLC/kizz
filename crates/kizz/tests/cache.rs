@@ -17,8 +17,12 @@
 //! the answer on the other side.
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: a plain std thread reads the pseudo-terminal"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: a plain std thread reads the pseudo-terminal, and the tests assert, \
+              lock and print"
 )]
 
 use std::{

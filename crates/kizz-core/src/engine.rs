@@ -104,16 +104,25 @@
 //! after a build, every task that stores a step position for a key owns the record
 //! under that key. A path reset and `kizz cache clean` use the owners (see
 //! [`cleanup`](crate::cleanup)).
+//!
+//! Shared state ("Kizz never panics"): the engine's state that the threads of a
+//! build share is locked with `kizz_threads::lock_within`, never with
+//! `Mutex::lock`, which may panic when the calling thread holds the lock; a lock
+//! that stays held for the engine's lock patience, `kizz_threads::LOCK_PATIENCE`
+//! unless [`Engine::with_lock_patience`] sets another, is an error of the step, or
+//! of the call that reads the state. The state of one task run lives in `Cell`s
+//! that the private `cells` module changes, never in a `RefCell`, whose borrows
+//! panic while the cell is borrowed.
 
 use std::{
-    cell::RefCell,
+    cell::Cell,
     collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fmt, mem,
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        Mutex, MutexGuard, PoisonError,
+        Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -127,12 +136,14 @@ use kizz_store::{
     StepSpecRecord, Store, StoreError, TaskId, TaskRecord, Txn, Verdict, WrittenBy,
     machine_changes,
 };
+use kizz_threads::{LOCK_PATIENCE, LockError};
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
     FirstReads, MachineState, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 
 use crate::{
+    cells,
     check::{Checked, check},
     explain::{
         Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
@@ -247,6 +258,10 @@ pub struct Engine<'a> {
     /// step key and build, so a step that names a part that changes all the time,
     /// such as `memory`, runs at most once per build, and the build still settles.
     machine_compared: Mutex<HashSet<StepKey>>,
+    /// How long a lock of the shared state above may stay held by another holder
+    /// before the step or the reader that waits for it fails: [`LOCK_PATIENCE`]
+    /// unless [`Engine::with_lock_patience`] sets another.
+    lock_patience: Duration,
 }
 
 impl fmt::Debug for Engine<'_> {
@@ -270,13 +285,47 @@ impl fmt::Debug for Engine<'_> {
             .field("connections", &self.connections)
             .field("fail_unchecked", &self.fail_unchecked)
             .field("machine_compared", &self.machine_compared)
+            .field("lock_patience", &self.lock_patience)
             .finish_non_exhaustive()
     }
 }
 
-/// Lock `mutex`, whether or not a thread panicked while holding it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+/// What the engine's field `always_ran` holds, as a [`LockError`] names it.
+const ALWAYS_RAN: &str = "the results of the build's `always` steps";
+
+/// What the engine's field `not_cached` holds, as a [`LockError`] names it.
+const NOT_CACHED: &str = "the build's results that were not cached";
+
+/// What the engine's field `warnings` holds, as a [`LockError`] names it.
+const WARNINGS: &str = "the build's warnings for repeated reasons";
+
+/// What the engine's field `unknown_calls` holds, as a [`LockError`] names it.
+const UNKNOWN_CALLS: &str = "the build's runs that made unknown system calls";
+
+/// What the engine's field `connections` holds, as a [`LockError`] names it.
+const CONNECTIONS: &str = "the build's runs that made connections";
+
+/// What the engine's field `machine_compared` holds, as a [`LockError`] names it.
+const MACHINE_COMPARED: &str = "the build's compared machine states";
+
+/// Lock `mutex`, which guards `what`, whether or not a thread panicked while
+/// holding it, with `kizz_threads::lock_within`, which never panics, waiting at
+/// most `patience` while another holder keeps it.
+fn lock<'m, T>(
+    mutex: &'m Mutex<T>,
+    what: &'static str,
+    patience: Duration,
+) -> Result<MutexGuard<'m, T>, LockError> {
+    kizz_threads::lock_within(mutex, what, patience)
+}
+
+/// [`lock`], with a lock that stays held as the error of the step.
+fn step_lock<'m, T>(
+    mutex: &'m Mutex<T>,
+    what: &'static str,
+    patience: Duration,
+) -> Result<MutexGuard<'m, T>, StepError> {
+    lock(mutex, what, patience).map_err(StepError::new)
 }
 
 impl<'a> Engine<'a> {
@@ -309,7 +358,34 @@ impl<'a> Engine<'a> {
             connections: Mutex::new(Vec::new()),
             fail_unchecked: false,
             machine_compared: Mutex::new(HashSet::new()),
+            lock_patience: LOCK_PATIENCE,
         }
+    }
+
+    /// The engine, whose readers and steps wait at most `patience` for its shared
+    /// state while another holder keeps it locked, and then fail with a
+    /// [`LockError`] or a step error, instead of [`LOCK_PATIENCE`]. Tests use a
+    /// short patience to reach those errors without waiting for the default.
+    #[must_use]
+    pub const fn with_lock_patience(
+        mut self,
+        patience: Duration,
+    ) -> Self {
+        self.lock_patience = patience;
+        self
+    }
+
+    /// Hold the build's warnings for repeated reasons locked until the returned
+    /// guard is dropped, so a test of a caller can reach what a reader does when
+    /// the engine's state stays locked; only builds with debug assertions, such as
+    /// tests, have it.
+    ///
+    /// # Errors
+    ///
+    /// A [`LockError`] when the warnings stay locked for the engine's patience.
+    #[cfg(debug_assertions)]
+    pub fn hold_warnings(&self) -> Result<impl Sized + '_, LockError> {
+        lock(&self.warnings, WARNINGS, self.lock_patience)
     }
 
     /// The engine, which caches the result of a run that made system calls that
@@ -335,17 +411,23 @@ impl<'a> Engine<'a> {
 
     /// The runs of the build that made system calls that the tracer does not know,
     /// in the order they ended, each with whether its result was cached.
-    #[must_use]
-    pub fn unknown_system_calls(&self) -> Vec<UnknownCalls> {
-        lock(&self.unknown_calls).clone()
+    ///
+    /// # Errors
+    ///
+    /// A [`LockError`] when the runs stay locked.
+    pub fn unknown_system_calls(&self) -> Result<Vec<UnknownCalls>, LockError> {
+        Ok(lock(&self.unknown_calls, UNKNOWN_CALLS, self.lock_patience)?.clone())
     }
 
     /// The runs of the build that connected to IPv4 or IPv6 addresses or to Unix
     /// sockets, in the order they ended, each with its connections and whether its
     /// result was cached. A cache hit is no run, so it adds nothing.
-    #[must_use]
-    pub fn connections(&self) -> Vec<StepConnections> {
-        lock(&self.connections).clone()
+    ///
+    /// # Errors
+    ///
+    /// A [`LockError`] when the runs stay locked.
+    pub fn connections(&self) -> Result<Vec<StepConnections>, LockError> {
+        Ok(lock(&self.connections, CONNECTIONS, self.lock_patience)?.clone())
     }
 
     /// The engine, which makes a task run that leaves a step unchecked fail when
@@ -387,17 +469,20 @@ impl<'a> Engine<'a> {
 
     /// The warnings for steps that re-ran in consecutive builds for the same
     /// self-inflicted reason, in the order they ran, one per step.
-    #[must_use]
-    pub fn warnings(&self) -> Vec<RepeatedWarning> {
-        lock(&self.warnings).clone()
+    ///
+    /// # Errors
+    ///
+    /// A [`LockError`] when the warnings stay locked.
+    pub fn warnings(&self) -> Result<Vec<RepeatedWarning>, LockError> {
+        Ok(lock(&self.warnings, WARNINGS, self.lock_patience)?.clone())
     }
 
     /// Keep `warning`, unless the same step already has one in this build.
     fn warn(
         &self,
         warning: RepeatedWarning,
-    ) {
-        let mut warnings = lock(&self.warnings);
+    ) -> Result<(), StepError> {
+        let mut warnings = step_lock(&self.warnings, WARNINGS, self.lock_patience)?;
         let known = warnings.iter().any(|known| {
             known.task.as_ref().map(|task| &task.task)
                 == warning.task.as_ref().map(|task| &task.task)
@@ -407,6 +492,7 @@ impl<'a> Engine<'a> {
         if !known {
             warnings.push(warning);
         }
+        Ok(())
     }
 
     /// The number of files whose content this engine has hashed, to record steps
@@ -465,14 +551,17 @@ impl<'a> Engine<'a> {
 
     /// The steps of the build whose last result was not cached, with why, sorted by
     /// step key.
-    #[must_use]
-    pub fn not_cached(&self) -> Vec<(StepKey, NotCachedReason)> {
-        let mut steps: Vec<_> = lock(&self.not_cached)
+    ///
+    /// # Errors
+    ///
+    /// A [`LockError`] when the results stay locked.
+    pub fn not_cached(&self) -> Result<Vec<(StepKey, NotCachedReason)>, LockError> {
+        let mut steps: Vec<_> = lock(&self.not_cached, NOT_CACHED, self.lock_patience)?
             .iter()
             .map(|(key, run)| (*key, run.why.clone()))
             .collect();
         steps.sort_by_key(|(key, _)| *key);
-        steps
+        Ok(steps)
     }
 
     /// The step executor of one run of a task program whose hash is `program` and
@@ -491,10 +580,10 @@ impl<'a> Engine<'a> {
             program,
             task_dir,
             identity: None,
-            occurrences: RefCell::new(Occurrences::new()),
-            keys: RefCell::new(Vec::new()),
-            decisions: RefCell::new(Vec::new()),
-            cached_positions: RefCell::new(Vec::new()),
+            occurrences: Cell::new(Occurrences::new()),
+            keys: Cell::new(Vec::new()),
+            decisions: Cell::new(Vec::new()),
+            cached_positions: Cell::new(Vec::new()),
         }
     }
 
@@ -512,10 +601,10 @@ impl<'a> Engine<'a> {
             program: identity.program,
             task_dir: identity.dir.clone(),
             identity: Some(identity),
-            occurrences: RefCell::new(Occurrences::new()),
-            keys: RefCell::new(Vec::new()),
-            decisions: RefCell::new(Vec::new()),
-            cached_positions: RefCell::new(Vec::new()),
+            occurrences: Cell::new(Occurrences::new()),
+            keys: Cell::new(Vec::new()),
+            decisions: Cell::new(Vec::new()),
+            cached_positions: Cell::new(Vec::new()),
         }
     }
 
@@ -524,9 +613,9 @@ impl<'a> Engine<'a> {
     fn first_always_result(
         &self,
         key: StepKey,
-    ) -> Option<Result<StepOutcome, StepError>> {
-        let mut ran = lock(&self.always_ran);
-        match ran.get(&key) {
+    ) -> Result<Option<Result<StepOutcome, StepError>>, StepError> {
+        let mut ran = step_lock(&self.always_ran, ALWAYS_RAN, self.lock_patience)?;
+        Ok(match ran.get(&key) {
             Some(Some(result)) => Some(result.clone()),
             Some(None) => {
                 Some(Err(StepError::new(
@@ -537,7 +626,7 @@ impl<'a> Engine<'a> {
                 ran.insert(key, None);
                 None
             },
-        }
+        })
     }
 
     /// Keep `result`, the result of the one run of the `always` step `key` in this
@@ -546,19 +635,19 @@ impl<'a> Engine<'a> {
         &self,
         key: StepKey,
         result: &Result<StepOutcome, StepError>,
-    ) {
+    ) -> Result<(), StepError> {
         let result = result.clone().map(|outcome| {
             StepOutcome {
                 cached: true,
                 ..outcome
             }
         });
-        lock(&self.always_ran).insert(key, Some(result));
+        step_lock(&self.always_ran, ALWAYS_RAN, self.lock_patience)?.insert(key, Some(result));
+        Ok(())
     }
 }
 
 /// The step executor of one run of a task program.
-#[derive(Debug)]
 pub struct TaskSteps<'a> {
     /// The engine.
     engine: &'a Engine<'a>,
@@ -570,14 +659,30 @@ pub struct TaskSteps<'a> {
     /// task record.
     identity: Option<TaskIdentity>,
     /// Counts identical commands in the run.
-    occurrences: RefCell<Occurrences>,
+    occurrences: Cell<Occurrences>,
     /// The key of each step of the run, in order.
-    keys: RefCell<Vec<StepKey>>,
+    keys: Cell<Vec<StepKey>>,
     /// What the build decided about each step of the run, in order.
-    decisions: RefCell<Vec<StepDecision>>,
+    decisions: Cell<Vec<StepDecision>>,
     /// The step positions of the cached steps, stored by [`TaskSteps::finish`],
     /// which also makes the task an owner of the record each of them names.
-    cached_positions: RefCell<Vec<(PositionKey, StepPosition)>>,
+    cached_positions: Cell<Vec<(PositionKey, StepPosition)>>,
+}
+
+impl fmt::Debug for TaskSteps<'_> {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.debug_struct("TaskSteps")
+            .field("engine", &self.engine)
+            .field("program", &self.program)
+            .field("task_dir", &self.task_dir)
+            .field("identity", &self.identity)
+            .field("keys", &cells::cloned(&self.keys))
+            .field("decisions", &cells::cloned(&self.decisions))
+            .finish_non_exhaustive()
+    }
 }
 
 /// What is known about a step before it runs.
@@ -864,14 +969,14 @@ impl TaskSteps<'_> {
     /// The key of each step so far, in order.
     #[must_use]
     pub fn keys(&self) -> Vec<StepKey> {
-        self.keys.borrow().clone()
+        cells::cloned(&self.keys)
     }
 
     /// What the build decided about each step so far, in order: why each one ran,
     /// or that it was cached.
     #[must_use]
     pub fn decisions(&self) -> Vec<StepDecision> {
-        self.decisions.borrow().clone()
+        cells::cloned(&self.decisions)
     }
 
     /// End the run of the task: store the step positions of its cached steps, add
@@ -896,7 +1001,7 @@ impl TaskSteps<'_> {
         let Some(identity) = &self.identity else {
             return Ok(());
         };
-        let steps = u32::try_from(self.keys.borrow().len()).unwrap_or(u32::MAX);
+        let steps = u32::try_from(cells::update(&self.keys, |keys| keys.len())).unwrap_or(u32::MAX);
         let mut txn = self.engine.store.write()?;
         for (key, position) in self.cached_positions.take() {
             if let Some(mut record) = txn.get::<StepRecord>(&position.step)?
@@ -956,7 +1061,12 @@ impl TaskSteps<'_> {
             txn.commit()
         };
         write(record).map_err(|error| store_error(&error))?;
-        lock(&self.engine.not_cached).remove(key);
+        step_lock(
+            &self.engine.not_cached,
+            NOT_CACHED,
+            self.engine.lock_patience,
+        )?
+        .remove(key);
         Ok(())
     }
 
@@ -1013,7 +1123,12 @@ impl TaskSteps<'_> {
             txn.commit()
         };
         write(record).map_err(|error| store_error(&error))?;
-        lock(&self.engine.not_cached).remove(&pending.key);
+        step_lock(
+            &self.engine.not_cached,
+            NOT_CACHED,
+            self.engine.lock_patience,
+        )?
+        .remove(&pending.key);
         Ok(())
     }
 
@@ -1023,10 +1138,16 @@ impl TaskSteps<'_> {
         key: StepKey,
         step: &StepSpec,
     ) -> Result<Decision, StepError> {
-        let remembered = lock(&self.engine.not_cached).get(&key).cloned();
+        let remembered = step_lock(
+            &self.engine.not_cached,
+            NOT_CACHED,
+            self.engine.lock_patience,
+        )?
+        .get(&key)
+        .cloned();
         if step.always {
             let known = remembered.is_some() || self.record(&key)?.is_some();
-            if let Some(first) = self.engine.first_always_result(key) {
+            if let Some(first) = self.engine.first_always_result(key)? {
                 return Ok(Decision::Replay(first));
             }
             let reason = if known {
@@ -1081,7 +1202,7 @@ impl TaskSteps<'_> {
                 )),
             ));
         }
-        let machine = self.changed_machine(key, &record);
+        let machine = self.changed_machine(key, &record)?;
         Ok(if checked.is_hit() && machine.is_empty() {
             Decision::Hit {
                 record: Box::new(record),
@@ -1113,13 +1234,20 @@ impl TaskSteps<'_> {
         &self,
         key: StepKey,
         record: &StepRecord,
-    ) -> Vec<MachineChange> {
+    ) -> Result<Vec<MachineChange>, StepError> {
         let parts = MachinePart::parts(&record.spec.machine);
-        if parts.is_empty() || !lock(&self.engine.machine_compared).insert(key) {
-            return Vec::new();
+        if parts.is_empty()
+            || !step_lock(
+                &self.engine.machine_compared,
+                MACHINE_COMPARED,
+                self.engine.lock_patience,
+            )?
+            .insert(key)
+        {
+            return Ok(Vec::new());
         }
         let current = machine_record(&self.engine.tracer.machine_state(&record.spec.cwd));
-        machine_changes(&parts, &record.machine, &current)
+        Ok(machine_changes(&parts, &record.machine, &current))
     }
 
     /// The step-position record of the step at `position`, before this decision.
@@ -1243,11 +1371,12 @@ impl TaskSteps<'_> {
         key: StepKey,
         step: &StepSpec,
     ) -> Result<(), StepError> {
-        self.decisions.borrow_mut().push(StepDecision {
+        let decision = StepDecision {
             position,
             command: step.command(),
             verdict: Verdict::Cached,
-        });
+        };
+        cells::update(&self.decisions, |decisions| decisions.push(decision));
         let Some(identity) = &self.identity else {
             return Ok(());
         };
@@ -1270,13 +1399,14 @@ impl TaskSteps<'_> {
             verdict: Verdict::Cached,
             carried: carried_from(previous.as_ref(), self.engine.build),
         };
-        self.cached_positions.borrow_mut().push((
+        let cached = (
             PositionKey {
                 task: identity.id.clone(),
                 position,
             },
             stored,
-        ));
+        );
+        cells::update(&self.cached_positions, |positions| positions.push(cached));
         Ok(())
     }
 
@@ -1286,7 +1416,7 @@ impl TaskSteps<'_> {
         &self,
         step: &StepSpec,
         pending: &Pending,
-    ) {
+    ) -> Result<(), StepError> {
         let command = step.command();
         if !pending.explanation.repeated.is_empty() {
             self.engine.warn(RepeatedWarning {
@@ -1294,13 +1424,15 @@ impl TaskSteps<'_> {
                 position: pending.position,
                 command: command.clone(),
                 paths: pending.explanation.repeated.clone(),
-            });
+            })?;
         }
-        self.decisions.borrow_mut().push(StepDecision {
+        let decision = StepDecision {
             position: pending.position,
             command,
             verdict: Verdict::Ran(pending.explanation.clone()),
-        });
+        };
+        cells::update(&self.decisions, |decisions| decisions.push(decision));
+        Ok(())
     }
 
     /// Return the result of the cache hit on `record`, stored under `key`, after
@@ -1487,14 +1619,24 @@ impl TaskSteps<'_> {
             (!files.is_empty()).then_some(NotCachedReason::ChangedAfterRead { files })
         });
         if !record.unknown_system_calls.is_empty() {
-            lock(&self.engine.unknown_calls).push(UnknownCalls {
+            step_lock(
+                &self.engine.unknown_calls,
+                UNKNOWN_CALLS,
+                self.engine.lock_patience,
+            )?
+            .push(UnknownCalls {
                 key: pending.key,
                 numbers: record.unknown_system_calls.clone(),
                 cached: why.is_none(),
             });
         }
         if !record.connections.is_empty() {
-            lock(&self.engine.connections).push(StepConnections {
+            step_lock(
+                &self.engine.connections,
+                CONNECTIONS,
+                self.engine.lock_patience,
+            )?
+            .push(StepConnections {
                 key: pending.key,
                 connections: record.connections.clone(),
                 cached: why.is_none(),
@@ -1511,7 +1653,12 @@ impl TaskSteps<'_> {
                 ..outcome
             }
         });
-        lock(&self.engine.not_cached).insert(pending.key, NotCachedRun {
+        step_lock(
+            &self.engine.not_cached,
+            NOT_CACHED,
+            self.engine.lock_patience,
+        )?
+        .insert(pending.key, NotCachedRun {
             why,
             observations: record.observations,
             recorded_at_nanos: record.recorded_at_nanos,
@@ -1611,7 +1758,12 @@ impl TaskSteps<'_> {
         pending: &Pending,
     ) -> Result<StepOutcome, StepError> {
         let lookup = find_program(name, &step.env, &step.cwd).map_err(StepError::new)?;
-        lock(&self.engine.machine_compared).insert(pending.key);
+        step_lock(
+            &self.engine.machine_compared,
+            MACHINE_COMPARED,
+            self.engine.lock_patience,
+        )?
+        .insert(pending.key);
         let machine = machine_record(&self.engine.tracer.machine_state(step.cwd.as_path()));
         let exit = match lookup {
             ProgramLookup::Found { program, checked } => {
@@ -1646,13 +1798,13 @@ impl StepExecutor for TaskSteps<'_> {
         let Some(name) = step.argv.first() else {
             return Err(StepError::new("run() needs a program"));
         };
-        let position = u32::try_from(self.keys.borrow().len()).unwrap_or(u32::MAX);
-        let (key, occurrence) = self
-            .occurrences
-            .borrow_mut()
-            .next_key(self.program, step)
-            .map_err(StepError::new)?;
-        self.keys.borrow_mut().push(key);
+        let position =
+            u32::try_from(cells::update(&self.keys, |keys| keys.len())).unwrap_or(u32::MAX);
+        let (key, occurrence) = cells::update(&self.occurrences, |occurrences| {
+            occurrences.next_key(self.program, step)
+        })
+        .map_err(StepError::new)?;
+        cells::update(&self.keys, |keys| keys.push(key));
         let ignore = self.patterns(&step.ignore)?;
         let track = self.patterns(&step.track)?;
         let (reason, baseline) = match self.decide(key, step)? {
@@ -1685,11 +1837,62 @@ impl StepExecutor for TaskSteps<'_> {
             explanation,
             carried,
         };
-        self.note_ran(step, &pending);
+        self.note_ran(step, &pending)?;
         let result = self.look_up_and_run(step, name, &pending);
         if step.always {
-            self.engine.finish_always(key, &result);
+            self.engine.finish_always(key, &result)?;
         }
         result
+    }
+}
+
+/// Unit tests of the locks of the engine's shared state.
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
+mod tests {
+    use std::{
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
+
+    use kizz_threads::LOCK_PATIENCE;
+
+    use super::{WARNINGS, lock, step_lock};
+
+    /// The short patience of the tests, in place of the engine's default,
+    /// [`LOCK_PATIENCE`], so a lock that stays held fails at once.
+    const TEST_PATIENCE: Duration = Duration::from_millis(50);
+
+    /// State that stays locked, here by the calling thread itself, where
+    /// `Mutex::lock` may panic, is an error that names the state, for a reader and
+    /// for a step, once the patience has passed; free state locks. The patience is
+    /// the short one of the tests, which the engine's lock path takes as a
+    /// parameter, so the two waits take a fraction of a second, not twice
+    /// [`LOCK_PATIENCE`].
+    #[test]
+    fn state_that_stays_locked_is_an_error_of_the_reader_and_the_step() {
+        let started = Instant::now();
+        let state = Mutex::new(vec![1]);
+        let held = lock(&state, WARNINGS, TEST_PATIENCE).unwrap();
+        let read = lock(&state, WARNINGS, TEST_PATIENCE).unwrap_err();
+        assert_eq!(read.what(), WARNINGS);
+        assert!(read.waited() >= TEST_PATIENCE, "{read:?}");
+        let step = step_lock(&state, WARNINGS, TEST_PATIENCE).unwrap_err();
+        assert!(
+            step.message
+                .starts_with("could not lock the build's warnings for repeated reasons"),
+            "{step}"
+        );
+        drop(held);
+        assert_eq!(*step_lock(&state, WARNINGS, TEST_PATIENCE).unwrap(), [1]);
+        assert!(
+            started.elapsed() < LOCK_PATIENCE,
+            "the test waited {:?}",
+            started.elapsed()
+        );
     }
 }

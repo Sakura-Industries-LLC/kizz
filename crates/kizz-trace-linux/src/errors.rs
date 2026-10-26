@@ -181,6 +181,11 @@ pub(crate) fn name(errno: i64) -> String {
 
 /// Unit tests of the error names.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::collections::BTreeSet;
 

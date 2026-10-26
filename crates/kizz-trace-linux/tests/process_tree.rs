@@ -18,8 +18,12 @@
 //! parent that comes before it, as [`tree_of`] checks.
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: a helper process starts a plain std thread"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: a helper process starts a plain std thread, and the tests assert, \
+              lock and print"
 )]
 
 use std::{

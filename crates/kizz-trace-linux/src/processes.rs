@@ -432,6 +432,11 @@ pub(crate) fn failed_start(
 
 /// Unit tests that replay the events of traced trees without real processes.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::collections::BTreeMap;
 

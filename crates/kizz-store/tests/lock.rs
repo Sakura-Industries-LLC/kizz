@@ -11,8 +11,12 @@
 //! start with [`MARK`], and releases the lock when its standard input closes.
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: a plain std thread reads a helper's output"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: a plain std thread reads a helper's output, and the tests assert, \
+              lock and print"
 )]
 
 use std::{

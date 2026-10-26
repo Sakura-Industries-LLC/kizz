@@ -12,8 +12,12 @@
 //! never started.
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: building the global pool proves that it never started"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: building the global pool proves that it never started, and the \
+              tests assert, lock and print"
 )]
 
 use std::{

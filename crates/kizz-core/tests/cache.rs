@@ -16,6 +16,14 @@
 //! Files that a test does not mean to be racily clean get a modification time an
 //! hour in the past, so the two-second rule does not hash them.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -425,9 +433,9 @@ impl Fixture {
         let built = Built {
             results,
             hashed: engine.files_hashed(),
-            not_cached: engine.not_cached(),
-            unknown: engine.unknown_system_calls(),
-            connections: engine.connections(),
+            not_cached: engine.not_cached()?,
+            unknown: engine.unknown_system_calls()?,
+            connections: engine.connections()?,
         };
         drop(task);
         drop(engine);
@@ -1387,7 +1395,7 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
         let again = engine.task(PROGRAM, fixture.dir()?).execute(&step);
         assert_eq!(tracer.runs(), 1, "{kind}");
         let key = step_key(PROGRAM, &step, 0)?;
-        assert_eq!(engine.not_cached(), [(key, why.clone())], "{kind}");
+        assert_eq!(engine.not_cached()?, [(key, why.clone())], "{kind}");
         let stored = store.read()?.scan::<StepRecord>(b"")?;
         assert_eq!(stored.len(), 1, "{kind}");
         let (stored_key, marker) = stored.first().ok_or("no marker")?;
@@ -1415,7 +1423,7 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
         assert!(!rerun.cached, "{kind}");
         assert_eq!(tracer.runs(), 2, "{kind}");
         let rerun_not_cached: Vec<_> = rerun_why.iter().map(|why| (key, why.clone())).collect();
-        assert_eq!(engine.not_cached(), rerun_not_cached, "{kind}");
+        assert_eq!(engine.not_cached()?, rerun_not_cached, "{kind}");
         drop(engine);
         store.close()?;
         let record = fixture.record(&step)?.ok_or("no record")?;
@@ -1786,7 +1794,7 @@ fn an_always_step_runs_once_per_build_whatever_changes() -> TestResult {
                 assert_eq!(tracer.runs(), build, "{kind}, build {build}, pass {pass}");
             }
             assert_eq!(
-                engine.not_cached().len(),
+                engine.not_cached()?.len(),
                 usize::from(kind == "signal"),
                 "{kind}"
             );

@@ -492,6 +492,7 @@ A process that makes one of them marks the run when it makes the call, whether o
 and `setns` only when it can enter a mount namespace: with that flag, or with no namespace type.
 The result is not cached, and kizz warns loudly and names the call.
 
+Kizz needs Linux 5.4 or later: the tracer collects its first process by descriptor (`pidfd_open` and `waitid` with `P_PIDFD`).
 The tracer knows the native system calls of the x86_64 table of Linux 7.3, numbers 0 through 336 and 424 through 472.
 Those that this section does not name run without a stop,
 so a file-system operation that none of the named calls makes is not recorded.
@@ -913,6 +914,10 @@ The workspace lints forbid code that panics, and `clippy.toml` bans the library 
 * A command's parallel work, hashing included, runs on one worker pool of at most 4 threads, never on a global pool.
 * SurrealKV, built from kizz's patched copy, never panics when a thread cannot start, as [Database](#database) says.
 * Discovery walks on the worker pool, and the store's runtime starts no thread of its own.
+* A write to standard output or standard error that fails, such as one to a closed pipe, is dropped, and kizz goes on.
+  It fails no step, task or command, and it changes no exit status.
+* Every other call that can panic, such as a `RefCell` borrow or `split_at`, uses a form that cannot.
+* The workspace lints and `clippy.toml` ban each kind of call that can panic, so that new code cannot bring one back.
 
 ## Crates and module boundaries
 

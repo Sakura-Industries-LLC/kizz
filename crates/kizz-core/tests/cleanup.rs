@@ -12,6 +12,14 @@
 //! `clean` checks real paths in a temporary directory. The tests of owners that the
 //! engine stores are in `tests/owners.rs`.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::BTreeSet,
     error::Error,

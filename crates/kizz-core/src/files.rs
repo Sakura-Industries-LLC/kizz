@@ -21,6 +21,12 @@
 //! writer. Text is UTF-8: bytes that are not valid UTF-8 are replaced with U+FFFD, as
 //! with command output. JSON is written in a stable form: object keys sorted by their
 //! UTF-8 bytes, `indent` spaces per level, and a trailing newline.
+//!
+//! No operation can panic ("Kizz never panics"): a glob pattern is split at its
+//! first glob component with `slice::get`, never `split_at`, and the indentation of
+//! JSON is built in space reserved with `String::try_reserve_exact`, never with
+//! `str::repeat`, which panics when the length overflows, so an indent too large
+//! for memory is an error of the write.
 
 use std::{
     collections::BTreeSet,
@@ -32,6 +38,7 @@ use std::{
 
 use globset::{GlobBuilder, GlobMatcher};
 use kizz_trace::{AbsolutePath, AccessKind, Accesses};
+use serde::ser::Error as _;
 
 /// A file operation that failed.
 #[derive(Debug, thiserror::Error)]
@@ -436,7 +443,10 @@ impl<'a> Files<'a> {
             .iter()
             .position(|component| component.contains(['*', '?', '[', ']', '{', '}', '\\']))
             .unwrap_or(components.len());
-        let (literal, globbed) = components.split_at(split);
+        // `split` is at most the number of components, and `get` turns an index past
+        // the end into empty parts, where `split_at` would panic.
+        let literal = components.get(..split).unwrap_or_default();
+        let globbed = components.get(split..).unwrap_or_default();
         let joined = literal.join("/");
         let start = if joined.is_empty() && pattern.starts_with('/') {
             "/".to_owned()
@@ -531,14 +541,41 @@ struct GlobSearch {
 ///
 /// # Errors
 ///
-/// Returns [`serde_json::Error`] when a value cannot be written.
+/// Returns [`serde_json::Error`] when a value cannot be written, or when the
+/// indentation of a line cannot be allocated, such as for an indent too large for
+/// memory, where `str::repeat` would panic.
 pub fn stable_json(
     value: &serde_json::Value,
     indent: usize,
 ) -> Result<String, serde_json::Error> {
     let mut text = String::new();
-    write_json_value(&mut text, value, &" ".repeat(indent), 0)?;
+    write_json_value(&mut text, value, &repeated(" ", indent)?, 0)?;
     text.push('\n');
+    Ok(text)
+}
+
+/// `unit` repeated `count` times, or an error when its length cannot be
+/// allocated: the length is reserved first with `String::try_reserve_exact`, which
+/// returns an error where `str::repeat` panics, so the pushes that follow fit.
+///
+/// # Errors
+///
+/// Returns [`serde_json::Error`] when the length overflows or cannot be allocated.
+fn repeated(
+    unit: &str,
+    count: usize,
+) -> Result<String, serde_json::Error> {
+    let mut text = String::new();
+    text.try_reserve_exact(unit.len().saturating_mul(count))
+        .map_err(|error| {
+            serde_json::Error::custom(format_args!(
+                "cannot indent by {count} times {} bytes: {error}",
+                unit.len()
+            ))
+        })?;
+    for _ in 0..count {
+        text.push_str(unit);
+    }
     Ok(text)
 }
 
@@ -555,11 +592,11 @@ fn write_json_value(
             text.push('[');
             for (index, item) in items.iter().enumerate() {
                 text.push_str(if index == 0 { "\n" } else { ",\n" });
-                text.push_str(&indent.repeat(inner));
+                text.push_str(&repeated(indent, inner)?);
                 write_json_value(text, item, indent, inner)?;
             }
             text.push('\n');
-            text.push_str(&indent.repeat(level));
+            text.push_str(&repeated(indent, level)?);
             text.push(']');
         },
         serde_json::Value::Object(map) if !map.is_empty() => {
@@ -568,13 +605,13 @@ fn write_json_value(
             text.push('{');
             for (index, (key, member)) in members.into_iter().enumerate() {
                 text.push_str(if index == 0 { "\n" } else { ",\n" });
-                text.push_str(&indent.repeat(inner));
+                text.push_str(&repeated(indent, inner)?);
                 text.push_str(&serde_json::to_string(key)?);
                 text.push_str(": ");
                 write_json_value(text, member, indent, inner)?;
             }
             text.push('\n');
-            text.push_str(&indent.repeat(level));
+            text.push_str(&repeated(indent, level)?);
             text.push('}');
         },
         other => text.push_str(&serde_json::to_string(other)?),
@@ -584,13 +621,18 @@ fn write_json_value(
 
 /// Unit tests for the file operations.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{fs, io, path::Path};
 
     use kizz_trace::{AbsolutePath, Accesses};
     use serde_json::json;
 
-    use super::{FileChanges, Files, stable_json};
+    use super::{FileChanges, Files, repeated, stable_json};
 
     /// The accesses as `(path relative to root, kinds)` pairs.
     fn shown(
@@ -642,6 +684,31 @@ mod tests {
             "{\n\"k\": [\n1\n]\n}\n"
         );
         assert_eq!(stable_json(&json!("s"), 2).unwrap(), "\"s\"\n");
+    }
+
+    /// An indentation whose length cannot be reserved is an error of the write,
+    /// where `str::repeat` would panic: a count of `usize::MAX` overflows the
+    /// largest length a `String` can reserve, so the reservation fails at once,
+    /// without allocating, for one byte and, through the saturating product, for
+    /// two bytes per level; a length that fits is built in full.
+    #[test]
+    fn an_indentation_that_cannot_be_reserved_is_an_error() {
+        let error = stable_json(&json!({"k": [1]}), usize::MAX).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("cannot indent by {} times 1 bytes: ", usize::MAX)),
+            "{error}"
+        );
+        let error = repeated("  ", usize::MAX).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("cannot indent by {} times 2 bytes: ", usize::MAX)),
+            "{error}"
+        );
+        assert_eq!(repeated("ab ", 2).unwrap(), "ab ab ");
+        assert_eq!(repeated("ab", 0).unwrap(), "");
     }
 
     /// A write creates parent directories and records them, and a write with

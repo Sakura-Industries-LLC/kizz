@@ -14,8 +14,12 @@
 //! processes are children of this process while it checks that none is left.
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: a plain std thread bounds how long a run may take"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: a plain std thread bounds how long a run may take, and the tests \
+              assert, lock and print"
 )]
 
 use std::{

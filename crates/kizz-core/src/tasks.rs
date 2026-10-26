@@ -207,6 +207,11 @@ fn line_of(
 
 /// Unit tests for task-block parsing.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::path::Path;
 

@@ -12,8 +12,12 @@
 //! set in the request's explicit environment.
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: tests and helper processes start plain std threads"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: tests and helper processes start plain std threads, and the tests \
+              assert, lock and print"
 )]
 
 use std::{

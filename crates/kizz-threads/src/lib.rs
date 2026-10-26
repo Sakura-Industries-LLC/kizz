@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The one place where kizz starts threads ("Kizz never panics").
+//! The one place where kizz starts threads, and where it locks the state that
+//! threads share ("Kizz never panics").
 //!
 //! [`spawn`] starts a named thread, and [`spawn_scoped`] starts one in a
 //! [`std::thread::scope`]. Neither panics: where `std::thread::spawn` and
@@ -27,14 +28,123 @@
 //! thread of the process. Those attempts go through the same retries, which then
 //! record each wait instead of sleeping, so tests check the waits exactly and finish
 //! at once. A release build has no such module and cannot fail a start on purpose.
+//!
+//! [`lock`] locks a [`Mutex`] without `Mutex::lock`, which may panic when the
+//! calling thread already holds the lock. It tries the lock with
+//! `Mutex::try_lock`, which cannot panic, and while another holder keeps it,
+//! it yields and then sleeps between tries, for at most [`LOCK_PATIENCE`]; a
+//! lock that stays held that long, such as one that the calling thread holds
+//! itself, is a [`LockError`] that names what the lock guards. A lock that a
+//! panicking thread left behind is taken as it is, as `Mutex::lock` would
+//! return it with its poison.
 
 use std::{
     any::Any,
     fmt, io,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
     thread::{self, Scope, Thread},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// How long [`lock`] waits for a lock that another holder keeps before it gives
+/// up: far longer than kizz holds any lock, which is only for a few operations on
+/// the data that it guards.
+pub const LOCK_PATIENCE: Duration = Duration::from_secs(30);
+
+/// How many times [`lock_within`] yields between tries before it sleeps between
+/// them instead.
+const LOCK_SPINS: u32 = 64;
+
+/// How long [`lock_within`] sleeps between tries after it has yielded
+/// [`LOCK_SPINS`] times.
+const LOCK_POLL: Duration = Duration::from_millis(1);
+
+/// A lock that stayed held for longer than kizz waits for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockError {
+    /// What the lock guards, such as "the build's warnings".
+    what: &'static str,
+    /// How long the tries waited in all.
+    waited: Duration,
+}
+
+impl LockError {
+    /// What the lock guards, such as "the build's warnings".
+    #[must_use]
+    pub const fn what(&self) -> &'static str {
+        self.what
+    }
+
+    /// How long the tries waited in all.
+    #[must_use]
+    pub const fn waited(&self) -> Duration {
+        self.waited
+    }
+}
+
+impl fmt::Display for LockError {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        let tenths = self.waited.as_millis().checked_div(100).unwrap_or_default();
+        write!(
+            f,
+            "could not lock {}: it stayed locked for {}.{} seconds",
+            self.what,
+            tenths.checked_div(10).unwrap_or_default(),
+            tenths.checked_rem(10).unwrap_or_default(),
+        )
+    }
+}
+
+impl std::error::Error for LockError {}
+
+/// Lock `mutex`, which guards `what`, such as "the build's warnings", waiting at
+/// most [`LOCK_PATIENCE`] while another holder keeps it.
+///
+/// # Errors
+///
+/// A [`LockError`] that names `what` when the lock stays held for
+/// [`LOCK_PATIENCE`], such as a lock that the calling thread holds itself.
+pub fn lock<'m, T: ?Sized>(
+    mutex: &'m Mutex<T>,
+    what: &'static str,
+) -> Result<MutexGuard<'m, T>, LockError> {
+    lock_within(mutex, what, LOCK_PATIENCE)
+}
+
+/// Lock `mutex`, which guards `what`, waiting at most `patience` while another
+/// holder keeps it: [`lock`] with a patience of its own, for tests.
+///
+/// # Errors
+///
+/// A [`LockError`] that names `what` when the lock stays held for `patience`.
+pub fn lock_within<'m, T: ?Sized>(
+    mutex: &'m Mutex<T>,
+    what: &'static str,
+    patience: Duration,
+) -> Result<MutexGuard<'m, T>, LockError> {
+    let started = Instant::now();
+    let mut tries: u32 = 0;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {},
+        }
+        let waited = started.elapsed();
+        if waited >= patience {
+            return Err(LockError { what, waited });
+        }
+        if tries < LOCK_SPINS {
+            thread::yield_now();
+        } else {
+            thread::sleep(LOCK_POLL);
+        }
+        tries = tries.saturating_add(1);
+    }
+}
 
 /// The waits before each retry of a start that the system refused for the moment:
 /// they double from 100 milliseconds up to 4 seconds, 22.3 seconds in all, so a
@@ -186,9 +296,11 @@ impl<F> Slot<F> {
         Self(Mutex::new(Some(work)))
     }
 
-    /// The work, the first time it is taken.
+    /// The work, the first time it is taken. Only the thread that started takes
+    /// it, so its lock is never held by another; a lock that stayed held would
+    /// give no work, which [`ran`] turns into an error of the thread.
     fn take(&self) -> Option<F> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+        lock(&self.0, "the work of a thread").ok()?.take()
     }
 }
 
@@ -408,7 +520,7 @@ pub mod testing {
     use std::{
         cell::Cell,
         io,
-        sync::{Arc, Mutex, MutexGuard, PoisonError},
+        sync::{Arc, Mutex, MutexGuard},
         time::Duration,
     };
 
@@ -460,9 +572,11 @@ pub mod testing {
     /// The failures of every thread of the process, if any.
     static PROCESS: Mutex<Option<Shared>> = Mutex::new(None);
 
-    /// Lock `mutex`, whether or not a thread panicked while holding it.
-    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Lock `mutex` with [`super::lock`], whether or not a thread panicked while
+    /// holding it, or `None` when it stays held: then no attempt fails on purpose,
+    /// no wait is recorded, and the counts read as empty.
+    fn lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+        super::lock(mutex, "the failures of thread starts").ok()
     }
 
     /// Put `failures` in place for the calling thread, and return those it had.
@@ -493,9 +607,9 @@ pub mod testing {
     /// The error of the next attempt to start a thread named `name`, when it fails on
     /// purpose, with the failures that it met.
     pub(crate) fn next_failure(name: &str) -> Option<(io::Error, Shared)> {
-        let shared = current().or_else(|| lock(&PROCESS).clone())?;
+        let shared = current().or_else(|| lock(&PROCESS)?.clone())?;
         let failure = {
-            let mut failures = lock(&shared);
+            let mut failures = lock(&shared)?;
             let applies = failures.name.as_deref().is_none_or(|only| only == name);
             if !applies || failures.remaining == 0 {
                 return None;
@@ -511,7 +625,9 @@ pub mod testing {
         failures: &Shared,
         wait: Duration,
     ) {
-        lock(failures).waits.push(wait);
+        if let Some(mut failures) = lock(failures) {
+            failures.waits.push(wait);
+        }
     }
 
     /// Failures that the calling thread, and the threads that it starts through the
@@ -531,13 +647,13 @@ pub mod testing {
         /// retried, in order.
         #[must_use]
         pub fn waits(&self) -> Vec<Duration> {
-            lock(&self.shared).waits.clone()
+            lock(&self.shared).map_or_else(Vec::new, |failures| failures.waits.clone())
         }
 
         /// How many attempts still fail.
         #[must_use]
         pub fn remaining(&self) -> u32 {
-            lock(&self.shared).remaining
+            lock(&self.shared).map_or(0, |failures| failures.remaining)
         }
     }
 
@@ -584,25 +700,30 @@ pub mod testing {
     /// Make the next `count` attempts to start any thread of the process fail with
     /// `EAGAIN`, where the starting thread has no failures of its own.
     pub fn fail_starts_in_process(count: u32) {
-        *lock(&PROCESS) = Some(Arc::new(Mutex::new(Failures {
-            remaining: count,
-            failure: Failure::Busy,
-            name: None,
-            waits: Vec::new(),
-        })));
+        if let Some(mut process) = lock(&PROCESS) {
+            *process = Some(Arc::new(Mutex::new(Failures {
+                remaining: count,
+                failure: Failure::Busy,
+                name: None,
+                waits: Vec::new(),
+            })));
+        }
     }
 }
 
-/// Unit tests of the retries, with the failures of [`testing`].
+/// Unit tests of the retries, with the failures of [`testing`], and of the locks.
 #[cfg(test)]
 #[allow(
     clippy::disallowed_methods,
-    reason = "test code: a plain std thread shows that failures stay with their thread"
+    clippy::disallowed_macros,
+    reason = "test code: a plain std thread shows that failures stay with their thread, \
+              and the tests assert"
 )]
 mod tests {
     use std::{
+        panic,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
@@ -610,9 +731,65 @@ mod tests {
     };
 
     use super::{
-        WAITS, spawn, spawn_scoped,
+        LOCK_PATIENCE, WAITS, lock, lock_within, spawn, spawn_scoped,
         testing::{Failure, fail_starts, fail_starts_named},
     };
+
+    /// A lock that the calling thread already holds is an error that names what
+    /// it guards and how long the tries waited, where `Mutex::lock` may panic; once
+    /// the holder lets it go, it locks again.
+    #[test]
+    fn a_lock_that_stays_held_is_an_error() {
+        let value = Mutex::new(5);
+        let held = lock(&value, "the test value").unwrap();
+        let error = lock_within(&value, "the test value", Duration::from_millis(30)).unwrap_err();
+        assert_eq!(error.what(), "the test value");
+        assert!(error.waited() >= Duration::from_millis(30), "{error:?}");
+        assert!(error.waited() < LOCK_PATIENCE, "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("could not lock the test value: it stayed locked for 0."),
+            "{message}"
+        );
+        assert!(message.ends_with(" seconds"), "{message}");
+        drop(held);
+        assert_eq!(*lock(&value, "the test value").unwrap(), 5);
+    }
+
+    /// A lock that another thread holds for a moment is taken once it lets go.
+    #[test]
+    fn a_lock_that_another_thread_holds_is_taken_when_it_lets_go() {
+        let value = Mutex::new(0_u32);
+        thread::scope(|scope| {
+            let held = lock(&value, "the test value").unwrap();
+            let waiter = scope.spawn(|| {
+                let mut taken = lock(&value, "the test value").unwrap();
+                *taken = taken.saturating_add(1);
+            });
+            thread::sleep(Duration::from_millis(20));
+            drop(held);
+            waiter.join().unwrap();
+        });
+        assert_eq!(*lock(&value, "the test value").unwrap(), 1);
+    }
+
+    /// A lock that a panicking thread left behind is taken as it is. The thread
+    /// unwinds with `resume_unwind`, which poisons the lock without a panic message.
+    #[test]
+    fn a_poisoned_lock_is_taken_as_it_is() {
+        let value = Mutex::new(7);
+        let unwound = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = lock(&value, "the test value").unwrap();
+                    panic::resume_unwind(Box::new("the holder unwinds"));
+                })
+                .join()
+        });
+        assert!(unwound.is_err());
+        assert!(value.is_poisoned());
+        assert_eq!(*lock(&value, "the test value").unwrap(), 7);
+    }
 
     /// How long a test that records its waits may take: far less than the waits.
     const AT_ONCE: Duration = Duration::from_secs(5);

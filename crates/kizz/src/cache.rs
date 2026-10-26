@@ -14,10 +14,14 @@
 //! A reset asks on standard error and reads the answer from standard input, so it
 //! needs both to be a terminal; without one it refuses to run unless `--yes` is
 //! given, which also skips the question.
+//!
+//! Every line goes through the `ui` helpers, which drop a write that fails, such
+//! as one to a closed pipe, where the `print!` macros would panic ("Kizz never
+//! panics"); the command goes on and exits with the status that its work gives.
 
 use std::{
     env,
-    io::{self, BufRead as _, IsTerminal as _, Write as _},
+    io::{self, BufRead as _, IsTerminal as _},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -56,20 +60,22 @@ pub(crate) fn clean() -> ExitCode {
         let store = Store::open(cache).map_err(|error| error.to_string())?;
         let cleaned = clean_cache(&store, &pool).map_err(|error| cannot("clean", &error))?;
         store.close().map_err(|error| error.to_string())?;
-        println!(
+        ui::print_line(&format!(
             "checked {}; {} no longer {}",
             ui::count(cleaned.checked, "recorded path"),
             cleaned.gone,
             if cleaned.gone == 1 { "exists" } else { "exist" }
-        );
+        ));
         if cleaned.removed.is_empty() {
-            println!("nothing to remove: no cache entry is about a file that no longer exists");
+            ui::print_line(
+                "nothing to remove: no cache entry is about a file that no longer exists",
+            );
         } else {
-            println!(
+            ui::print_line(&format!(
                 "removed {}{}",
                 entries(&cleaned.removed),
                 kept(&cleaned.removed, CLEAN_KEEPS)
-            );
+            ));
         }
         Ok(())
     }))
@@ -129,44 +135,44 @@ fn reset_all(
         && differences.is_empty()
         && !missing_identity
     {
-        println!(
+        ui::print_line(&format!(
             "the cache at `{}` is empty; nothing to remove",
             cache.display()
-        );
+        ));
         return Ok(());
     }
-    println!(
+    ui::print_line(&format!(
         "kizz cache reset --all wipes the whole cache at `{}`: {}",
         cache.display(),
         tasks_and_entries(&inventory.entries)
-    );
+    ));
     if let Some(version) = other_version {
-        println!(
+        ui::print_line(&format!(
             "the cache has schema version {version}, and this kizz uses schema version \
              {SCHEMA_VERSION}"
-        );
+        ));
     }
     if !differences.is_empty() {
-        println!(
+        ui::print_line(&format!(
             "the cache belongs to another machine or user: {}",
             identity_differences_text(&differences)
-        );
+        ));
     }
     if missing_identity {
-        println!(
+        ui::print_line(
             "the cache has no cache identity, so kizz cannot tell which machine and user it \
-             belongs to"
+             belongs to",
         );
     }
     if !confirm(yes)? {
-        println!("reset declined; nothing was removed");
+        ui::print_line("reset declined; nothing was removed");
         return Ok(());
     }
     Store::wipe(cache).map_err(|error| cannot("wipe", &error))?;
-    println!(
+    ui::print_line(&format!(
         "wiped the whole cache: removed {}",
         entries(&inventory.entries)
-    );
+    ));
     Ok(())
 }
 
@@ -183,31 +189,37 @@ fn reset_under(
     let plan = plan_reset(&store, dir).map_err(|error| cannot("read", &error))?;
     let counts = plan.counts();
     if counts.is_empty() {
-        println!(
+        ui::print_line(&format!(
             "the cache has no entries for tasks under `{}`; nothing to remove",
             plan.dir().display()
-        );
+        ));
         return store.close().map_err(|error| error.to_string());
     }
-    println!(
+    ui::print_line(&format!(
         "kizz cache reset wipes every entry for the tasks under `{}`: {}{}",
         plan.dir().display(),
         tasks_and_entries(&counts),
         kept(&counts, RESET_KEEPS)
-    );
+    ));
     if !confirm(yes)? {
-        println!("reset declined; nothing was removed");
+        ui::print_line("reset declined; nothing was removed");
         return store.close().map_err(|error| error.to_string());
     }
     plan.apply(&store)
         .map_err(|error| cannot("change", &error))?;
     store.close().map_err(|error| error.to_string())?;
-    println!("removed {}{}", entries(&counts), kept(&counts, RESET_KEEPS));
+    ui::print_line(&format!(
+        "removed {}{}",
+        entries(&counts),
+        kept(&counts, RESET_KEEPS)
+    ));
     Ok(())
 }
 
 /// Whether the reset may go ahead: at once with `yes`; otherwise only when standard
 /// input and standard error are a terminal and the answer to the question is yes.
+/// The question is written and flushed through [`ui::print_question`], which drops
+/// a write that fails instead of panicking as the `print!` macros would.
 ///
 /// # Errors
 ///
@@ -221,9 +233,6 @@ fn confirm(yes: bool) -> Result<bool, String> {
         return Err(NO_TERMINAL.to_owned());
     }
     ui::print_question("Remove these entries? [y/N]");
-    io::stderr()
-        .flush()
-        .map_err(|error| format!("cannot ask for confirmation: {error}"))?;
     let mut answer = String::new();
     io::stdin()
         .lock()
@@ -309,6 +318,11 @@ fn failure(message: &str) -> ExitCode {
 
 /// Unit tests for the answers and the descriptions of entries.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use kizz_store::EntryCounts;
 

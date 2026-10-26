@@ -348,6 +348,11 @@ fn walk_warning(
 
 /// Unit tests for discovery and its order.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{
         cmp::Ordering,

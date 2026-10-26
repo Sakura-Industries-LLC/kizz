@@ -80,13 +80,23 @@
 //! directly: it receives the interrupt exactly once, from the tracer.
 //!
 //! Each run starts its threads through `kizz_threads`, which waits and retries while
-//! the system cannot start a thread for the moment, and never panics: the tracing
-//! thread, `kizz-tracer`; the thread that feeds `stdin`, `kizz-feeder`; a thread that
-//! captures each output stream, `kizz-stdout` and `kizz-stderr`, or `kizz-output`
-//! for merged output; and the watchdog of cancellation, `kizz-watchdog`. When one
-//! still cannot start, the run kills and collects every process of the request and
-//! returns [`TraceError::Tracer`], whose message names the thread and the system's
-//! error.
+//! the system cannot start a thread for the moment, and never panics: the thread
+//! that feeds `stdin`, `kizz-feeder`, and a thread that captures each output
+//! stream, `kizz-stdout` and `kizz-stderr`, or `kizz-output` for merged output,
+//! which start first, before anything of the request runs; then the tracing
+//! thread, `kizz-tracer`; and the watchdog of cancellation, `kizz-watchdog`. When
+//! one still cannot start, no process of the request is left, and the run returns
+//! [`TraceError::Tracer`], whose message names the thread and the system's error.
+//!
+//! The cleanup of last resort is the end of the tracing thread: every process and
+//! thread of the tree is its tracee, with `PTRACE_O_EXITKILL`, so when the thread
+//! ends, for an error, a panic or the end of the tree, Linux kills whatever is left
+//! of the tree, also processes that left its process group or session and threads
+//! in stops that the tracer already collected. The run then collects its first
+//! process through a process descriptor, and its output and input threads end with
+//! the pipes. No step of that reads `/proc` or signals a process or thread ID.
+//! Collecting by descriptor needs Linux 5.4 or later: the descriptor comes from
+//! `pidfd_open`, and `waitid` with `P_PIDFD` collects the process.
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("the kizz tracer supports only Linux on x86_64");
@@ -103,8 +113,12 @@ mod sys;
 use std::{
     collections::BTreeSet,
     io,
+    os::fd::OwnedFd,
     path::Path,
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        OnceLock,
+        mpsc::{self, RecvTimeoutError},
+    },
     thread,
     time::Duration,
 };
@@ -117,12 +131,12 @@ use kizz_trace::{
     Accesses, Cancellation, EchoSink, ExtendedAttributes, FirstReads, MachineState, OutputStream,
     RunRequest, RunResult, TraceError, Tracer,
 };
-use libc::pid_t;
+use libc::{pid_t, sock_filter};
 
 use crate::{
     capture::TracerStdio,
     follow::{Escalation, LiveProcesses},
-    spawn::{Program, Started},
+    spawn::{ChildStdio, Program, Started},
 };
 
 /// How often the cancellation watchdog checks the cancellation flag.
@@ -205,25 +219,51 @@ const fn reader_thread(stream: OutputStream) -> (&'static str, &'static str) {
 /// are all blocked and report nothing. It signals only the process IDs in the live
 /// set, never the ID of a thread that does not lead its process, which that thread
 /// releases when it runs `exec`.
+///
+/// When the live set stays locked for `patience`, so the watchdog cannot signal its
+/// processes, it asks the tracing thread to end the run, with [`Escalation::end`],
+/// which wakes the thread from its wait, and asks again every
+/// [`CANCEL_POLL_INTERVAL`] until the loop has ended and dropped `done`. The
+/// tracing thread's end then kills the whole tree, escaped and stopped processes
+/// included, with no live set, no process group and no ID.
+///
+/// # Errors
+///
+/// The error of a live set that stays locked; the run then fails with it.
 fn watch(
     live: &LiveProcesses,
     cancel: &Cancellation,
     escalation: &Escalation,
     done: &mpsc::Receiver<()>,
-) {
+    patience: Duration,
+) -> io::Result<()> {
+    // End the run without the live set, for a set that stays locked.
+    let end = |error: io::Error| -> io::Result<()> {
+        loop {
+            // A wake that fails leaves the request noted, and the loop reads it
+            // before its next wait; the next round wakes it again.
+            drop(escalation.end());
+            match done.recv_timeout(CANCEL_POLL_INTERVAL) {
+                Err(RecvTimeoutError::Timeout) => {},
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => return Err(error),
+            }
+        }
+    };
     while !cancel.is_cancelled() {
         match done.recv_timeout(CANCEL_POLL_INTERVAL) {
             Err(RecvTimeoutError::Timeout) => {},
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
-    follow::interrupt_all(live);
+    if let Err(error) = follow::signal_all(live, libc::SIGINT, patience) {
+        return end(error);
+    }
     match done.recv_timeout(CANCEL_GRACE_PERIOD) {
         Err(RecvTimeoutError::Timeout) => {},
-        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
     }
     escalation.escalate();
-    follow::kill_all(live);
+    follow::signal_all(live, libc::SIGKILL, patience).or_else(end)
 }
 
 /// What the event loop and the helper threads of one run produced.
@@ -239,36 +279,140 @@ struct Supervised {
     fed: Result<(), TraceError>,
 }
 
-/// Follow a started child to the end of its tree while helper threads feed its
-/// input, capture its output, and watch for cancellation.
+/// What the tracing thread needs to start the traced program.
+struct Launch<'a> {
+    /// The request.
+    request: &'a RunRequest,
+    /// The program, its arguments and its environment, prepared for the child.
+    program: &'a Program,
+    /// The seccomp-bpf filter that the child installs.
+    filter: &'a [sock_filter],
+    /// The child's ends of its standard streams, which kizz closes once the child
+    /// has them, or when the program never starts.
+    stdio: ChildStdio,
+    /// The write end of the failure pipe.
+    report: OwnedFd,
+}
+
+/// What the tracing thread produced: the process ID of the child that it forked,
+/// and the outcome of the event loop, or `None` when the child exited before it
+/// came under `ptrace`.
+type Traced = (pid_t, io::Result<Option<follow::Outcome>>);
+
+/// The loop's result `followed` together with the watchdog's `watched`: when the
+/// watchdog asked the tracing thread to end the run, the loop failed only for that,
+/// and the watchdog's error, the live set that stayed locked, is the run's;
+/// otherwise the loop's error comes first, then the watchdog's.
+fn settle(
+    followed: io::Result<follow::Outcome>,
+    watched: io::Result<()>,
+    escalation: &Escalation,
+) -> io::Result<Option<follow::Outcome>> {
+    match (followed, watched) {
+        (Ok(outcome), Ok(())) => Ok(Some(outcome)),
+        (Err(_), Err(error)) if escalation.is_ended() => Err(error),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+/// Start the program of `launch` on the calling thread, the tracing thread, and
+/// follow its tree to the end while the watchdog, whose live-set locks wait at most
+/// `patience`, watches `cancel`.
 ///
-/// The event loop runs on the calling thread, the tracer of the tree. Each helper
-/// thread starts through `kizz_threads`, which waits and retries while the system
-/// cannot start a thread for the moment. When one still cannot start, the run kills
-/// and collects every process of the tree, as when the event loop fails, so no
-/// process of the request stays behind and the helper threads that started end with
-/// the tree's pipes, and it returns [`TraceError::Tracer`], whose message names the
-/// thread and the system's error. A panic on the tracer thread kills and collects the
-/// tree the same way before the helper threads are waited for, so the panic ends the
-/// run instead of leaving it waiting for readers of a tree that waits for its tracer.
+/// The thread's only child is the program's first process, whose descriptor goes
+/// into `root` at once, before the program runs, so the caller can collect the
+/// process once this thread has ended. When anything fails after the start, the
+/// error is returned at once and nothing here cleans up: this thread then ends, and
+/// its end kills the whole tree ("The cleanup of last resort" of the `follow`
+/// module). That holds for a thread that cannot be prepared to be woken, a first
+/// process that cannot enter the live set, a watchdog that cannot start, and a
+/// loop that fails, the loop that the watchdog ends included.
+///
+/// # Errors
+///
+/// The [`TraceError`] of the start, of preparing this thread to be woken, of the
+/// live set, or of the watchdog's start; the error of the loop is the second value
+/// of the result.
+fn trace(
+    launch: Launch<'_>,
+    cancel: &Cancellation,
+    live: &LiveProcesses,
+    patience: Duration,
+    root: &OnceLock<OwnedFd>,
+) -> Result<Traced, TraceError> {
+    let request = launch.request;
+    let started = spawn::start(
+        request,
+        launch.program,
+        launch.filter,
+        &launch.stdio,
+        launch.report,
+    )?;
+    drop(launch.stdio);
+    let (pid, handle) = match started {
+        Started::Running(pid, handle) => (pid, handle),
+        Started::Exited(pid) => return Ok((pid, Ok(None))),
+    };
+    // Only this call sets the cell, once per run, so it cannot be set already.
+    drop(root.set(handle));
+    let escalation = Escalation::new()
+        .map_err(|error| tracer_error("could not prepare the tracing thread to be woken", error))?;
+    // The first process is live before the watchdog starts, so an interrupt for a
+    // request that is already cancelled reaches it.
+    follow::track_root(live, pid)
+        .map_err(|error| tracer_error("could not follow the traced program", error))?;
+    let (done_sender, done) = mpsc::channel::<()>();
+    let escalation = &escalation;
+    thread::scope(|scope| {
+        let watchdog = kizz_threads::spawn_scoped(
+            scope,
+            "kizz-watchdog",
+            "the thread that watches for cancellation",
+            move || watch(live, cancel, escalation, &done, patience),
+        )
+        .map_err(|error| not_started(&error))?;
+        let followed = follow::follow(pid, live, escalation, request.tree.then_some(request));
+        drop(done_sender);
+        // The watchdog only signals processes and wakes this thread; a live set
+        // that it could not lock is the run's error.
+        let watched = watchdog.join().unwrap_or(Ok(()));
+        Ok((pid, settle(followed, watched, escalation)))
+    })
+}
+
+/// Run the program of `launch` on a new thread, the tracing thread, while helper
+/// threads of the calling thread feed its input and capture its output, and collect
+/// its first process once the tracing thread has ended.
+///
+/// The feeder and the readers start first, before anything of the request runs.
+/// When one cannot start, the run returns [`TraceError::Tracer`], whose message
+/// names the thread and the system's error, and those that started end at once,
+/// because the child's ends of the pipes close with `launch`.
+///
+/// The tracing thread starts next, through `kizz_threads`; when it cannot start,
+/// nothing of the request has run, and the error names it. A new thread has no
+/// child until it starts the traced program, so no wait of a run collects, signals
+/// or adopts a child that the calling thread, or any other thread, started. It is
+/// the tracer of the whole tree, and when it ends, for an error, a panic or the end
+/// of the tree, Linux kills whatever is left of the tree (`PTRACE_O_EXITKILL`); the
+/// readers then see their pipes end, and the feeder its pipe close. The first
+/// process, a child of this process whose thread has ended, is then collected
+/// through its descriptor, unless the loop already collected it. No step of that
+/// reads `/proc`, needs the live set, or signals a process or thread ID.
+///
+/// The watchdog waits at most `patience` for `live`, the live set of the tree.
 fn supervise(
-    request: &RunRequest,
-    started: Started,
+    launch: Launch<'_>,
     tracer_stdio: TracerStdio,
     echo: Option<&dyn EchoSink>,
     cancel: &Cancellation,
+    live: &LiveProcesses,
+    patience: Duration,
 ) -> Result<Supervised, TraceError> {
-    let live = LiveProcesses::new(BTreeSet::new());
-    let escalation = Escalation::new();
-    // Kill and collect the tree, for a helper thread that could not start.
-    let give_up = |live: &LiveProcesses, error: &kizz_threads::StartError| {
-        if let Started::Running(root) = started {
-            follow::lock(live).insert(root);
-        }
-        follow::abandon(live);
-        not_started(error)
-    };
-    follow::scope_abandoning_on_panic(&live, |scope| {
+    let request = launch.request;
+    let root = OnceLock::new();
+    let root = &root;
+    thread::scope(|scope| {
         let feeder = tracer_stdio
             .stdin
             .map(|stdin| {
@@ -281,7 +425,7 @@ fn supervise(
                 )
             })
             .transpose()
-            .map_err(|error| give_up(&live, &error))?;
+            .map_err(|error| not_started(&error))?;
         let readers = tracer_stdio
             .outputs
             .into_iter()
@@ -293,34 +437,25 @@ fn supervise(
                 .map(|reader| (stream, reader))
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| give_up(&live, &error))?;
-        let (pid, followed) = match started {
-            Started::Running(root) => {
-                let (done_sender, done) = mpsc::channel::<()>();
-                let live = &live;
-                let escalation = &escalation;
-                // The first process is live before the watchdog starts, so an
-                // interrupt for a request that is already cancelled reaches it.
-                follow::lock(live).insert(root);
-                let watchdog = kizz_threads::spawn_scoped(
-                    scope,
-                    "kizz-watchdog",
-                    "the thread that watches for cancellation",
-                    move || watch(live, cancel, escalation, &done),
-                )
-                .map_err(|error| give_up(live, &error))?;
-                let followed =
-                    follow::follow(root, live, escalation, request.tree.then_some(request));
-                if followed.is_err() {
-                    follow::abandon(live);
-                }
-                drop(done_sender);
-                // The watchdog only signals processes; it has no result.
-                drop(watchdog.join());
-                (root, followed.map(Some))
-            },
-            Started::Exited(pid) => (pid, Ok(None)),
-        };
+            .map_err(|error| not_started(&error))?;
+        let tracing_thread =
+            kizz_threads::spawn_scoped(scope, "kizz-tracer", "the tracing thread", move || {
+                trace(launch, cancel, live, patience, root)
+            })
+            .map_err(|error| not_started(&error))?;
+        let traced = tracing_thread.join().unwrap_or_else(|_| {
+            Err(TraceError::Tracer {
+                message: "the tracing thread panicked".to_owned(),
+                source: None,
+            })
+        });
+        // The tracing thread has ended, and with it whatever was left of the tree.
+        let reaped = root.get().map_or(Ok(()), sys::reap).map_err(|error| {
+            tracer_error(
+                "could not collect the first process of the traced program",
+                error,
+            )
+        });
         let streams = readers
             .into_iter()
             .map(|(stream, reader)| {
@@ -328,35 +463,13 @@ fn supervise(
             })
             .collect();
         let fed = feeder.map_or(Ok(()), |feeder| join(feeder, "that feeds stdin"));
+        let (pid, followed) = traced?;
+        reaped?;
         Ok(Supervised {
             pid,
             followed,
             streams,
             fed,
-        })
-    })
-}
-
-/// Run `work`, which starts and follows a traced tree, on a new thread that becomes
-/// the tracer of the tree, and return its result.
-///
-/// The event loop's waits report every child of the waiting thread. A new thread has
-/// no child until it starts the traced program, so no wait of a run collects,
-/// signals or adopts a child that the calling thread, or any other thread, started.
-/// The thread starts through `kizz_threads`; when it cannot start, nothing of the
-/// request has started, and the error names the tracing thread and the system's
-/// error.
-fn on_tracer_thread<T: Send>(
-    work: impl FnOnce() -> Result<T, TraceError> + Send
-) -> Result<T, TraceError> {
-    thread::scope(|scope| {
-        let tracer = kizz_threads::spawn_scoped(scope, "kizz-tracer", "the tracing thread", work)
-            .map_err(|error| not_started(&error))?;
-        tracer.join().unwrap_or_else(|_| {
-            Err(TraceError::Tracer {
-                message: "the tracing thread panicked".to_owned(),
-                source: None,
-            })
         })
     })
 }
@@ -388,17 +501,22 @@ impl Tracer for LinuxTracer {
             .map_err(|error| tracer_error("could not create the standard streams", error))?;
         let (report_read, report_write) = sys::pipe()
             .map_err(|error| tracer_error("could not create the failure pipe", error))?;
-        let supervised = on_tracer_thread(move || {
-            let started = spawn::start(request, &program, &filter, &child_stdio, report_write)?;
-            drop(child_stdio);
-            supervise(
-                request,
-                started,
-                tracer_stdio,
-                request.echo.then_some(echo),
-                cancel,
-            )
-        })?;
+        let live = LiveProcesses::default();
+        let launch = Launch {
+            request,
+            program: &program,
+            filter: &filter,
+            stdio: child_stdio,
+            report: report_write,
+        };
+        let supervised = supervise(
+            launch,
+            tracer_stdio,
+            request.echo.then_some(echo),
+            cancel,
+            &live,
+            kizz_threads::LOCK_PATIENCE,
+        )?;
         let pid = supervised.pid;
         let outcome = supervised
             .followed

@@ -8,6 +8,14 @@
 //! a temporary directory, and runs in another temporary directory, so no run can
 //! reach the real cache or a real project.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{io, process::Command};
 
 /// A line of the banner that no other output contains.

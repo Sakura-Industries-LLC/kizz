@@ -35,6 +35,14 @@
 //! file that a step reads or runs before it writes it, at the moment of the read,
 //! so `rw` and `bump` leave a result that is not cached.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -392,7 +400,7 @@ impl Fixture {
         }
         let built = Built {
             decisions,
-            warnings: engine.warnings(),
+            warnings: engine.warnings()?,
         };
         drop(engine);
         store.close()?;

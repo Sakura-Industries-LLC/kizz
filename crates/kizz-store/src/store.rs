@@ -25,6 +25,14 @@
 //! the copy starts a thread when it can and otherwise replays them on the thread
 //! that opens the store.
 //!
+//! The store waits for `SurrealKV` with `Runtime::block_on` only after it checks,
+//! with `Handle::try_current`, that the calling thread is in no runtime, because
+//! `block_on` panics when it is called within an asynchronous execution context
+//! ("Kizz never panics"); a call from inside a runtime is
+//! [`StoreError::InsideRuntime`] instead. Its runtime never panics when it is
+//! dropped either: inside an asynchronous context, where dropping a Tokio runtime
+//! panics, it shuts down in the background instead.
+//!
 //! When the store creates the database it writes [`SCHEMA_VERSION`] and the current
 //! [`CacheIdentity`] into it. It refuses to open a database with another version,
 //! and then one whose identity differs from the current one or that has none,
@@ -149,6 +157,10 @@ pub enum StoreError {
     /// one changed nothing.
     #[error("a concurrent transaction changed the same cache records; nothing was written")]
     Conflict,
+    /// The store was called from inside an asynchronous execution context, where
+    /// waiting for the database would panic, so it did not wait.
+    #[error("the cache database cannot be waited for from inside an asynchronous task")]
+    InsideRuntime,
     /// A record could not be encoded.
     #[error("cannot encode a {family}: {message}")]
     Encode {
@@ -280,7 +292,7 @@ pub struct Store {
     /// The `SurrealKV` tree. Declared before the runtime so that it is dropped first.
     tree: Tree,
     /// The runtime that drives the tree's commits and background work.
-    runtime: tokio::runtime::Runtime,
+    runtime: StoreRuntime,
     /// The database directory.
     path: PathBuf,
     /// Whether the tree has been closed.
@@ -435,7 +447,7 @@ impl Store {
         };
         Ok(Self {
             tree,
-            runtime,
+            runtime: StoreRuntime(Some(runtime)),
             path,
             closed: false,
         })
@@ -486,7 +498,7 @@ impl Store {
             return Ok(());
         }
         self.closed = true;
-        self.runtime.block_on(self.tree.close())?;
+        wait_for(&self.runtime, self.tree.close())??;
         Ok(())
     }
 
@@ -684,7 +696,7 @@ impl Txn<'_> {
     /// both cases nothing was written.
     pub fn commit(mut self) -> Result<(), StoreError> {
         self.inner.set_durability(Durability::Eventual);
-        match self.store.runtime.block_on(self.inner.commit()) {
+        match wait_for(&self.store.runtime, self.inner.commit())? {
             Ok(()) => {},
             Err(surrealkv::Error::TransactionWriteConflict) => return Err(StoreError::Conflict),
             Err(error) => return Err(error.into()),
@@ -694,6 +706,57 @@ impl Txn<'_> {
         self.store.tree.flush_wal(false)?;
         Ok(())
     }
+}
+
+/// The store's runtime, which never panics when it is dropped ("Kizz never
+/// panics").
+///
+/// Dropping a Tokio runtime waits for its blocking pool, which panics with "Cannot
+/// drop a runtime in a context where blocking is not allowed" inside an
+/// asynchronous context. Kizz drops no store there, but should one be dropped
+/// there, its runtime shuts down in the background, with
+/// `Runtime::shutdown_background`, which does not wait, instead; elsewhere it shuts
+/// down as usual. The runtime is `None` only while it is dropped.
+struct StoreRuntime(Option<tokio::runtime::Runtime>);
+
+impl StoreRuntime {
+    /// The runtime, until it is dropped.
+    const fn get(&self) -> Option<&tokio::runtime::Runtime> {
+        self.0.as_ref()
+    }
+}
+
+impl Drop for StoreRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// Runs `future` to its end on `runtime` with `Runtime::block_on`, after checking
+/// that the calling thread is in no runtime, where `block_on` would panic.
+///
+/// # Errors
+///
+/// [`StoreError::InsideRuntime`] when the calling thread is in a runtime; the
+/// future is dropped without running. [`StoreError::Runtime`] for a runtime that
+/// is already gone, which only a store being dropped has.
+fn wait_for<F: Future>(
+    runtime: &StoreRuntime,
+    future: F,
+) -> Result<F::Output, StoreError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(StoreError::InsideRuntime);
+    }
+    let Some(runtime) = runtime.get() else {
+        return Err(StoreError::Runtime(io::Error::other(
+            "the cache database runtime has shut down",
+        )));
+    };
+    Ok(runtime.block_on(future))
 }
 
 /// Decodes a stored record of type `R`.
@@ -721,8 +784,69 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// Unit tests for the parts of the store that need no database.
 #[cfg(test)]
+#[allow(clippy::disallowed_macros, reason = "test code: the tests assert")]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// The store's runtime, dropped inside an asynchronous context, where dropping a
+    /// Tokio runtime panics with "Cannot drop a runtime in a context where blocking
+    /// is not allowed", shuts down in the background instead, and the context goes
+    /// on; dropped outside one, it shuts down as usual.
+    #[test]
+    fn the_runtime_drops_without_a_panic_inside_an_asynchronous_context() {
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let inside = StoreRuntime(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        ));
+        assert!(inside.get().is_some());
+        outer.block_on(async move { drop(inside) });
+        let outside = StoreRuntime(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        ));
+        drop(outside);
+        let gone = StoreRuntime(None);
+        assert!(matches!(
+            wait_for(&gone, async { 5 }),
+            Err(StoreError::Runtime(_))
+        ));
+    }
+
+    /// Waiting for the database from inside a runtime is
+    /// [`StoreError::InsideRuntime`], where `Runtime::block_on` would panic, and
+    /// the future never runs; outside a runtime, it runs to its end.
+    #[test]
+    fn waiting_inside_a_runtime_is_an_error() {
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let runtime = StoreRuntime(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        ));
+        let ran = Cell::new(false);
+        let entered = outer.enter();
+        let inside = wait_for(&runtime, async { ran.set(true) });
+        assert!(
+            matches!(inside, Err(StoreError::InsideRuntime)),
+            "{inside:?}"
+        );
+        assert!(!ran.get());
+        assert_eq!(
+            StoreError::InsideRuntime.to_string(),
+            "the cache database cannot be waited for from inside an asynchronous task"
+        );
+        drop(entered);
+        assert_eq!(wait_for(&runtime, async { 5 }).unwrap(), 5);
+    }
 
     #[test]
     fn prefix_end_is_the_first_key_after_the_prefix() {

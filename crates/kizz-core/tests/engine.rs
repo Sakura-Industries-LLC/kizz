@@ -11,6 +11,14 @@
 //! records back from the store, and observe hashing through the engine's count of
 //! hashed files, never through timing.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

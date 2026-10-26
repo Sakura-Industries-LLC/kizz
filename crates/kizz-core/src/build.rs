@@ -67,9 +67,12 @@
 //! build in which the program does not write the file.
 //! Each run of a task ends with [`TaskSteps::finish`], which stores the task record:
 //! the program hash and a summary of the run.
+//!
+//! The builder keeps the step keys under which the build ran a command in a field
+//! that only its own `&mut self` methods change, so no `RefCell` borrow, which
+//! would panic while the cell is borrowed, is needed ("Kizz never panics").
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     path::PathBuf,
@@ -397,8 +400,9 @@ struct Builder<'b> {
     caller: &'b BTreeMap<String, String>,
     /// Where the lines that task programs print go.
     print: &'b dyn PrintSink,
-    /// The step keys under which the build ran a command so far.
-    ran: RefCell<BTreeSet<StepKey>>,
+    /// The step keys under which the build ran a command so far, which only the
+    /// builder's own `&mut self` methods change, so it needs no `RefCell`.
+    ran: BTreeSet<StepKey>,
 }
 
 impl Builder<'_> {
@@ -410,7 +414,7 @@ impl Builder<'_> {
     /// fails unchecked steps and the program succeeded, the run fails with every
     /// unchecked step instead, before its task record is stored.
     fn run_task(
-        &self,
+        &mut self,
         task: &TaskInfo,
     ) -> Result<(TaskResult, TaskTrace), StoreError> {
         let load = TaskProgram::load(task.clone(), self.print);
@@ -445,7 +449,7 @@ impl Builder<'_> {
                 .and_then(|position| keys.get(position))
                 .copied()
         };
-        let mut ran = self.ran.borrow_mut();
+        let ran = &mut self.ran;
         for decision in &decisions {
             if matches!(decision.verdict, Verdict::Ran(_))
                 && let Some(key) = position_key(decision.position)
@@ -465,7 +469,6 @@ impl Builder<'_> {
                 })
             })
             .collect();
-        drop(ran);
         self.engine.program_wrote(&task_id(task), &changes)?;
         let missing = if result.is_err() {
             missing_paths(self.engine.store(), &keys, &accesses)?
@@ -488,7 +491,7 @@ impl Builder<'_> {
     /// Run one pass, numbered `number`, over `tasks`, keeping what each run touched
     /// in `traces`. Returns the pass and whether the build was interrupted.
     fn pass(
-        &self,
+        &mut self,
         number: usize,
         tasks: &[TaskInfo],
         traces: &mut BTreeMap<TaskId, TaskTrace>,
@@ -532,11 +535,11 @@ pub fn build(
         .into_iter()
         .filter_map(|index| tasks.get(index).cloned())
         .collect();
-    let builder = Builder {
+    let mut builder = Builder {
         engine,
         caller,
         print,
-        ran: RefCell::new(BTreeSet::new()),
+        ran: BTreeSet::new(),
     };
     let limit = pass_limit(ordered.len());
     let mut passes: Vec<Pass> = Vec::new();
@@ -856,6 +859,11 @@ fn learn(
 
 /// Unit tests for the order of tasks and the pass limit.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::{learned_order, pass_limit};
 

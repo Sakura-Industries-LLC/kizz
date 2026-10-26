@@ -477,6 +477,11 @@ impl Record for LearnedOrder {
 
 /// Unit tests for the key layout and the record encoding.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
 

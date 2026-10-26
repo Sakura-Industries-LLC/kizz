@@ -387,6 +387,11 @@ pub enum Verdict {
 
 /// Unit tests for the encoding of explanations.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
 

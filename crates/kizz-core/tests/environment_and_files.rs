@@ -10,6 +10,14 @@
 //! step specifications the fake executor received, the lines the program printed,
 //! the files it wrote, and the accesses recorded against the task.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, borrow cells, lock and print"
+)]
+
 use std::{
     cell::RefCell,
     collections::BTreeMap,

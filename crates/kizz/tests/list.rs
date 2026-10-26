@@ -9,6 +9,14 @@
 //! temporary directory that must still be empty afterwards, because `kizz list` does
 //! not use the cache.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{fs, io, os::unix::fs::symlink, path::Path, process::Command};
 
 /// The start of every terminal escape sequence.

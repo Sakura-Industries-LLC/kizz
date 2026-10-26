@@ -8,6 +8,12 @@
 //! process tree, because Linux makes that thread, not the whole process, the tracer.
 //! The calls that run in the child between `fork` and `exec` live in the `spawn`
 //! module, because they must avoid everything that is not async-signal-safe.
+//!
+//! No wrapper panics ("Kizz never panics"): a buffer whose size the kernel reports
+//! is reserved with `Vec::try_reserve_exact`, which returns an error where
+//! `vec![0; size]` panics on a size that overflows, and the CPU numbers of the
+//! affinity mask come from each word's index with saturating arithmetic, never
+//! from `step_by`, which panics on a step of zero.
 
 use std::{
     ffi::{CStr, CString},
@@ -357,12 +363,21 @@ pub(crate) enum Pending {
 /// Wait for a state change of a child or tracee of the calling thread, with the
 /// `waitid` target `id_type` and `id` and the extra `flags`, without collecting it,
 /// and return the thread and the change, or `None` when there is nothing to report.
+///
+/// Before each wait, and when a signal interrupts one, the wait asks `stop`; when
+/// it answers yes, the wait ends with [`stopped_waiting`] instead of waiting on. A
+/// signal that [`wake`] sends interrupts a wait in progress, because its handler
+/// is installed without `SA_RESTART`.
 fn peek(
     id_type: libc::idtype_t,
     id: libc::id_t,
     flags: c_int,
+    stop: &dyn Fn() -> bool,
 ) -> io::Result<Option<(pid_t, Pending)>> {
     loop {
+        if stop() {
+            return Err(stopped_waiting());
+        }
         // SAFETY: `siginfo_t` is plain data, for which all zero bytes are a valid
         // value.
         let mut info: libc::siginfo_t = unsafe { mem::zeroed() };
@@ -401,14 +416,24 @@ fn peek(
     }
 }
 
+/// The error of a wait that ended because its caller asked it to stop.
+pub(crate) fn stopped_waiting() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "the tracing thread was asked to stop waiting for the traced processes",
+    )
+}
+
 /// Wait until a child or tracee of the calling thread changes state, without
 /// collecting the change, and return its thread ID and the change, or `None` when
 /// the calling thread has no child or tracee left to wait for.
 ///
 /// The wait covers every child of the calling thread, so the caller must be a
-/// thread whose only children are the traced program's first process.
-pub(crate) fn wait_pending() -> io::Result<Option<(pid_t, Pending)>> {
-    peek(libc::P_ALL, 0, 0)
+/// thread whose only children are the traced program's first process. It ends
+/// with [`stopped_waiting`] once `stop` answers yes, before it waits or when a
+/// signal, such as the one of [`wake`], interrupts it.
+pub(crate) fn wait_pending(stop: &dyn Fn() -> bool) -> io::Result<Option<(pid_t, Pending)>> {
+    peek(libc::P_ALL, 0, 0, stop)
 }
 
 /// The state change of the thread `pid` that a wait would report now, without
@@ -418,7 +443,7 @@ pub(crate) fn wait_pending() -> io::Result<Option<(pid_t, Pending)>> {
 pub(crate) fn pending(pid: pid_t) -> io::Result<Option<Pending>> {
     let id = libc::id_t::try_from(pid)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    Ok(peek(libc::P_PID, id, libc::WNOHANG)?.map(|(_, pending)| pending))
+    Ok(peek(libc::P_PID, id, libc::WNOHANG, &|| false)?.map(|(_, pending)| pending))
 }
 
 /// Collect the waiting state change of `pid`, if it has one, and return its wait
@@ -446,6 +471,141 @@ pub(crate) fn wait_for(pid: pid_t) -> io::Result<c_int> {
         match check(ret) {
             Ok(_) => return Ok(status),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The signal with which another thread of kizz wakes the tracing thread from a
+/// wait, with [`wake`]. Nothing else in kizz uses `SIGURG`, which no program sends
+/// to a process without asking for it, and its default action ignores it.
+const WAKE_SIGNAL: c_int = libc::SIGURG;
+
+/// The handler of [`WAKE_SIGNAL`]: it does nothing, so the signal only interrupts
+/// the system call that the woken thread is waiting in.
+extern "C" fn on_wake(_signal: c_int) {}
+
+/// Make the calling thread one that [`wake`] can wake from a wait, and return its
+/// handle for [`wake`].
+///
+/// The handler of [`WAKE_SIGNAL`] is installed for the process without
+/// `SA_RESTART`, so the signal interrupts a wait with `EINTR` instead of
+/// restarting it, and the signal is unblocked in the calling thread. Installing
+/// the same handler again, for another run, changes nothing.
+///
+/// # Errors
+///
+/// The error of `sigaction` or `pthread_sigmask`; the thread then cannot be woken.
+pub(crate) fn prepare_wake() -> io::Result<libc::pthread_t> {
+    // SAFETY: `sigaction` is plain data, for which all zero bytes are a valid value.
+    let mut action: libc::sigaction = unsafe { mem::zeroed() };
+    let handler: extern "C" fn(c_int) = on_wake;
+    action.sa_sigaction = handler as libc::sighandler_t;
+    action.sa_flags = 0;
+    // SAFETY: `sa_mask` is a valid signal set for `sigemptyset` to clear.
+    check(unsafe { libc::sigemptyset(&raw mut action.sa_mask) })?;
+    // SAFETY: `action` is a valid `sigaction` whose handler does nothing, which is
+    // async-signal-safe, and the old action is not asked for.
+    check(unsafe { libc::sigaction(WAKE_SIGNAL, &raw const action, ptr::null_mut()) })?;
+    // SAFETY: `sigset_t` is plain data, for which all zero bytes are a valid value.
+    let mut set: libc::sigset_t = unsafe { mem::zeroed() };
+    // SAFETY: `set` is a valid signal set, and `WAKE_SIGNAL` a valid signal.
+    unsafe {
+        check(libc::sigemptyset(&raw mut set))?;
+        check(libc::sigaddset(&raw mut set, WAKE_SIGNAL))?;
+    }
+    // SAFETY: `set` is a valid signal set, and the old mask is not asked for.
+    let ret = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, ptr::null_mut()) };
+    if ret != 0 {
+        return Err(io::Error::from_raw_os_error(ret));
+    }
+    // SAFETY: `pthread_self` has no requirements and cannot fail.
+    Ok(unsafe { libc::pthread_self() })
+}
+
+/// Wake `thread`, which [`prepare_wake`] prepared, from the wait it is in, if
+/// any: send it [`WAKE_SIGNAL`], which interrupts the wait.
+///
+/// The caller must know that `thread` has not ended: a thread of kizz that the
+/// caller's own thread outlives, such as the tracing thread for the watchdog that
+/// it waits for before it ends. A thread handle is never a process or thread ID of
+/// another process.
+///
+/// # Errors
+///
+/// The error of `pthread_kill`.
+pub(crate) fn wake(thread: libc::pthread_t) -> io::Result<()> {
+    // SAFETY: the caller guarantees that `thread` is a live thread of this process.
+    let ret = unsafe { libc::pthread_kill(thread, WAKE_SIGNAL) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(ret))
+    }
+}
+
+/// A process descriptor of `pid`, a child of the calling thread that has not been
+/// collected, so its ID still names it: the descriptor keeps naming that process,
+/// and never another, even after the ID is released.
+///
+/// # Errors
+///
+/// The error of `pidfd_open`.
+pub(crate) fn process_handle(pid: pid_t) -> io::Result<OwnedFd> {
+    let flags: c_uint = 0;
+    // SAFETY: `pidfd_open` takes a process ID and flags, and touches no memory.
+    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
+    let fd =
+        c_int::try_from(ret).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    check(fd)?;
+    // SAFETY: a successful `pidfd_open` returned a new descriptor that nothing
+    // else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Wait for the process of `handle`, a process descriptor of a child of this
+/// process, to exit, and collect it, unless a wait already collected it.
+///
+/// The wait names the process by its descriptor, so it collects that process or
+/// nothing, never another process that took over its ID, and it covers the
+/// children of every thread of this process: a child whose parent thread ended
+/// belongs to another thread of the process.
+///
+/// A child that a thread of this process still traces reports its `ptrace` stops
+/// to this wait too, whatever its flags, as when its tracing thread is ending but
+/// has not yet let go of it; such a report collects only the stop, and the wait
+/// goes on until the process exits.
+///
+/// # Errors
+///
+/// The error of `waitid`, other than that the process was already collected.
+pub(crate) fn reap(handle: &OwnedFd) -> io::Result<()> {
+    let id = libc::id_t::try_from(handle.as_raw_fd())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    loop {
+        // SAFETY: `siginfo_t` is plain data, for which all zero bytes are a valid
+        // value.
+        let mut info: libc::siginfo_t = unsafe { mem::zeroed() };
+        // SAFETY: `info` is a valid `siginfo_t` for `waitid` to fill.
+        let ret = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                id,
+                &raw mut info,
+                libc::WEXITED | libc::__WALL,
+            )
+        };
+        match check(ret) {
+            Ok(_) => {
+                if matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                ) {
+                    return Ok(());
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
             Err(error) => return Err(error),
         }
     }
@@ -485,16 +645,23 @@ const ATTRIBUTE_ATTEMPTS: usize = 8;
 
 /// Read a list or value whose size the kernel tells first: `call` with a null
 /// buffer and a size of zero returns the size, and with a buffer fills it. A
-/// buffer that became too small (`ERANGE`) is sized again.
+/// buffer that became too small (`ERANGE`) is sized again. The buffer is reserved
+/// with `Vec::try_reserve_exact` before it is filled with zeros, so a size that
+/// cannot be allocated is an error.
 ///
 /// # Errors
 ///
-/// Returns the error of the call, or `ERANGE` when the size kept changing.
+/// Returns the error of the call, `ERANGE` when the size kept changing, or
+/// `ENOMEM` when the buffer cannot be allocated.
 fn sized_read(mut call: impl FnMut(*mut c_void, usize) -> isize) -> io::Result<Vec<u8>> {
     for _ in 0..ATTRIBUTE_ATTEMPTS {
         let size =
             usize::try_from(call(ptr::null_mut(), 0)).map_err(|_| io::Error::last_os_error())?;
-        let mut buffer = vec![0_u8; size];
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(size)
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+        buffer.resize(size, 0_u8);
         let filled = call(buffer.as_mut_ptr().cast(), buffer.len());
         if let Ok(filled) = usize::try_from(filled) {
             buffer.truncate(filled);
@@ -683,7 +850,11 @@ fn affinity() -> io::Result<Vec<u32>> {
         return Err(io::Error::last_os_error());
     }
     let mut cpus = Vec::new();
-    for (first, word) in (0_u32..).step_by(64).zip(mask) {
+    for (index, word) in mask.into_iter().enumerate() {
+        // The first CPU of the word: 64 for each word before it.
+        let first = u32::try_from(index)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(u64::BITS);
         for bit in 0..u64::BITS {
             if word.checked_shr(bit).unwrap_or(0) & 1 == 1 {
                 cpus.push(first.saturating_add(bit));
@@ -789,8 +960,10 @@ pub(crate) fn machine_state(cwd: &Path) -> MachineState {
 /// Unit tests for the wrappers that need no traced process.
 #[cfg(test)]
 #[allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: a plain std thread gives the test a thread to read"
+    reason = "test code: a plain std thread gives the test a thread to read, and the tests \
+              assert"
 )]
 mod tests {
     use std::{

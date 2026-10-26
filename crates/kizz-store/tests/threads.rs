@@ -9,6 +9,14 @@
 //! This is a test executable of its own, with one test, so no other test's threads
 //! change the count while it runs.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{fs, io};
 
 use kizz_store::{SCHEMA_VERSION, SchemaKey, SchemaVersion, Store};

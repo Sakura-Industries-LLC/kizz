@@ -665,6 +665,11 @@ fn same_file(
 /// Unit tests for listing hashes, for recognizing paths that lead into `/proc` and
 /// `/sys`, and for comparing first reads with recorded states.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::os::unix::fs::symlink;
 

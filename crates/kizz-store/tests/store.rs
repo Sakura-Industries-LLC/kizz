@@ -12,8 +12,12 @@
 //! reports on its standard output, in lines that start with [`MARK`].
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: threads of a scope share the store"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: threads of a scope share the store, and the tests assert, lock and \
+              print"
 )]
 
 use std::{

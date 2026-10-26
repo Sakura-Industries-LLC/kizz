@@ -411,10 +411,13 @@ pub(crate) fn read_failure(report: OwnedFd) -> io::Result<Option<ChildFailure>> 
 
 /// A started child: stopped under `ptrace` with the options set and then resumed,
 /// or already exited with a failure to report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Started {
-    /// The child is traced and running towards its program.
-    Running(pid_t),
+    /// The child, with this process ID, is traced and running towards its
+    /// program; the descriptor names it for good, also after its ID is released,
+    /// so the caller can collect it with `sys::reap` once the tracing thread has
+    /// ended, when no wait of the loop collected it.
+    Running(pid_t, OwnedFd),
     /// The child, with this process ID, exited before it came under `ptrace`; the
     /// failure pipe says why.
     Exited(pid_t),
@@ -501,6 +504,18 @@ pub(crate) fn start(
             source: None,
         });
     }
+    // The child is stopped and not collected, so its ID still names it, and the
+    // descriptor is taken while that holds.
+    let handle = match sys::process_handle(pid) {
+        Ok(handle) => handle,
+        Err(error) => {
+            abandon(pid);
+            return Err(tracer_error(
+                "could not open a descriptor of the child",
+                error,
+            ));
+        },
+    };
     if let Err(error) = sys::set_options(pid, TRACE_OPTIONS) {
         abandon(pid);
         return Err(tracer_error("could not set the ptrace options", error));
@@ -509,11 +524,16 @@ pub(crate) fn start(
         abandon(pid);
         return Err(tracer_error("could not resume the child", error));
     }
-    Ok(Started::Running(pid))
+    Ok(Started::Running(pid, handle))
 }
 
 /// Unit tests for the child's failure reports.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{collections::BTreeMap, ffi::OsString};
 

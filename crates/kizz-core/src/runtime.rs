@@ -34,9 +34,16 @@
 //! program ends, [`TaskRun::unchecked`] lists every step that exited with a
 //! non-zero code or was killed by a signal, whose `run()` had no `expect`, and
 //! whose result the program never checked ("Exit codes and failure").
+//!
+//! The runtime never panics ("Kizz never panics"): the state of the running task
+//! and of a module being loaded lives in `Cell`s, which the private `cells` module
+//! takes out, changes and puts back, where `RefCell` borrows would panic while the
+//! cell is borrowed; and the blank lines that put the block at its line of the
+//! `kizz.md` are pushed into space reserved with `String::try_reserve_exact`, where
+//! `str::repeat` would panic on a length that overflows.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{BTreeMap, HashMap},
     fmt, fs,
     io::ErrorKind,
@@ -55,6 +62,7 @@ use kizz_trace::{
 use starlark::{
     PrintHandler,
     any::ProvidesStaticType,
+    collections::SmallMap,
     environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module},
     eval::{Evaluator, FileLoader},
     pagable::{
@@ -65,7 +73,7 @@ use starlark::{
     syntax::{AstModule, Dialect},
     values::{
         AllocValue, Heap, StarlarkValue, Value, ValueLike,
-        dict::{AllocDict, UnpackDictEntries},
+        dict::{Dict, UnpackDictEntries},
         list_or_tuple::UnpackListOrTuple,
         none::{NoneOr, NoneType},
         starlark_value,
@@ -75,6 +83,7 @@ use starlark::{
 };
 
 use crate::{
+    cells,
     dotenv::{self, DotenvError},
     files::{FileChanges, FileError, Files},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
@@ -424,6 +433,9 @@ enum RunError {
     /// A JSON number has no Starlark value.
     #[error("fs.read_json(): the number {0} is out of range")]
     NumberRange(String),
+    /// A JSON key has no Starlark dict key.
+    #[error("fs.read_json(): the key {0:?} cannot be a dict key")]
+    JsonKey(String),
     /// A `run()` result was to be stored as a frozen value, which never happens,
     /// because a result exists only while its task runs.
     #[error("a run() result exists only while its task runs, so it cannot be stored")]
@@ -441,20 +453,20 @@ struct TaskState<'a> {
     /// The caller environment, which `env.caller` and `env.inherit` read.
     caller: &'a BTreeMap<String, String>,
     /// The task environment, which starts empty.
-    env: RefCell<BTreeMap<String, String>>,
+    env: Cell<BTreeMap<String, String>>,
     /// Every file access the program makes.
-    accesses: RefCell<Accesses>,
+    accesses: Cell<Accesses>,
     /// Every file the program changes.
-    changes: RefCell<FileChanges>,
+    changes: Cell<FileChanges>,
     /// The step whose exit status `expect` did not accept, if any.
-    unexpected: RefCell<Option<UnexpectedExit>>,
+    unexpected: Cell<Option<UnexpectedExit>>,
     /// The number of `run()` calls that reached the executor so far, which is the
     /// position of the next step in the task's run.
     started: Cell<u32>,
     /// The steps that exited with a non-zero code or were killed by a signal and
     /// had no `expect`, in the order they ran, each with whether the program
     /// checked its result.
-    watched: RefCell<Vec<Watched>>,
+    watched: Cell<Vec<Watched>>,
 }
 
 /// A step that is unchecked unless the program checks its result before it ends:
@@ -475,9 +487,9 @@ struct LoadingModule {
     /// The directory of the task that loads it, against which `fs` paths resolve.
     dir: AbsolutePath,
     /// Every file access the module's top-level code makes.
-    accesses: RefCell<Accesses>,
+    accesses: Cell<Accesses>,
     /// Every file the module's top-level code changes.
-    changes: RefCell<FileChanges>,
+    changes: Cell<FileChanges>,
 }
 
 /// The error for `call`, a function that needs the running task, when `eval`
@@ -516,6 +528,10 @@ fn with_task<R>(
 /// Call `f` with the file operations of the task that `eval` evaluates or loads a
 /// module for, so every access and every change is recorded against that task.
 ///
+/// The accesses and the changes are taken out of their cells for the length of
+/// `f`, which only does file operations and reaches neither cell, and put back
+/// after it.
+///
 /// # Errors
 ///
 /// Fails when `f` fails.
@@ -525,21 +541,20 @@ fn with_files<R>(
     f: impl FnOnce(&mut Files<'_>) -> Result<R, RunError>,
 ) -> starlark::Result<R> {
     let extra = eval.extra;
-    let result = if let Some(state) = extra.and_then(|extra| extra.downcast_ref::<TaskState>()) {
-        f(&mut Files::new(
-            &state.task.dir,
-            &mut state.accesses.borrow_mut(),
-            &mut state.changes.borrow_mut(),
-        ))
+    let (dir, accesses, changes) = if let Some(state) =
+        extra.and_then(|extra| extra.downcast_ref::<TaskState>())
+    {
+        (&state.task.dir, &state.accesses, &state.changes)
     } else if let Some(loading) = extra.and_then(|extra| extra.downcast_ref::<LoadingModule>()) {
-        f(&mut Files::new(
-            &loading.dir,
-            &mut loading.accesses.borrow_mut(),
-            &mut loading.changes.borrow_mut(),
-        ))
+        (&loading.dir, &loading.accesses, &loading.changes)
     } else {
         return Err(outside_task(eval, call));
     };
+    let result = cells::update(accesses, |accesses| {
+        cells::update(changes, |changes| {
+            f(&mut Files::new(dir, accesses, changes))
+        })
+    });
     result.map_err(starlark::Error::new_other)
 }
 
@@ -706,7 +721,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
         }
         machine.sort();
         machine.dedup();
-        let mut step_env = state.env.borrow().clone();
+        let mut step_env = cells::cloned(&state.env);
         if let NoneOr::Other(entries) = env {
             for (name, value) in entries.entries {
                 match value {
@@ -748,17 +763,17 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
                 command: step.command(),
                 termination: outcome.termination,
             };
-            *state.unexpected.borrow_mut() = Some(UnexpectedExit {
+            state.unexpected.set(Some(UnexpectedExit {
                 argv: step.argv,
                 termination: outcome.termination,
                 expect: expect.clone(),
                 output: outcome.output,
-            });
+            }));
             return Err(starlark::Error::new_other(error));
         }
         let result = RunResult::new(&outcome);
         if step.expect.is_none() && outcome.termination != Termination::Exited(0) {
-            state.watched.borrow_mut().push(Watched {
+            let watched = Watched {
                 exit: UncheckedExit {
                     position,
                     argv: step.argv,
@@ -767,7 +782,8 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
                     cached: outcome.cached,
                 },
                 checked: Arc::clone(&result.checked),
-            });
+            };
+            cells::update(&state.watched, |steps| steps.push(watched));
         }
         Ok(eval.heap().alloc(result))
     }
@@ -1022,12 +1038,13 @@ fn env_functions(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'_, '_, '_>,
     ) -> starlark::Result<NoneType> {
         with_task(eval, "env.inherit()", |state| {
-            let mut env = state.env.borrow_mut();
-            for name in names.items {
-                if let Some(value) = state.caller.get(name) {
-                    env.insert(name.to_owned(), value.clone());
+            cells::update(&state.env, |env| {
+                for name in names.items {
+                    if let Some(value) = state.caller.get(name) {
+                        env.insert(name.to_owned(), value.clone());
+                    }
                 }
-            }
+            });
             Ok(NoneType)
         })
     }
@@ -1049,16 +1066,18 @@ fn env_functions(builder: &mut GlobalsBuilder) {
                 check_variable(call, name, value)?;
                 vars.insert(name.to_owned(), value.to_owned());
             }
-            let mut accesses = state.accesses.borrow_mut();
-            let mut changes = state.changes.borrow_mut();
-            let mut files = Files::new(&state.task.dir, &mut accesses, &mut changes);
-            let file = if required {
-                Some(require_dotenv(&mut files, call, path)?)
-            } else {
-                read_dotenv(&mut files, call, path)?
-            };
+            let file = cells::update(&state.accesses, |accesses| {
+                cells::update(&state.changes, |changes| {
+                    let mut files = Files::new(&state.task.dir, accesses, changes);
+                    if required {
+                        require_dotenv(&mut files, call, path).map(Some)
+                    } else {
+                        read_dotenv(&mut files, call, path)
+                    }
+                })
+            })?;
             vars.extend(file.unwrap_or_default());
-            state.env.borrow_mut().extend(vars.clone());
+            cells::update(&state.env, |env| env.extend(vars.clone()));
             Ok(vars)
         })?;
         Ok(eval.heap().alloc(vars))
@@ -1084,10 +1103,9 @@ fn env_functions(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<NoneType> {
         with_task(eval, "env.set()", |state| {
             check_variable("env.set()", name, value)?;
-            state
-                .env
-                .borrow_mut()
-                .insert(name.to_owned(), value.to_owned());
+            cells::update(&state.env, |env| {
+                env.insert(name.to_owned(), value.to_owned());
+            });
             Ok(NoneType)
         })
     }
@@ -1101,12 +1119,14 @@ fn env_functions(builder: &mut GlobalsBuilder) {
             for (name, value) in &values.entries {
                 check_variable("env.update()", name, value)?;
             }
-            state.env.borrow_mut().extend(
-                values
-                    .entries
-                    .iter()
-                    .map(|&(name, value)| (name.to_owned(), value.to_owned())),
-            );
+            cells::update(&state.env, |env| {
+                env.extend(
+                    values
+                        .entries
+                        .iter()
+                        .map(|&(name, value)| (name.to_owned(), value.to_owned())),
+                );
+            });
             Ok(NoneType)
         })
     }
@@ -1117,7 +1137,9 @@ fn env_functions(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'_, '_, '_>,
     ) -> starlark::Result<NoneType> {
         with_task(eval, "env.unset()", |state| {
-            state.env.borrow_mut().remove(name);
+            cells::update(&state.env, |env| {
+                env.remove(name);
+            });
             Ok(NoneType)
         })
     }
@@ -1130,7 +1152,7 @@ fn env_functions(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         let value = with_task(eval, "env.get()", |state| {
-            Ok(state.env.borrow().get(name).cloned())
+            Ok(cells::update(&state.env, |env| env.get(name).cloned()))
         })?;
         Ok(value.map_or_else(
             || default.unwrap_or_else(Value::new_none),
@@ -1140,14 +1162,14 @@ fn env_functions(builder: &mut GlobalsBuilder) {
 
     /// The task environment as a new dict.
     fn dict<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<Value<'v>> {
-        let env = with_task(eval, "env.dict()", |state| Ok(state.env.borrow().clone()))?;
+        let env = with_task(eval, "env.dict()", |state| Ok(cells::cloned(&state.env)))?;
         Ok(eval.heap().alloc(env))
     }
 
     /// Empty the task environment.
     fn clear(eval: &mut Evaluator<'_, '_, '_>) -> starlark::Result<NoneType> {
         with_task(eval, "env.clear()", |state| {
-            state.env.borrow_mut().clear();
+            cells::update(&state.env, BTreeMap::clear);
             Ok(NoneType)
         })
     }
@@ -1304,11 +1326,17 @@ fn json_value<'v>(
             heap.alloc(items)
         },
         serde_json::Value::Object(members) => {
-            let members = members
-                .iter()
-                .map(|(key, member)| Ok((key.as_str(), json_value(heap, member)?)))
-                .collect::<Result<Vec<_>, RunError>>()?;
-            heap.alloc(AllocDict(members))
+            // Each key is hashed with `get_hashed`, whose error is returned, where
+            // `AllocDict` "panics if a key is not hashable" (its documentation).
+            let mut map = SmallMap::new();
+            for (key, member) in members {
+                let hashed = heap
+                    .alloc(key.as_str())
+                    .get_hashed()
+                    .map_err(|_not_hashed| RunError::JsonKey(key.clone()))?;
+                map.insert_hashed(hashed, json_value(heap, member)?);
+            }
+            heap.alloc(Dict::new(map))
         },
     })
 }
@@ -1466,8 +1494,8 @@ fn evaluate_module(
     let marker = LoadingModule {
         path: path.clone(),
         dir: task.dir.clone(),
-        accesses: RefCell::new(Accesses::new()),
-        changes: RefCell::new(FileChanges::new()),
+        accesses: Cell::new(Accesses::new()),
+        changes: Cell::new(FileChanges::new()),
     };
     let result = Module::with_temp_heap(|module| {
         set_task_value(&module, task);
@@ -1552,6 +1580,35 @@ impl fmt::Debug for TaskProgram {
     }
 }
 
+/// `source` after `lines` blank lines, so Starlark's line numbers are those of
+/// the `kizz.md`.
+///
+/// The space is reserved first with `String::try_reserve_exact`, which returns an
+/// error where `str::repeat` panics on a length that overflows, so the pushes that
+/// follow fit.
+///
+/// # Errors
+///
+/// A [`TaskFailure::Program`] when the padded source cannot be allocated.
+fn padded_source(
+    lines: usize,
+    source: &str,
+) -> Result<String, TaskFailure> {
+    let mut padded = String::new();
+    padded
+        .try_reserve_exact(lines.saturating_add(source.len()))
+        .map_err(|error| {
+            TaskFailure::program(format_args!(
+                "cannot place the task's source after {lines} blank lines: {error}"
+            ))
+        })?;
+    for _ in 0..lines {
+        padded.push('\n');
+    }
+    padded.push_str(source);
+    Ok(padded)
+}
+
 impl TaskProgram {
     /// Parse the task block and load every module it loads, directly or
     /// indirectly.
@@ -1582,9 +1639,11 @@ impl TaskProgram {
         let file_name = task.relative_file.display().to_string();
         // Blank lines before the source make Starlark's line numbers those of the
         // `kizz.md`.
-        let padded = format!("{}{}", "\n".repeat(task.line), task.source);
-        let parsed = AstModule::parse(&file_name, padded, &Dialect::Extended)
-            .map_err(TaskFailure::program)
+        let parsed = padded_source(task.line, &task.source)
+            .and_then(|padded| {
+                AstModule::parse(&file_name, padded, &Dialect::Extended)
+                    .map_err(TaskFailure::program)
+            })
             .and_then(|ast| {
                 let imports = loader.load_imports(&ast, &task.dir, &file_name)?;
                 Ok((ast, imports))
@@ -1680,12 +1739,12 @@ impl TaskProgram {
             task: &task,
             executor,
             caller,
-            env: RefCell::new(BTreeMap::new()),
-            accesses: RefCell::new(Accesses::new()),
-            changes: RefCell::new(FileChanges::new()),
-            unexpected: RefCell::new(None),
+            env: Cell::new(BTreeMap::new()),
+            accesses: Cell::new(Accesses::new()),
+            changes: Cell::new(FileChanges::new()),
+            unexpected: Cell::new(None),
             started: Cell::new(0),
-            watched: RefCell::new(Vec::new()),
+            watched: Cell::new(Vec::new()),
         };
         let result = Module::with_temp_heap(|module| {
             set_task_value(&module, &task);
@@ -1743,12 +1802,17 @@ pub struct TaskRun {
 
 /// Unit tests for the runtime's own logic.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert, borrow cells and lock"
+)]
 mod tests {
     use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
 
     use kizz_trace::{AbsolutePath, CapturedOutput, Termination};
 
-    use super::{PrintSink, TaskInfo, TaskProgram, UnexpectedExit};
+    use super::{PrintSink, TaskFailure, TaskInfo, TaskProgram, UnexpectedExit, padded_source};
     use crate::step::{StepError, StepExecutor, StepOutcome, StepSpec};
 
     /// Records each step and answers with exit status 0 and no output.
@@ -1852,5 +1916,27 @@ mod tests {
             "command `make all`: killed by signal 9, but `expect` accepts exit code 0\n--- \
              output ---\npartial\n"
         );
+    }
+
+    /// A task's source after blank lines whose total length cannot be reserved is a
+    /// program failure, where `str::repeat` would panic: `usize::MAX` lines saturate
+    /// the length, which overflows the largest length a `String` can reserve, so the
+    /// reservation fails at once, without allocating; a length that fits is built in
+    /// full.
+    #[test]
+    fn padding_that_cannot_be_reserved_is_a_program_failure() {
+        let Err(TaskFailure::Program { message }) = padded_source(usize::MAX, "run(\"a\")\n")
+        else {
+            panic!("the padding was reserved");
+        };
+        assert!(
+            message.starts_with(&format!(
+                "cannot place the task's source after {} blank lines: ",
+                usize::MAX
+            )),
+            "{message}"
+        );
+        assert_eq!(padded_source(2, "x").unwrap(), "\n\nx");
+        assert_eq!(padded_source(0, "x").unwrap(), "x");
     }
 }

@@ -21,6 +21,14 @@
 //!
 //! Relative paths are relative to the project directory.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::BTreeSet,
     error::Error,
@@ -274,7 +282,7 @@ impl Fixture {
             .ok_or("the build decided nothing")?;
         let built = Built {
             cached: outcome.cached,
-            not_cached: engine.not_cached(),
+            not_cached: engine.not_cached()?,
             decision,
         };
         drop(task);

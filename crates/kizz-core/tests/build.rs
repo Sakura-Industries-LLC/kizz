@@ -29,6 +29,14 @@
 //! writes it, at the moment of the read, so a `bump` leaves a result that is not
 //! cached, because the file changed after the command read it.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

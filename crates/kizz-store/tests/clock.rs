@@ -7,8 +7,12 @@
 //! every reading is greater than the one before.
 
 #![allow(
+    clippy::disallowed_macros,
     clippy::disallowed_methods,
-    reason = "test code: threads of a scope read the clock at the same time"
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: threads of a scope read the clock at the same time, and the tests \
+              assert, lock and print"
 )]
 
 use std::{

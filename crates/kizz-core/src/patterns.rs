@@ -203,6 +203,11 @@ fn anchor_glob(
 
 /// Unit tests for each pattern form.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
 

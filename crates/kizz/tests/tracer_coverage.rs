@@ -103,6 +103,14 @@
 //! same variable for calls and numbers that the tracer never saw, with their
 //! notices.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

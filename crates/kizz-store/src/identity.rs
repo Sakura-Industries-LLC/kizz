@@ -290,14 +290,20 @@ pub fn identity_differences_text(differences: &[IdentityDifference]) -> String {
 }
 
 /// The supplementary group IDs of this process, sorted and distinct; empty when they
-/// cannot be read.
+/// cannot be read, or when the buffer for them cannot be allocated: it is reserved
+/// with `Vec::try_reserve_exact`, where `vec![0; len]` panics on a length that
+/// overflows ("Kizz never panics").
 fn supplementary_groups() -> Vec<u32> {
     // SAFETY: a size of zero asks only for the number of groups, and writes nothing.
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     let Ok(len) = usize::try_from(count) else {
         return Vec::new();
     };
-    let mut groups: Vec<libc::gid_t> = vec![0; len];
+    let mut groups: Vec<libc::gid_t> = Vec::new();
+    if groups.try_reserve_exact(len).is_err() {
+        return Vec::new();
+    }
+    groups.resize(len, 0);
     // SAFETY: the buffer holds `count` group IDs, the size passed.
     let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
     let Ok(filled) = usize::try_from(filled) else {
@@ -393,6 +399,11 @@ pub(crate) fn colliding_cpu_models() -> Vec<CpuModelCollision> {
 
 /// Unit tests for parsing the identity and describing its differences.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
 

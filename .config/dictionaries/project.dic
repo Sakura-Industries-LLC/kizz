@@ -218,6 +218,7 @@ hermeticity
 idents
 idtype
 IFIFO
+ilog
 inotify
 interp
 iovec
@@ -287,6 +288,7 @@ ptsname
 QCMD
 quic
 quotactl
+rchunks
 RDONLY
 RDWR
 readlink
@@ -325,6 +327,7 @@ SETMASK
 setns
 SETOPTIONS
 setpgid
+setsid
 SETSIGMASK
 setxattr
 setxattrat
@@ -343,6 +346,7 @@ SIGSEGV
 sigset
 SIGSTOP
 SIGTRAP
+SIGURG
 SIGUSR
 sockaddr
 Starlark
