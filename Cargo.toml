@@ -3,9 +3,11 @@ members = [
     "crates/kizz",
     "crates/kizz-core",
     "crates/kizz-store",
+    "crates/kizz-threads",
     "crates/kizz-trace",
     "crates/kizz-trace-linux",
 ]
+exclude = ["vendor/surrealkv"]
 resolver = "3"
 
 [workspace.lints.clippy]
@@ -61,3 +63,6 @@ homepage = "https://github.com/Sakura-Industries-LLC/kizz"
 license = "AGPL-3.0-only"
 repository = "https://github.com/Sakura-Industries-LLC/kizz"
 rust-version = "1.96.0"
+
+[patch.crates-io]
+surrealkv = { path = "vendor/surrealkv" }

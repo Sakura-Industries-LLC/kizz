@@ -16,6 +16,11 @@
 //! output, and error are its terminal side, and the test reads the output and types
 //! the answer on the other side.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: a plain std thread reads the pseudo-terminal"
+)]
+
 use std::{
     collections::BTreeMap,
     error::Error,

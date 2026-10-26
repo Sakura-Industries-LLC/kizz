@@ -93,20 +93,42 @@
 //!
 //! A socket call that connects or sends to a destination adds, when it returns,
 //! the connections that [`decode::Call::connections`] gives to the outcome.
+//!
+//! # The process tree
+//!
+//! When the request asks for the process tree, the loop also keeps the
+//! bookkeeping of [`Processes`]: it tells it each creation event, each first stop
+//! of a thread it did not follow yet, each `exec` event and each exit. At the entry
+//! of a tracked call it notes the program that the thread's process runs, and for
+//! `execve` and `execveat` it reads the argument vector; at the `exec` event the
+//! call's program becomes the one that the call starts. When the call returns, its
+//! paths go into the run's accesses exactly as without the tree, and into the
+//! observations of that program, each kind with the call's outcome. Connections,
+//! unknown system calls and every reason that the trace is incomplete go to the
+//! program that the thread's process runs, while the run keeps the first reason
+//! only. Without the tree, the loop does none of this.
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map},
+    ffi::OsString,
     io, mem,
     sync::{
         Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
 };
 
-use kizz_trace::{Accesses, Connection, FirstReads, IncompleteReason, Termination};
+use kizz_trace::{
+    Accesses, Connection, FirstReads, IncompleteReason, ProcessTree, RunRequest, Termination,
+};
 use libc::{c_int, c_long, c_ulong, pid_t};
 
-use crate::{decode, filter, sys};
+use crate::{
+    decode, filter,
+    processes::{Creation, Processes, ProgramId},
+    sys,
+};
 
 /// The signal of a stop at the exit of a system call, with
 /// `PTRACE_O_TRACESYSGOOD`: `SIGTRAP` with the high bit set.
@@ -201,6 +223,23 @@ pub(crate) struct Outcome {
     pub unknown_system_calls: BTreeSet<u32>,
     /// The connections that the tree made, sorted and without repeats.
     pub connections: BTreeSet<Connection>,
+    /// The process tree, when the request asked for it.
+    pub tree: Option<ProcessTree>,
+}
+
+/// A tracked system call that a thread is in, decoded at its entry, until the loop
+/// reads its result.
+#[derive(Debug)]
+struct Pending {
+    /// The decoded call.
+    call: decode::Call,
+    /// With the process tree, the program that the call belongs to: the one that
+    /// the thread's process ran at the entry, or the one that a successful `exec`
+    /// started.
+    caller: Option<ProgramId>,
+    /// With the process tree, the argument vector of an `execve` or `execveat`,
+    /// read at the entry.
+    arguments: Vec<OsString>,
 }
 
 /// What the loop knows about one traced thread.
@@ -213,9 +252,8 @@ struct Tracee {
     /// A new thread can report its first stop, and even its exit, before that
     /// event.
     announced: bool,
-    /// The tracked system call the thread is in, decoded at its entry, until the
-    /// loop reads its result.
-    pending: Option<decode::Call>,
+    /// The tracked system call the thread is in, until the loop reads its result.
+    pending: Option<Pending>,
 }
 
 impl Tracee {
@@ -252,6 +290,9 @@ struct Tree<'a> {
     killed: bool,
     /// What the loop has observed so far.
     outcome: Outcome,
+    /// The bookkeeping of the processes and programs, when the request asked for
+    /// the process tree.
+    processes: Option<Processes>,
 }
 
 /// Whether an error means the thread no longer exists, which happens when it was
@@ -348,8 +389,34 @@ impl<'a> Tree<'a> {
                 first_reads: FirstReads::new(),
                 unknown_system_calls: BTreeSet::new(),
                 connections: BTreeSet::new(),
+                tree: None,
             },
+            processes: None,
         }
+    }
+
+    /// Keep the bookkeeping of the processes and programs of the tree, whose first
+    /// process runs `request`, for the process tree.
+    fn keep_processes(
+        &mut self,
+        request: &RunRequest,
+    ) {
+        self.processes = Some(Processes::new(
+            self.root,
+            request.program.clone(),
+            request.args.clone(),
+        ));
+    }
+
+    /// The program that the process of the thread `pid` runs now, with the process
+    /// tree.
+    fn current(
+        &self,
+        pid: pid_t,
+    ) -> Option<ProgramId> {
+        self.processes
+            .as_ref()
+            .and_then(|processes| processes.current(pid))
     }
 
     /// Start following a thread, unless it is already followed. A thread that
@@ -376,15 +443,21 @@ impl<'a> Tree<'a> {
     fn forget(
         &mut self,
         pid: pid_t,
-    ) -> Option<decode::Call> {
+    ) -> Option<Pending> {
         self.tracees.remove(&pid).and_then(|tracee| tracee.pending)
     }
 
-    /// Note why the trace is incomplete, unless an earlier reason was noted.
+    /// Note why the trace is incomplete, unless an earlier reason was noted, and
+    /// with the process tree, attribute the reason to `program`, the program that
+    /// caused it.
     fn incomplete(
         &mut self,
+        program: Option<ProgramId>,
         reason: IncompleteReason,
     ) {
+        if let (Some(processes), Some(program)) = (self.processes.as_mut(), program) {
+            processes.incomplete(program, reason.clone());
+        }
         if self.outcome.incomplete.is_none() {
             self.outcome.incomplete = Some(reason);
         }
@@ -392,7 +465,9 @@ impl<'a> Tree<'a> {
 
     /// Record the paths of a tracked call of the thread `pid` that returned
     /// `result`, or whose result was never seen, with what the kernel loaded to run
-    /// the program of an `exec`, and the connections of a socket call.
+    /// the program of an `exec`, and the connections of a socket call; with the
+    /// process tree, also attribute them, each kind with the call's outcome, and a
+    /// reason that the call makes the trace incomplete, to the program of the call.
     ///
     /// The first-read metadata of the files the call opened for reading or ran is
     /// noted first, while the accesses hold only the calls that returned earlier,
@@ -400,9 +475,12 @@ impl<'a> Tree<'a> {
     fn finish(
         &mut self,
         pid: pid_t,
-        mut call: decode::Call,
+        pending: Pending,
         result: Option<i64>,
     ) {
+        let Pending {
+            mut call, caller, ..
+        } = pending;
         let thread = sys::Thread(pid);
         call.loaded(result, &thread);
         for (path, metadata) in call.first_reads(result, &thread) {
@@ -410,9 +488,18 @@ impl<'a> Tree<'a> {
                 .first_reads
                 .note(&path, metadata, &self.outcome.accesses);
         }
-        self.outcome.connections.extend(call.connections(result));
-        if let Some(detail) = call.finish(result, &mut self.outcome.accesses) {
-            self.incomplete(IncompleteReason::Other { detail });
+        let connections = call.connections(result);
+        if let (Some(processes), Some(caller)) = (self.processes.as_mut(), caller) {
+            processes.connect(caller, connections.iter().cloned());
+        }
+        self.outcome.connections.extend(connections);
+        let observations = match (self.processes.as_mut(), caller) {
+            (Some(processes), Some(caller)) => processes.observations(caller),
+            _ => None,
+        };
+        if let Some(detail) = call.finish_observed(result, &mut self.outcome.accesses, observations)
+        {
+            self.incomplete(caller, IncompleteReason::Other { detail });
         }
     }
 
@@ -478,16 +565,24 @@ impl<'a> Tree<'a> {
         if !announced {
             self.exited_unannounced.insert(pid);
         }
-        if let Some(call) = tracee.and_then(|tracee| tracee.pending) {
+        if let Some(pending) = tracee.and_then(|tracee| tracee.pending) {
             // The thread ended inside the call, which may have taken effect.
-            self.finish(pid, call, None);
+            self.finish(pid, pending, None);
+        }
+        // Without the process tree, only the first process's status is kept.
+        if self.processes.is_none() && pid != self.root {
+            return;
+        }
+        let termination = if libc::WIFEXITED(status) {
+            Termination::Exited(libc::WEXITSTATUS(status))
+        } else {
+            Termination::Signaled(libc::WTERMSIG(status))
+        };
+        if let Some(processes) = self.processes.as_mut() {
+            processes.exited(pid, termination);
         }
         if pid == self.root {
-            self.outcome.termination = Some(if libc::WIFEXITED(status) {
-                Termination::Exited(libc::WEXITSTATUS(status))
-            } else {
-                Termination::Signaled(libc::WTERMSIG(status))
-            });
+            self.outcome.termination = Some(termination);
         }
     }
 
@@ -518,8 +613,11 @@ impl<'a> Tree<'a> {
         // A new thread or process can report its first stop before the event of
         // the thread that created it. It is stopped, so its ID still names it.
         if !self.tracees.contains_key(&pid) {
-            let leader = leads_its_process(pid);
-            self.adopt(pid, Tracee::new(true, false), leader);
+            let process = sys::thread_group(pid).ok();
+            if let Some(processes) = self.processes.as_mut() {
+                processes.first_stop(pid, process);
+            }
+            self.adopt(pid, Tracee::new(true, false), process == Some(pid));
         }
         if signal == libc::SIGTRAP && event != 0 {
             return self.event_stop(pid, event);
@@ -558,25 +656,26 @@ impl<'a> Tree<'a> {
         &mut self,
         pid: pid_t,
     ) -> io::Result<()> {
-        let call = self
+        let pending = self
             .tracees
             .get_mut(&pid)
             .and_then(|tracee| tracee.pending.take());
-        if let Some(mut call) = call {
+        if let Some(mut pending) = pending {
             // Without the registers the result is unknown, so the call is recorded
             // as one that may or may not have taken effect.
             let result = sys::registers(pid)
                 .ok()
                 .map(|registers| i64::from_ne_bytes(registers.rax.to_ne_bytes()));
             // A descriptor the call returned names the object it actually opened.
-            call.opened(result, &sys::Thread(pid));
-            self.finish(pid, call, result);
+            pending.call.opened(result, &sys::Thread(pid));
+            self.finish(pid, pending, result);
         }
         unless_vanished(sys::resume(pid, 0))
     }
 
     /// Decode the tracked system call a thread is entering at a seccomp stop, and
-    /// keep it until the call returns.
+    /// keep it until the call returns; with the process tree, also note the program
+    /// that the thread's process runs, and the argument vector of an `exec`.
     fn system_call_entry(
         &mut self,
         pid: pid_t,
@@ -590,16 +689,32 @@ impl<'a> Tree<'a> {
                 return;
             },
         };
-        let Some(call) = c_long::try_from(registers.orig_rax)
+        let thread = sys::Thread(pid);
+        let Some((number, call)) = c_long::try_from(registers.orig_rax)
             .ok()
-            .and_then(|number| decode::enter(number, arguments(&registers), &sys::Thread(pid)))
+            .and_then(|number| {
+                decode::enter(number, arguments(&registers), &thread).map(|call| (number, call))
+            })
         else {
             return;
+        };
+        let (caller, vector) = if self.processes.is_some() {
+            (
+                self.current(pid),
+                decode::argument_vector(number, arguments(&registers), &thread),
+            )
+        } else {
+            (None, Vec::new())
+        };
+        let pending = Pending {
+            call,
+            caller,
+            arguments: vector,
         };
         let earlier = self
             .tracees
             .get_mut(&pid)
-            .and_then(|tracee| tracee.pending.replace(call));
+            .and_then(|tracee| tracee.pending.replace(pending));
         if let Some(earlier) = earlier {
             // A call whose exit was never seen; it cannot happen when every stop
             // is handled, and is recorded as one whose result is unknown.
@@ -607,16 +722,35 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Follow a thread or process that a thread just created at an `event`.
+    /// Follow a thread or process that the thread `creator` just created at an
+    /// `event`, and with the process tree, note the creation.
     ///
     /// After the escalation a new thread is killed at once: its first stop may
     /// still be pending, and nothing else would signal it before then. During the
     /// grace period after cancellation it runs, as it does without cancellation.
     fn created(
         &mut self,
+        creator: pid_t,
         child: pid_t,
         event: c_int,
     ) -> io::Result<()> {
+        if let Some(processes) = self.processes.as_mut() {
+            // A thread that exited before both its first stop and this event left
+            // nothing to attribute, and is not noted, so its ID names nothing.
+            let early = processes.awaits_creation(child);
+            if early || !self.exited_unannounced.contains(&child) {
+                let how = match event {
+                    libc::PTRACE_EVENT_FORK => Creation::Fork,
+                    libc::PTRACE_EVENT_VFORK => Creation::Vfork,
+                    _ => {
+                        Creation::Clone {
+                            thread: !early && !leads_its_process(child),
+                        }
+                    },
+                };
+                processes.created(creator, child, how);
+            }
+        }
         if self.exited_unannounced.remove(&child) {
             // It already exited, and its exit has been collected.
             return Ok(());
@@ -640,6 +774,30 @@ impl<'a> Tree<'a> {
         Ok(())
     }
 
+    /// With the process tree, note the successful `exec` that the thread `former`
+    /// made and that now runs under `pid`: the process runs the program that the
+    /// call names, with the arguments that it passed, and the call belongs to it.
+    fn exec_started(
+        &mut self,
+        pid: pid_t,
+        former: pid_t,
+    ) {
+        let Some(processes) = self.processes.as_mut() else {
+            return;
+        };
+        let pending = self
+            .tracees
+            .get_mut(&pid)
+            .and_then(|tracee| tracee.pending.as_mut());
+        let (path, vector) = pending.as_ref().map_or((None, Vec::new()), |pending| {
+            (pending.call.program().cloned(), pending.arguments.clone())
+        });
+        let started = processes.exec(pid, former, path, vector);
+        if let Some(pending) = pending {
+            pending.caller = started;
+        }
+    }
+
     /// Handle a `ptrace` event stop, then resume the thread, or kill it after the
     /// escalation.
     ///
@@ -659,7 +817,7 @@ impl<'a> Tree<'a> {
         let escalated = self.escalation.is_escalated();
         match event {
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
-                self.created(message_pid(message)?, event)?;
+                self.created(pid, message_pid(message)?, event)?;
             },
             libc::PTRACE_EVENT_EXEC => {
                 // A thread other than the leader that runs `exec` takes over the
@@ -678,6 +836,7 @@ impl<'a> Tree<'a> {
                         self.finish(pid, ended, None);
                     }
                 }
+                self.exec_started(pid, former);
             },
             libc::PTRACE_EVENT_SECCOMP if !escalated => self.seccomp_stop(pid, message),
             _ => {},
@@ -695,7 +854,7 @@ impl<'a> Tree<'a> {
         pid: pid_t,
         error: &io::Error,
     ) {
-        self.incomplete(IncompleteReason::Other {
+        self.incomplete(self.current(pid), IncompleteReason::Other {
             detail: format!(
                 "could not read the registers of thread {pid} at a system call: {error}"
             ),
@@ -704,12 +863,13 @@ impl<'a> Tree<'a> {
 
     /// Handle the entry of a call that can make the trace incomplete: mark the run
     /// with the process and the call when the call, with its arguments, marks it,
-    /// unless the run is already marked. The call then runs unchanged.
+    /// unless the run is already marked and the request did not ask for the process
+    /// tree, which lists every reason. The call then runs unchanged.
     fn untraceable_entry(
         &mut self,
         pid: pid_t,
     ) {
-        if self.outcome.incomplete.is_some() {
+        if self.outcome.incomplete.is_some() && self.processes.is_none() {
             return;
         }
         let registers = match sys::registers(pid) {
@@ -727,15 +887,16 @@ impl<'a> Tree<'a> {
                 decode::untraceable(number, arguments(&registers), &sys::Thread(pid))
             });
         if let Some(made) = made {
-            self.incomplete(IncompleteReason::UntraceableSystemCall {
+            self.incomplete(self.current(pid), IncompleteReason::UntraceableSystemCall {
                 detail: format!("process {pid} {made}"),
             });
         }
     }
 
     /// Handle the entry of a native call that the tracer does not know: note its
-    /// number, the low 32 bits of the number register, as the filter saw it. The
-    /// call then runs unchanged, and the trace stays complete.
+    /// number, the low 32 bits of the number register, as the filter saw it, and
+    /// with the process tree, attribute it to the program of the thread's process.
+    /// The call then runs unchanged, and the trace stays complete.
     fn unknown_entry(
         &mut self,
         pid: pid_t,
@@ -745,6 +906,11 @@ impl<'a> Tree<'a> {
                 let low = registers.orig_rax & u64::from(u32::MAX);
                 if let Ok(number) = u32::try_from(low) {
                     self.outcome.unknown_system_calls.insert(number);
+                    if let (Some(program), Some(processes)) =
+                        (self.current(pid), self.processes.as_mut())
+                    {
+                        processes.unknown(program, number);
+                    }
                 }
             },
             // A thread that vanished makes no call.
@@ -780,7 +946,7 @@ impl<'a> Tree<'a> {
             Ok(filter::DATA_X32) => "the x32 interface",
             Ok(_) | Err(_) => return,
         };
-        if self.outcome.incomplete.is_some() {
+        if self.outcome.incomplete.is_some() && self.processes.is_none() {
             return;
         }
         let call = match sys::registers(pid) {
@@ -792,7 +958,7 @@ impl<'a> Tree<'a> {
             },
             Err(_) => "a system call".to_owned(),
         };
-        self.outcome.incomplete = Some(IncompleteReason::NonNativeSystemCall {
+        self.incomplete(self.current(pid), IncompleteReason::NonNativeSystemCall {
             detail: format!("process {pid} made {call} through {interface}"),
         });
     }
@@ -811,7 +977,8 @@ const fn arguments(registers: &libc::user_regs_struct) -> decode::Arguments {
     ]
 }
 
-/// Follow the tree whose first process is `root` until all of it has exited.
+/// Follow the tree whose first process is `root` until all of it has exited, and
+/// with `tree`, the request that the first process runs, keep its process tree.
 ///
 /// `root` must be a resumed tracee, and the only child, of the calling thread.
 /// Until `escalation` is set, the loop follows the tree in full, also during the
@@ -826,10 +993,15 @@ pub(crate) fn follow(
     root: pid_t,
     live: &LiveProcesses,
     escalation: &Escalation,
+    tree: Option<&RunRequest>,
 ) -> io::Result<Outcome> {
-    let mut tree = Tree::new(root, live, escalation);
-    tree.run()?;
-    Ok(tree.outcome)
+    let mut followed = Tree::new(root, live, escalation);
+    if let Some(request) = tree {
+        followed.keep_processes(request);
+    }
+    followed.run()?;
+    followed.outcome.tree = followed.processes.take().map(Processes::into_tree);
+    Ok(followed.outcome)
 }
 
 /// Kill every thread of a tree the loop could not follow to its end, including
@@ -848,9 +1020,45 @@ pub(crate) fn abandon(live: &LiveProcesses) {
     lock(live).clear();
 }
 
+/// Run `body` in a thread scope on the tracer thread of a tree whose live processes
+/// are `live`, and return what it returns; when `body` panics, kill and collect the
+/// whole tree with [`abandon`] before the scope waits for its threads.
+///
+/// The scope's threads feed the tree's input and read its output until the tree
+/// has exited, and the tree waits in its `ptrace` stops for this thread. A panic
+/// on this thread, such as a helper thread that cannot be started, would otherwise
+/// leave the scope waiting for readers that wait for a tree that waits for this
+/// thread, for good. Killed, the tree closes its pipes, the readers end, and the
+/// panic reaches the caller.
+pub(crate) fn scope_abandoning_on_panic<'env, T>(
+    live: &'env LiveProcesses,
+    body: impl for<'scope> FnOnce(&'scope thread::Scope<'scope, 'env>) -> T,
+) -> T {
+    thread::scope(|scope| {
+        let _abandon = AbandonOnPanic(live);
+        body(scope)
+    })
+}
+
+/// Kills and collects the tree of the live processes it holds, with [`abandon`],
+/// when it is dropped while its thread panics; see [`scope_abandoning_on_panic`].
+struct AbandonOnPanic<'a>(&'a LiveProcesses);
+
+impl Drop for AbandonOnPanic<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            abandon(self.0);
+        }
+    }
+}
+
 /// Tests that drive the loop by hand with real traced processes, to stop it at
 /// exactly the moment a test needs.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: helper processes and tests start plain std threads"
+)]
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -858,6 +1066,7 @@ mod tests {
         fs,
         io::{Read as _, Write as _},
         os::fd::OwnedFd,
+        panic::{self, AssertUnwindSafe},
         path::Path,
         ptr,
         sync::mpsc,
@@ -990,6 +1199,7 @@ mod tests {
             stdin: None,
             capture: CaptureMode::Split,
             echo: false,
+            tree: false,
         }
     }
 
@@ -1652,5 +1862,55 @@ mod tests {
         escalation.escalate();
         kill_all(&live);
         finish_cancelled(tree, &live, &traced, &[created], libc::SIGKILL);
+    }
+
+    /// A panic on the tracer thread, while a thread of the scope waits for the end
+    /// of the tree's output and the tree waits in a `ptrace` stop for the tracer
+    /// thread, kills and collects the tree, so the scope ends and the panic reaches
+    /// the caller. This is the order in which a run waited for good when the tracer
+    /// thread could not start a helper thread; the first process is not even in the
+    /// live set, as when starting an output reader fails.
+    #[test]
+    fn a_panic_on_the_tracer_thread_kills_the_tree_that_waits_for_it() {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            // This thread starts the helper, so it is the helper's tracer. No loop
+            // follows the helper, which therefore waits in its first seccomp stop.
+            let Traced {
+                root,
+                finished,
+                _report: report,
+                ..
+            } = trace_helper("clone");
+            let live = LiveProcesses::default();
+            let ended = Mutex::new(Vec::new());
+            let outcome = {
+                let ended = &ended;
+                let live = &live;
+                panic::catch_unwind(AssertUnwindSafe(move || {
+                    scope_abandoning_on_panic(live, move |scope| -> u8 {
+                        scope.spawn(move || {
+                            // Each output reader reports once its pipe has ended.
+                            for _ in 0..2 {
+                                let reported = finished.recv().unwrap();
+                                ended.lock().unwrap().push(reported);
+                            }
+                        });
+                        panic::resume_unwind(Box::new("the tracer could not start a thread"))
+                    })
+                }))
+            };
+            drop(report);
+            let ended = ended.into_inner().unwrap();
+            sender
+                .send((outcome.is_err(), has_exited(root), ended))
+                .ok();
+        });
+        let (panicked, exited, ended) = receiver
+            .recv_timeout(PATIENCE)
+            .expect("the scope of the tracer thread that panicked did not end");
+        assert!(panicked, "the panic did not reach the caller");
+        assert!(exited, "the helper survived the panic");
+        assert_eq!(ended, [true, true], "an output pipe did not end");
     }
 }

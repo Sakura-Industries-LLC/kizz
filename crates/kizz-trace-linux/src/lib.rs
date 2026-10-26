@@ -45,6 +45,19 @@
 //! the descriptor that an opening call returned, and through the path for the
 //! program of an `exec` and each interpreter and loader that the kernel loaded.
 //!
+//! When the request asks for the process tree, the tracer also keeps, apart from
+//! the combined accesses, which stay exactly as without it, each process of the
+//! tree with the programs it ran and how it ended, and attributes what each call
+//! touched to the program that its thread's process ran, each kind with the call's
+//! outcome: `ok`, the name of the error, or `unknown` for a call whose result it
+//! never saw. A successful `exec` belongs to the program that it starts, whose
+//! arguments the tracer reads at the call's entry. Connections, unknown system
+//! calls and every reason that the trace is incomplete belong to programs in the
+//! same way, while the result keeps the first reason. A command that cannot start
+//! gives an error whose tree holds its one process, without a status, with the
+//! request's program and what the attempt touched. Without the request, the tracer
+//! does none of this extra work.
+//!
 //! [`LinuxTracer`] also answers the platform queries of the tracer interface. It
 //! reads the extended attributes of a path with `listxattr` and `getxattr`, or
 //! `llistxattr` and `lgetxattr` without following a final symbolic link, and a file
@@ -52,7 +65,10 @@
 //! a command it starts inherits from its own thread: the kernel with `uname`, every
 //! resource limit with `getrlimit`, the CPUs with `sched_getaffinity`, the
 //! `MemTotal` and `MemAvailable` lines of `/proc/meminfo`, and the file system of
-//! the working directory with `statfs`, and its mount flags with `statvfs`.
+//! the working directory with `statfs`, and its mount flags with `statvfs`. It
+//! names an error number with Linux's name for it, such as `ENOENT`, the kernel's
+//! names for its internal restart errors, such as `ERESTARTSYS`, and `errno` and the
+//! number for any other.
 //!
 //! When a request is cancelled, the tracer interrupts the tree: it sends `SIGINT`
 //! once to every live process. It follows the tree as before for
@@ -62,14 +78,25 @@
 //! it handled the interrupt. The program runs in a process group of its own, so an
 //! interrupt that a terminal sends to the tracer's process group never reaches it
 //! directly: it receives the interrupt exactly once, from the tracer.
+//!
+//! Each run starts its threads through `kizz_threads`, which waits and retries while
+//! the system cannot start a thread for the moment, and never panics: the tracing
+//! thread, `kizz-tracer`; the thread that feeds `stdin`, `kizz-feeder`; a thread that
+//! captures each output stream, `kizz-stdout` and `kizz-stderr`, or `kizz-output`
+//! for merged output; and the watchdog of cancellation, `kizz-watchdog`. When one
+//! still cannot start, the run kills and collects every process of the request and
+//! returns [`TraceError::Tracer`], whose message names the thread and the system's
+//! error.
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("the kizz tracer supports only Linux on x86_64");
 
 mod capture;
 mod decode;
+mod errors;
 mod filter;
 mod follow;
+mod processes;
 mod spawn;
 mod sys;
 
@@ -78,17 +105,19 @@ use std::{
     io,
     path::Path,
     sync::mpsc::{self, RecvTimeoutError},
-    thread::{self, ScopedJoinHandle},
+    thread,
     time::Duration,
 };
 
 pub use filter::{
     KNOWN_SYSTEM_CALLS, TRACKED_SYSTEM_CALLS, TrackedSystemCall, UNTRACEABLE_SYSTEM_CALLS,
 };
+use kizz_threads::ScopedJoinHandle;
 use kizz_trace::{
     Accesses, Cancellation, EchoSink, ExtendedAttributes, FirstReads, MachineState, OutputStream,
     RunRequest, RunResult, TraceError, Tracer,
 };
+use libc::pid_t;
 
 use crate::{
     capture::TracerStdio,
@@ -146,6 +175,24 @@ fn join<T>(
     }
 }
 
+/// The tracer error for a thread of the run that could not be started, whose
+/// message names the thread and the system's error.
+fn not_started(error: &kizz_threads::StartError) -> TraceError {
+    TraceError::Tracer {
+        message: error.to_string(),
+        source: None,
+    }
+}
+
+/// The name and the description of the thread that captures `stream`.
+const fn reader_thread(stream: OutputStream) -> (&'static str, &'static str) {
+    match stream {
+        OutputStream::Stdout => ("kizz-stdout", "the thread that captures standard output"),
+        OutputStream::Stderr => ("kizz-stderr", "the thread that captures standard error"),
+        OutputStream::Merged => ("kizz-output", "the thread that captures the merged output"),
+    }
+}
+
 /// Interrupt the tree when the request is cancelled, and kill whatever remains of
 /// it when the grace period ends, until `done` is dropped.
 ///
@@ -181,6 +228,8 @@ fn watch(
 
 /// What the event loop and the helper threads of one run produced.
 struct Supervised {
+    /// The process ID of the child that the tracer forked.
+    pid: pid_t,
     /// The outcome of the event loop, or `None` when the child exited before it
     /// came under `ptrace`.
     followed: io::Result<Option<follow::Outcome>>,
@@ -193,32 +242,59 @@ struct Supervised {
 /// Follow a started child to the end of its tree while helper threads feed its
 /// input, capture its output, and watch for cancellation.
 ///
-/// The event loop runs on the calling thread, the tracer of the tree.
+/// The event loop runs on the calling thread, the tracer of the tree. Each helper
+/// thread starts through `kizz_threads`, which waits and retries while the system
+/// cannot start a thread for the moment. When one still cannot start, the run kills
+/// and collects every process of the tree, as when the event loop fails, so no
+/// process of the request stays behind and the helper threads that started end with
+/// the tree's pipes, and it returns [`TraceError::Tracer`], whose message names the
+/// thread and the system's error. A panic on the tracer thread kills and collects the
+/// tree the same way before the helper threads are waited for, so the panic ends the
+/// run instead of leaving it waiting for readers of a tree that waits for its tracer.
 fn supervise(
     request: &RunRequest,
     started: Started,
     tracer_stdio: TracerStdio,
     echo: Option<&dyn EchoSink>,
     cancel: &Cancellation,
-) -> Supervised {
+) -> Result<Supervised, TraceError> {
     let live = LiveProcesses::new(BTreeSet::new());
     let escalation = Escalation::new();
-    thread::scope(|scope| {
-        let feeder = tracer_stdio.stdin.map(|stdin| {
-            let content = request.stdin.as_deref().unwrap_or_default();
-            scope.spawn(move || capture::feed(stdin, content))
-        });
-        let readers: Vec<_> = tracer_stdio
+    // Kill and collect the tree, for a helper thread that could not start.
+    let give_up = |live: &LiveProcesses, error: &kizz_threads::StartError| {
+        if let Started::Running(root) = started {
+            follow::lock(live).insert(root);
+        }
+        follow::abandon(live);
+        not_started(error)
+    };
+    follow::scope_abandoning_on_panic(&live, |scope| {
+        let feeder = tracer_stdio
+            .stdin
+            .map(|stdin| {
+                let content = request.stdin.as_deref().unwrap_or_default();
+                kizz_threads::spawn_scoped(
+                    scope,
+                    "kizz-feeder",
+                    "the thread that feeds stdin",
+                    move || capture::feed(stdin, content),
+                )
+            })
+            .transpose()
+            .map_err(|error| give_up(&live, &error))?;
+        let readers = tracer_stdio
             .outputs
             .into_iter()
             .map(|(stream, pipe)| {
-                (
-                    stream,
-                    scope.spawn(move || capture::collect(pipe, stream, echo)),
-                )
+                let (name, what) = reader_thread(stream);
+                kizz_threads::spawn_scoped(scope, name, what, move || {
+                    capture::collect(pipe, stream, echo)
+                })
+                .map(|reader| (stream, reader))
             })
-            .collect();
-        let followed = match started {
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| give_up(&live, &error))?;
+        let (pid, followed) = match started {
             Started::Running(root) => {
                 let (done_sender, done) = mpsc::channel::<()>();
                 let live = &live;
@@ -226,17 +302,24 @@ fn supervise(
                 // The first process is live before the watchdog starts, so an
                 // interrupt for a request that is already cancelled reaches it.
                 follow::lock(live).insert(root);
-                let watchdog = scope.spawn(move || watch(live, cancel, escalation, &done));
-                let followed = follow::follow(root, live, escalation);
+                let watchdog = kizz_threads::spawn_scoped(
+                    scope,
+                    "kizz-watchdog",
+                    "the thread that watches for cancellation",
+                    move || watch(live, cancel, escalation, &done),
+                )
+                .map_err(|error| give_up(live, &error))?;
+                let followed =
+                    follow::follow(root, live, escalation, request.tree.then_some(request));
                 if followed.is_err() {
                     follow::abandon(live);
                 }
                 drop(done_sender);
                 // The watchdog only signals processes; it has no result.
                 drop(watchdog.join());
-                followed.map(Some)
+                (root, followed.map(Some))
             },
-            Started::Exited => Ok(None),
+            Started::Exited(pid) => (pid, Ok(None)),
         };
         let streams = readers
             .into_iter()
@@ -245,11 +328,12 @@ fn supervise(
             })
             .collect();
         let fed = feeder.map_or(Ok(()), |feeder| join(feeder, "that feeds stdin"));
-        Supervised {
+        Ok(Supervised {
+            pid,
             followed,
             streams,
             fed,
-        }
+        })
     })
 }
 
@@ -259,14 +343,15 @@ fn supervise(
 /// The event loop's waits report every child of the waiting thread. A new thread has
 /// no child until it starts the traced program, so no wait of a run collects,
 /// signals or adopts a child that the calling thread, or any other thread, started.
+/// The thread starts through `kizz_threads`; when it cannot start, nothing of the
+/// request has started, and the error names the tracing thread and the system's
+/// error.
 fn on_tracer_thread<T: Send>(
     work: impl FnOnce() -> Result<T, TraceError> + Send
 ) -> Result<T, TraceError> {
     thread::scope(|scope| {
-        let tracer = thread::Builder::new()
-            .name("kizz-tracer".to_owned())
-            .spawn_scoped(scope, work)
-            .map_err(|error| tracer_error("could not start the tracing thread", error))?;
+        let tracer = kizz_threads::spawn_scoped(scope, "kizz-tracer", "the tracing thread", work)
+            .map_err(|error| not_started(&error))?;
         tracer.join().unwrap_or_else(|_| {
             Err(TraceError::Tracer {
                 message: "the tracing thread panicked".to_owned(),
@@ -288,6 +373,9 @@ impl Tracer for LinuxTracer {
                 program: request.program.clone(),
                 source: io::Error::new(io::ErrorKind::InvalidInput, error),
                 accesses: Accesses::new(),
+                tree: request
+                    .tree
+                    .then(|| processes::failed_start(None, request, None)),
             }
         })?;
         let filter = filter::program().map_err(|error| {
@@ -303,48 +391,40 @@ impl Tracer for LinuxTracer {
         let supervised = on_tracer_thread(move || {
             let started = spawn::start(request, &program, &filter, &child_stdio, report_write)?;
             drop(child_stdio);
-            Ok(supervise(
+            supervise(
                 request,
                 started,
                 tracer_stdio,
                 request.echo.then_some(echo),
                 cancel,
-            ))
+            )
         })?;
+        let pid = supervised.pid;
         let outcome = supervised
             .followed
-            .map_err(|error| tracer_error("could not follow the traced processes", error))?;
+            .map_err(|error| tracer_error("could not follow the traced processes", error))?
+            .unwrap_or_else(|| {
+                follow::Outcome {
+                    termination: None,
+                    accesses: Accesses::new(),
+                    incomplete: None,
+                    first_reads: FirstReads::new(),
+                    unknown_system_calls: BTreeSet::new(),
+                    connections: BTreeSet::new(),
+                    tree: None,
+                }
+            });
         let streams = supervised.streams?;
         supervised.fed?;
-        let (termination, accesses, incomplete, first_reads, unknown_system_calls, connections) =
-            outcome.map_or_else(
-                || {
-                    (
-                        None,
-                        Accesses::new(),
-                        None,
-                        FirstReads::new(),
-                        BTreeSet::new(),
-                        BTreeSet::new(),
-                    )
-                },
-                |outcome| {
-                    (
-                        outcome.termination,
-                        outcome.accesses,
-                        outcome.incomplete,
-                        outcome.first_reads,
-                        outcome.unknown_system_calls,
-                        outcome.connections,
-                    )
-                },
-            );
         if let Some(failure) = spawn::read_failure(report_read)
             .map_err(|error| tracer_error("could not read the failure pipe", error))?
         {
-            return Err(failure.into_error(request, accesses));
+            let tree = request
+                .tree
+                .then(|| processes::failed_start(outcome.tree, request, Some(pid)));
+            return Err(failure.into_error(request, outcome.accesses, tree));
         }
-        let Some(termination) = termination else {
+        let Some(termination) = outcome.termination else {
             return Err(TraceError::Tracer {
                 message: "the traced program ended without an exit status".to_owned(),
                 source: None,
@@ -353,11 +433,12 @@ impl Tracer for LinuxTracer {
         Ok(RunResult {
             termination,
             output: capture::assemble(request.capture, streams),
-            accesses,
-            incomplete,
-            first_reads,
-            unknown_system_calls,
-            connections,
+            accesses: outcome.accesses,
+            incomplete: outcome.incomplete,
+            first_reads: outcome.first_reads,
+            unknown_system_calls: outcome.unknown_system_calls,
+            connections: outcome.connections,
+            tree: outcome.tree,
         })
     }
 
@@ -374,5 +455,12 @@ impl Tracer for LinuxTracer {
         cwd: &Path,
     ) -> MachineState {
         sys::machine_state(cwd)
+    }
+
+    fn error_name(
+        &self,
+        errno: i32,
+    ) -> String {
+        errors::name(i64::from(errno))
     }
 }

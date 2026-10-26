@@ -1,0 +1,2088 @@
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use crc32fast::Hasher;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
+
+use crate::error::{EncryptionError, Error, Result};
+use crate::tde::{EncryptionContext, FileCipher};
+use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
+
+pub(crate) mod sealed;
+
+/// Test-only: the VLog files whose fsync completed, in order.
+#[cfg(test)]
+pub(crate) static SYNCED_VLOG_FILES: parking_lot::Mutex<Vec<PathBuf>> =
+	parking_lot::Mutex::new(Vec::new());
+
+/// Test-only: for every fsync of a VLog file that completed, the file and the length it had just
+/// before the fsync, which is how much of it the fsync is sure to have made durable.
+#[cfg(test)]
+pub(crate) static SYNCED_VLOG_LENGTHS: parking_lot::Mutex<Vec<(PathBuf, u64)>> =
+	parking_lot::Mutex::new(Vec::new());
+
+/// VLog format version
+pub const VLOG_FORMAT_VERSION: u16 = 1;
+
+/// Size of a ValuePointer when encoded (1 + 4 + 8 + 4 + 4 + 4 bytes)
+pub const VALUE_POINTER_SIZE: usize = 25;
+
+/// Bit flags for meta operations
+pub const BIT_VALUE_POINTER: u8 = 1; // Set if the value is NOT stored directly next to key
+/// Set if an 8-byte big-endian timestamp follows the version byte. The timestamp is the
+/// version's own time (a commit time, or one the caller chose with `set_at`), kept with the value
+/// so that the internal key stays flat. Absent from entries written without one.
+pub const BIT_HAS_TIMESTAMP: u8 = 2;
+pub const VALUE_LOCATION_VERSION: u8 = 1;
+/// Size of the timestamp that follows the version byte when `BIT_HAS_TIMESTAMP` is set.
+pub(crate) const VALUE_TIMESTAMP_SIZE: usize = 8;
+pub const VALUE_POINTER_VERSION: u8 = 1;
+
+/// VLog file header with comprehensive metadata
+#[derive(Debug, Clone)]
+pub(crate) struct VLogFileHeader {
+	pub magic: u32,         // "VLOG"
+	pub version: u16,       // Format version
+	pub file_id: u32,       // File ID
+	pub created_at: u64,    // Creation timestamp
+	pub max_file_size: u64, // Maximum file size from options
+	pub compression: u8,    // Compression type
+	pub reserved: u32,      // Reserved for future use
+}
+
+impl VLogFileHeader {
+	const MAGIC: u32 = 0x564C_4F47;
+	// "VLOG" in hex
+	const SIZE: usize = 31;
+
+	// 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
+
+	pub(crate) fn new(file_id: u32, max_file_size: u64, compression: u8) -> Self {
+		Self {
+			magic: Self::MAGIC,
+			version: VLOG_FORMAT_VERSION,
+			file_id,
+			created_at: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_millis() as u64,
+			max_file_size,
+			compression,
+			reserved: 0,
+		}
+	}
+
+	pub(crate) fn encode(&self) -> [u8; Self::SIZE] {
+		let mut encoded = [0u8; Self::SIZE];
+		let mut offset = 0;
+
+		// Magic (4 bytes)
+		encoded[offset..offset + 4].copy_from_slice(&self.magic.to_be_bytes());
+		offset += 4;
+
+		// Version (2 bytes)
+		encoded[offset..offset + 2].copy_from_slice(&self.version.to_be_bytes());
+		offset += 2;
+
+		// File ID (4 bytes)
+		encoded[offset..offset + 4].copy_from_slice(&self.file_id.to_be_bytes());
+		offset += 4;
+
+		// Created at (8 bytes)
+		encoded[offset..offset + 8].copy_from_slice(&self.created_at.to_be_bytes());
+		offset += 8;
+
+		// Max file size (8 bytes)
+		encoded[offset..offset + 8].copy_from_slice(&self.max_file_size.to_be_bytes());
+		offset += 8;
+
+		// Compression (1 byte)
+		encoded[offset] = self.compression;
+		offset += 1;
+
+		// Reserved (4 bytes)
+		encoded[offset..offset + 4].copy_from_slice(&self.reserved.to_be_bytes());
+
+		encoded
+	}
+
+	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
+		if data.len() != Self::SIZE {
+			return Err(Error::Corruption(format!(
+				"Invalid VLog header size: expected {} bytes, got {} bytes",
+				Self::SIZE,
+				data.len()
+			)));
+		}
+
+		let mut offset = 0;
+
+		// Magic (4 bytes)
+		let magic = u32::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+		]);
+		offset += 4;
+
+		if magic != Self::MAGIC {
+			return Err(Error::Corruption(format!(
+				"Invalid VLog magic number: expected 0x{:08X}, got 0x{:08X}",
+				Self::MAGIC,
+				magic
+			)));
+		}
+
+		// Version (2 bytes)
+		let version = u16::from_be_bytes([data[offset], data[offset + 1]]);
+		offset += 2;
+
+		// File ID (4 bytes)
+		let file_id = u32::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+		]);
+		offset += 4;
+
+		// Created at (8 bytes)
+		let created_at = u64::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+			data[offset + 4],
+			data[offset + 5],
+			data[offset + 6],
+			data[offset + 7],
+		]);
+		offset += 8;
+
+		// Max file size (8 bytes)
+		let max_file_size = u64::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+			data[offset + 4],
+			data[offset + 5],
+			data[offset + 6],
+			data[offset + 7],
+		]);
+		offset += 8;
+
+		// Compression (1 byte)
+		let compression = data[offset];
+		offset += 1;
+
+		// Reserved (4 bytes)
+		let reserved = u32::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+		]);
+
+		Ok(Self {
+			magic,
+			version,
+			file_id,
+			created_at,
+			max_file_size,
+			compression,
+			reserved,
+		})
+	}
+
+	pub(crate) fn is_compatible(&self) -> bool {
+		self.version == VLOG_FORMAT_VERSION
+	}
+
+	/// Whether `file` is what a crash leaves of plaintext file `file_id` while its header was
+	/// being written: zeros where the header did not reach the disk, or the start of the header
+	/// and no more. The header is written on its own before any entry, so such a file holds no
+	/// entry. An empty file is not torn: it is given its header when it is reopened.
+	pub(crate) fn is_torn(file: &[u8], file_id: u32) -> bool {
+		if file.is_empty() || file.len() > Self::SIZE {
+			return false;
+		}
+		if file.iter().all(|&byte| byte == 0) {
+			return true;
+		}
+		if file.len() == Self::SIZE {
+			return false;
+		}
+		// What every header of this file starts with: the magic, the version and the file id.
+		let mut start = [0u8; 10];
+		start[..4].copy_from_slice(&Self::MAGIC.to_be_bytes());
+		start[4..6].copy_from_slice(&VLOG_FORMAT_VERSION.to_be_bytes());
+		start[6..].copy_from_slice(&file_id.to_be_bytes());
+		let len = file.len().min(start.len());
+		file[..len] == start[..len]
+	}
+
+	pub(crate) fn validate(&self, file_id: u32) -> Result<()> {
+		if self.file_id != file_id {
+			return Err(Error::Corruption(format!(
+				"File ID mismatch: expected {}, got {}",
+				file_id, self.file_id
+			)));
+		}
+
+		Ok(())
+	}
+}
+/// ValueLocation represents the value info that can be associated with a key,
+/// including the internal Meta field for various flags and operations.
+///
+/// Encoded layout: `meta (1) | version (1) | timestamp (8, only if BIT_HAS_TIMESTAMP) | value`.
+/// Every reader of encoded bytes goes through this type (`decode`, `peek_pointer_payload`,
+/// `peek_timestamp`) so that the optional timestamp never shifts a payload offset by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValueLocation {
+	/// Meta flags for various operations (value pointer etc.). `BIT_HAS_TIMESTAMP` is never
+	/// kept here: it is implied by `timestamp` and set on encode.
+	pub meta: u8,
+	/// The actual value data
+	pub value: Value,
+	/// Version number for the value
+	pub version: u8,
+	/// The version's own timestamp, if it was stored with one
+	pub timestamp: Option<u64>,
+}
+
+impl ValueLocation {
+	/// Creates a new ValueLocation
+	pub(crate) fn new(meta: u8, value: Value, version: u8) -> Self {
+		Self {
+			meta: meta & !BIT_HAS_TIMESTAMP,
+			value,
+			version,
+			timestamp: None,
+		}
+	}
+
+	/// Sets the timestamp stored with the value.
+	pub(crate) fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+		self.timestamp = timestamp;
+		self
+	}
+
+	/// Length of the header of an encoded ValueLocation with this meta byte: everything before
+	/// the value.
+	fn header_len(meta: u8) -> usize {
+		if meta & BIT_HAS_TIMESTAMP != 0 {
+			2 + VALUE_TIMESTAMP_SIZE
+		} else {
+			2
+		}
+	}
+
+	/// The time a version was written at, from the encoded value of the entry of a key of kind
+	/// `kind`: the timestamp stored with it, or `None` for what has none. A version written
+	/// while the tree was not versioned has none, and neither has a hard delete, which is a
+	/// barrier and not a version. The value of a range delete is its end key, not an encoded
+	/// value, so it is never read for one.
+	pub(crate) fn entry_time(kind: crate::InternalKeyKind, encoded_value: &[u8]) -> Option<u64> {
+		if matches!(kind, crate::InternalKeyKind::RangeDelete | crate::InternalKeyKind::Delete) {
+			return None;
+		}
+		Self::peek_timestamp(encoded_value)
+	}
+
+	/// The times of the versions of a key, which are given newest write first as the time each was
+	/// stamped with, if it was, and whether it is a barrier (a hard delete or a replace).
+	///
+	/// A version that has no time was written while the tree was not versioned, between versions
+	/// that have: it reads as written at the newest time of the versions written before it, so as
+	/// after them and at the same time as the latest of them. A tree that was versioned, then not,
+	/// then versioned again, reads what it was written without versioning as the newest writes,
+	/// and a database that never was reads it as written at 0. Nothing below a barrier counts.
+	pub(crate) fn infer_times(versions: &[(Option<u64>, bool)]) -> Vec<u64> {
+		let mut times = Vec::new();
+		Self::infer_times_into(versions.len(), |idx| versions[idx], &mut times);
+		times
+	}
+
+	/// As `infer_times`, for `count` versions given by `version`, into `times`, whose capacity is
+	/// reused.
+	pub(crate) fn infer_times_into(
+		count: usize,
+		version: impl Fn(usize) -> (Option<u64>, bool),
+		times: &mut Vec<u64>,
+	) {
+		times.clear();
+		times.resize(count, 0);
+		let mut newest = 0u64;
+		for idx in (0..count).rev() {
+			let (stamp, barrier) = version(idx);
+			if barrier {
+				newest = 0;
+			}
+			times[idx] = match stamp {
+				Some(time) => {
+					newest = newest.max(time);
+					time
+				}
+				None => newest,
+			};
+		}
+	}
+
+	/// Returns the timestamp of an ENCODED ValueLocation, if it carries one.
+	pub(crate) fn peek_timestamp(data: &[u8]) -> Option<u64> {
+		match data.first() {
+			Some(meta) if meta & BIT_HAS_TIMESTAMP != 0 => {
+				let bytes = data.get(2..2 + VALUE_TIMESTAMP_SIZE)?;
+				Some(u64::from_be_bytes(bytes.try_into().ok()?))
+			}
+			_ => None,
+		}
+	}
+
+	/// Creates a ValueLocation that points to a value in VLog
+	pub(crate) fn with_pointer(pointer: ValuePointer) -> Self {
+		let encoded_pointer = pointer.encode();
+		Self::new(BIT_VALUE_POINTER, encoded_pointer, VALUE_LOCATION_VERSION)
+	}
+
+	/// Creates a ValueLocation with inline value
+	pub(crate) fn with_inline_value(value: Value) -> Self {
+		Self::new(0, value, VALUE_LOCATION_VERSION)
+	}
+
+	/// Checks if the value is a pointer to VLog
+	pub fn is_value_pointer(&self) -> bool {
+		(self.meta & BIT_VALUE_POINTER) != 0
+	}
+
+	/// Returns the pointer payload of an ENCODED ValueLocation when its meta
+	/// byte has the value-pointer bit set, without copying the value bytes.
+	/// Layout: meta (1 byte), version (1 byte), timestamp (8 bytes, if the meta byte says so),
+	/// value. The payload starts after the timestamp, so a pointer is found whether or not the
+	/// entry carries one.
+	pub(crate) fn peek_pointer_payload(data: &[u8]) -> Option<&[u8]> {
+		match data.first() {
+			Some(&meta) if meta & BIT_VALUE_POINTER != 0 => data.get(Self::header_len(meta)..),
+			_ => None,
+		}
+	}
+
+	/// Calculates the encoded size of this ValueLocation
+	pub(crate) fn encoded_size(&self) -> usize {
+		// meta (1 byte) + version (1 byte) + optional timestamp + value length
+		let timestamp = if self.timestamp.is_some() {
+			VALUE_TIMESTAMP_SIZE
+		} else {
+			0
+		};
+		1 + 1 + timestamp + self.value.len()
+	}
+
+	/// Encodes the ValueLocation into a byte vector
+	pub(crate) fn encode(&self) -> Vec<u8> {
+		let mut encoded = Vec::with_capacity(self.encoded_size());
+		self.encode_into(&mut encoded).unwrap();
+		encoded
+	}
+
+	/// Encodes the ValueLocation into a writer
+	pub(crate) fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
+		// Write meta byte, with the timestamp bit set exactly when a timestamp follows
+		let meta = if self.timestamp.is_some() {
+			self.meta | BIT_HAS_TIMESTAMP
+		} else {
+			self.meta & !BIT_HAS_TIMESTAMP
+		};
+		writer.write_all(&[meta])?;
+
+		// Write version as u8
+		writer.write_all(&[self.version])?;
+
+		// Write the timestamp
+		if let Some(timestamp) = self.timestamp {
+			writer.write_all(&timestamp.to_be_bytes())?;
+		}
+
+		// Write value
+		writer.write_all(&self.value)?;
+
+		Ok(())
+	}
+
+	/// Decodes a ValueLocation from bytes
+	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
+		let mut cursor = Cursor::new(data);
+		Self::decode_from(&mut cursor)
+	}
+
+	/// Decodes a ValueLocation from a reader
+	fn decode_from<R: Read>(reader: &mut R) -> Result<Self> {
+		// Read meta byte
+		let mut meta_buf = [0u8; 1];
+		reader.read_exact(&mut meta_buf)?;
+		let meta = meta_buf[0];
+
+		// Read version as u8
+		let mut version_buf = [0u8; 1];
+		reader.read_exact(&mut version_buf)?;
+		let version = version_buf[0];
+
+		// Read the timestamp
+		let timestamp = if meta & BIT_HAS_TIMESTAMP != 0 {
+			let mut timestamp_buf = [0u8; VALUE_TIMESTAMP_SIZE];
+			reader.read_exact(&mut timestamp_buf).map_err(|_| {
+				Error::Corruption(
+					"a value location says it has a timestamp but is too short to hold it"
+						.to_string(),
+				)
+			})?;
+			Some(u64::from_be_bytes(timestamp_buf))
+		} else {
+			None
+		};
+
+		// Read remaining data as value
+		let mut value = Vec::new();
+		reader.read_to_end(&mut value)?;
+
+		Ok(Self::new(meta, value, version).with_timestamp(timestamp))
+	}
+
+	/// Resolves the actual value, returning inline bytes directly or fetching from VLog.
+	pub(crate) fn resolve_value(self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
+		if self.is_value_pointer() {
+			if let Some(vlog) = vlog {
+				let pointer = ValuePointer::decode(&self.value)?;
+				vlog.get(&pointer).map_err(|e| match e {
+					// A failed authentication is not a missing value: the caller tells them
+					// apart, so the error is not turned into text.
+					Error::Encryption(_) => e,
+					e => Error::Other(format!(
+						"Failed to resolve value from VLog: {e}. ValuePointer: {:?}",
+						pointer
+					)),
+				})
+			} else {
+				Err(Error::Other("VLog not available for pointer resolution".to_string()))
+			}
+		} else {
+			// Value is stored inline
+			Ok(self.value)
+		}
+	}
+}
+
+/// A pointer to a value stored in the value log
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValuePointer {
+	/// Version of the ValuePointer format
+	pub version: u8,
+	/// ID of the VLog file containing the value
+	pub file_id: u32,
+	/// Offset within the file where the value starts
+	pub offset: u64,
+	/// Size of the key in bytes
+	pub key_size: u32,
+	/// Size of the value in bytes
+	pub value_size: u32,
+	/// CRC32 checksum of the value for integrity verification
+	pub checksum: u32,
+}
+
+/// The version of a pointer to an entry that is sealed: its key and value are one AEAD message
+/// in the file, and it is longer than the entry of a plaintext log by the length of the key
+/// and the tag. A pointer is still the same 25 bytes.
+pub const VALUE_POINTER_SEALED_VERSION: u8 = 2;
+
+impl ValuePointer {
+	/// Creates a new ValuePointer
+	pub(crate) fn new(
+		file_id: u32,
+		offset: u64,
+		key_size: u32,
+		value_size: u32,
+		checksum: u32,
+	) -> Self {
+		Self {
+			version: VALUE_POINTER_VERSION,
+			file_id,
+			offset,
+			key_size,
+			value_size,
+			checksum,
+		}
+	}
+
+	/// Creates a pointer to a sealed entry. `checksum` is the CRC-32 of the entry as it is stored,
+	/// ciphertext and tag included, and the sizes are those of the key and the value.
+	pub(crate) fn sealed(
+		file_id: u32,
+		offset: u64,
+		key_size: u32,
+		value_size: u32,
+		checksum: u32,
+	) -> Self {
+		Self {
+			version: VALUE_POINTER_SEALED_VERSION,
+			..Self::new(file_id, offset, key_size, value_size, checksum)
+		}
+	}
+
+	/// Whether the pointer is to a sealed entry, see [`VALUE_POINTER_SEALED_VERSION`].
+	pub(crate) fn is_sealed(&self) -> bool {
+		self.version == VALUE_POINTER_SEALED_VERSION
+	}
+
+	/// Encodes the pointer as bytes for storage
+	pub(crate) fn encode(&self) -> Vec<u8> {
+		let mut encoded = Vec::with_capacity(VALUE_POINTER_SIZE);
+		encoded.push(self.version);
+		encoded.extend_from_slice(&self.file_id.to_be_bytes());
+		encoded.extend_from_slice(&self.offset.to_be_bytes());
+		encoded.extend_from_slice(&self.key_size.to_be_bytes());
+		encoded.extend_from_slice(&self.value_size.to_be_bytes());
+		encoded.extend_from_slice(&self.checksum.to_be_bytes());
+		encoded
+	}
+
+	/// Decodes a pointer from bytes
+	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
+		if data.len() != VALUE_POINTER_SIZE {
+			return Err(Error::Corruption(format!(
+				"Invalid ValuePointer size: expected {} bytes, got {} bytes",
+				VALUE_POINTER_SIZE,
+				data.len()
+			)));
+		}
+
+		let version = data[0];
+		let file_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+		let offset = u64::from_be_bytes([
+			data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
+		]);
+		let key_size = u32::from_be_bytes([data[13], data[14], data[15], data[16]]);
+		let value_size = u32::from_be_bytes([data[17], data[18], data[19], data[20]]);
+		let checksum = u32::from_be_bytes([data[21], data[22], data[23], data[24]]);
+
+		Ok(Self {
+			version,
+			file_id,
+			offset,
+			key_size,
+			value_size,
+			checksum,
+		})
+	}
+
+	/// The size of the entry in its file. A plaintext entry is a header with both lengths, the
+	/// key, the value and a crc32. A sealed one has no header, as nothing about it is in the
+	/// clear: its length is what the pointer says, and the length of the key, the key, the
+	/// value and the tag are one message.
+	pub(crate) fn total_entry_size(&self) -> u64 {
+		let content = self.key_size as u64 + self.value_size as u64;
+		if self.is_sealed() {
+			sealed::ENTRY_OVERHEAD as u64 + content
+		} else {
+			8 + content + 4
+		}
+	}
+}
+
+/// A file of the log that is open for reading: the handle, and for a sealed file the cipher that
+/// opens its entries, which is made from its header once, when the file is first opened, and
+/// goes when the handle does.
+pub(crate) struct OpenFile {
+	file: File,
+	cipher: Option<FileCipher>,
+}
+
+/// Represents a VLog file that can be read from
+#[derive(Debug)]
+pub(crate) struct VLogFile {
+	/// File path
+	pub path: PathBuf,
+}
+
+impl VLogFile {
+	fn new(_id: u32, path: PathBuf, _size: u64) -> Self {
+		Self {
+			path,
+		}
+	}
+}
+
+/// The file a [`VLogWriter`] writes to. In tests a write can be made to fail, as a full disk
+/// does.
+struct Sink {
+	file: File,
+	/// Bytes the file still takes before one write fails.
+	#[cfg(test)]
+	fail_after: Option<usize>,
+}
+
+impl Sink {
+	fn new(file: File) -> Self {
+		Self {
+			file,
+			#[cfg(test)]
+			fail_after: None,
+		}
+	}
+}
+
+impl Write for Sink {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		#[cfg(test)]
+		if let Some(left) = self.fail_after {
+			if left == 0 {
+				self.fail_after = None;
+				return Err(io::Error::other("injected write failure"));
+			}
+			let written = self.file.write(&buf[..buf.len().min(left)])?;
+			self.fail_after = Some(left - written);
+			return Ok(written);
+		}
+		self.file.write(buf)
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		self.file.flush()
+	}
+}
+
+/// The lengths of the key and the value of an entry as its header and its pointer store them, a
+/// `u32` each. An entry with a longer key or value is refused: a cast would store a length that
+/// wrapped around, and the entry could not be read back.
+pub(crate) fn entry_lens(key: usize, value: usize) -> Result<(u32, u32)> {
+	match (u32::try_from(key), u32::try_from(value)) {
+		(Ok(key), Ok(value)) => Ok((key, value)),
+		_ => Err(Error::InvalidArgument(format!(
+			"a VLog entry takes a key and a value of at most {} bytes each, got a key of {key} \
+			 bytes and a value of {value} bytes",
+			u32::MAX
+		))),
+	}
+}
+
+/// Writer for a single VLog file
+pub(crate) struct VLogWriter {
+	/// Buffered writer for the file
+	writer: BufWriter<Sink>,
+	/// Cloned file descriptor for fsync outside the write lock.
+	/// Points to the same inode as the BufWriter's file.
+	sync_fd: Arc<File>,
+	/// Current offset in the file: its length once everything buffered is written
+	pub(crate) current_offset: u64,
+	/// ID of this VLog file
+	file_id: u32,
+	/// Total bytes written to this file
+	bytes_written: u64,
+	/// Set when an append failed and the file could not be cut back to the end of the last
+	/// complete entry, or when an append to a sealed file failed at all. The writer then
+	/// refuses appends, and the log replaces it on its next append.
+	poisoned: bool,
+	/// The cipher that seals the entries of a sealed file, which is the only thing that seals
+	/// in it: `None` for a plaintext file.
+	cipher: Option<FileCipher>,
+	/// Test-only: the next cut of a failed append fails.
+	#[cfg(test)]
+	fail_cut_back: bool,
+}
+
+impl VLogWriter {
+	/// Creates a new VLogWriter for the specified file
+	pub(crate) fn new(
+		path: &Path,
+		file_id: u32,
+		max_file_size: u64,
+		compression: u8,
+	) -> Result<Self> {
+		let file_exists = path.exists();
+		let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+		// Clone the fd before BufWriter consumes ownership. This cloned fd
+		// is used to perform fsync outside the write lock.
+		let sync_fd = Arc::new(file.try_clone()?);
+
+		let current_offset = file.metadata()?.len();
+		if current_offset > 0 {
+			// A sealed file is never appended to by a writer that does not seal: its entries
+			// would be plaintext in the middle of ciphertext, and the sealing writer of the file
+			// is gone, so no other may pick up where it stopped.
+			//
+			// The handle above can only append, so the start of the file is read through
+			// another one.
+			let mut start = [0u8; 6];
+			let read = vfs::File::read_up_to(&File::open(path)?, 0, &mut start)?;
+			if sealed::is_sealed_start(&start[..read]) {
+				return Err(EncryptionError::InvalidInput(
+					"a sealed value-log file is never reopened for appending",
+				)
+				.into());
+			}
+		}
+		let mut writer = BufWriter::new(Sink::new(file));
+
+		// If this is a new file, write the header
+		if !file_exists || current_offset == 0 {
+			let header = VLogFileHeader::new(file_id, max_file_size, compression);
+			let header_bytes = header.encode();
+			writer.write_all(&header_bytes)?;
+			writer.flush()?;
+		}
+
+		// Update offset to account for header
+		let current_offset = if !file_exists || current_offset == 0 {
+			VLogFileHeader::SIZE as u64
+		} else {
+			current_offset
+		};
+
+		Ok(Self {
+			writer,
+			sync_fd,
+			current_offset,
+			file_id,
+			bytes_written: current_offset,
+			poisoned: false,
+			cipher: None,
+			#[cfg(test)]
+			fail_cut_back: false,
+		})
+	}
+
+	/// Creates the writer of a new sealed file, which is as long as its header and has its
+	/// header on disk. The file must not exist: the writer seals under a key that is its own, and
+	/// no writer ever picks a file up again.
+	pub(crate) fn create_sealed(
+		path: &Path,
+		file_id: u32,
+		max_file_size: u64,
+		compression: u8,
+		context: &EncryptionContext,
+	) -> Result<Self> {
+		let (file, cipher) = sealed::create(path, file_id, max_file_size, compression, context)?;
+		let sync_fd = Arc::new(file.try_clone()?);
+		let header_len = sealed::SEALED_HEADER_LEN as u64;
+		Ok(Self {
+			writer: BufWriter::new(Sink::new(file)),
+			sync_fd,
+			current_offset: header_len,
+			file_id,
+			bytes_written: header_len,
+			poisoned: false,
+			cipher: Some(cipher),
+			#[cfg(test)]
+			fail_cut_back: false,
+		})
+	}
+
+	/// Appends a key+value entry to the file and returns a pointer to it
+	/// Layout: +--------+-----+-------+-------+
+	///         | header  | key | value | crc32 |
+	///         +--------+-----+-------+--------+
+	///
+	/// A failed append leaves the file as it was: the part of the entry that reached the
+	/// buffer or the file is cut off, so the next entry starts where its pointer says. If the
+	/// cut fails too, the writer is poisoned.
+	pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+		if self.poisoned {
+			return Err(Error::Io(Arc::new(io::Error::other(
+				"VLog writer is poisoned by an earlier failed append",
+			))));
+		}
+
+		let (key_len, value_len) = entry_lens(key.len(), value.len())?;
+		if self.cipher.is_some() {
+			return self.append_sealed(key, value, (key_len, value_len));
+		}
+		let offset = self.current_offset;
+
+		// Calculate CRC32 of key + value
+		let mut hasher = Hasher::new();
+		hasher.update(key);
+		hasher.update(value);
+		let crc32 = hasher.finalize();
+
+		if let Err(e) = self.write_entry(key, value, (key_len, value_len), crc32) {
+			if let Err(cut) = self.cut_back(offset) {
+				tracing::error!(
+					"Failed to cut a partial entry off VLog file {}, poisoning its writer: {cut}",
+					self.file_id
+				);
+				self.poisoned = true;
+			}
+			return Err(e);
+		}
+
+		let entry_size = 8 + key.len() as u64 + value.len() as u64 + 4; // header + key + value +
+																		// crc32
+		self.current_offset += entry_size;
+		self.bytes_written += entry_size;
+
+		Ok(ValuePointer::new(self.file_id, offset, key_len, value_len, crc32))
+	}
+
+	/// Appends an entry to a sealed file.
+	///
+	/// The entry is sealed at its offset, which is its nonce slot, and a position is sealed once
+	/// per key: so the position is spoken for the moment it is given to the cipher, before any
+	/// byte is written, and the writer is poisoned until the append has gone through. Any way out
+	/// of here but the end, a failed seal or a failed or partial write, leaves it poisoned, and the
+	/// log then starts a file of its own, with a key of its own. The file cannot be cut back and
+	/// tried again the way a plaintext one is: the position that the failed entry had would be
+	/// sealed a second time with other bytes, which under the same key and nonce leaks what the
+	/// two entries have in common. What an earlier append left in the buffer is still written.
+	fn append_sealed(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		(key_len, value_len): (u32, u32),
+	) -> Result<ValuePointer> {
+		let offset = self.current_offset;
+
+		// What can fail without taking the position: the allocation, and an offset that does
+		// not fit.
+		let mut entry = sealed::frame(key, value)?;
+		let stored_len = (entry.len() + crate::tde::TAG_LEN) as u64;
+		let next = offset.checked_add(stored_len).ok_or_else(|| {
+			Error::InvalidArgument("The offset in a VLog file does not fit in 64 bits".to_string())
+		})?;
+
+		// From here the position is spoken for, whatever happens to the entry.
+		self.poisoned = true;
+		self.current_offset = next;
+		self.bytes_written += stored_len;
+
+		let cipher = self.cipher.as_ref().ok_or_else(|| {
+			Error::Other("a sealed append was made on a writer without a cipher".to_string())
+		})?;
+		sealed::seal(cipher, offset, &mut entry)?;
+		let checksum = crc32fast::hash(&entry);
+		self.writer.write_all(&entry)?;
+
+		self.poisoned = false;
+		Ok(ValuePointer::sealed(self.file_id, offset, key_len, value_len, checksum))
+	}
+
+	fn write_entry(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		(key_len, value_len): (u32, u32),
+		crc32: u32,
+	) -> Result<()> {
+		// Write header: [key_len: 4 bytes][value_len: 4 bytes]
+		self.writer.write_all(&key_len.to_be_bytes())?;
+		self.writer.write_all(&value_len.to_be_bytes())?;
+
+		// Write key
+		self.writer.write_all(key)?;
+
+		// Write value
+		self.writer.write_all(value)?;
+
+		// Write CRC32
+		self.writer.write_all(&crc32.to_be_bytes())?;
+		Ok(())
+	}
+
+	/// Cuts everything after the first `len` bytes of the file's stream (the file followed by
+	/// the buffer) off: the bytes of an entry whose append failed.
+	///
+	/// Entries before it may still be partly in the buffer, with pointers that were already
+	/// handed out, so the buffer is kept up to `len` and not dropped. What is kept goes into a
+	/// buffer that has room for it, as a buffer that the bytes fill would write them straight to
+	/// the file, where they could fail again. Once the file has been cut, nothing that follows
+	/// touches the disk, so a failed cut loses no entry that was appended before.
+	fn cut_back(&mut self, len: u64) -> Result<()> {
+		#[cfg(test)]
+		if std::mem::take(&mut self.fail_cut_back) {
+			return Err(Error::Io(Arc::new(io::Error::other("injected cut failure"))));
+		}
+		let on_disk = self.sync_fd.metadata()?.len();
+		let sink = Sink::new(self.sync_fd.try_clone()?);
+		if on_disk > len {
+			// The entries before are all in the file, so what is buffered belongs to the failed
+			// one.
+			self.sync_fd.set_len(len)?;
+		}
+
+		// Rebuild the buffer around the same file. The old one is taken apart rather than
+		// dropped, because dropping a `BufWriter` writes out what it still holds.
+		let kept = len.saturating_sub(on_disk) as usize;
+		let capacity = self.writer.capacity().max(kept + 1);
+		let stale = std::mem::replace(&mut self.writer, BufWriter::with_capacity(capacity, sink));
+		let (_, buffered) = stale.into_parts();
+		if kept > 0 {
+			let lost = || Error::Io(Arc::new(io::Error::other("a VLog buffer was lost")));
+			let buffered = buffered.map_err(|_| lost())?;
+			self.writer.write_all(buffered.get(..kept).ok_or_else(lost)?)?;
+		}
+		Ok(())
+	}
+
+	/// Whether the next append belongs in another file: this one is full, or its writer is
+	/// poisoned.
+	fn needs_replacing(&self, max_file_size: u64) -> bool {
+		self.poisoned || self.size() >= max_file_size
+	}
+
+	/// Test-only: the file takes `bytes` more bytes and then one write fails, as a full disk
+	/// makes it. Whatever is buffered reaches the file up to that point, as a short write does.
+	#[cfg(test)]
+	pub(crate) fn fail_writes_after(&mut self, bytes: usize) {
+		self.writer.get_mut().fail_after = Some(bytes);
+	}
+
+	/// Test-only: the next cut of a failed append fails, as a file that cannot be truncated
+	/// does.
+	#[cfg(test)]
+	pub(crate) fn fail_next_cut_back(&mut self) {
+		self.fail_cut_back = true;
+	}
+
+	/// Test-only: the first position that may still be sealed in a sealed file, which is one past
+	/// the last that was given to the cipher.
+	#[cfg(test)]
+	pub(crate) fn next_position_to_seal(&self) -> Option<u64> {
+		self.cipher.as_ref().map(|cipher| cipher.next_position())
+	}
+
+	/// Test-only: marks the writer as one whose failed append could not be cut back.
+	#[cfg(test)]
+	pub(crate) fn poison(&mut self) {
+		self.poisoned = true;
+	}
+
+	/// Flushes and syncs the writer (test helper).
+	#[cfg(test)]
+	pub(crate) fn sync(&mut self) -> Result<()> {
+		self.writer.flush()?;
+		self.writer.get_ref().file.sync_all()?;
+		Ok(())
+	}
+
+	/// Flushes buffered data to OS cache (not to disk).
+	pub(crate) fn flush(&mut self) -> Result<()> {
+		self.writer.flush()?;
+		Ok(())
+	}
+
+	/// Returns a clone of the sync file descriptor Arc for
+	/// performing fsync outside the write lock.
+	pub(crate) fn sync_fd(&self) -> Arc<File> {
+		Arc::clone(&self.sync_fd)
+	}
+
+	/// Gets the current size of the file
+	fn size(&self) -> u64 {
+		self.current_offset
+	}
+}
+
+/// A count of changes that an fsync has to cover, and how many of them an fsync that completed
+/// covers.
+///
+/// An fsync settles what it covers only once it has succeeded. One that is still in flight, or
+/// that failed, leaves its changes pending, so a caller that asks meanwhile fsyncs them itself
+/// instead of relying on it.
+#[derive(Default)]
+struct Pending {
+	changed: AtomicU64,
+	synced: AtomicU64,
+}
+
+impl Pending {
+	fn mark(&self) {
+		self.changed.fetch_add(1, Ordering::SeqCst);
+	}
+
+	fn count(&self) -> u64 {
+		self.changed.load(Ordering::SeqCst)
+	}
+
+	/// Whether an fsync has completed on the first `count` changes.
+	fn covers(&self, count: u64) -> bool {
+		self.synced.load(Ordering::SeqCst) >= count
+	}
+
+	fn settle(&self, count: u64) {
+		self.synced.fetch_max(count, Ordering::SeqCst);
+	}
+
+	fn is_clean(&self) -> bool {
+		self.covers(self.count())
+	}
+}
+
+/// Value Log (VLog) for WiscKey-style key-value separation with GC
+///
+/// This implementation includes:
+/// - Iterator reference counting for safe garbage collection
+/// - Discard statistics tracking for intelligent GC candidate selection
+/// - Atomic file replacement during compaction
+/// - LSM integration for staleness detection
+pub(crate) struct VLog {
+	/// Base directory for VLog files
+	path: PathBuf,
+
+	/// Maximum size for each VLog file before rotation
+	max_file_size: u64,
+
+	/// Checksum verification level
+	checksum_level: VLogChecksumLevel,
+
+	/// Next file ID to be assigned
+	pub(crate) next_file_id: AtomicU32,
+
+	/// ID of the file currently open for writing
+	pub(crate) active_writer_id: AtomicU32,
+
+	/// Writer for the current active file
+	pub(crate) writer: RwLock<Option<VLogWriter>>,
+
+	/// Files the writer rolled over from, until an fsync of each has succeeded: their bytes
+	/// reached the OS but may not be on disk. Locked after `writer`, never before it.
+	unsynced: Mutex<Vec<(u32, Arc<File>)>>,
+
+	/// The entries appended, marked under the `writer` lock, and how many of them a completed
+	/// fsync covers.
+	appended: Pending,
+
+	/// The files created, whose directory entry a completed fsync of the directory covers.
+	created: Pending,
+
+	/// Maps file_id to VLogFile metadata
+	files_map: RwLock<HashMap<u32, Arc<VLogFile>>>,
+
+	/// Cached open file handles for reading
+	pub(crate) file_handles: RwLock<HashMap<u32, Arc<OpenFile>>>,
+
+	/// Replaced, under the `file_handles` lock, by every [`reload`](Self::reload): a handle that
+	/// was opened before it belongs to a file that was replaced, and is not cached. It is drawn
+	/// from the same counter as the identity of a table instance, so that no other log, nor any
+	/// generation of this one, has the same value: logs that are given clones of one `Options`
+	/// share a block cache, and the values of one must not be found under the key of another.
+	generation: AtomicU64,
+
+	/// Options for VLog configuration
+	pub(crate) opts: Arc<Options>,
+
+	/// Test-only: the next fsync of a file fails.
+	#[cfg(test)]
+	fail_next_sync: std::sync::atomic::AtomicBool,
+
+	/// Test-only: runs in `sync` between taking the fds and fsyncing them.
+	#[cfg(test)]
+	sync_gap: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+
+	/// Number of live [`VLogPin`]s. While there is one, no file is deleted.
+	pins: AtomicUsize,
+
+	/// The file that the commit group in flight started in, `u32::MAX` while there is none. Set
+	/// by [`pin_group`](Self::pin_group), by the one flusher (and by the test-only `flush_group`,
+	/// which must not run beside it): a second group at a time would release the pin of the
+	/// first.
+	group_floor: AtomicU32,
+}
+
+/// Keeps a [`VLog`] from deleting files until it is dropped.
+pub(crate) struct VLogPin<'a>(&'a VLog);
+
+impl Drop for VLogPin<'_> {
+	fn drop(&mut self) {
+		self.0.pins.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
+/// Keeps a [`VLog`] from deleting the files that the values of a commit group are written to
+/// until it is dropped, see [`VLog::pin_group`].
+pub(crate) struct VLogGroupPin<'a>(&'a VLog);
+
+impl Drop for VLogGroupPin<'_> {
+	fn drop(&mut self) {
+		self.0.group_floor.store(u32::MAX, Ordering::SeqCst);
+	}
+}
+
+/// The newest file of a log, as [`VLog::load_files`] leaves it.
+struct Newest {
+	id: u32,
+	path: PathBuf,
+	/// Its entries are sealed, or it was set aside as a file that a crash left half made: either
+	/// way nothing is ever appended to it.
+	sealed: bool,
+	/// The file is still where it was, and not set aside.
+	present: bool,
+}
+
+impl VLog {
+	/// The encryption the log's files are sealed with, if it is configured with any.
+	fn encryption(&self) -> Option<&EncryptionContext> {
+		self.opts.encryption_context().map(|context| &**context)
+	}
+
+	/// Returns the file path for a VLog file with the given ID
+	pub(crate) fn vlog_file_path(&self, file_id: u32) -> PathBuf {
+		self.opts.vlog_file_path(file_id as u64)
+	}
+
+	/// Creates a new VLog instance
+	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		// A key manager that was never turned into the database's context would leave the
+		// log in plaintext without saying so.
+		if opts.key_manager.is_some() && opts.encryption_context().is_none() {
+			return Err(Error::InvalidArgument(
+				"A key manager is configured but the encryption of the database was not resolved: \
+				 refusing to write a value log in plaintext"
+					.to_string(),
+			));
+		}
+		let vlog = Self {
+			path: opts.vlog_dir(),
+			max_file_size: opts.vlog_max_file_size,
+			checksum_level: opts.vlog_checksum_verification,
+			next_file_id: AtomicU32::new(1),
+			active_writer_id: AtomicU32::new(0),
+			writer: RwLock::new(None),
+			unsynced: Mutex::new(Vec::new()),
+			appended: Pending::default(),
+			created: Pending::default(),
+			files_map: RwLock::new(HashMap::new()),
+			file_handles: RwLock::new(HashMap::new()),
+			generation: AtomicU64::new(crate::cache::next_instance_id()),
+			opts,
+			#[cfg(test)]
+			fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			sync_gap: Mutex::new(None),
+			pins: AtomicUsize::new(0),
+			group_floor: AtomicU32::new(u32::MAX),
+		};
+
+		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
+		vlog.prefill_file_handles()?;
+
+		Ok(vlog)
+	}
+
+	/// Appends a key+value pair to the log and returns a ValuePointer
+	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+		let mut writer = self.writer.write();
+		if writer.as_ref().is_none_or(|w| w.needs_replacing(self.max_file_size)) {
+			self.roll_over(&mut writer)?;
+		}
+		let pointer = writer.as_mut().expect("a writer was just installed").append(key, value)?;
+		self.appended.mark();
+		Ok(pointer)
+	}
+
+	/// Replaces the active writer with one for a new file.
+	///
+	/// The old file is flushed first, and a failure of that flush is an error: dropping its
+	/// writer would swallow it and lose entries that pointers were already handed out for. It
+	/// is not fsynced here, which would stall every commit behind it, but queued for the next
+	/// [`sync`](Self::sync).
+	fn roll_over(&self, active: &mut Option<VLogWriter>) -> Result<()> {
+		let old = match active.as_mut() {
+			Some(writer) => {
+				writer.flush()?;
+				Some((writer.file_id, writer.sync_fd()))
+			}
+			None => None,
+		};
+
+		// Create new file
+		let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+		let file_path = self.vlog_file_path(file_id);
+		let new_writer = match self.encryption() {
+			Some(context) => {
+				// A sealed file starts with a new salt and a header that is on disk, and its name
+				// is on disk too before anything is written to it: a restart that found entries
+				// in a file whose name was lost would not find the file the pointers name.
+				let writer = VLogWriter::create_sealed(
+					&file_path,
+					file_id,
+					self.opts.vlog_max_file_size,
+					CompressionType::None as u8,
+					context,
+				)?;
+				crate::lsm::fsync_directory(&self.path)?;
+				writer
+			}
+			None => VLogWriter::new(
+				&file_path,
+				file_id,
+				self.opts.vlog_max_file_size,
+				CompressionType::None as u8,
+			)?,
+		};
+
+		// Register the new file for GC safety
+		self.register_vlog_file(file_id, file_path, 0); // Start with size 0
+
+		// Update the active writer ID
+		self.active_writer_id.store(file_id, Ordering::SeqCst);
+
+		self.unsynced.lock().extend(old);
+		self.created.mark();
+		if self.encryption().is_some() {
+			// The directory was fsynced above, and that covers every file created before it.
+			self.created.settle(self.created.count());
+		}
+		*active = Some(new_writer);
+		Ok(())
+	}
+
+	/// Pre-fills the file_handles cache with all existing VLog files
+	fn prefill_file_handles(&self) -> Result<()> {
+		let Some(newest) = self.load_files()? else {
+			return Ok(());
+		};
+
+		// Found existing files, set next_file_id to one past the highest existing file ID
+		self.next_file_id.store(newest.id + 1, Ordering::SeqCst);
+
+		if newest.sealed {
+			// A sealed file is never appended to again. Its key is the one of the writer that
+			// made it, and the positions that writer sealed at are spoken for, so a writer that
+			// picked the file up would start sealing over them again. The first append starts a
+			// file of its own, with a salt of its own, and until then the newest file is only
+			// read.
+			self.active_writer_id.store(newest.id, Ordering::SeqCst);
+			if newest.present {
+				// What an earlier run left in the file may not be on disk yet, and there is no
+				// writer to hold a descriptor for the first sync to use.
+				let file = vfs::open_for_sync(&newest.path)?;
+				self.unsynced.lock().push((newest.id, Arc::new(file)));
+			}
+			self.appended.mark();
+			return Ok(());
+		}
+
+		// Set the last file up as the active writer
+		let writer = VLogWriter::new(
+			&newest.path,
+			newest.id,
+			self.opts.vlog_max_file_size,
+			CompressionType::None as u8,
+		)?;
+		self.active_writer_id.store(newest.id, Ordering::SeqCst);
+		*self.writer.write() = Some(writer);
+		// What an earlier run left in the file may not be on disk yet: the first sync
+		// covers it.
+		self.appended.mark();
+
+		Ok(())
+	}
+
+	/// Opens and validates every file in the log's directory, registers it in `file_handles` and
+	/// `files_map`, and returns the one with the highest id. A directory that does not exist
+	/// holds none.
+	///
+	/// A log may find a crash's leftover as its newest file: a file that the crash cut off
+	/// before its header was complete, and which therefore holds no entry. It is set aside
+	/// under another name, never deleted, and the newest file is reported as one that is never
+	/// appended to and is no longer there, so that its id is not used again. Only the newest
+	/// file can be that, and only a header that is incomplete or damaged and is no longer than a
+	/// header counts: whatever fails to authenticate is an error and leaves every file as it is.
+	/// The file is renamed only after every other file has opened, so a log that fails on a key
+	/// that does not fit changes nothing, whichever order the directory lists the files in.
+	fn load_files(&self) -> Result<Option<Newest>> {
+		let entries = match std::fs::read_dir(&self.path) {
+			Ok(entries) => entries,
+			Err(_) => return Ok(None), // Directory doesn't exist yet
+		};
+
+		// Which file is the newest has to be known before any is opened
+		let mut found = Vec::new();
+		for entry in entries {
+			let entry = entry?;
+			let file_name = entry.file_name();
+
+			// Look for VLog files
+			if let Some(file_id) = self.opts.extract_vlog_file_id(&file_name.to_string_lossy()) {
+				found.push((file_id, entry.path(), entry.metadata()?.len()));
+			}
+		}
+		let Some(newest_id) = found.iter().map(|(file_id, ..)| *file_id).max() else {
+			return Ok(None);
+		};
+
+		let mut newest = None;
+		// The newest file, if a crash left it without a complete header. Nothing is renamed until
+		// every other file has opened: the files come in whatever order the directory lists them,
+		// and a log that then fails on a key that does not fit must leave the directory as it was.
+		let mut torn = None;
+		// The order `cleanup_obsolete_files` takes them in
+		let mut files_map = self.files_map.write();
+		let mut file_handles = self.file_handles.write();
+
+		for (file_id, file_path, file_size) in found {
+			let is_newest = file_id == newest_id;
+			if is_newest && self.is_torn(&file_path, file_id, file_size)? {
+				torn = Some((file_id, file_path));
+				continue;
+			}
+
+			// Pre-open the file handle and validate header
+			match File::open(&file_path) {
+				Ok(file) => {
+					let mut cipher = None;
+					// Validate file header for existing files
+					if file_size > 0 {
+						let mut header_data = vec![0u8; VLogFileHeader::SIZE];
+						vfs::File::read_at(&file, 0, &mut header_data)?;
+						let header = VLogFileHeader::decode(&header_data)?;
+						cipher = self.open_layout(&file, &header, file_id, true)?;
+						if cipher.is_none() {
+							header.validate(file_id)?;
+						}
+					} else if self.encryption().is_some() {
+						return Err(Error::Corruption(format!(
+							"VLog file {file_id} of a sealed log is empty and is not its newest file"
+						)));
+					}
+
+					if is_newest {
+						newest = Some(Newest {
+							id: file_id,
+							path: file_path.clone(),
+							sealed: cipher.is_some(),
+							present: true,
+						});
+					}
+					file_handles.insert(
+						file_id,
+						Arc::new(OpenFile {
+							file,
+							cipher,
+						}),
+					);
+
+					// Also register in files_map
+					files_map
+						.insert(file_id, Arc::new(VLogFile::new(file_id, file_path, file_size)));
+				}
+				Err(e) => {
+					tracing::error!("Failed to pre-open VLog file {file_path:?}: {e}");
+					return Err(Error::Io(Arc::new(e)));
+				}
+			}
+		}
+
+		// Every other file opened, so no key was refused and nothing is in doubt but this file.
+		if let Some((file_id, file_path)) = torn {
+			self.set_aside(file_id, &file_path)?;
+			newest = Some(Newest {
+				id: file_id,
+				path: file_path,
+				sealed: true,
+				present: false,
+			});
+		}
+
+		Ok(newest)
+	}
+
+	/// Checks what the header of a file says about how its entries are stored against what the
+	/// log is configured for, and opens a sealed file. Returns the cipher that opens its entries,
+	/// or `None` for the plaintext file of a log without encryption, whose header the caller goes
+	/// on to check.
+	///
+	/// A log reads files of one kind. One that is configured with encryption refuses a plaintext
+	/// file and one that is not refuses a sealed file, and the file is the same afterwards:
+	/// neither is damage, and neither is a reason to repair. `prepare` asks the key manager to
+	/// make the key of the file available first, which is for when the log is opened and not for
+	/// a read, which a manager must not make wait.
+	fn open_layout(
+		&self,
+		file: &File,
+		header: &VLogFileHeader,
+		file_id: u32,
+		prepare: bool,
+	) -> Result<Option<FileCipher>> {
+		let sealed = header.version == sealed::SEALED_VERSION;
+		let Some(context) = self.encryption() else {
+			return if sealed {
+				Err(EncryptionError::NotConfigured.into())
+			} else {
+				Ok(None)
+			};
+		};
+		if !sealed {
+			return Err(if header.version == VLOG_FORMAT_VERSION {
+				EncryptionError::PlaintextInEncryptedDb.into()
+			} else {
+				Error::Corruption(format!(
+					"Incompatible VLog file version (file_id={file_id}): {}",
+					header.version
+				))
+			});
+		}
+		let mut head = vec![0u8; sealed::SEALED_HEADER_LEN];
+		let read = vfs::File::read_up_to(file, 0, &mut head)?;
+		head.truncate(read);
+		sealed::open_header(context, file_id, &head, prepare).map(Some)
+	}
+
+	/// Whether `path`, the newest file of the log, is what a crash during its creation leaves,
+	/// see [`sealed::is_torn`] and [`VLogFileHeader::is_torn`].
+	fn is_torn(&self, path: &Path, file_id: u32, file_size: u64) -> Result<bool> {
+		if self.encryption().is_some() {
+			if file_size > sealed::SEALED_HEADER_LEN as u64 {
+				return Ok(false);
+			}
+			return Ok(sealed::is_torn(&std::fs::read(path)?));
+		}
+		if file_size == 0 || file_size > VLogFileHeader::SIZE as u64 {
+			return Ok(false);
+		}
+		Ok(VLogFileHeader::is_torn(&std::fs::read(path)?, file_id))
+	}
+
+	/// Renames a file that a crash left without a complete header, which holds no entry, to a
+	/// name that the log does not read.
+	fn set_aside(&self, file_id: u32, path: &Path) -> Result<()> {
+		let to = sealed::set_aside(path)?;
+		tracing::warn!(
+			"VLog file {file_id} was cut off before its header was complete and holds no entry: \
+			 it was set aside as {to:?}"
+		);
+		if let Err(e) = crate::lsm::fsync_directory(&self.path) {
+			tracing::warn!("Failed to sync the VLog directory after setting a file aside: {e}");
+		}
+		Ok(())
+	}
+
+	/// Keeps every append, and with it every roll over to a new file, out until the guard is
+	/// dropped or given to [`reload`](Self::reload). A restore holds it from before it removes the
+	/// directory of the log: a group that began before the restore and writes its values meanwhile
+	/// would create a file in the directory while it is removed, which fails the restore half
+	/// way, or in the restored one, under the id of a restored file or one that it does not have.
+	///
+	/// The lock sits below the WAL's, as a rotation takes it: the holder takes no other lock until
+	/// it has given the guard to `reload`.
+	pub(crate) fn hold_writer(&self) -> RwLockWriteGuard<'_, Option<VLogWriter>> {
+		self.writer.write()
+	}
+
+	/// Replaces everything the log knows about its files by what its directory holds now, after
+	/// a restore replaced the directory. The writer, the handles and the file registry belong to
+	/// files that are gone, and a file id that the restored directory has again would otherwise
+	/// be read through, and appended to by, the old file.
+	///
+	/// The log has no writer afterwards, so the next append starts a file of its own, one past
+	/// the highest id found, and never one of the restored files. `writer` is the guard that
+	/// [`hold_writer`](Self::hold_writer) returned before the directory was replaced, and keeps
+	/// appends out until the log is loaded.
+	pub(crate) fn reload(
+		&self,
+		mut writer: RwLockWriteGuard<'_, Option<VLogWriter>>,
+	) -> Result<()> {
+		// Before the directory is read: a checkpoint without a value log leaves none.
+		std::fs::create_dir_all(&self.path)?;
+
+		// What the old writer still buffers goes to a file that was removed.
+		*writer = None;
+		self.unsynced.lock().clear();
+		{
+			let mut files_map = self.files_map.write();
+			let mut file_handles = self.file_handles.write();
+			files_map.clear();
+			file_handles.clear();
+			self.generation.store(crate::cache::next_instance_id(), Ordering::SeqCst);
+		}
+
+		let highest = self.load_files()?;
+		self.next_file_id.store(highest.map_or(1, |newest| newest.id + 1), Ordering::SeqCst);
+		self.active_writer_id.store(0, Ordering::SeqCst);
+		// The files were copied in, and neither they nor the directory entries are known to be
+		// on disk: the first sync covers them.
+		self.appended.mark();
+		self.created.mark();
+		Ok(())
+	}
+
+	/// The key under which the block cache keeps the values of file `file_id` of the log as it is
+	/// now: a reload makes the same file id another file, and another log has files of the same
+	/// ids, so the generation, which is not the generation of any other log, is part of the key.
+	/// The generation takes the upper 32 bits, which a process would need to make over four
+	/// billion tables and logs to fill.
+	pub(crate) fn cache_id(&self, file_id: u32) -> u64 {
+		(self.generation.load(Ordering::SeqCst) << 32) | u64::from(file_id)
+	}
+
+	/// Retrieves (and caches) an open file handle for the given file ID
+	fn get_file_handle(&self, file_id: u32) -> Result<Arc<OpenFile>> {
+		let generation = {
+			let handles = self.file_handles.read();
+			if let Some(handle) = handles.get(&file_id) {
+				return Ok(Arc::clone(handle));
+			}
+			self.generation.load(Ordering::SeqCst)
+		};
+
+		// Open and validate the file
+		let file_path = self.vlog_file_path(file_id);
+		let file = File::open(&file_path).map_err(|e| {
+			tracing::error!(
+				"Failed to open VLog file: file_id={}, path={:?}, error={}",
+				file_id,
+				file_path,
+				e
+			);
+			Error::Other(format!(
+				"Failed to open VLog file (file_id={}, path={:?}): {}",
+				file_id, file_path, e
+			))
+		})?;
+
+		// Validate file header for existing files
+		let file_size = file
+			.metadata()
+			.map_err(|e| {
+				tracing::error!(
+					"Failed to get VLog file metadata: file_id={}, path={:?}, error={}",
+					file_id,
+					file_path,
+					e
+				);
+				Error::Other(format!(
+					"Failed to get VLog file metadata (file_id={}, path={:?}): {}",
+					file_id, file_path, e
+				))
+			})?
+			.len();
+
+		let mut cipher = None;
+		if file_size > 0 {
+			// Only validate header if file has content (not a new empty file)
+			let mut header_data = vec![0u8; VLogFileHeader::SIZE];
+			vfs::File::read_at(&file, 0, &mut header_data).map_err(|e| {
+				tracing::error!(
+					"Failed to read VLog header: file_id={}, path={:?}, error={}",
+					file_id,
+					file_path,
+					e
+				);
+				Error::Other(format!(
+					"Failed to read VLog header (file_id={}, path={:?}): {}",
+					file_id, file_path, e
+				))
+			})?;
+
+			let header = VLogFileHeader::decode(&header_data).map_err(|e| {
+				tracing::error!(
+					"Failed to decode VLog header: file_id={}, path={:?}, error={}",
+					file_id,
+					file_path,
+					e
+				);
+				Error::Other(format!(
+					"Failed to decode VLog header (file_id={}, path={:?}): {}",
+					file_id, file_path, e
+				))
+			})?;
+
+			// A sealed file is checked as a whole when it is opened, and what it says about how
+			// its entries are stored is checked against what the log is configured for.
+			cipher = self.open_layout(&file, &header, file_id, false)?;
+			if cipher.is_none() {
+				if !header.is_compatible() {
+					tracing::error!(
+						"Incompatible VLog file version: file_id={}, path={:?}, version={} (expected {})",
+						file_id, file_path, header.version, VLOG_FORMAT_VERSION
+					);
+					return Err(Error::Corruption(format!(
+						"Incompatible VLog file version (file_id={}, path={:?}): {} (expected {})",
+						file_id, file_path, header.version, VLOG_FORMAT_VERSION
+					)));
+				}
+
+				// Validate header against current options
+				header.validate(file_id).map_err(|e| {
+					tracing::error!(
+						"VLog header validation failed: file_id={}, path={:?}, error={}",
+						file_id,
+						file_path,
+						e
+					);
+					Error::Other(format!(
+						"VLog header validation failed (file_id={}, path={:?}): {}",
+						file_id, file_path, e
+					))
+				})?;
+			}
+		} else if self.encryption().is_some() {
+			return Err(Error::Corruption(format!("VLog file {file_id} of a sealed log is empty")));
+		}
+
+		let handle = Arc::new(OpenFile {
+			file,
+			cipher,
+		});
+
+		let mut handles = self.file_handles.write();
+		// The file may have been replaced while it was opened: the caller reads what it opened,
+		// and it is not kept for the file that has this id now.
+		if self.generation.load(Ordering::SeqCst) != generation {
+			return Ok(handle);
+		}
+		// Another thread might have inserted it while we were opening the file
+		let entry = handles.entry(file_id).or_insert_with(|| Arc::clone(&handle));
+		Ok(Arc::clone(entry))
+	}
+
+	/// Retrieves a value using a ValuePointer
+	pub(crate) fn get(&self, pointer: &ValuePointer) -> Result<Value> {
+		// Fixed before anything is read: a restore that reloads the log while this call reads a
+		// file of the old one leaves what it reads under the key of the old log.
+		let cache_id = self.cache_id(pointer.file_id);
+
+		// Check unified block cache first
+		if let Some(cached_value) = self.opts.block_cache.get_vlog(cache_id, pointer.offset) {
+			return Ok(cached_value);
+		}
+
+		let handle = self.get_file_handle(pointer.file_id)?;
+		match (&handle.cipher, pointer.is_sealed()) {
+			(Some(cipher), true) => {
+				return self.get_sealed(&handle.file, cipher, pointer, cache_id)
+			}
+			(None, false) => {}
+			(Some(_), false) | (None, true) => {
+				// A pointer and a file that disagree about whether entries are sealed: the
+				// entry is not read as the one kind or the other.
+				return Err(Error::Corruption(format!(
+					"The pointer and the file disagree about whether the entry is sealed \
+					 (file_id={}, offset={})",
+					pointer.file_id, pointer.offset
+				)));
+			}
+		}
+		let file = &handle.file;
+
+		// Read the entire entry in a single call using sizes from the pointer
+		let key_len = pointer.key_size;
+		let value_len = pointer.value_size;
+		let total_size = pointer.total_entry_size();
+
+		// `read_at` may return fewer bytes than asked for, and returns none at the end of the
+		// file: read until the entry is complete or the file ends. An entry that the end of its
+		// file cuts short is an error, not a value whose tail is the zeros of the buffer: without
+		// checksum verification nothing else would tell them apart from what was written.
+		let mut entry_data_vec = vec![0u8; total_size as usize];
+		let mut filled = 0;
+		while filled < entry_data_vec.len() {
+			let read = vfs::File::read_at(
+				file,
+				pointer.offset + filled as u64,
+				&mut entry_data_vec[filled..],
+			)
+			.map_err(|e| {
+				tracing::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
+				Error::Other(format!(
+					"Failed to read VLog entry (file_id={}, offset={}, key_size={}, value_size={}): {}",
+					pointer.file_id, pointer.offset, pointer.key_size, pointer.value_size, e
+				))
+			})?;
+			if read == 0 {
+				break;
+			}
+			filled += read;
+		}
+		if filled < entry_data_vec.len() {
+			tracing::error!(
+				"VLog entry cut short by the end of its file: pointer={:?}, read {} of {} bytes",
+				pointer,
+				filled,
+				total_size
+			);
+			return Err(Error::Corruption(format!(
+				"VLog entry cut short by the end of its file (file_id={}, offset={}): read {} of {} \
+				 bytes",
+				pointer.file_id, pointer.offset, filled, total_size
+			)));
+		}
+
+		// Verify header sizes
+		let header_key_len = u32::from_be_bytes([
+			entry_data_vec[0],
+			entry_data_vec[1],
+			entry_data_vec[2],
+			entry_data_vec[3],
+		]);
+		let header_value_len = u32::from_be_bytes([
+			entry_data_vec[4],
+			entry_data_vec[5],
+			entry_data_vec[6],
+			entry_data_vec[7],
+		]);
+
+		if header_key_len != key_len || header_value_len != value_len {
+			tracing::error!(
+				"VLog header size mismatch: pointer={:?}, header_key_len={}, header_value_len={}",
+				pointer,
+				header_key_len,
+				header_value_len
+			);
+			return Err(Error::Corruption(format!(
+				"Header size mismatch (file_id={}, offset={}): expected key {} value {}, got key {} value {}",
+				pointer.file_id, pointer.offset, key_len, value_len, header_key_len, header_value_len
+			)));
+		}
+
+		// Parse offsets from the buffer
+		let key_start = 8;
+		let value_start = key_start + key_len as usize;
+		let crc_start = value_start + value_len as usize;
+
+		let stored_crc32 = u32::from_be_bytes([
+			entry_data_vec[crc_start],
+			entry_data_vec[crc_start + 1],
+			entry_data_vec[crc_start + 2],
+			entry_data_vec[crc_start + 3],
+		]);
+
+		// Checksum verification
+		if self.checksum_level != VLogChecksumLevel::Disabled && stored_crc32 != pointer.checksum {
+			tracing::error!(
+				"VLog CRC32 mismatch (stored vs pointer): pointer={:?}, stored_crc32={}",
+				pointer,
+				stored_crc32
+			);
+			return Err(Error::Corruption(format!(
+				"CRC32 mismatch (file_id={}, offset={}): expected {}, got {} (stored in file)",
+				pointer.file_id, pointer.offset, pointer.checksum, stored_crc32
+			)));
+		}
+
+		if self.checksum_level == VLogChecksumLevel::Full {
+			let key = &entry_data_vec[key_start..value_start];
+			let value = &entry_data_vec[value_start..crc_start];
+			let mut hasher = Hasher::new();
+			hasher.update(key);
+			hasher.update(value);
+			let calculated_crc32 = hasher.finalize();
+			if calculated_crc32 != pointer.checksum {
+				tracing::error!(
+					"VLog Key+Value CRC32 mismatch: pointer={:?}, calculated_crc32={}",
+					pointer,
+					calculated_crc32
+				);
+				return Err(Error::Corruption(format!(
+					"Key+Value CRC32 mismatch (file_id={}, offset={}): expected {}, calculated {}",
+					pointer.file_id, pointer.offset, pointer.checksum, calculated_crc32
+				)));
+			}
+		}
+
+		// Extract value slice from entry data
+		let value_bytes = entry_data_vec[value_start..crc_start].to_vec();
+
+		// Cache the value in unified block cache for future reads
+		self.opts.block_cache.insert_vlog(cache_id, pointer.offset, value_bytes.clone());
+
+		Ok(value_bytes)
+	}
+
+	/// Reads the value of a sealed entry. What is read is checked against the pointer's CRC-32 and
+	/// authenticated before anything of it is looked at, whatever `checksum_level` is: the tag
+	/// is the verification, and it is not an option.
+	fn get_sealed(
+		&self,
+		file: &File,
+		cipher: &FileCipher,
+		pointer: &ValuePointer,
+		cache_id: u64,
+	) -> Result<Value> {
+		let cut_short = || {
+			Error::Corruption(format!(
+				"VLog entry cut short by the end of its file (file_id={}, offset={})",
+				pointer.file_id, pointer.offset
+			))
+		};
+
+		// The size of the allocation is bounded by the file, not by what a pointer claims.
+		let total = pointer.total_entry_size();
+		let end = pointer.offset.checked_add(total).ok_or_else(cut_short)?;
+		if end > file.metadata()?.len() {
+			return Err(cut_short());
+		}
+		let size = usize::try_from(total).map_err(|_| cut_short())?;
+		let mut stored = Vec::new();
+		stored.try_reserve_exact(size).map_err(|e| Error::Io(Arc::new(io::Error::from(e))))?;
+		stored.resize(size, 0);
+		match vfs::File::read_exact_at(file, pointer.offset, &mut stored) {
+			Ok(()) => {}
+			Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+				return Err(cut_short())
+			}
+			Err(e) => return Err(e),
+		}
+
+		let value = sealed::open_entry(cipher, pointer, stored)?;
+		self.opts.block_cache.insert_vlog(cache_id, pointer.offset, value.clone());
+		Ok(value)
+	}
+
+	/// Keeps every file in place until the pin is dropped. A checkpoint takes one while it holds
+	/// the manifest and copies the files after releasing it, so a flush or a compaction cannot
+	/// delete files that the checkpointed tables point into in between.
+	pub(crate) fn pin_files(&self) -> VLogPin<'_> {
+		self.pins.fetch_add(1, Ordering::SeqCst);
+		VLogPin(self)
+	}
+
+	/// Pins the files that the values of a commit group are about to be written to. The flusher
+	/// takes it before it appends the first value of the group and drops it once the group is in
+	/// a memtable or a table, or, for a group that failed with its records logged, once the
+	/// active memtable accounts for the files they point into. Every value of the group goes to
+	/// the file that is active now or a later one.
+	///
+	/// Between the first append and that point the values are in no table and in no memtable, so
+	/// the bound of a cleanup (`lsm::vlog_floor`) cannot see them. [`unregistered_floor`]
+	/// (Self::unregistered_floor) makes the cleanup keep them.
+	pub(crate) fn pin_group(&self) -> VLogGroupPin<'_> {
+		self.group_floor.store(self.active_writer_id.load(Ordering::SeqCst), Ordering::SeqCst);
+		VLogGroupPin(self)
+	}
+
+	/// The smallest file that a cleanup may not delete, whatever the tables and memtables say:
+	/// the files of values that no table and no memtable points into yet. A cleanup reads it
+	/// before it reads them, for the argument that it is enough:
+	///
+	/// - A group that started before the active file was read has its pin read next, if it is still
+	///   held. Its values are in files at or above the pin.
+	/// - A group that released its pin before it was read has put its values into a memtable or a
+	///   table first (the release is sequentially consistent, and the reads of the bound that
+	///   follow see what came before it).
+	/// - A group that starts after the pin was read appends to files at or above the active file
+	///   that was read first, since the active file only grows.
+	///
+	/// The active file comes first for the third case: read after the pin, it could already be a
+	/// file that such a group rolled over to, and the files of the group below it would go.
+	pub(crate) fn unregistered_floor(&self) -> u32 {
+		let active = self.active_writer_id.load(Ordering::SeqCst);
+		active.min(self.group_floor.load(Ordering::SeqCst))
+	}
+
+	/// Cleans up obsolete vlog files based on the global minimum file id that anything points into.
+	///
+	/// A vlog file is safe to delete when:
+	/// - Its file_id < min_oldest_vlog (no SST and no unflushed memtable has a value in it, see
+	///   `lsm::vlog_floor`, and no commit group is about to, see
+	///   [`unregistered_floor`](Self::unregistered_floor))
+	/// - It is below the active writer's file
+	/// - No iterators are active
+	/// - No [`VLogPin`] is held
+	///
+	/// This implements the "global minimum" GC approach where files are deleted
+	/// once nothing can possibly reference them. If iterators are active or a pin is
+	/// held, cleanup is skipped and will be retried on the next GC trigger.
+	///
+	/// It picks the files to delete by id and removes them by id, and it takes the bound as an
+	/// argument, so it must not overlap a [`reload`](Self::reload): ids mean other files after it,
+	/// and a bound from before it is no bound for the restored tables. Every caller holds
+	/// `flush_lock` or `compactions` (or runs before the tree is shared), which a restore holds
+	/// from before it replaces the directory until it is done.
+	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
+		if self.pins.load(Ordering::SeqCst) > 0 {
+			return Ok(());
+		}
+
+		// The bound is capped at the active file, the newest one that can be deleted: a rollover
+		// registers the file it creates before it makes it the active one, and a bound of
+		// `u32::MAX` (nothing points into the log) would otherwise take that file along.
+		let bound = min_oldest_vlog.min(self.active_writer_id.load(Ordering::SeqCst));
+
+		// Collect files that are safe to delete
+		let to_delete: Vec<u32> = {
+			let files_map = self.files_map.read();
+			files_map.keys().filter(|&&id| id < bound).copied().collect()
+		};
+
+		if to_delete.is_empty() {
+			return Ok(());
+		}
+
+		// No active iterators, safe to delete
+		self.unsynced.lock().retain(|(id, _)| !to_delete.contains(id));
+		let mut files_map = self.files_map.write();
+		let mut file_handles = self.file_handles.write();
+
+		for file_id in to_delete {
+			file_handles.remove(&file_id);
+			if let Some(vlog_file) = files_map.remove(&file_id) {
+				if let Err(e) = std::fs::remove_file(&vlog_file.path) {
+					tracing::error!(
+						"Failed to delete obsolete VLog file: file_id={}, path={:?}, error={}",
+						file_id,
+						vlog_file.path,
+						e
+					);
+					// Continue with other files, don't fail the entire cleanup
+				} else {
+					tracing::debug!(
+						"Deleted obsolete VLog file: file_id={}, path={:?}",
+						file_id,
+						vlog_file.path
+					);
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Flushes buffered data in the active writer to OS page cache.
+	pub(crate) fn flush(&self) -> Result<()> {
+		let mut guard = self.writer.write();
+		if let Some(ref mut writer) = *guard {
+			writer.flush()?;
+		}
+		Ok(())
+	}
+
+	/// Syncs all data to disk: the active file and every file the writer rolled over from
+	/// that is not synced yet, then the directory if a file was created since it was last synced.
+	///
+	/// The write lock is held only for the BufWriter flush (draining the internal buffer to
+	/// OS page cache, ~microseconds). The expensive fsync is performed outside the lock using
+	/// pre-cloned file descriptors, allowing concurrent VLog appends to proceed.
+	pub(crate) fn sync(&self) -> Result<()> {
+		// Phase 1: Under write lock — flush BufWriter and grab the sync fds, and what they cover
+		let (queued, active, appended, created) = {
+			let mut guard = self.writer.write();
+			let active = match guard.as_mut() {
+				Some(writer) => {
+					writer.flush()?;
+					Some((writer.file_id, writer.sync_fd()))
+				}
+				None => None,
+			};
+			(self.unsynced.lock().clone(), active, self.appended.count(), self.created.count())
+			// write lock released here
+		};
+		#[cfg(test)]
+		{
+			let gap = self.sync_gap.lock().clone();
+			if let Some(gap) = gap {
+				gap();
+			}
+		}
+
+		// Phase 2: Outside lock — fsync to disk (slow, doesn't block appends). A rolled-over
+		// file leaves the queue only once its fsync has succeeded, so a failed sync is retried,
+		// and a sync that overlaps another fsyncs the file itself, as the other's fsync may
+		// still be in flight. Only a file that was queued when the fds were taken may leave it:
+		// the active file is queued again by a rollover after that, for bytes this fsync may
+		// not cover.
+		//
+		// An entry is the descriptor that was queued, not its id: a sync that outlasts a reload
+		// fsyncs a file that is gone, and the log may have queued a file of the same id since,
+		// whose bytes this fsync did not cover. `queued` keeps the descriptors alive, so one
+		// cannot be freed and its address reused while this runs.
+		for (file_id, fd) in &queued {
+			self.fsync(*file_id, fd)?;
+			self.unsynced.lock().retain(|(_, entry)| !Arc::ptr_eq(entry, fd));
+		}
+		if let Some((file_id, fd)) = &active {
+			self.fsync(*file_id, fd)?;
+		}
+
+		// A file's fsync does not make its name durable everywhere: the directory is fsynced
+		// once for the files created since it last was, and not by the commit that rolled the
+		// log over, which fsyncs nothing.
+		if !self.created.covers(created) {
+			crate::lsm::fsync_directory(&self.path)?;
+			self.created.settle(created);
+		}
+		self.appended.settle(appended);
+		Ok(())
+	}
+
+	/// [`sync`](Self::sync), unless every entry appended is covered by an fsync that has
+	/// completed: then there is nothing to make durable, and no fsync is made.
+	///
+	/// A sync still in flight does not count, so a caller that arrives while one runs fsyncs
+	/// itself. What counts is what this process appended, and what the active file held when the
+	/// log was opened.
+	pub(crate) fn sync_dirty(&self) -> Result<()> {
+		if self.appended.is_clean() {
+			return Ok(());
+		}
+		self.sync()
+	}
+
+	fn fsync(&self, file_id: u32, fd: &File) -> Result<()> {
+		#[cfg(test)]
+		if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+			return Err(Error::Io(Arc::new(io::Error::other("injected fsync failure"))));
+		}
+		#[cfg(test)]
+		let len = fd.metadata().map(|m| m.len()).unwrap_or(0);
+		fd.sync_all()?;
+		tracing::trace!("Synced VLog file {file_id}");
+		#[cfg(test)]
+		{
+			SYNCED_VLOG_FILES.lock().push(self.vlog_file_path(file_id));
+			SYNCED_VLOG_LENGTHS.lock().push((self.vlog_file_path(file_id), len));
+		}
+		Ok(())
+	}
+
+	/// Test-only: how many times the log's directory has been fsynced, by anyone.
+	#[cfg(test)]
+	pub(crate) fn dir_syncs(&self) -> usize {
+		let dir = self.path.canonicalize().unwrap_or_else(|_| self.path.clone());
+		crate::lsm::SYNCED_DIRECTORIES.lock().iter().filter(|synced| **synced == dir).count()
+	}
+
+	/// Test-only: the ids of the files that wait for an fsync because the writer rolled over from
+	/// them, in the order they were queued.
+	#[cfg(test)]
+	pub(crate) fn unsynced_file_ids(&self) -> Vec<u32> {
+		self.unsynced.lock().iter().map(|(id, _)| *id).collect()
+	}
+
+	/// Test-only: makes the next fsync of [`sync`](Self::sync) fail, as a failing disk does.
+	#[cfg(test)]
+	pub(crate) fn fail_next_sync(&self) {
+		self.fail_next_sync.store(true, Ordering::SeqCst);
+	}
+
+	/// Test-only: sets what runs in [`sync`](Self::sync) between taking the fds and fsyncing
+	/// them, with no lock held.
+	#[cfg(test)]
+	pub(crate) fn set_sync_gap(&self, gap: Option<Arc<dyn Fn() + Send + Sync>>) {
+		*self.sync_gap.lock() = gap;
+	}
+
+	/// Test-only: makes the active file take `bytes` more bytes and then fail one write, as a
+	/// full disk does (see [`VLogWriter::fail_writes_after`]).
+	#[cfg(test)]
+	pub(crate) fn fail_writes_after(&self, bytes: usize) {
+		self.writer.write().as_mut().expect("a file was written to").fail_writes_after(bytes);
+	}
+
+	/// Registers a VLog file in the files map for tracking
+	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
+		let mut files_map = self.files_map.write();
+		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
+	}
+
+	pub(crate) fn close(&self) -> Result<()> {
+		self.sync()?;
+		Ok(())
+	}
+}

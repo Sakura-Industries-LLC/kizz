@@ -3,3 +3,27 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 msrv = "1.96"
+
+# Kizz never panics ("Kizz never panics" in architecture.md): these library calls panic
+# when the system refuses them. Every thread starts through kizz_threads instead.
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "panics when the system cannot start a thread; use kizz_threads::spawn" },
+    { path = "std::thread::Scope::spawn", reason = "panics when the system cannot start a thread; use kizz_threads::spawn_scoped" },
+    { path = "std::thread::Builder::spawn", reason = "only kizz_threads starts threads, retrying while the system cannot; use kizz_threads::spawn" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "only kizz_threads starts threads, retrying while the system cannot; use kizz_threads::spawn_scoped" },
+    { path = "std::thread::Builder::spawn_unchecked", reason = "only kizz_threads starts threads, retrying while the system cannot" },
+    { path = "rayon::ThreadPoolBuilder::build_global", reason = "the global pool panics when it cannot start a thread; use kizz_core::WorkerPool", allow-invalid = true },
+    { path = "rayon::join", reason = "runs on the global pool outside a pool; run parallel work inside WorkerPool::install", allow-invalid = true },
+    { path = "rayon::scope", reason = "runs on the global pool outside a pool; run parallel work inside WorkerPool::install", allow-invalid = true },
+    { path = "rayon::scope_fifo", reason = "runs on the global pool outside a pool; run parallel work inside WorkerPool::install", allow-invalid = true },
+    { path = "rayon::spawn", reason = "runs on the global pool outside a pool; run parallel work inside WorkerPool::install", allow-invalid = true },
+    { path = "rayon::spawn_fifo", reason = "runs on the global pool outside a pool; run parallel work inside WorkerPool::install", allow-invalid = true },
+    { path = "rayon::broadcast", reason = "runs on the global pool outside a pool; run parallel work inside WorkerPool::install", allow-invalid = true },
+    { path = "rayon::spawn_broadcast", reason = "runs on the global pool outside a pool; run parallel work inside WorkerPool::install", allow-invalid = true },
+    { path = "ignore::WalkBuilder::build_parallel", reason = "starts its threads with std::thread::Scope::spawn, which panics when the system cannot start one", allow-invalid = true },
+    { path = "tokio::runtime::Builder::new_multi_thread", reason = "starts its workers on the blocking pool, which panics when the system cannot start a thread; use new_current_thread", allow-invalid = true },
+    { path = "tokio::task::spawn_blocking", reason = "starts a thread of the blocking pool, which panics when the system cannot start one", allow-invalid = true },
+    { path = "tokio::task::block_in_place", reason = "needs a multi-thread runtime, which starts threads that panic when the system cannot start one", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "starts a thread of the blocking pool, which panics when the system cannot start one", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "starts a thread of the blocking pool, which panics when the system cannot start one", allow-invalid = true },
+]

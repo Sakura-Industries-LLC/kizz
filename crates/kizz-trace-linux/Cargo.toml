@@ -13,6 +13,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+kizz-threads = { path = "../kizz-threads", version = "0.0.1" }
 kizz-trace = { path = "../kizz-trace", version = "0.0.1" }
 libc = "0.2.191"
 

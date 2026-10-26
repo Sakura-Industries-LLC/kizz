@@ -22,7 +22,7 @@ use std::{
     process::ExitCode,
 };
 
-use kizz_core::{clean as clean_cache, plan_reset};
+use kizz_core::{WorkerPool, clean as clean_cache, plan_reset};
 use kizz_store::{
     CacheIdentity, CacheLock, EntryCounts, LockDetails, SCHEMA_VERSION, Store, StoreError,
     cache_dir_from_env, identity_differences_text,
@@ -48,11 +48,13 @@ const CLEAN_KEEPS: &str = "kept without the tasks whose kizz.md no longer exists
 /// step records it keeps, without asking; return the exit status.
 ///
 /// A cache that cannot be located, locked, opened, or cleaned exits with
-/// [`USAGE_ERROR`].
+/// [`USAGE_ERROR`], and so does a clean whose worker pool, which checks the recorded
+/// paths, cannot start.
 pub(crate) fn clean() -> ExitCode {
     finish(locked(|cache| {
+        let pool = WorkerPool::new().map_err(|error| error.to_string())?;
         let store = Store::open(cache).map_err(|error| error.to_string())?;
-        let cleaned = clean_cache(&store).map_err(|error| cannot("clean", &error))?;
+        let cleaned = clean_cache(&store, &pool).map_err(|error| cannot("clean", &error))?;
         store.close().map_err(|error| error.to_string())?;
         println!(
             "checked {}; {} no longer {}",

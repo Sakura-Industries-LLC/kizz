@@ -85,11 +85,28 @@
 //! `NOTICE:` names it. Either way its step must have exited with 0, and its mode
 //! must report the call with an error. A call or number that the tracer saw is
 //! checked in full.
+//!
+//! Two more tests run the program through the Linux tracer in the test process,
+//! with the process tree and without a cache, after `kizz build coverage-build` in
+//! copies of their own, with the request that `coverage-test` makes. The first
+//! requires that the tree combines to exactly the run's accesses over every path,
+//! and to its connections; that under the task directory its paths, kinds and
+//! outcomes are exactly those of the expectation file, where an entry's outcomes
+//! for a kind are the outcomes of its sources that add that kind, under the same
+//! availability gate and notice; that process 1 runs `./coverage`, that the child
+//! that runs the program again lists it as inherited and then as the program of its
+//! `exec`, that each path that a successful `exec` names, each script included, is
+//! a program of its own, and that the second thread's read belongs to process 1.
+//! The second runs each mode of `coverage-incomplete` the same way and requires
+//! that its tree lists the call's reason, or the unknown number, on the program
+//! that made it, under the same gate for `open_tree_attr` and `fchroot` and the
+//! same variable for calls and numbers that the tracer never saw, with their
+//! notices.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    ffi::{CStr, OsStr},
+    ffi::{CStr, OsStr, OsString},
     fmt::{self, Write as _},
     fs,
     io::{self, Write as _},
@@ -105,7 +122,11 @@ use kizz_store::{
     NotCachedReason, PathState, RecordedOutput, SpecialKind, StepExit, StepKey, StepRecord, Store,
     TaskId,
 };
-use kizz_trace_linux::{TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
+use kizz_trace::{
+    AbsolutePath, AccessKind, Cancellation, CaptureMode, CapturedOutput, IncompleteReason,
+    ProcessTree, Program, RunRequest, RunResult, StdioEcho, Termination, Tracer,
+};
+use kizz_trace_linux::{LinuxTracer, TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
 use libc::c_long;
 
 /// The result of a test or a test helper.
@@ -2650,6 +2671,612 @@ fn with_the_option_the_steps_of_unknown_numbers_are_cached() -> TestResult {
     problems.extend(built.problems.iter().cloned());
     skips.write_notice(test)?;
     built.assert_no_problems(&problems)
+}
+
+/// The outcomes of each access kind of each path, as names: `ok`, the name of an
+/// error, or `unknown`, by the path relative to the task directory.
+type PathOutcomes = BTreeMap<String, BTreeMap<Kind, BTreeSet<String>>>;
+
+/// The outcomes that `entries` expect for the platform the test runs on, where
+/// every gated call that an entry's mark names is available in `available`: for
+/// each kind of an entry, the outcomes of its sources that add that kind.
+fn expected_outcomes(
+    entries: &[Entry],
+    available: &Availability,
+) -> PathOutcomes {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.platform.is_current()
+                && entry
+                    .needs
+                    .iter()
+                    .all(|name| available.get(name) == Some(&true))
+        })
+        .map(|entry| {
+            let kinds = entry
+                .kinds
+                .0
+                .iter()
+                .map(|kind| {
+                    let outcomes = entry
+                        .sources
+                        .iter()
+                        .filter(|source| source.kinds.0.contains(kind))
+                        .map(|source| source.outcome.clone())
+                        .collect();
+                    (*kind, outcomes)
+                })
+                .collect();
+            (entry.path.clone(), kinds)
+        })
+        .collect()
+}
+
+/// The kind of the test that names the tracer's access kind `kind`.
+fn kind_of(kind: AccessKind) -> Option<Kind> {
+    KINDS
+        .iter()
+        .find(|(_, name, _)| *name == kind.name())
+        .map(|(kind, ..)| *kind)
+}
+
+/// The outcomes that `tree` records under `dir`, combined over its programs, by
+/// the path relative to `dir`; `dir` itself is `.`.
+fn tree_outcomes(
+    tree: &ProcessTree,
+    dir: &Path,
+) -> PathOutcomes {
+    tree.observations()
+        .iter()
+        .filter_map(|(path, kinds)| {
+            let relative = path.as_path().strip_prefix(dir).ok()?;
+            let name = if relative.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                relative.to_string_lossy().into_owned()
+            };
+            let kinds = kinds
+                .iter()
+                .filter_map(|(kind, outcomes)| {
+                    Some((
+                        kind_of(*kind)?,
+                        outcomes.iter().map(ToString::to_string).collect(),
+                    ))
+                })
+                .collect();
+            Some((name, kinds))
+        })
+        .collect()
+}
+
+/// The outcomes of each kind, such as `read:ok probe:ENOENT,ok`, or `(none)`.
+fn outcomes_text(kinds: &BTreeMap<Kind, BTreeSet<String>>) -> String {
+    if kinds.is_empty() {
+        return "(none)".to_owned();
+    }
+    kinds
+        .iter()
+        .map(|(kind, outcomes)| {
+            let outcomes: Vec<&str> = outcomes.iter().map(String::as_str).collect();
+            format!("{}:{}", Kinds(BTreeSet::from([*kind])), outcomes.join(","))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every difference between the `expected` and the `recorded` outcomes, in path
+/// order: a path that is missing, unexpected, or recorded with other kinds or
+/// outcomes.
+fn outcome_differences(
+    expected: &PathOutcomes,
+    recorded: &PathOutcomes,
+) -> Vec<String> {
+    let paths: BTreeSet<&String> = expected.keys().chain(recorded.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            match (expected.get(path), recorded.get(path)) {
+                (Some(want), None) => {
+                    Some(format!(
+                        "missing from the tree: {path}, expected {}",
+                        outcomes_text(want)
+                    ))
+                },
+                (None, Some(got)) => {
+                    Some(format!(
+                        "unexpected in the tree: {path}, recorded {}",
+                        outcomes_text(got)
+                    ))
+                },
+                (Some(want), Some(got)) if want != got => {
+                    Some(format!(
+                        "mismatched in the tree: {path}, expected {}, recorded {}",
+                        outcomes_text(want),
+                        outcomes_text(got)
+                    ))
+                },
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The request that `coverage-test` makes in `copy`, the task directory, with the
+/// mode `mode` after the program's name when it is given, as `coverage-incomplete`
+/// makes it, and with the process tree: the program `./coverage`, an empty
+/// environment, merged capture and no `stdin`.
+fn coverage_request(
+    copy: &Path,
+    mode: Option<&str>,
+) -> TestResult<RunRequest> {
+    let mut args = vec![OsString::from("./coverage")];
+    args.extend(mode.map(OsString::from));
+    Ok(RunRequest {
+        program: AbsolutePath::new(copy.join("coverage"))?,
+        args,
+        env: BTreeMap::new(),
+        cwd: AbsolutePath::new(copy)?,
+        stdin: None,
+        capture: CaptureMode::Merged,
+        echo: false,
+        tree: true,
+    })
+}
+
+/// Run `request` through the Linux tracer in this test process, without echo or
+/// cancellation.
+fn trace(request: &RunRequest) -> TestResult<RunResult> {
+    Ok(LinuxTracer::new().run(request, &StdioEcho, &Cancellation::new())?)
+}
+
+/// The captured output of a run, both streams.
+fn captured_text(output: &CapturedOutput) -> String {
+    match output {
+        CapturedOutput::Merged { output } => String::from_utf8_lossy(output).into_owned(),
+        CapturedOutput::Split { stdout, stderr } => {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(stdout),
+                String::from_utf8_lossy(stderr)
+            )
+        },
+    }
+}
+
+/// A short description of `program`: its path, whether it is inherited, and its
+/// arguments.
+fn program_text(program: &Program) -> String {
+    format!(
+        "{}{} {:?}",
+        program.path,
+        if program.inherited {
+            " (inherited)"
+        } else {
+            ""
+        },
+        program.args
+    )
+}
+
+/// The problems of `tree`, the tree of `result`: it must combine to exactly the
+/// run's accesses, over every path, and to its connections and unknown system
+/// calls; its processes must be numbered from 1 through their number, in order,
+/// and every process but the first must have a parent in the tree.
+fn combination_problems(
+    tree: &ProcessTree,
+    result: &RunResult,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let combined = tree.accesses();
+    if combined != result.accesses {
+        let differing: Vec<String> = combined
+            .iter()
+            .chain(&result.accesses)
+            .filter(|(path, kinds)| {
+                combined.get(path) != Some(**kinds) || result.accesses.get(path) != Some(**kinds)
+            })
+            .map(|(path, _)| path.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        problems.push(format!(
+            "the tree does not combine to the run's accesses at {differing:?}"
+        ));
+    }
+    if tree.connections() != result.connections {
+        problems.push(format!(
+            "the tree's connections {:?} are not the run's {:?}",
+            tree.connections(),
+            result.connections
+        ));
+    }
+    if tree.unknown_system_calls() != result.unknown_system_calls {
+        problems.push(format!(
+            "the tree's unknown system calls {:?} are not the run's {:?}",
+            tree.unknown_system_calls(),
+            result.unknown_system_calls
+        ));
+    }
+    for (number, process) in (1_u32..).zip(&tree.processes) {
+        if process.number != number {
+            problems.push(format!(
+                "process {} is listed as number {number}",
+                process.number
+            ));
+        }
+        let parented = process
+            .parent
+            .is_some_and(|parent| tree.process(parent).is_some() && parent != number);
+        if number > 1 && !parented {
+            problems.push(format!(
+                "process {number} has the parent {:?}, which is not in the tree",
+                process.parent
+            ));
+        }
+    }
+    problems
+}
+
+/// The problems of the programs of `tree`, the tree of the coverage program in
+/// `copy`, whose expected entries for this platform are `entries` where
+/// `available` allows them: process 1's first program is the program with the
+/// arguments `./coverage`; the child that runs the program again lists it as
+/// inherited and then as the program of its `exec`; each path that a successful
+/// `exec` names, scripts included, is a program of its own; and the second thread's
+/// read belongs to the program of process 1, so the thread is no process.
+fn program_problems(
+    tree: &ProcessTree,
+    copy: &Path,
+    entries: &[Entry],
+    available: &Availability,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let program = copy.join("coverage");
+    let named = [OsString::from("./coverage")];
+    match tree.process(1).and_then(|process| process.programs.first()) {
+        Some(first)
+            if first.path.as_path() == program && first.args == named && !first.inherited => {},
+        other => {
+            problems.push(format!(
+                "process 1's first program is {:?}, not {} with the arguments ./coverage",
+                other.map(program_text),
+                program.display()
+            ));
+        },
+    }
+    let again = tree.processes.iter().any(|process| {
+        matches!(process.programs.as_slice(), [inherited, ran, ..]
+            if inherited.inherited
+                && inherited.path.as_path() == program
+                && inherited.args == named
+                && !ran.inherited
+                && ran.path.as_path() == program
+                && ran.args.get(1).map(OsString::as_os_str) == Some(OsStr::new("child-core")))
+    });
+    if !again {
+        problems.push(
+            "no process lists the program as inherited and then runs it again with execv"
+                .to_owned(),
+        );
+    }
+    let started: BTreeSet<&Path> = tree
+        .programs()
+        .filter(|(_, program)| !program.inherited)
+        .map(|(_, program)| program.path.as_path())
+        .collect();
+    let execs = ["execve", "execveat", "execv"];
+    for entry in entries {
+        let here = entry.platform.is_current()
+            && entry
+                .needs
+                .iter()
+                .all(|name| available.get(name) == Some(&true));
+        let ran = entry.sources.iter().any(|source| {
+            matches!(source.origin, Origin::Sys | Origin::Libc)
+                && execs.contains(&source.name.as_str())
+                && source.succeeded()
+        });
+        let path = copy.join(&entry.path);
+        if here && ran && !started.contains(path.as_path()) {
+            problems.push(format!(
+                "line {}: {} ran, but it is no program of the tree",
+                entry.line, entry.path
+            ));
+        }
+    }
+    let thread_read = copy.join("in/core/thread.txt");
+    let readers: Vec<(u32, bool)> = tree
+        .programs()
+        .filter(|(_, program)| {
+            program
+                .observations
+                .iter()
+                .any(|(path, _)| path.as_path() == thread_read)
+        })
+        .map(|(process, program)| (process.number, program.inherited))
+        .collect();
+    if readers != [(1, false)] {
+        problems.push(format!(
+            "the second thread's read belongs to {readers:?}, not to the program of process 1"
+        ));
+    }
+    problems
+}
+
+/// Copy the fixture into a temporary directory and build the program there with
+/// `kizz build coverage-build`, with a temporary cache. Return the temporary
+/// directory, the copy, and the build's run.
+fn built_copy() -> TestResult<(tempfile::TempDir, PathBuf, Run)> {
+    let dir = tempfile::tempdir()?;
+    let copy = dir.path().canonicalize()?.join(FIXTURE);
+    copy_tree(&fixture_dir(), &copy)?;
+    let cache = tempfile::tempdir()?;
+    let run = run_kizz(&copy, cache.path(), &["build", "coverage-build"])?;
+    Ok((dir, copy, run))
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, through the Linux tracer in this test process with the request that
+/// `coverage-test` makes and the process tree, without a cache. The tree must
+/// combine to exactly the run's accesses; under the task directory its paths,
+/// kinds and outcomes must be exactly those of the expectation file, each kind
+/// with the outcomes of the entry's sources that add it, leaving out the entries
+/// that name an unavailable gated call, as the test's own check and the program's
+/// report, which must agree, find; and its processes and programs must be those
+/// that [`program_problems`] requires. A notice names each unavailable gated call.
+#[test]
+fn the_process_tree_of_the_coverage_program_holds_every_outcome() -> TestResult {
+    let test = "the_process_tree_of_the_coverage_program_holds_every_outcome";
+    let (available, mut problems) = own_availability()?;
+    write_notice(test, &available)?;
+    let entries = fixture_entries()?;
+    let (_dir, copy, build) = built_copy()?;
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    let result = trace(&coverage_request(&copy, None)?)?;
+    let output = captured_text(&result.output);
+    if result.termination != Termination::Exited(0) {
+        problems.push(format!("the program ended with {}", result.termination));
+    }
+    if !output.lines().any(|line| line.starts_with(SUCCESS_LINE)) {
+        problems.push("the program did not print its summary line".to_owned());
+    }
+    if !result.is_complete() || !result.unknown_system_calls.is_empty() {
+        problems.push(format!(
+            "the run is incomplete, {:?}, or made unknown system calls, {:?}",
+            result.incomplete, result.unknown_system_calls
+        ));
+    }
+    let (reported, report_problems) = reported_availability(&output);
+    problems.extend(report_problems);
+    problems.extend(disagreements(&reported, &available));
+    match &result.tree {
+        Some(tree) => {
+            problems.extend(combination_problems(tree, &result));
+            problems.extend(outcome_differences(
+                &expected_outcomes(&entries, &available),
+                &tree_outcomes(tree, &copy),
+            ));
+            problems.extend(program_problems(tree, &copy, &entries, &available));
+        },
+        None => problems.push("the result holds no process tree".to_owned()),
+    }
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\nprogram output:\n{output}\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// The problems of a run of `coverage-incomplete`'s mode for `made`, whose result
+/// is `result` and whose output is `output`, when the tracer never saw the call or
+/// number: the program must have exited with 0, and its mode must have reported
+/// the call once, with an error.
+fn unseen_run_problems(
+    result: &RunResult,
+    output: &str,
+    made: Made,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if result.termination != Termination::Exited(0) {
+        problems.push(format!(
+            "the run of {made} ended with {}",
+            result.termination
+        ));
+    }
+    let report = made.report();
+    let results: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(report.as_str()))
+        .collect();
+    if !matches!(results.as_slice(), [answer] if *answer != "success") {
+        problems.push(format!(
+            "the tracer never saw {}, but its run did not report it once with an error: \
+             {output}",
+            made.quoted()
+        ));
+    }
+    problems
+}
+
+/// The problems of the run of the coverage program in `copy` in the mode of
+/// `coverage-incomplete` that makes `made`, which `available` gives as available or
+/// not, through the Linux tracer with the process tree. The tree must combine to
+/// the run's accesses. For a gated call, the program's report must agree with
+/// `available`. A call or number that the tracer never saw is judged by
+/// [`Skips::never_saw`] where it is available, and needs no reason where it is
+/// not. Otherwise the run must have exited with 0, and the program that made it,
+/// the one that process 1 runs with the mode's arguments, must list the call's
+/// reason, or the number, which no other program lists.
+fn made_problems(
+    copy: &Path,
+    made: Made,
+    available: bool,
+    skips: &mut Skips,
+) -> TestResult<Vec<String>> {
+    let request = coverage_request(copy, Some(&made.mode()))?;
+    let result = trace(&request)?;
+    let output = captured_text(&result.output);
+    let Some(tree) = &result.tree else {
+        return Ok(vec![format!("the run of {made} holds no process tree")]);
+    };
+    let mut problems = combination_problems(tree, &result);
+    if let Made::Call(name) = made
+        && GATED_UNTRACEABLE.contains(&name)
+    {
+        let reported: Vec<bool> = output
+            .lines()
+            .filter_map(|line| {
+                if line == format!("{AVAILABLE_LINE}{name}") {
+                    Some(true)
+                } else if line == format!("{UNAVAILABLE_LINE}{name}") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if reported != [available] {
+            problems.push(format!(
+                "the run of {name} reported {reported:?}, but the test's own check found it {}",
+                availability_word(available)
+            ));
+        }
+    }
+    let saw = !result.is_complete() || !result.unknown_system_calls.is_empty();
+    if !saw {
+        if available {
+            problems.extend(skips.never_saw(made, unseen_run_problems(&result, &output, made)));
+        } else if result.termination != Termination::Exited(0) {
+            problems.push(format!(
+                "the run of {made} ended with {}",
+                result.termination
+            ));
+        }
+        return Ok(problems);
+    }
+    if result.termination != Termination::Exited(0) {
+        problems.push(format!(
+            "the run of {made} ended with {}",
+            result.termination
+        ));
+    }
+    let lists = |program: &Program| {
+        match made {
+            Made::Call(name) => {
+                let named = format!("`{name}`");
+                program.incomplete.iter().any(|reason| {
+                    matches!(reason, IncompleteReason::UntraceableSystemCall { detail }
+                        if detail.contains(&named))
+                })
+            },
+            Made::Number(number) => program.unknown_system_calls.contains(&number),
+        }
+    };
+    let listing: Vec<(u32, String)> = tree
+        .programs()
+        .filter(|(_, program)| lists(program))
+        .map(|(process, program)| (process.number, program_text(program)))
+        .collect();
+    let maker = tree.process(1).and_then(|process| {
+        process.programs.iter().find(|program| {
+            !program.inherited && program.path == request.program && program.args == request.args
+        })
+    });
+    let expected = maker.map(|program| (1, program_text(program)));
+    if listing.len() != 1 || listing.first() != expected.as_ref() {
+        problems.push(format!(
+            "{} is listed by {listing:?}, not by the program that made it, {expected:?}",
+            made.quoted()
+        ));
+    }
+    Ok(problems)
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, in each mode of `coverage-incomplete` through the Linux tracer in this
+/// test process with the process tree: each tree combines to its run's accesses
+/// and lists the call's reason, or the unknown number, on the program that made
+/// it. Where `open_tree_attr` or `fchroot` is unavailable, as the test's own check
+/// and the program's report find, its run need not be marked, and a notice names
+/// it. A call or number that the tracer never saw fails the test, unless
+/// [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn the_process_tree_lists_each_incomplete_reason_on_its_program() -> TestResult {
+    let test = "the_process_tree_lists_each_incomplete_reason_on_its_program";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let (_dir, copy, build) = built_copy()?;
+    let mut problems = Vec::new();
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    for call in UNTRACEABLE_SYSTEM_CALLS {
+        let has = available.get(call.name).copied().unwrap_or(true);
+        problems.extend(made_problems(
+            &copy,
+            Made::Call(call.name),
+            has,
+            &mut skips,
+        )?);
+    }
+    for number in UNKNOWN_NUMBERS {
+        problems.extend(made_problems(
+            &copy,
+            Made::Number(number),
+            true,
+            &mut skips,
+        )?);
+    }
+    skips.write_notice(test)?;
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// An entry's expected outcomes are, for each of its kinds, the outcomes of its
+/// sources that add that kind, and the comparison names each path that the tree
+/// records otherwise.
+#[test]
+fn outcomes_are_expected_from_the_sources_that_add_each_kind() -> TestResult {
+    let entry = parse_entry(
+        1,
+        "out/core probe+write dir all libc:mkdir:ok:write libc:mkdir:EEXIST:probe",
+    )?;
+    let expected = expected_outcomes(&[entry], &Availability::new());
+    let want: PathOutcomes = BTreeMap::from([(
+        "out/core".to_owned(),
+        BTreeMap::from([
+            (Kind::Probe, BTreeSet::from(["EEXIST".to_owned()])),
+            (Kind::Write, BTreeSet::from(["ok".to_owned()])),
+        ]),
+    )]);
+    assert_eq!(expected, want);
+    assert_eq!(outcome_differences(&expected, &want), Vec::<String>::new());
+    let mut recorded = want.clone();
+    recorded
+        .get_mut("out/core")
+        .and_then(|kinds| kinds.get_mut(&Kind::Probe))
+        .ok_or("no probe")?
+        .insert("ok".to_owned());
+    recorded.insert("extra".to_owned(), BTreeMap::new());
+    assert_eq!(outcome_differences(&expected, &recorded), [
+        "unexpected in the tree: extra, recorded (none)",
+        "mismatched in the tree: out/core, expected probe:EEXIST write:ok, recorded \
+         probe:EEXIST,ok write:ok",
+    ]);
+    assert_eq!(outcome_differences(&recorded, &BTreeMap::new()).len(), 2);
+    assert_eq!(kind_of(AccessKind::Xattr), Some(Kind::Xattr));
+    Ok(())
 }
 
 /// The little-endian field of `size` bytes, at most eight, at `offset` in `bytes`.

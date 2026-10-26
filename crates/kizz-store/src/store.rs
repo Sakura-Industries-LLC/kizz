@@ -13,6 +13,18 @@
 //! store hands the write-ahead log to the operating system, so a committed record
 //! survives a crash of the process.
 //!
+//! The store starts no thread of its own ("Kizz never panics"), so it cannot fail
+//! when the system cannot start one. Its runtime is a current-thread runtime, which
+//! runs `SurrealKV`'s tasks on the threads that call the store, while they wait for a
+//! commit or the close. Kizz builds `SurrealKV` from a patched copy in
+//! `vendor/surrealkv`, and the store opens it with the copy's direct clock,
+//! [`ClockMode::Direct`], which reads the system clock on every reading instead of
+//! keeping a thread that brings it up to date. Its stall thresholds, [`STALL_THRESHOLD`],
+//! are so high that `SurrealKV` never paces or stalls a write, which a cache of small
+//! records does not need. When it replays several log segments after a crash,
+//! the copy starts a thread when it can and otherwise replays them on the thread
+//! that opens the store.
+//!
 //! When the store creates the database it writes [`SCHEMA_VERSION`] and the current
 //! [`CacheIdentity`] into it. It refuses to open a database with another version,
 //! and then one whose identity differs from the current one or that has none,
@@ -28,7 +40,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use surrealkv::{Durability, LSMIterator as _, Mode, ReadOptions, Transaction, Tree, TreeBuilder};
+use surrealkv::{
+    ClockMode, Durability, LSMIterator as _, Mode, Options, ReadOptions, Transaction, Tree,
+    TreeBuilder,
+};
 
 use crate::{
     identity::{CacheIdentity, IdentityDifference, IdentityKey, identity_differences_text},
@@ -42,6 +57,25 @@ pub const DATABASE_DIR: &str = "db";
 
 /// The name a wiped database directory has while [`Store::wipe`] removes it.
 const WIPED_DIR: &str = "db.wiped";
+
+/// The number of immutable memory tables, and of level-0 files, at which `SurrealKV`
+/// would stall writes, as the store sets it: the largest number there is.
+///
+/// `SurrealKV` paces writes once a count passes 2 below its memory-table threshold
+/// or 4 below its level-0 threshold, and stalls them at the threshold, so with this
+/// value it would take more than `usize::MAX - 4` memory tables or files in one
+/// database, which no process can hold: write pacing, which waited on a thread in
+/// published `SurrealKV`, never runs, and no write stalls.
+pub const STALL_THRESHOLD: usize = usize::MAX;
+
+/// The options the store opens the database in `path` with: the direct clock, which
+/// starts no thread, and stall thresholds that keep write pacing from running.
+fn tree_options(path: PathBuf) -> Options {
+    Options::new_with_clock(ClockMode::Direct)
+        .with_path(path)
+        .with_memtable_stall_threshold(STALL_THRESHOLD)
+        .with_l0_stall_threshold(STALL_THRESHOLD)
+}
 
 /// The version of the record encoding that this build of kizz reads and writes.
 ///
@@ -388,16 +422,16 @@ impl Store {
                 source,
             }
         })?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("kizz-store")
+        // A current-thread runtime starts no thread: the tree's tasks run on the
+        // threads that wait in `block_on`.
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(StoreError::Runtime)?;
         let tree = {
             // The tree starts its background tasks on the runtime it is opened in.
             let _entered = runtime.enter();
-            TreeBuilder::new().with_path(path.clone()).build()?
+            TreeBuilder::with_options(tree_options(path.clone())).build()?
         };
         Ok(Self {
             tree,
@@ -813,5 +847,23 @@ mod tests {
     #[test]
     fn schema_version_17_records_machine_state() {
         assert_eq!(SCHEMA_VERSION, 17);
+    }
+
+    /// The store's thresholds keep write pacing from running: `SurrealKV` paces a
+    /// write only while a count of immutable memory tables passes its threshold less
+    /// 2, or a count of level-0 files its threshold less 4 (`StallThresholds::new`
+    /// and `WriteStallController::check` in `vendor/surrealkv/src/stall.rs`), and
+    /// both counts are lengths of collections in memory, which never pass
+    /// `isize::MAX`.
+    #[test]
+    fn write_pacing_cannot_run_under_the_store_thresholds() {
+        let options = tree_options(PathBuf::from("/cache/db"));
+        assert_eq!(options.memtable_stall_threshold, STALL_THRESHOLD);
+        assert_eq!(options.l0_stall_threshold, STALL_THRESHOLD);
+        let memtable_soft_limit = options.memtable_stall_threshold.saturating_sub(2).max(1);
+        let l0_soft_limit = options.l0_stall_threshold.saturating_sub(4).max(1);
+        let longest = usize::try_from(isize::MAX).unwrap();
+        assert!(memtable_soft_limit > longest);
+        assert!(l0_soft_limit > longest);
     }
 }

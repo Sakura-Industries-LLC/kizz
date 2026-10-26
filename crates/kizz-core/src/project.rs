@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::{
     discovery::{Discovery, KizzFile, discover},
+    pool::WorkerPool,
     targets::TARGET_NAME_RULE,
     tasks::{Task, parse_tasks},
     warning::{Warning, location, shown},
@@ -131,7 +132,7 @@ impl fmt::Display for LoadError {
     }
 }
 
-/// Discover every `kizz.md` under `root` and parse its tasks.
+/// Discover every `kizz.md` under `root`, walking on `pool`, and parse its tasks.
 ///
 /// # Errors
 ///
@@ -139,7 +140,10 @@ impl fmt::Display for LoadError {
 /// [`LoadError::Config`] with every configuration error found when any `kizz.md`
 /// cannot be read or has an invalid target name, together with every discovery and
 /// parsing warning found.
-pub fn load(root: &Path) -> Result<Project, LoadError> {
+pub fn load(
+    root: &Path,
+    pool: &WorkerPool,
+) -> Result<Project, LoadError> {
     let root_error = |source| {
         LoadError::Root {
             root: root.to_path_buf(),
@@ -154,7 +158,7 @@ pub fn load(root: &Path) -> Result<Project, LoadError> {
     let Discovery {
         files,
         mut warnings,
-    } = discover(&root);
+    } = discover(&root, pool);
     let mut tasks: Vec<Task> = Vec::new();
     let mut errors: Vec<ConfigError> = Vec::new();
     for file in &files {
@@ -189,8 +193,13 @@ pub fn load(root: &Path) -> Result<Project, LoadError> {
 mod tests {
     use std::{fs, io, path::Path};
 
-    use super::{ConfigError, LoadError, load};
-    use crate::{tasks::Task, warning::Warning};
+    use super::{ConfigError, LoadError};
+    use crate::{pool::WorkerPool, tasks::Task, warning::Warning};
+
+    /// Load the project under `root` with a worker pool of its own.
+    fn load(root: &Path) -> Result<super::Project, LoadError> {
+        super::load(root, &WorkerPool::new().unwrap())
+    }
 
     /// The recursive-link warning that [`link_up`] causes for `dir`.
     fn recursive_link_warning(dir: &str) -> String {

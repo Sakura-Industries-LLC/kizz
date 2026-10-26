@@ -31,7 +31,7 @@ use std::{
 
 use kizz_core::{
     Engine, PrintSink, ProgramHash, StepConnections, StepExecutor, StepOutcome, StepSpec, TaskInfo,
-    TaskProgram, UnknownCalls, observe::listing, parse_tasks, step_key,
+    TaskProgram, UnknownCalls, WorkerPool, observe::listing, parse_tasks, step_key,
 };
 use kizz_store::{
     AccessBits, Attribute, Attributes, Change, Connection as StoredConnection, ContentHash,
@@ -40,8 +40,8 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Connection,
-    EchoSink, ExtendedAttributes, FirstReads, IncompleteReason, OutputStream, RunRequest,
-    RunResult, Termination, TraceError, Tracer,
+    EchoSink, ExtendedAttributes, FirstReads, IncompleteReason, OutputStream, ProcessTree,
+    RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -222,6 +222,9 @@ fn finished(
     Ok(RunResult {
         termination,
         output: CapturedOutput::empty(request.capture),
+        tree: request
+            .tree
+            .then(|| ProcessTree::of_request(request, &accesses, Some(termination))),
         accesses,
         incomplete: None,
         first_reads,
@@ -415,7 +418,7 @@ impl Fixture {
         steps: &[&StepSpec],
     ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None)
+        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None, &WorkerPool::new()?)
             .with_cache_unknown_system_calls(cache_unknown);
         let task = engine.task(PROGRAM, self.dir()?);
         let results = steps.iter().map(|step| task.execute(step)).collect();
@@ -753,7 +756,14 @@ fn build_task(
     let task = TaskInfo::new(parsed.tasks.first().ok_or("no task")?, &["ci".to_owned()])?;
     let program = TaskProgram::load(task, &Lines::default()).program?;
     let store = fixture.store()?;
-    let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     let steps = engine.task(program.hash(), fixture.dir()?);
     let lines = Lines::default();
     program
@@ -856,7 +866,14 @@ fn always_steps_with_identical_output_leave_dependents_cached() -> TestResult {
     // The second build runs the `always` step once, even when a later pass checks
     // the task again, and the step that reads its output stays cached.
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        &tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     for pass in 0..2 {
         let task = engine.task(PROGRAM, fixture.dir()?);
         assert_eq!(task.execute(&generate)?.cached, pass == 1, "pass {pass}");
@@ -1238,7 +1255,14 @@ fn show(
     let lines = Lines::default();
     let program = TaskProgram::load(task, &lines).program?;
     let store = fixture.store()?;
-    let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     let steps = engine.task(program.hash(), fixture.dir()?);
     program
         .run(&BTreeMap::new(), &steps, &lines)
@@ -1268,10 +1292,14 @@ fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
             _ => Termination::Exited(0),
         };
         if text == "start" {
+            let touched = reported(request, &accesses)?;
             return Err(TraceError::StartFailed {
                 program: request.program.clone(),
                 source: io::Error::from(io::ErrorKind::OutOfMemory),
-                accesses: reported(request, &accesses)?,
+                tree: request
+                    .tree
+                    .then(|| ProcessTree::of_request(request, &touched, None)),
+                accesses: touched,
             });
         }
         let mut result = finished(request, &accesses, termination)?;
@@ -1354,7 +1382,7 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
             cancel.cancel();
         }
         let store = fixture.store()?;
-        let engine = Engine::new(&tracer, &store, &NoEcho, cancel, None);
+        let engine = Engine::new(&tracer, &store, &NoEcho, cancel, None, &WorkerPool::new()?);
         let first = engine.task(PROGRAM, fixture.dir()?).execute(&step);
         let again = engine.task(PROGRAM, fixture.dir()?).execute(&step);
         assert_eq!(tracer.runs(), 1, "{kind}");
@@ -1737,7 +1765,14 @@ fn an_always_step_runs_once_per_build_whatever_changes() -> TestResult {
 
         for build in 1..=2 {
             let store = fixture.store()?;
-            let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+            let engine = Engine::new(
+                &tracer,
+                &store,
+                &NoEcho,
+                Cancellation::new(),
+                None,
+                &WorkerPool::new()?,
+            );
             for pass in 0..3 {
                 let result = engine.task(PROGRAM, fixture.dir()?).execute(&step)?;
                 assert_eq!(
@@ -1794,7 +1829,14 @@ fn a_shared_file_is_hashed_once_per_build_and_again_after_a_write() -> TestResul
     let after = fixture.step(&["tool", "d"])?;
 
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        &tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     let steps = engine.task(PROGRAM, fixture.dir()?);
     for reader in &readers {
         steps.execute(reader)?;

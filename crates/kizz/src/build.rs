@@ -53,6 +53,15 @@
 //! receives `SIGINT` exactly once, and kills whatever of it still runs 2 seconds
 //! later; its result is not cached, however it ends. Kizz then closes the
 //! database, releases and deletes the lock file, and exits with [`INTERRUPTED`].
+//!
+//! Threads ("Kizz never panics"): the thread that handles Ctrl-C starts through
+//! `kizz_threads`, which waits and retries while the system cannot start a thread for
+//! the moment; when it still cannot start, kizz prints the error, which names the
+//! thread and the system's error, releases and deletes the lock file, and exits with
+//! [`USAGE_ERROR`]. Discovery and the build's parallel work run on one
+//! [`WorkerPool`], whose workers start the same way; a pool that cannot start is an
+//! error with the same status. A thread of a command's tracer that cannot start fails
+//! that command's step, and so its task.
 
 use std::{
     cell::{Cell, RefCell},
@@ -66,15 +75,19 @@ use std::{
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, LoadError, PrintSink,
     ProgramWrite, Project, Render, StepConnections, StepDecision, TargetExpr, TaskInfo, TaskResult,
-    UncheckedStep, UnknownCalls, Warning, build, load, task_id, task_label,
+    UncheckedStep, UnknownCalls, Warning, WorkerPool, build, load, task_id, task_label,
 };
 use kizz_store::{
     CacheLock, LockDetails, NotCachedReason, StepKey, StepRecord, Store, TaskId, Verdict,
     cache_dir_from_env, connections_text, system_call_numbers,
 };
+use kizz_threads::StartError;
 use kizz_trace::{AbsolutePath, Cancellation, StdioEcho};
 use kizz_trace_linux::LinuxTracer;
-use signal_hook::{consts::SIGINT, iterator::Signals};
+use signal_hook::{
+    consts::SIGINT,
+    iterator::{Handle, Signals},
+};
 
 use crate::{
     cli::{INTERRUPTED, TASK_FAILED, USAGE_ERROR},
@@ -145,25 +158,72 @@ pub(crate) fn run(
             return failure(&format!("cannot handle Ctrl-C: {error}"));
         },
     };
-    let handle = signals.handle();
     let cancel = Cancellation::new();
-    let status = thread::scope(|scope| {
-        let watcher = cancel.clone();
-        scope.spawn(move || {
-            let mut signals = signals;
-            for _signal in signals.forever() {
-                watcher.cancel();
-            }
-        });
+    // When the signal thread cannot start, the build never runs: dropping it
+    // releases the lock and deletes its file, and kizz exits with
+    // [`USAGE_ERROR`], its status for its own errors.
+    let status = match with_interrupts(signals, &cancel, || {
         let mut status = with_store(&cache, &cwd, &expression, options, &cancel);
         if let Err(error) = lock.release() {
             ui::print_error(&error.to_string());
             status = worse(status);
         }
-        handle.close();
         status
-    });
+    }) {
+        Ok(status) => status,
+        Err(error) => {
+            ui::print_error(&error.to_string());
+            USAGE_ERROR
+        },
+    };
     ExitCode::from(status)
+}
+
+/// Run `work` while a thread cancels `cancel` at each signal that `signals`
+/// delivers, and return what `work` returns.
+///
+/// The thread starts through `kizz_threads`, which waits and retries while the
+/// system cannot start a thread for the moment. When it still cannot start, `work`
+/// never runs and is dropped, and the error names the thread and the system's error.
+///
+/// The thread waits for signals until the delivery is closed, and the scope that
+/// runs it waits for it before it returns, also when `work` panics. A
+/// [`CloseOnDrop`] therefore closes the delivery whichever way `work` ends: a panic
+/// in the build then ends kizz with the panic instead of leaving it waiting for the
+/// signal thread for good.
+fn with_interrupts<T>(
+    signals: Signals,
+    cancel: &Cancellation,
+    work: impl FnOnce() -> T,
+) -> Result<T, StartError> {
+    let handle = signals.handle();
+    thread::scope(|scope| {
+        let _close = CloseOnDrop(handle);
+        let watcher = cancel.clone();
+        kizz_threads::spawn_scoped(
+            scope,
+            "kizz-signals",
+            "the thread that handles Ctrl-C",
+            move || {
+                let mut signals = signals;
+                for _signal in signals.forever() {
+                    watcher.cancel();
+                }
+            },
+        )?;
+        Ok(work())
+    })
+}
+
+/// Closes a signal delivery when dropped, which ends the thread that waits for its
+/// signals; dropped at the end of [`with_interrupts`]'s scope, and while a panic
+/// unwinds out of it, before the scope waits for that thread.
+struct CloseOnDrop(Handle);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// `status`, or [`USAGE_ERROR`] in place of success, after an error in using the
@@ -205,7 +265,10 @@ fn build_selected(
     options: Options,
     cancel: &Cancellation,
 ) -> u8 {
-    let Some(project) = load_project(cwd) else {
+    let Some(pool) = worker_pool() else {
+        return USAGE_ERROR;
+    };
+    let Some(project) = load_project(cwd, &pool) else {
         return USAGE_ERROR;
     };
     let mut warnings = print_warnings(&project.warnings);
@@ -242,6 +305,7 @@ fn build_selected(
         cancel.clone(),
         home.as_deref()
             .and_then(|home| AbsolutePath::new(home).ok()),
+        &pool,
     )
     .with_cache_unknown_system_calls(options.engine.cache_unknown_syscalls)
     .with_fail_unchecked(options.engine.fail_unchecked);
@@ -275,10 +339,25 @@ fn build_selected(
     status
 }
 
-/// Load the project under `cwd`, printing its configuration errors and warnings
-/// when it has errors.
-fn load_project(cwd: &Path) -> Option<Project> {
-    match load(cwd) {
+/// The worker pool of a command, which runs its parallel work, or `None` after
+/// printing why a worker could not start.
+pub(crate) fn worker_pool() -> Option<WorkerPool> {
+    match WorkerPool::new() {
+        Ok(pool) => Some(pool),
+        Err(error) => {
+            ui::print_error(&error.to_string());
+            None
+        },
+    }
+}
+
+/// Load the project under `cwd`, walking on `pool`, printing its configuration
+/// errors and warnings when it has errors.
+fn load_project(
+    cwd: &Path,
+    pool: &WorkerPool,
+) -> Option<Project> {
+    match load(cwd, pool) {
         Ok(project) => Some(project),
         Err(LoadError::Config { errors, warnings }) => {
             let warnings = print_warnings(&warnings);
@@ -297,7 +376,10 @@ fn load_project(cwd: &Path) -> Option<Project> {
 
 /// Fail because no target was given, listing the available targets under `cwd`.
 fn missing_target(cwd: &Path) -> ExitCode {
-    let Some(project) = load_project(cwd) else {
+    let Some(pool) = worker_pool() else {
+        return ExitCode::from(USAGE_ERROR);
+    };
+    let Some(project) = load_project(cwd, &pool) else {
         return ExitCode::from(USAGE_ERROR);
     };
     let warnings = print_warnings(&project.warnings);
@@ -831,12 +913,25 @@ fn command_counts(report: &BuildReport) -> (usize, usize) {
 /// Unit tests for counting the commands of a build and for the line at the start
 /// of a pass.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: a plain std thread bounds how long a test waits"
+)]
 mod tests {
+    use std::{
+        panic::{self, AssertUnwindSafe},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
     use kizz_core::{BuildOutcome, BuildReport, Pass, StepDecision, TaskInfo, TaskResult};
     use kizz_store::{Explanation, Reason, Verdict};
-    use kizz_trace::AbsolutePath;
+    use kizz_threads::testing::{Failure, fail_starts_named};
+    use kizz_trace::{AbsolutePath, Cancellation};
+    use signal_hook::{consts::SIGUSR2, iterator::Signals};
 
-    use super::{command_counts, pass_line};
+    use super::{command_counts, pass_line, with_interrupts};
 
     /// A task run whose steps have the verdicts `verdicts`, ran when `true`.
     fn result(verdicts: &[bool]) -> TaskResult {
@@ -919,5 +1014,63 @@ mod tests {
             outcome: BuildOutcome::Succeeded,
         };
         assert_eq!(command_counts(&report), (3, 1));
+    }
+
+    /// How long the test waits for a build that panicked to end.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// A build that panics while the signal thread waits for signals still ends:
+    /// the delivery is closed while the panic unwinds, before the scope waits for
+    /// that thread, and the panic reaches the caller. Without the close, the thread
+    /// waits for a signal for good, and so does the scope, as kizz did when it could
+    /// not start a thread during a build.
+    #[test]
+    fn a_panic_in_the_build_does_not_wait_for_the_signal_thread() {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            // A signal that nothing in the test process uses.
+            let signals = Signals::new([SIGUSR2]).unwrap();
+            let cancel = Cancellation::new();
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                with_interrupts(signals, &cancel, || -> u8 {
+                    panic::resume_unwind(Box::new("the build could not start a thread"))
+                })
+            }));
+            sender.send(outcome.is_err()).ok();
+        });
+        assert_eq!(
+            receiver.recv_timeout(PATIENCE),
+            Ok(true),
+            "the build that panicked did not end"
+        );
+    }
+
+    /// A build that ends normally returns its result after the signal thread ended.
+    #[test]
+    fn a_build_returns_its_result_after_the_signal_thread() {
+        let signals = Signals::new([SIGUSR2]).unwrap();
+        let cancel = Cancellation::new();
+        assert_eq!(with_interrupts(signals, &cancel, || 7).unwrap(), 7);
+        assert!(!cancel.is_cancelled());
+    }
+
+    /// When the signal thread cannot start, even after its retries, the build never
+    /// runs, and the error names the thread and error 11 instead of a panic.
+    #[test]
+    fn a_signal_thread_that_cannot_start_is_an_error() {
+        let signals = Signals::new([SIGUSR2]).unwrap();
+        let cancel = Cancellation::new();
+        let failures = fail_starts_named(11, Failure::Busy, "kizz-signals");
+        let mut ran = false;
+        let error = with_interrupts(signals, &cancel, || ran = true).unwrap_err();
+        assert!(!ran);
+        assert_eq!(failures.remaining(), 0);
+        assert_eq!(error.error().raw_os_error(), Some(11));
+        assert!(
+            error.to_string().starts_with(
+                "could not start the thread that handles Ctrl-C after 11 attempts in 22.3 seconds"
+            ),
+            "{error}"
+        );
     }
 }

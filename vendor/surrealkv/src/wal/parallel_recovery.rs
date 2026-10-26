@@ -1,0 +1,351 @@
+//! Parallel WAL Replay for sub-millisecond crash recovery.
+//!
+//! Because SurrealKV V2 is a single-version KV store without in-tree timestamps,
+//! WAL segments and record batches across disjoint sequence numbers can be decoded
+//! and prepared concurrently across available CPU cores via thread pools.
+
+use std::fs::File;
+use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::batch::Batch;
+use crate::error::{Error, Result};
+use crate::memtable::MemTable;
+use crate::wal::reader::Reader;
+use crate::wal::recovery::{apply_batch_with_oversized_fallback, DefaultReporter};
+use crate::wal::sealed_recovery::{self, DecodedSegment};
+use crate::wal::{Error as WalError, SegmentRef, WalContext};
+
+/// Decodes a single plaintext WAL segment file into batches and the segment's maximum sequence
+/// number.
+#[cfg(test)]
+pub(crate) fn decode_segment_batches(
+	file_path: &Path,
+	segment_id: u64,
+) -> Result<(u64, Vec<Batch>)> {
+	decode_segment_batches_with(&WalContext::plaintext(), file_path, segment_id)
+}
+
+/// Decodes a single WAL segment file, read as `context` says, into batches and the segment's
+/// maximum sequence number.
+pub(crate) fn decode_segment_batches_with(
+	context: &WalContext,
+	file_path: &Path,
+	segment_id: u64,
+) -> Result<(u64, Vec<Batch>)> {
+	let file = File::open(file_path)?;
+	let reporter = Box::new(DefaultReporter::new(segment_id));
+	let mut reader = Reader::with_context(file, Some(reporter), segment_id, context);
+
+	let mut batches = Vec::new();
+	let mut max_seq = 0u64;
+	let mut last_valid_offset = 0;
+
+	loop {
+		match reader.read() {
+			Ok((record_data, offset)) => {
+				last_valid_offset = offset as usize;
+				let batch = Batch::decode(record_data)?;
+				let seq = batch.get_highest_seq_num();
+				if seq > max_seq {
+					max_seq = seq;
+				}
+				batches.push(batch);
+			}
+			Err(WalError::Corruption(err)) => {
+				return Err(Error::wal_corruption(
+					segment_id as usize,
+					last_valid_offset,
+					format!("Corrupted WAL record: {}", err),
+				));
+			}
+			Err(WalError::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+				break;
+			}
+			Err(err) => return Err(err.into()),
+		}
+	}
+
+	Ok((max_seq, batches))
+}
+
+/// Decodes the sealed segments of `segments`, in order: in parallel on the workers of the pool if
+/// there are several, where each worker has the context, and the first failure that is not a tear
+/// is the error. Nothing is read through a worker that was not given the context.
+pub(crate) fn decode_sealed_segments(
+	context: &WalContext,
+	segments: &[SegmentRef],
+) -> Result<Vec<DecodedSegment>> {
+	let decode = |segment: &SegmentRef| {
+		sealed_recovery::decode_segment(context, &segment.file_path, segment.id)
+	};
+	if segments.len() <= 1 {
+		return segments.iter().map(decode).collect();
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	{
+		segments.iter().map(decode).collect()
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+				return tokio::task::block_in_place(|| {
+					handle.block_on(decode_sealed_segments_parallel(context, segments))
+				});
+			}
+		}
+
+		let segs = segments.to_vec();
+		let worker_context = context.clone();
+		let spawned = std::thread::Builder::new().spawn(move || {
+			let rt = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.map_err(|e| Error::Other(format!("Failed to build temporary runtime: {e}")))?;
+			rt.block_on(decode_sealed_segments_parallel(&worker_context, &segs))
+		});
+		match spawned {
+			Ok(handle) => handle
+				.join()
+				.map_err(|_| Error::Other("WAL parallel recovery thread panicked".to_string()))?,
+			// Without the thread, decode the segments on this thread, in order
+			Err(_) => segments.iter().map(decode).collect(),
+		}
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn decode_sealed_segments_parallel(
+	context: &WalContext,
+	segments: &[SegmentRef],
+) -> Result<Vec<DecodedSegment>> {
+	let mut tasks = Vec::with_capacity(segments.len());
+	for segment in segments {
+		let path = segment.file_path.clone();
+		let id = segment.id;
+		let context = context.clone();
+		tasks.push(affinitypool::spawn(move || {
+			sealed_recovery::decode_segment(&context, &path, id)
+		}));
+	}
+	let mut decoded = Vec::with_capacity(tasks.len());
+	for task in tasks {
+		decoded.push(task.await?);
+	}
+	Ok(decoded)
+}
+
+pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize);
+
+/// Synchronous entry point for parallel segment replay.
+pub(crate) fn replay_segments_sync(
+	context: &WalContext,
+	segments: &[SegmentRef],
+	arena_size: usize,
+) -> Result<ParallelReplayResult> {
+	#[cfg(target_arch = "wasm32")]
+	{
+		let mut memtables = Vec::new();
+		let mut max_seq: Option<u64> = None;
+		let mut total_batches = 0;
+		let mut segments_processed = 0;
+		for seg in segments {
+			let (seg_max, batches) = decode_segment_batches_with(context, &seg.file_path, seg.id)?;
+			if batches.is_empty() {
+				continue;
+			}
+			if seg_max > 0 {
+				max_seq = Some(max_seq.map_or(seg_max, |m| m.max(seg_max)));
+			}
+			segments_processed += 1;
+			total_batches += batches.len();
+			let mut current_memtable = Arc::new(MemTable::new(arena_size));
+			for batch in batches {
+				current_memtable = apply_batch_with_oversized_fallback(
+					current_memtable,
+					&batch,
+					arena_size,
+					seg.id,
+					&mut memtables,
+				)?;
+			}
+			memtables.push((current_memtable, false, seg.id));
+		}
+		Ok((max_seq, memtables, total_batches, segments_processed))
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+				return tokio::task::block_in_place(|| {
+					handle.block_on(replay_segments_parallel(context, segments, arena_size))
+				});
+			}
+		}
+
+		let segs = segments.to_vec();
+		let worker_context = context.clone();
+		let spawned = std::thread::Builder::new().spawn(move || {
+			let rt = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.map_err(|e| Error::Other(format!("Failed to build temporary runtime: {e}")))?;
+			rt.block_on(replay_segments_parallel(&worker_context, &segs, arena_size))
+		});
+		match spawned {
+			Ok(handle) => handle
+				.join()
+				.map_err(|_| Error::Other("WAL parallel recovery thread panicked".to_string()))?,
+			// Without the thread, replay the segments on this thread, in order
+			Err(_) => replay_segments_in_order(context, segments, arena_size),
+		}
+	}
+}
+
+/// Replays a slice of segments on the calling thread, in order, with the result of
+/// `replay_segments_parallel`: for when no thread can be started to run it.
+#[cfg(not(target_arch = "wasm32"))]
+fn replay_segments_in_order(
+	context: &WalContext,
+	segments: &[SegmentRef],
+	arena_size: usize,
+) -> Result<ParallelReplayResult> {
+	let decoded_segments = segments
+		.iter()
+		.map(|seg| decode_segment_batches_with(context, &seg.file_path, seg.id))
+		.collect::<Result<Vec<_>>>()?;
+	populate_memtables(segments, decoded_segments, arena_size)
+}
+
+/// Replays a slice of segments in parallel using affinitypool, applying batches
+/// sequentially into memtables to maintain strict WAL order.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn replay_segments_parallel(
+	context: &WalContext,
+	segments: &[SegmentRef],
+	arena_size: usize,
+) -> Result<ParallelReplayResult> {
+	if segments.is_empty() {
+		return Ok((None, Vec::new(), 0, 0));
+	}
+
+	// 1. Concurrently decode all WAL segments in parallel on worker threads
+	let mut decode_tasks = Vec::with_capacity(segments.len());
+	for seg in segments {
+		let path = seg.file_path.clone();
+		let id = seg.id;
+		let context = context.clone();
+		let task = affinitypool::spawn(move || decode_segment_batches_with(&context, &path, id));
+		decode_tasks.push(task);
+	}
+
+	let mut decoded_segments = Vec::with_capacity(decode_tasks.len());
+	for task in decode_tasks {
+		let res = task.await;
+		decoded_segments.push(res?);
+	}
+	populate_memtables(segments, decoded_segments, arena_size)
+}
+
+/// Populates memtables from the decoded segments, sequentially, in segment order.
+#[cfg(not(target_arch = "wasm32"))]
+fn populate_memtables(
+	segments: &[SegmentRef],
+	decoded_segments: Vec<(u64, Vec<Batch>)>,
+	arena_size: usize,
+) -> Result<ParallelReplayResult> {
+	// 2. Sequentially populate memtables from ordered segments
+	let global_max_seq = AtomicU64::new(0);
+	let mut memtables = Vec::new();
+	let mut total_batches = 0;
+	let mut segments_processed = 0;
+
+	for (seg_idx, (seg_max_seq, batches)) in decoded_segments.into_iter().enumerate() {
+		let segment_id = segments[seg_idx].id;
+		if batches.is_empty() {
+			continue;
+		}
+
+		global_max_seq.fetch_max(seg_max_seq, Ordering::SeqCst);
+		segments_processed += 1;
+		total_batches += batches.len();
+
+		let mut current_memtable = Arc::new(MemTable::new(arena_size));
+		for batch in batches {
+			current_memtable = apply_batch_with_oversized_fallback(
+				current_memtable,
+				&batch,
+				arena_size,
+				segment_id,
+				&mut memtables,
+			)?;
+		}
+
+		if !current_memtable.is_empty() {
+			memtables.push((current_memtable, false, segment_id));
+		}
+	}
+
+	let max_seq = global_max_seq.load(Ordering::SeqCst);
+	let res_seq = if max_seq > 0 {
+		Some(max_seq)
+	} else {
+		None
+	};
+
+	Ok((res_seq, memtables, total_batches, segments_processed))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use tempfile::TempDir;
+
+	use super::*;
+	use crate::InternalKeyKind;
+
+	#[tokio::test]
+	async fn test_parallel_wal_replay_single_segment() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_path = temp_dir.path().join("00000000000000000001.wal");
+
+		// Write test batches to a segment file
+		{
+			let file = File::create(&wal_path).unwrap();
+			let buf_writer = crate::wal::BufferedFileWriter::new(file, crate::wal::BLOCK_SIZE);
+			let mut writer = crate::wal::writer::Writer::new(
+				buf_writer,
+				false,
+				crate::wal::CompressionType::None,
+				0,
+			);
+
+			let mut b1 = Batch::new(10);
+			b1.add_record(InternalKeyKind::Set, b"k1".to_vec(), Some(b"v1".to_vec()), 0).unwrap();
+			let mut enc = Vec::new();
+			b1.encode_into(&mut enc).unwrap();
+			writer.add_record(&enc).unwrap();
+			writer.close().unwrap();
+		}
+
+		let seg = SegmentRef {
+			id: 1,
+			file_path: wal_path,
+		};
+
+		let (max_seq, memtables, total_batches, segments_processed) =
+			replay_segments_parallel(&WalContext::plaintext(), &[seg], 1024 * 1024).await.unwrap();
+		assert_eq!(max_seq, Some(10));
+		assert_eq!(memtables.len(), 1);
+		assert_eq!(total_batches, 1);
+		assert_eq!(segments_processed, 1);
+
+		let val = memtables[0].0.get(b"k1", None).unwrap();
+		assert_eq!(val.1, b"v1");
+	}
+}

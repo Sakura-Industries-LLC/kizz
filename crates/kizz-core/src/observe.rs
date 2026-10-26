@@ -238,11 +238,11 @@ pub fn access_bits(kinds: AccessKinds) -> AccessBits {
     }))
 }
 
-/// Record the state of every path in `accesses`, concurrently, leaving out and
-/// counting the paths that `ignore` matches, and hashing the `/proc` and `/sys`
-/// paths that `track` matches. Hashes go through `states`, and the extended
-/// attributes of the paths whose attributes were read or listed come from the
-/// attribute query of `tracer`.
+/// Record the state of every path in `accesses`, concurrently on the worker pool of
+/// `states`, leaving out and counting the paths that `ignore` matches, and hashing
+/// the `/proc` and `/sys` paths that `track` matches. Hashes go through `states`, and
+/// the extended attributes of the paths whose attributes were read or listed come
+/// from the attribute query of `tracer`.
 #[must_use]
 pub fn observe(
     accesses: &Accesses,
@@ -255,10 +255,11 @@ pub fn observe(
         .iter()
         .map(|(path, kinds)| (path, *kinds))
         .partition(|(path, _)| !ignore.matches(path));
-    let recorded: Vec<(Observation, Vec<Observation>)> = kept
-        .par_iter()
-        .map(|&(path, kinds)| observation(path, kinds, track, states, tracer))
-        .collect();
+    let recorded: Vec<(Observation, Vec<Observation>)> = states.pool().install(|| {
+        kept.par_iter()
+            .map(|&(path, kinds)| observation(path, kinds, track, states, tracer))
+            .collect()
+    });
     let mut observations = BTreeMap::new();
     let mut links = Vec::new();
     for (observation, on_the_way) in recorded {

@@ -1,0 +1,301 @@
+name: CI
+
+run-name: "CI run '${{ github.head_ref || github.ref_name }}'"
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        target: [ 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'x86_64-pc-windows-msvc', 'x86_64-apple-darwin', 'aarch64-apple-darwin' ]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Install cross-compilation toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --target=${{ matrix.target }}
+
+      - name: Run tests
+        if: ${{ !contains(matrix.os, 'windows') }}
+        # Skip tests on Windows as compaction tests and some file system operations are not supported
+        env:
+          SURREALKV_SIM_SEEDS: 500
+          SURREALKV_SIM_STEPS: 5000
+        run: make test
+
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --deny warnings
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install cargo-deny
+        run: which cargo-deny || cargo install --debug --locked cargo-deny@0.14.24
+
+      - name: License check
+        run: cargo deny check licenses
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+  
+  # Encryption is on by default, so the normal jobs cover it. Build and test without it here, to
+  # keep the guard that rejects a key manager from rotting.
+  no-encryption:
+    name: Without the encryption feature
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --deny warnings
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy -p surrealkv --all-targets --no-default-features -- -D warnings
+
+      - name: Test
+        run: cargo test -p surrealkv --no-default-features --test encryption_guard
+
+      # The command line tool built on the library without encryption: a key is refused by the
+      # guard, and the tests of that run here and nowhere else.
+      - name: Clippy (skv)
+        run: cargo clippy -p surrealkv-cli --all-targets --no-default-features -- -D warnings
+
+      - name: Test (skv)
+        run: cargo test -p surrealkv-cli --no-default-features
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # nightly
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      - name: Format
+        run: cargo +nightly fmt --all -- --check
+
+  readme:
+    name: README Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Regenerate CARGO.md
+        run: make readme
+
+      - name: Check CARGO.md matches README.md (run make readme to fix)
+        run: git diff --exit-code -- CARGO.md
+
+  wasm-check:
+    name: WASM Check & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Check WASM
+        run: cargo check --target wasm32-unknown-unknown -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb
+
+      - name: Clippy WASM
+        run: cargo clippy --target wasm32-unknown-unknown -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb -- -D warnings
+
+      - name: Build WASM
+        run: cargo build --target wasm32-unknown-unknown -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb
+
+  wasm-test:
+    name: WASM Test (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [browser, node]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
+        with:
+          # Pinned: with the default, the action once installed wasm-pack v0.9.1, which does not
+          # accept `--test`, and the browser step failed before it ran any test.
+          version: v0.15.0
+
+      - name: Run WASM tests in Browser (Headless Chrome)
+        if: matrix.runtime == 'browser'
+        run: |
+          # Every tests/opfs_*.rs target runs in headless Chrome. Each one picks its own context
+          # (a dedicated worker, or the main thread for opfs_window_test) with
+          # wasm_bindgen_test_configure!, and the default below only covers a target that does not.
+          # The runner gives a whole test binary 20 seconds by default.
+          for test in tests/opfs_*.rs; do
+            name=$(basename "$test" .rs)
+            echo "Running $name"
+            WASM_BINDGEN_TEST_TIMEOUT=120 WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome --test "$name"
+          done
+          wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb
+
+      - name: Run WASM tests in Node.js
+        if: matrix.runtime == 'node'
+        run: wasm-pack test --node crates/surrealkv-compat-indxdb
+
+  apple-targets:
+    name: Apple Ecosystem (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - aarch64-apple-tvos
+          - aarch64-apple-tvos-sim
+          - aarch64-apple-visionos
+          - aarch64-apple-visionos-sim
+          - aarch64-apple-watchos
+          - aarch64-apple-watchos-sim
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --target ${{ matrix.target }}
+
+  android-target:
+    name: Android Ecosystem (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+
+      - name: Configure Android NDK toolchain
+        run: |
+          NDK_PATH="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
+            NDK_PATH="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
+          CLANG_BIN="$(find "$TOOLCHAIN/bin" -name "aarch64-linux-android*-clang" | grep -v '++' | sort -V | tail -n 1)"
+          LLVM_AR="$TOOLCHAIN/bin/llvm-ar"
+          echo "CC_aarch64_linux_android=$CLANG_BIN" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=$LLVM_AR" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$LLVM_AR" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG_BIN" >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --target aarch64-linux-android

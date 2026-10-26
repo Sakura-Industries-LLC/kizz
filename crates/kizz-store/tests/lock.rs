@@ -10,6 +10,11 @@
 //! variable set. A helper reports what happens on its standard output, in lines that
 //! start with [`MARK`], and releases the lock when its standard input closes.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: a plain std thread reads a helper's output"
+)]
+
 use std::{
     ffi::OsStr,
     fs, io,

@@ -30,15 +30,31 @@
 //! [`RunResult::connections`], and the engine records it, warns about it and still
 //! caches the result.
 //!
+//! A request can also ask, with [`RunRequest::tree`], for the [`ProcessTree`] of the
+//! run, which the result then holds besides the combined accesses: each traced
+//! process, a thread group whose threads fold into it, with its number, its process
+//! ID, the number of the process that created it, the programs it ran and the
+//! status it ended with. Each [`Program`] holds what the tracer attributes to it:
+//! its [`Observations`], each path with its access kinds and each kind with its
+//! [`Outcome`]s, `ok`, the name of an error such as `ENOENT`, or `unknown`, and its
+//! connections, unknown system calls and every reason that the trace is incomplete.
+//! The kinds of each path in the tree, combined over every program, are exactly
+//! that path's kinds in the combined accesses. The request flag is off by default,
+//! and builds never set it, so a build's tracer does no more work than before, and
+//! a failed start carries the tree in its [`TraceError`] only when it is set.
+//!
 //! Through the same interface, the engine reads what the standard library cannot:
-//! the extended attributes of a path, with [`Tracer::extended_attributes`], and the
-//! [`MachineState`] that a command starts with, with [`Tracer::machine_state`].
+//! the extended attributes of a path, with [`Tracer::extended_attributes`], the
+//! [`MachineState`] that a command starts with, with [`Tracer::machine_state`], and
+//! the name of an error number, with [`Tracer::error_name`], whose default answer
+//! is `errno` and the number, [`unnamed_error`].
 //!
 //! Version 1 has one tracer, for Linux, in `kizz_trace_linux`; tests of the engine
 //! implement [`Tracer`] with a fake, which notes first reads with
-//! [`FirstReads::note_at`] as it reads or runs files, as the Linux tracer does, and
+//! [`FirstReads::note_at`] as it reads or runs files, as the Linux tracer does,
 //! answers the attribute query from attributes that the test sets and the machine
-//! query with a state that the test scripts.
+//! query with a state that the test scripts, and builds the tree of one process
+//! that a request asks for with [`ProcessTree::of_request`].
 //! Nothing in the engine changes when the tracer does.
 
 use std::{
@@ -661,6 +677,11 @@ pub struct RunRequest {
     /// Whether output is also echoed live, through the [`EchoSink`] given to
     /// [`Tracer::run`], while it is captured.
     pub echo: bool,
+    /// Whether the result also holds the [`ProcessTree`] of the run, and a failed
+    /// start the tree of its one process. Off unless set: builds never set it, so the
+    /// tracer does not read the arguments of `exec` calls or keep each program's
+    /// observations for them.
+    pub tree: bool,
 }
 
 /// The stream a chunk of live output came from.
@@ -913,6 +934,362 @@ impl fmt::Display for Connection {
     }
 }
 
+/// The answer of [`Tracer::error_name`] for an error number that has no name, and
+/// its default answer for every number: `errno` and the number, such as
+/// `errno 200`.
+#[must_use]
+pub fn unnamed_error(errno: i32) -> String {
+    format!("errno {errno}")
+}
+
+/// How the calls that touched a path in one way ended.
+///
+/// Outcomes sort with [`Outcome::Ok`] first, then the errors in the byte order of
+/// their names, then [`Outcome::Unknown`], so a set of them lists them in that
+/// order, each once.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Outcome {
+    /// The call succeeded.
+    Ok,
+    /// The call failed with the error of this name, such as `ENOENT`, or with an
+    /// error without a name, written as [`unnamed_error`] writes it.
+    Error(String),
+    /// The tracer never saw the call's result, because its thread was killed during
+    /// the call.
+    Unknown,
+}
+
+impl fmt::Display for Outcome {
+    /// `ok`, the error's name, or `unknown`.
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::Error(name) => f.write_str(name),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+/// The outcomes of one access kind of one path, in the order of [`Outcome`].
+pub type Outcomes = BTreeSet<Outcome>;
+
+/// The access kinds of one observed path, each with its outcomes, in the order of
+/// [`AccessKind::ALL`].
+pub type KindOutcomes = BTreeMap<AccessKind, Outcomes>;
+
+/// The paths that a program touched, each with its access kinds and each kind with
+/// its outcomes, in sorted path order.
+///
+/// Recording and merging are set unions: a path keeps every kind recorded for it,
+/// and a kind every outcome, each once, whatever the order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Observations {
+    /// The kinds and outcomes of each observed path.
+    paths: BTreeMap<AbsolutePath, KindOutcomes>,
+}
+
+impl Observations {
+    /// No observations.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The observations of every path of `accesses`, each of its kinds with
+    /// `outcome` alone.
+    #[must_use]
+    pub fn from_accesses(
+        accesses: &Accesses,
+        outcome: &Outcome,
+    ) -> Self {
+        let mut observations = Self::new();
+        for (path, kinds) in accesses {
+            observations.record_kinds(path.clone(), *kinds, outcome);
+        }
+        observations
+    }
+
+    /// Record that a call with `outcome` touched `path` in the way `kind` names.
+    pub fn record(
+        &mut self,
+        path: AbsolutePath,
+        kind: AccessKind,
+        outcome: Outcome,
+    ) {
+        self.paths
+            .entry(path)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .insert(outcome);
+    }
+
+    /// Record that a call with `outcome` touched `path` in every way of `kinds`.
+    /// The path is observed even when `kinds` is empty, as [`Accesses::record_kinds`]
+    /// records it.
+    pub fn record_kinds(
+        &mut self,
+        path: AbsolutePath,
+        kinds: AccessKinds,
+        outcome: &Outcome,
+    ) {
+        let entry = self.paths.entry(path).or_default();
+        for kind in kinds.iter() {
+            entry.entry(kind).or_default().insert(outcome.clone());
+        }
+    }
+
+    /// Combine every observation of `other` into these.
+    pub fn merge(
+        &mut self,
+        other: &Self,
+    ) {
+        for (path, kinds) in &other.paths {
+            let entry = self.paths.entry(path.clone()).or_default();
+            for (kind, outcomes) in kinds {
+                entry
+                    .entry(*kind)
+                    .or_default()
+                    .extend(outcomes.iter().cloned());
+            }
+        }
+    }
+
+    /// The kinds of `path`, each with its outcomes, if it was observed.
+    #[must_use]
+    pub fn get(
+        &self,
+        path: &AbsolutePath,
+    ) -> Option<&KindOutcomes> {
+        self.paths.get(path)
+    }
+
+    /// The combined access kinds of `path`, if it was observed.
+    #[must_use]
+    pub fn kinds(
+        &self,
+        path: &AbsolutePath,
+    ) -> Option<AccessKinds> {
+        self.paths
+            .get(path)
+            .map(|kinds| kinds.keys().copied().collect())
+    }
+
+    /// The number of observed paths.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Whether no path was observed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    /// The observed paths with their kinds and outcomes, in sorted path order.
+    pub fn iter(&self) -> btree_map::Iter<'_, AbsolutePath, KindOutcomes> {
+        self.paths.iter()
+    }
+
+    /// Every observed path with its combined access kinds, without the outcomes.
+    #[must_use]
+    pub fn accesses(&self) -> Accesses {
+        let mut accesses = Accesses::new();
+        for (path, kinds) in &self.paths {
+            accesses.record_kinds(path.clone(), kinds.keys().copied().collect());
+        }
+        accesses
+    }
+}
+
+impl<'a> IntoIterator for &'a Observations {
+    type IntoIter = btree_map::Iter<'a, AbsolutePath, KindOutcomes>;
+    type Item = (&'a AbsolutePath, &'a KindOutcomes);
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.paths.iter()
+    }
+}
+
+/// One program that a traced process ran, with everything the tracer attributes to
+/// it.
+///
+/// A program is the path that an `exec` call named, resolved as its observation is,
+/// with the arguments that the call passed; a process that a fork, a vfork or a
+/// clone created first runs its creator's program, which it lists as inherited.
+/// Everything the process does while it runs the program belongs to the program,
+/// and so does a successful `exec` that starts it: its own path, its interpreters
+/// and its ELF loader. A failed `exec` belongs to the program that made the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Program {
+    /// The path of the program.
+    pub path: AbsolutePath,
+    /// The argument vector that the program received, starting with its
+    /// `argv[0]`, or empty when the tracer could not read it.
+    pub args: Vec<OsString>,
+    /// Whether the process runs the program because its creator ran it, rather than
+    /// through an `exec` of its own.
+    pub inherited: bool,
+    /// The paths that the program touched, with their kinds and outcomes.
+    pub observations: Observations,
+    /// The connections that the program made.
+    pub connections: BTreeSet<Connection>,
+    /// The native numbers of the system calls that the program made and that the
+    /// tracer does not know.
+    pub unknown_system_calls: BTreeSet<u32>,
+    /// Every reason that the program made the trace incomplete, in the order the
+    /// tracer found them.
+    pub incomplete: Vec<IncompleteReason>,
+}
+
+impl Program {
+    /// The program at `path` with `args`, inherited or not, to which nothing is
+    /// attributed yet.
+    #[must_use]
+    pub const fn new(
+        path: AbsolutePath,
+        args: Vec<OsString>,
+        inherited: bool,
+    ) -> Self {
+        Self {
+            path,
+            args,
+            inherited,
+            observations: Observations {
+                paths: BTreeMap::new(),
+            },
+            connections: BTreeSet::new(),
+            unknown_system_calls: BTreeSet::new(),
+            incomplete: Vec::new(),
+        }
+    }
+
+    /// Whether nothing is attributed to the program: no observation, connection,
+    /// unknown system call or incomplete reason.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.observations.is_empty()
+            && self.connections.is_empty()
+            && self.unknown_system_calls.is_empty()
+            && self.incomplete.is_empty()
+    }
+}
+
+/// One traced process: a thread group, whose threads fold into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Process {
+    /// The number of the process, unique within the run: processes are numbered
+    /// from 1 in the order the tracer saw them start, and process 1 is the command.
+    pub number: u32,
+    /// The process ID that the system gave it, or `None` when none is known, as
+    /// for a fake tracer or a command whose process never started.
+    pub pid: Option<u32>,
+    /// The number of the process that created it, or `None` for the command and
+    /// for a process whose creation the tracer never saw.
+    pub parent: Option<u32>,
+    /// The programs it ran, in order.
+    pub programs: Vec<Program>,
+    /// How it ended, or `None` when the tracer did not see it end, or the command
+    /// could not start.
+    pub status: Option<Termination>,
+}
+
+/// The processes of a run, in the order the tracer saw them start, each with its
+/// programs and their observations.
+///
+/// A process ID that the system gives to a new process within the run starts a new
+/// process, so two processes never merge. The kinds of each path, combined over
+/// every program, are exactly its kinds in the run's combined accesses.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProcessTree {
+    /// The processes, numbered from 1, in order.
+    pub processes: Vec<Process>,
+}
+
+impl ProcessTree {
+    /// The tree of one process, the command of `request`, without a process ID,
+    /// whose one program is the request's program with its arguments, which
+    /// touched every path of `accesses` with its kinds, each with the outcome
+    /// `ok`, and which ended as `status` says. Fake tracers build their trees
+    /// with it.
+    #[must_use]
+    pub fn of_request(
+        request: &RunRequest,
+        accesses: &Accesses,
+        status: Option<Termination>,
+    ) -> Self {
+        let mut program = Program::new(request.program.clone(), request.args.clone(), false);
+        program.observations = Observations::from_accesses(accesses, &Outcome::Ok);
+        Self {
+            processes: vec![Process {
+                number: 1,
+                pid: None,
+                parent: None,
+                programs: vec![program],
+                status,
+            }],
+        }
+    }
+
+    /// The process numbered `number`, if there is one.
+    #[must_use]
+    pub fn process(
+        &self,
+        number: u32,
+    ) -> Option<&Process> {
+        self.processes
+            .iter()
+            .find(|process| process.number == number)
+    }
+
+    /// Every program of every process, with its process, in order.
+    pub fn programs(&self) -> impl Iterator<Item = (&Process, &Program)> {
+        self.processes.iter().flat_map(|process| {
+            process
+                .programs
+                .iter()
+                .map(move |program| (process, program))
+        })
+    }
+
+    /// The observations of every program, combined.
+    #[must_use]
+    pub fn observations(&self) -> Observations {
+        let mut combined = Observations::new();
+        for (_, program) in self.programs() {
+            combined.merge(&program.observations);
+        }
+        combined
+    }
+
+    /// The access kinds of every path of every program, combined, without the
+    /// outcomes.
+    #[must_use]
+    pub fn accesses(&self) -> Accesses {
+        self.observations().accesses()
+    }
+
+    /// The connections of every program, combined.
+    #[must_use]
+    pub fn connections(&self) -> BTreeSet<Connection> {
+        self.programs()
+            .flat_map(|(_, program)| program.connections.iter().cloned())
+            .collect()
+    }
+
+    /// The unknown system calls of every program, combined.
+    #[must_use]
+    pub fn unknown_system_calls(&self) -> BTreeSet<u32> {
+        self.programs()
+            .flat_map(|(_, program)| program.unknown_system_calls.iter().copied())
+            .collect()
+    }
+}
+
 /// The result of a request that started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
@@ -937,6 +1314,9 @@ pub struct RunResult {
     /// repeats, as [`Connection`] describes them. They do not make the trace
     /// incomplete: the engine records them and warns about them.
     pub connections: BTreeSet<Connection>,
+    /// The process tree of the run when the request asked for it with
+    /// [`RunRequest::tree`], and `None` otherwise.
+    pub tree: Option<ProcessTree>,
 }
 
 impl RunResult {
@@ -962,6 +1342,9 @@ pub enum TraceError {
         program: AbsolutePath,
         /// The paths touched while trying to start the program.
         accesses: Accesses,
+        /// The tree of the one process that tried to start the program, when the
+        /// request asked for it with [`RunRequest::tree`].
+        tree: Option<ProcessTree>,
     },
     /// The program exists but cannot be executed.
     #[error("program is not executable: {program}: {source}")]
@@ -972,6 +1355,9 @@ pub enum TraceError {
         source: io::Error,
         /// The paths touched while trying to start the program.
         accesses: Accesses,
+        /// The tree of the one process that tried to start the program, when the
+        /// request asked for it with [`RunRequest::tree`].
+        tree: Option<ProcessTree>,
     },
     /// The command could not start for a reason other than a missing or
     /// non-executable program.
@@ -983,6 +1369,9 @@ pub enum TraceError {
         source: io::Error,
         /// The paths touched while trying to start the program.
         accesses: Accesses,
+        /// The tree of the one process that tried to start the program, when the
+        /// request asked for it with [`RunRequest::tree`].
+        tree: Option<ProcessTree>,
     },
     /// The tracer itself failed, independently of the command.
     #[error("tracer failure: {message}")]
@@ -1019,6 +1408,18 @@ impl TraceError {
             Self::ProgramNotFound { accesses, .. }
             | Self::ProgramNotExecutable { accesses, .. }
             | Self::StartFailed { accesses, .. } => Some(accesses),
+            Self::Tracer { .. } => None,
+        }
+    }
+
+    /// The tree of the one process that tried to start the program, if the error is
+    /// a failure to start and the request asked for the tree.
+    #[must_use]
+    pub const fn tree(&self) -> Option<&ProcessTree> {
+        match self {
+            Self::ProgramNotFound { tree, .. }
+            | Self::ProgramNotExecutable { tree, .. }
+            | Self::StartFailed { tree, .. } => tree.as_ref(),
             Self::Tracer { .. } => None,
         }
     }
@@ -1152,17 +1553,36 @@ pub trait Tracer: Send + Sync {
         &self,
         cwd: &Path,
     ) -> MachineState;
+
+    /// The name of the error number `errno` on the platform, such as `ENOENT`, which
+    /// the core uses to report a failed check of its own as the tracer reports a
+    /// failed call.
+    ///
+    /// The default answer is [`unnamed_error`], `errno` and the number, so a tracer
+    /// that knows no names, such as a fake, needs no implementation.
+    fn error_name(
+        &self,
+        errno: i32,
+    ) -> String {
+        unnamed_error(errno)
+    }
 }
 
 /// Unit tests for the logic of the tracer interface.
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, io, path::Path};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        ffi::OsString,
+        fs, io,
+        path::Path,
+    };
 
     use super::{
         AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
-        Connection, FileMetadata, FirstReads, IncompleteReason, NotAbsoluteError, RunResult,
-        Termination, TraceError,
+        Connection, EchoSink, ExtendedAttributes, FileMetadata, FirstReads, IncompleteReason,
+        MachineState, NotAbsoluteError, Observations, Outcome, Process, ProcessTree, Program,
+        RunRequest, RunResult, Termination, TraceError, Tracer, unnamed_error,
     };
 
     /// Build an absolute path for a test.
@@ -1426,6 +1846,7 @@ mod tests {
             first_reads: FirstReads::new(),
             unknown_system_calls: BTreeSet::new(),
             connections: BTreeSet::new(),
+            tree: None,
         };
         assert!(result.is_complete());
         result.incomplete = Some(IncompleteReason::NonNativeSystemCall {
@@ -1506,6 +1927,7 @@ mod tests {
         let not_found = TraceError::ProgramNotFound {
             program: program.clone(),
             accesses: accesses.clone(),
+            tree: None,
         };
         assert!(not_found.is_missing_program());
         assert!(!not_found.is_tracer_failure());
@@ -1516,6 +1938,7 @@ mod tests {
             program: program.clone(),
             source: io::Error::from(io::ErrorKind::PermissionDenied),
             accesses: accesses.clone(),
+            tree: None,
         };
         assert!(not_executable.is_missing_program());
         assert!(!not_executable.is_tracer_failure());
@@ -1524,6 +1947,7 @@ mod tests {
             program,
             source: io::Error::from(io::ErrorKind::OutOfMemory),
             accesses,
+            tree: None,
         };
         assert!(!start_failed.is_missing_program());
         assert!(!start_failed.is_tracer_failure());
@@ -1540,5 +1964,284 @@ mod tests {
             tracer.to_string(),
             "tracer failure: seccomp filter rejected"
         );
+    }
+
+    /// A request for `/bin/tool` with two arguments.
+    fn tool_request() -> RunRequest {
+        RunRequest {
+            program: path("/bin/tool"),
+            args: vec![OsString::from("tool"), OsString::from("--flag")],
+            env: BTreeMap::new(),
+            cwd: path("/work"),
+            stdin: None,
+            capture: CaptureMode::Split,
+            echo: false,
+            tree: true,
+        }
+    }
+
+    /// Outcomes sort with `ok` first, then the error names in byte order, then
+    /// `unknown`, and a set keeps each once; they display by name.
+    #[test]
+    fn outcomes_sort_and_merge_as_sets() {
+        let error = |name: &str| Outcome::Error(name.to_owned());
+        let outcomes: BTreeSet<Outcome> = [
+            Outcome::Unknown,
+            error("errno 200"),
+            error("ERESTART_RESTARTBLOCK"),
+            error("ENOENT"),
+            Outcome::Ok,
+            error("ERESTARTSYS"),
+            error("EACCES"),
+            error("ENOENT"),
+            Outcome::Ok,
+        ]
+        .into_iter()
+        .collect();
+        let names: Vec<String> = outcomes.iter().map(ToString::to_string).collect();
+        assert_eq!(names, [
+            "ok",
+            "EACCES",
+            "ENOENT",
+            "ERESTARTSYS",
+            "ERESTART_RESTARTBLOCK",
+            "errno 200",
+            "unknown"
+        ]);
+
+        let mut observations = Observations::new();
+        assert!(observations.is_empty());
+        observations.record(path("/a"), AccessKind::Probe, error("ENOENT"));
+        observations.record(path("/a"), AccessKind::Probe, Outcome::Ok);
+        observations.record(path("/a"), AccessKind::Probe, error("ENOENT"));
+        observations.record_kinds(
+            path("/a"),
+            AccessKinds::only(AccessKind::Read).with(AccessKind::Probe),
+            &Outcome::Unknown,
+        );
+        let mut other = Observations::new();
+        other.record(path("/a"), AccessKind::Read, Outcome::Ok);
+        other.record_kinds(path("/b"), AccessKinds::EMPTY, &Outcome::Ok);
+        observations.merge(&other);
+        let a = observations.get(&path("/a")).unwrap();
+        assert_eq!(
+            a.get(&AccessKind::Probe).unwrap(),
+            &BTreeSet::from([Outcome::Ok, error("ENOENT"), Outcome::Unknown])
+        );
+        assert_eq!(
+            a.get(&AccessKind::Read).unwrap(),
+            &BTreeSet::from([Outcome::Ok, Outcome::Unknown])
+        );
+        assert_eq!(
+            observations.kinds(&path("/a")),
+            Some(AccessKinds::only(AccessKind::Read).with(AccessKind::Probe))
+        );
+        // A path recorded without kinds is observed, as the combined accesses
+        // record it.
+        assert_eq!(observations.kinds(&path("/b")), Some(AccessKinds::EMPTY));
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations.accesses().get(&path("/b")),
+            Some(AccessKinds::EMPTY)
+        );
+        let order: Vec<String> = (&observations)
+            .into_iter()
+            .map(|(path, _)| path.to_string())
+            .collect();
+        assert_eq!(order, ["/a", "/b"]);
+    }
+
+    /// The observations of two programs combine into the union of their kinds and,
+    /// for each kind, of their outcomes; so do their connections and unknown system
+    /// calls.
+    #[test]
+    fn the_observations_of_two_programs_combine() {
+        let mut shell = Program::new(path("/bin/sh"), vec![OsString::from("sh")], false);
+        shell
+            .observations
+            .record(path("/in"), AccessKind::Read, Outcome::Ok);
+        shell.observations.record(
+            path("/missing"),
+            AccessKind::Probe,
+            Outcome::Error("ENOENT".to_owned()),
+        );
+        shell.unknown_system_calls.insert(400);
+        let mut inherited = Program::new(path("/bin/sh"), vec![OsString::from("sh")], true);
+        assert!(inherited.is_empty());
+        inherited
+            .observations
+            .record(path("/in"), AccessKind::Write, Outcome::Ok);
+        inherited
+            .observations
+            .record(path("/missing"), AccessKind::Probe, Outcome::Unknown);
+        inherited
+            .connections
+            .insert(Connection::UnixAbstract(b"kizz".to_vec()));
+        assert!(!inherited.is_empty());
+        let mut cat = Program::new(path("/bin/cat"), vec![OsString::from("cat")], false);
+        cat.observations
+            .record(path("/other"), AccessKind::Read, Outcome::Ok);
+        cat.incomplete.push(IncompleteReason::Other {
+            detail: "lost".to_owned(),
+        });
+        let tree = ProcessTree {
+            processes: vec![
+                Process {
+                    number: 1,
+                    pid: Some(10),
+                    parent: None,
+                    programs: vec![shell],
+                    status: Some(Termination::Exited(0)),
+                },
+                Process {
+                    number: 2,
+                    pid: Some(11),
+                    parent: Some(1),
+                    programs: vec![inherited, cat],
+                    status: Some(Termination::Signaled(9)),
+                },
+            ],
+        };
+        let combined = tree.observations();
+        assert_eq!(
+            combined.kinds(&path("/in")),
+            Some(AccessKinds::only(AccessKind::Read).with(AccessKind::Write))
+        );
+        assert_eq!(
+            combined
+                .get(&path("/missing"))
+                .and_then(|kinds| kinds.get(&AccessKind::Probe)),
+            Some(&BTreeSet::from([
+                Outcome::Error("ENOENT".to_owned()),
+                Outcome::Unknown
+            ]))
+        );
+        assert_eq!(combined.len(), 3);
+        let mut expected = Accesses::new();
+        expected.record(path("/in"), AccessKind::Read);
+        expected.record(path("/in"), AccessKind::Write);
+        expected.record(path("/missing"), AccessKind::Probe);
+        expected.record(path("/other"), AccessKind::Read);
+        assert_eq!(tree.accesses(), expected);
+        assert_eq!(tree.unknown_system_calls(), BTreeSet::from([400]));
+        assert_eq!(
+            tree.connections(),
+            BTreeSet::from([Connection::UnixAbstract(b"kizz".to_vec())])
+        );
+        assert_eq!(tree.programs().count(), 3);
+        assert_eq!(tree.process(2).map(|process| process.parent), Some(Some(1)));
+        assert!(tree.process(3).is_none());
+    }
+
+    /// The helper's tree of one process combines to exactly the accesses it was
+    /// given, each with `ok`, under the request's program and arguments.
+    #[test]
+    fn the_helper_tree_combines_to_its_accesses() {
+        let request = tool_request();
+        let mut accesses = Accesses::new();
+        accesses.record(path("/bin/tool"), AccessKind::Exec);
+        accesses.record(path("/work/in"), AccessKind::Read);
+        accesses.record(path("/work/in"), AccessKind::Probe);
+        accesses.record(path("/work/out"), AccessKind::Write);
+        let tree = ProcessTree::of_request(&request, &accesses, Some(Termination::Exited(3)));
+        assert_eq!(tree.accesses(), accesses);
+        let [process] = tree.processes.as_slice() else {
+            panic!("expected one process, got {tree:?}");
+        };
+        assert_eq!(
+            (process.number, process.pid, process.parent, process.status),
+            (1, None, None, Some(Termination::Exited(3)))
+        );
+        let [program] = process.programs.as_slice() else {
+            panic!("expected one program, got {process:?}");
+        };
+        assert_eq!(program.path, request.program);
+        assert_eq!(program.args, request.args);
+        assert!(!program.inherited);
+        for (_, kinds) in &program.observations {
+            for outcomes in kinds.values() {
+                assert_eq!(outcomes, &BTreeSet::from([Outcome::Ok]));
+            }
+        }
+        let empty = ProcessTree::of_request(&request, &Accesses::new(), None);
+        assert!(empty.accesses().is_empty());
+        assert_eq!(empty.process(1).map(|process| process.status), Some(None));
+    }
+
+    /// A tracer that runs nothing and implements only the required methods, so the
+    /// error-name query gives its default answer.
+    struct Unnamed;
+
+    impl Tracer for Unnamed {
+        fn run(
+            &self,
+            _request: &RunRequest,
+            _echo: &dyn EchoSink,
+            _cancel: &Cancellation,
+        ) -> Result<RunResult, TraceError> {
+            Err(TraceError::Tracer {
+                message: "the test tracer runs nothing".to_owned(),
+                source: None,
+            })
+        }
+
+        fn extended_attributes(
+            &self,
+            _path: &Path,
+            _follow: bool,
+        ) -> io::Result<ExtendedAttributes> {
+            Ok(ExtendedAttributes::new())
+        }
+
+        fn machine_state(
+            &self,
+            _cwd: &Path,
+        ) -> MachineState {
+            MachineState::default()
+        }
+    }
+
+    /// The default error name is `errno` and the number.
+    #[test]
+    fn the_default_error_name_is_errno_and_the_number() {
+        assert_eq!(Unnamed.error_name(2), "errno 2");
+        assert_eq!(Unnamed.error_name(200), "errno 200");
+        assert_eq!(Unnamed.error_name(-1), "errno -1");
+        assert_eq!(unnamed_error(512), "errno 512");
+    }
+
+    /// A failed start carries the tree of its one process when it has one, and a
+    /// failure of the tracer has none.
+    #[test]
+    fn failed_starts_carry_their_tree() {
+        let request = tool_request();
+        let mut accesses = Accesses::new();
+        accesses.record(request.program.clone(), AccessKind::Probe);
+        let tree = ProcessTree::of_request(&request, &accesses, None);
+        let not_found = TraceError::ProgramNotFound {
+            program: request.program.clone(),
+            accesses: accesses.clone(),
+            tree: Some(tree.clone()),
+        };
+        assert_eq!(not_found.tree(), Some(&tree));
+        let not_executable = TraceError::ProgramNotExecutable {
+            program: request.program.clone(),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+            accesses: accesses.clone(),
+            tree: Some(tree.clone()),
+        };
+        assert_eq!(not_executable.tree(), Some(&tree));
+        let start_failed = TraceError::StartFailed {
+            program: request.program,
+            source: io::Error::from(io::ErrorKind::OutOfMemory),
+            accesses,
+            tree: None,
+        };
+        assert_eq!(start_failed.tree(), None);
+        let tracer = TraceError::Tracer {
+            message: "failed".to_owned(),
+            source: None,
+        };
+        assert_eq!(tracer.tree(), None);
     }
 }

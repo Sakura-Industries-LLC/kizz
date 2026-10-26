@@ -49,8 +49,8 @@ use std::{
 
 use kizz_core::{
     Engine, PrintSink, ProgramHash, ProgramParts, Render, RepeatedWarning, StepDecision,
-    StepExecutor as _, StepSpec, TaskIdentity, TaskInfo, TaskProgram, TaskSteps, observe,
-    parse_tasks, why,
+    StepExecutor as _, StepSpec, TaskIdentity, TaskInfo, TaskProgram, TaskSteps, WorkerPool,
+    observe, parse_tasks, why,
 };
 use kizz_store::{
     Explanation, Owner, PathState, Reason, SelfInflicted, StepPosition, StepRecord, Store, TaskId,
@@ -58,7 +58,8 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Connection,
-    EchoSink, FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    EchoSink, FirstReads, OutputStream, ProcessTree, RunRequest, RunResult, Termination,
+    TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -158,6 +159,9 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
     Ok(RunResult {
         termination,
         output: CapturedOutput::empty(request.capture),
+        tree: request
+            .tree
+            .then(|| ProcessTree::of_request(request, &accesses, Some(termination))),
         accesses,
         incomplete: None,
         first_reads,
@@ -365,8 +369,15 @@ impl Fixture {
         cache_unknown: bool,
     ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None)
-            .with_cache_unknown_system_calls(cache_unknown);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        )
+        .with_cache_unknown_system_calls(cache_unknown);
         let mut decisions = Vec::new();
         for _ in 0..passes {
             for (identity, steps) in tasks {
@@ -619,7 +630,14 @@ fn a_changed_program_names_its_block_or_the_loaded_module() -> TestResult {
         let task = TaskInfo::new(parsed.tasks.first().ok_or("no task")?, &["ci".to_owned()])?;
         let program = TaskProgram::load(task, &NoPrint).program?;
         let store = fixture.store()?;
-        let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            &tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let steps = engine.task_for(TaskIdentity::of(&program));
         let run = program.run(&caller, &steps, &NoPrint);
         run.result.map_err(|failure| failure.to_string())?;

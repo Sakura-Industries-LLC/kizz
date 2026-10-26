@@ -135,10 +135,10 @@ fn times_change(
 }
 
 /// Compare every observation in `observations`, recorded with the record written at
-/// `recorded_at_nanos`, with the file system, concurrently, hashing through
-/// `states`. With `timestamps`, the times of what the step read, ran, listed, or
-/// checked are compared too. Recorded extended attributes are read again through
-/// the attribute query of `tracer`.
+/// `recorded_at_nanos`, with the file system, concurrently on the worker pool of
+/// `states`, hashing through `states`. With `timestamps`, the times of what the step
+/// read, ran, listed, or checked are compared too. Recorded extended attributes are
+/// read again through the attribute query of `tracer`.
 #[must_use]
 pub fn check(
     observations: &[Observation],
@@ -154,28 +154,30 @@ pub fn check(
         timestamps,
         states,
     };
-    let compared: Vec<Compared> = observations
-        .par_iter()
-        .map(|observation| {
-            let compared = compare(
-                &observation.path,
-                &observation.state,
-                false,
-                observation.tracked,
-                Context {
-                    timestamps: context.timestamps && uses(observation.access),
-                    ..context
-                },
-            );
-            match (&compared, &observation.attributes) {
-                (Compared::Changed(_), _) | (_, None) => compared,
-                (_, Some(recorded)) => {
-                    let current = record_attributes(&observation.path, tracer);
-                    attributes_change(recorded, &current).map_or(compared, Compared::Changed)
-                },
-            }
-        })
-        .collect();
+    let compared: Vec<Compared> = states.pool().install(|| {
+        observations
+            .par_iter()
+            .map(|observation| {
+                let compared = compare(
+                    &observation.path,
+                    &observation.state,
+                    false,
+                    observation.tracked,
+                    Context {
+                        timestamps: context.timestamps && uses(observation.access),
+                        ..context
+                    },
+                );
+                match (&compared, &observation.attributes) {
+                    (Compared::Changed(_), _) | (_, None) => compared,
+                    (_, Some(recorded)) => {
+                        let current = record_attributes(&observation.path, tracer);
+                        attributes_change(recorded, &current).map_or(compared, Compared::Changed)
+                    },
+                }
+            })
+            .collect()
+    });
     let mut checked = Checked {
         observations: Vec::with_capacity(observations.len()),
         ..Checked::default()
@@ -539,7 +541,15 @@ mod tests {
     };
 
     use super::*;
-    use crate::observe::{access_bits, path_state};
+    use crate::{
+        observe::{access_bits, path_state},
+        pool::WorkerPool,
+    };
+
+    /// An empty cache of file states, on a worker pool of its own.
+    fn fresh_states() -> FileStates {
+        FileStates::new(WorkerPool::new().unwrap())
+    }
 
     /// A fake tracer that runs nothing, whose attribute query finds no attributes
     /// anywhere, for the tests that record none, and whose machine query knows no
@@ -649,7 +659,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 dir: tempfile::tempdir().unwrap(),
-                states: FileStates::new(),
+                states: fresh_states(),
             }
         }
 
@@ -735,7 +745,7 @@ mod tests {
             dir.observe("missing", AccessKind::Probe),
         ];
         assert_eq!(dir.states.files_hashed(), 1);
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert!(checked.is_hit(), "{checked:?}");
         assert!(!checked.refresh);
@@ -749,7 +759,7 @@ mod tests {
         dir.write_old("read", "content");
         let observations = vec![dir.observe("read", AccessKind::Read)];
         fs::write(dir.path("read"), "longer content").unwrap();
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert_eq!(changes(&checked), [Change::Size { old: 7, new: 14 }]);
         assert_eq!(states.files_hashed(), 0);
@@ -766,7 +776,7 @@ mod tests {
         dir.write_old("read", "content");
         let observations = vec![dir.observe("read", AccessKind::Read)];
         fs::write(dir.path("read"), "content").unwrap();
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert!(checked.is_hit());
         assert!(checked.refresh);
@@ -786,7 +796,7 @@ mod tests {
         let dir = Dir::new();
         fs::write(dir.path("fresh"), "content").unwrap();
         let observations = vec![dir.observe("fresh", AccessKind::Read)];
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert!(checked.is_hit());
         assert!(checked.refresh);
@@ -801,7 +811,7 @@ mod tests {
         fs::set_permissions(dir.path("checked"), fs::Permissions::from_mode(0o644)).unwrap();
         let observations = vec![dir.observe("checked", AccessKind::Probe)];
         set_modified(&dir.path("checked"), 7_200);
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert_eq!(changes(&checked), [Change::Metadata]);
         fs::write(dir.path("checked"), "longer content").unwrap();
@@ -883,7 +893,7 @@ mod tests {
         // Without the option, the bytes decide for a read file, which is hashed, once
         // through the link and once by its own path, and refreshed; directory times are
         // never compared; a checked file compares all of its metadata, as before.
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert_eq!(changes(&checked), [Change::Metadata]);
         assert!(checked.refresh);
@@ -891,7 +901,7 @@ mod tests {
 
         // With it, every time that changed is the change, found without hashing; a
         // directory that was only written is not compared by its times.
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), true, &states, &NoAttributes);
         assert_eq!(changes(&checked), [
             Change::Metadata,
@@ -918,7 +928,7 @@ mod tests {
         // A link made again has new times of its own, which are never compared.
         fs::remove_file(dir.path("link")).unwrap();
         symlink("read", dir.path("link")).unwrap();
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), true, &states, &NoAttributes);
         assert!(checked.is_hit(), "{checked:?}");
         assert!(!checked.refresh);
@@ -932,7 +942,7 @@ mod tests {
         fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o644)).unwrap();
         let observations = vec![dir.observe("read", AccessKind::Read)];
         fs::write(dir.path("read"), "longer content").unwrap();
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), true, &states, &NoAttributes);
         assert_eq!(changes(&checked), [Change::Size { old: 7, new: 14 }]);
         fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -980,7 +990,7 @@ mod tests {
         for name in ["read", "listed", "opened"] {
             fs::set_permissions(dir.path(name), fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert_eq!(changes(&checked), [
             Change::Permissions {
@@ -1008,7 +1018,7 @@ mod tests {
         let observations = vec![dir.observe("read", AccessKind::Read)];
         set_modified(&dir.path("read"), 7_200);
         fs::set_permissions(dir.path("read"), fs::Permissions::from_mode(0o600)).unwrap();
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         assert_eq!(changes(&checked), [Change::Permissions {
             old: 0o644,
@@ -1038,7 +1048,7 @@ mod tests {
             gid: current.gid(),
         };
         let recorded = other_owner(&mut observations);
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &NoAttributes);
         let owner = Change::Owner {
             old: recorded,
@@ -1114,13 +1124,7 @@ mod tests {
         fs::remove_file(dir.path("gone")).unwrap();
         fs::remove_file(dir.path("retyped")).unwrap();
         fs::create_dir(dir.path("retyped")).unwrap();
-        let checked = check(
-            &observations,
-            now(),
-            false,
-            &FileStates::new(),
-            &NoAttributes,
-        );
+        let checked = check(&observations, now(), false, &fresh_states(), &NoAttributes);
         assert_eq!(changes(&checked), [
             Change::Appeared,
             Change::Disappeared,
@@ -1142,7 +1146,7 @@ mod tests {
             &observations[2..3],
             now(),
             false,
-            &FileStates::new(),
+            &fresh_states(),
             &NoAttributes,
         );
         assert_eq!(changes(&checked), [Change::LinkTarget {
@@ -1203,7 +1207,7 @@ mod tests {
                 &[with_listing(&observed, listing)],
                 now(),
                 false,
-                &FileStates::new(),
+                &fresh_states(),
                 &NoAttributes,
             ))
         };
@@ -1261,7 +1265,7 @@ mod tests {
                 &[with_listing(&observed, listing)],
                 now(),
                 false,
-                &FileStates::new(),
+                &fresh_states(),
                 &NoAttributes,
             ))
         };
@@ -1309,7 +1313,7 @@ mod tests {
             &[observation, special],
             now(),
             false,
-            &FileStates::new(),
+            &fresh_states(),
             &NoAttributes,
         );
         assert!(checked.is_hit(), "{checked:?}");
@@ -1415,7 +1419,7 @@ mod tests {
             .into_iter()
             .map(|name| observe_attributes(&dir, name, &query))
             .collect();
-        let states = FileStates::new();
+        let states = fresh_states();
         let checked = check(&observations, now(), false, &states, &query);
         assert!(checked.is_hit(), "{checked:?}");
         assert!(!checked.refresh);
@@ -1477,7 +1481,7 @@ mod tests {
         let observations = vec![observe_attributes(&dir, "file", &query)];
         fs::set_permissions(dir.path("file"), fs::Permissions::from_mode(0o600)).unwrap();
         query.set(&dir.path("file"), false, &[("user.a", "2")]);
-        let checked = check(&observations, now(), false, &FileStates::new(), &query);
+        let checked = check(&observations, now(), false, &fresh_states(), &query);
         assert_eq!(changes(&checked), [Change::Permissions {
             old: 0o644,
             new: 0o600,

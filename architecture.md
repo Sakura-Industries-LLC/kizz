@@ -189,7 +189,7 @@ Exit status: 0 on success, 1 when a task fails, 2 for usage or configuration err
 
 * Discovery starts in the current working directory and never looks above it.
 * It finds every file named exactly `kizz.md` in that directory and every subdirectory, hidden directories included.
-* It uses a concurrent directory walk, the same walker ripgrep uses (the `ignore` crate's parallel walker), with all filtering off.
+* It uses a concurrent directory walk of its own, on kizz's worker pool, with all filtering off.
 * It does not consult git or its ignore rules: every `kizz.md` it finds is part of the build.
 * Other Markdown files are documentation and are never read.
 * Symbolic links to directories are followed, except a link that would make the walk recurse into one of its own parents.
@@ -405,8 +405,10 @@ def go_build(package, output, version):
 The core never starts a process itself and knows nothing about system calls.
 It asks a tracer to run one command with an exact program, arguments, environment, working directory and `stdin`.
 The tracer returns the exit status, the captured output, and every path the process tree touched, with how it touched it.
+A request can also ask for the process tree, which [Processes and outcomes](#processes-and-outcomes) describes.
 Through the same interface, the core reads what the standard library cannot: the extended attributes of a path,
 and the machine and process state that a command starts with.
+The core also asks it for the name of an error number, such as `ENOENT`, to report a failed check of its own.
 Version 1 has one tracer, for Linux, and tests use a fake one.
 Nothing in the core changes when the tracer does.
 
@@ -501,6 +503,35 @@ Either way, kizz warns loudly when the command runs, naming the command and each
 and repeats the warning in the summary; `kizz why` lists the unknown calls of each step that made any.
 The option is not part of the step key, so a result cached with it is reused by later builds with or without it,
 until something that the step recorded changes.
+
+### Processes and outcomes
+
+A request can ask the tracer for the process tree of the run, besides the combined accesses that builds record.
+Builds never ask for it, so they record and compare exactly what they did before.
+`kizz execute` asks for it, and so does `kizz run` when it writes a report.
+Neither the tree nor its outcomes are stored in the cache.
+
+* Each traced process is a thread group: its threads fold into it.
+* A process has a number, unique within the run, its process ID, and the number of the process that created it.
+* Processes are numbered from 1 in the order the tracer saw them start, and process 1 is the command.
+* A process ID that the system gives to a new process within the run starts a new process, so two processes never merge.
+* A process lists the programs it ran, in order, and the status it ended with, when the tracer saw it end.
+* A program is the path that an `exec` named, resolved as its observation is, with the arguments that the call passed.
+* A process created by a fork, a vfork or a clone first runs its creator's program, which it lists as inherited.
+* An inherited program is listed only when something is attributed to it.
+* When the command cannot start, its process lists the program that kizz tried to start, without a status.
+
+Everything the tree records belongs to the program that its process ran when the call was made.
+A successful `exec` belongs to the program that it starts: that program's own path, its interpreters and its ELF loader.
+A failed `exec` belongs to the program that made the call.
+Connections, untraceable calls and unknown system calls belong to programs in the same way.
+
+An observation is a path with its access kinds, and each kind with its outcomes.
+An outcome is `ok`, the name of the error that a failed call returned, such as `ENOENT`, or `unknown`.
+A call whose result the tracer never saw, because its thread was killed during the call, has the outcome `unknown`.
+An error number without a name is written as `errno` and the number, such as `errno 200`.
+The kinds of each path in the tree, combined over every program, are exactly that path's kinds in the combined accesses.
+The tree lists every reason that the trace is incomplete, each with its program, while the combined result names the first.
 
 ### What is recorded
 
@@ -645,6 +676,13 @@ The store holds these records:
 * the cache identity: the stamp of the machine and user that the cache belongs to
 
 The database is shared by concurrent threads within a build; SurrealKV provides concurrent transactions.
+The store's runtime runs SurrealKV's work on the threads that use the store and starts no thread of its own.
+Kizz builds SurrealKV from a copy in `vendor/surrealkv`, patched so that it never panics when a thread cannot start.
+The store opens SurrealKV with the patch's clock option, so SurrealKV starts no clock thread.
+That clock reads the system clock directly on every reading, and each reading is greater than the one before.
+SurrealKV's write pacing is turned off, with its write stalls, and the patched pacing starts no thread.
+To replay several log segments, SurrealKV starts a thread when it can, and otherwise replays them on the calling thread.
+`vendor/surrealkv/KIZZ-PATCHES.md` lists each change against SurrealKV 1.0.0, with its reason, to offer upstream.
 
 ### Lock file
 
@@ -724,6 +762,7 @@ During a build, file states and hashes are held in a concurrent in-memory cache,
 so a file that many steps depend on is hashed once per build.
 An entry is dropped when a step records a write to its path.
 Hashing uses BLAKE3, multi-threaded for large files.
+Hashing and the other parallel work of a command run on kizz's worker pool, as [Kizz never panics](#kizz-never-panics) says.
 
 ### Results that are not cached
 
@@ -860,6 +899,21 @@ This is the first version of the rule, to be refined later.
   Kizz kills every process of the command that is still running 2 seconds after the interrupt.
   Kizz then releases and deletes the lock file, closes the database, and exits with status 130.
 
+### Kizz never panics
+
+Kizz never panics: a failure is an error that kizz handles, and a panic is a bug.
+The workspace lints forbid code that panics, and `clippy.toml` bans the library calls that panic when the system refuses them.
+
+* Every thread that kizz starts goes through one helper, in `kizz-threads`, which never panics.
+* When the system cannot start a thread for the moment (`EAGAIN`), the helper waits and tries again, up to 10 times.
+* The waits are 100, 200, 400, 800, 1,600 and 3,200 milliseconds, then 4 seconds four times: 22.3 seconds in all.
+* Any other error, or a tenth retry that fails, is an error that names the thread and the system's error.
+* A thread that a command's tracer cannot start fails the command's step, and so its task.
+* Anywhere else, kizz prints the error and exits with the status of its own errors: 2, or 125 for `kizz execute`.
+* A command's parallel work, hashing included, runs on one worker pool of at most 4 threads, never on a global pool.
+* SurrealKV, built from kizz's patched copy, never panics when a thread cannot start, as [Database](#database) says.
+* Discovery walks on the worker pool, and the store's runtime starts no thread of its own.
+
 ## Crates and module boundaries
 
 ```text
@@ -868,20 +922,22 @@ crates/
   kizz-core/         the engine, with no Linux code: discovery, Markdown, Starlark runtime, step keys,
                      cache checks, explanations and ordering
   kizz-store/        the cache location, the lock file, and the SurrealKV store of typed records
-  kizz-trace/        the tracer interface: the run request, the result, access kinds, the tracer trait
-                     and the platform queries of the core: extended attributes and machine state
+  kizz-threads/      the one place that starts threads, waiting and retrying while the system cannot start one
+  kizz-trace/        the tracer interface: the run request, the result, the process tree, access kinds,
+                     the tracer trait and the platform queries of the core: extended attributes, machine state
+                     and error names
   kizz-trace-linux/  the ptrace and seccomp-bpf tracer
 ```
 
 * `kizz-core` depends on `kizz-trace` and `kizz-store`, never on `kizz-trace-linux`.
 * Only the binary wires in the Linux tracer.
+* Every kizz crate that starts a thread does so through `kizz-threads`, which depends on no other kizz crate.
 * Tests of `kizz-core` use a fake tracer.
 
 ## Technology
 
 Kizz is written in Rust, edition 2024, with a minimum Rust version of 1.96, the same as cbork.
-The command line and output use the same libraries as the cbork CLI: `bpaf` with derive, `console`, `anyhow`,
-`build-info` and `ignore`.
+The command line and output use the same libraries as the cbork CLI: `bpaf` with derive, `console`, `anyhow` and `build-info`.
 
 | Purpose | Crate | Version when planned |
 | --- | --- | --- |
@@ -890,11 +946,10 @@ The command line and output use the same libraries as the cbork CLI: `bpaf` with
 | Application errors | `anyhow` | 1.0.104 |
 | Library error types | `thiserror` | 2.0.21 |
 | Version and banner | `build-info`, `build-info-build` | 0.0.47 |
-| Directory walking | `ignore` | 0.4.33 |
 | Hashing | `blake3` with `rayon` and `mmap` | 1.8.2, pinned by `starlark` 0.14.2 |
 | Task programs | `starlark` | 0.14.2 |
 | Markdown | `pulldown-cmark` | 0.13.5 |
-| Database | `surrealkv` | 1.0.0 |
+| Database | `surrealkv`, built from kizz's patched copy in `vendor/surrealkv` | 1.0.0 |
 | Records and step keys | `minicbor` with `derive` | 2.3.1 |
 | JSON | `serde_json` | 1.0.154 |
 | Ignore patterns | `globset`, `regex` | 0.4.20, 1.13.1 |
@@ -919,12 +974,17 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
     * `.rumdl.toml`, adding `starlark` to the custom code-block languages
     * `cspell.json` and `.config/dictionaries/project.dic`
     * `deny.toml`, with `AGPL-3.0-only` as the first-party license
+* `clippy.toml` also bans the library calls that panic when the system refuses them, such as `std::thread::spawn`.
+  Kizz's crates use fallible forms instead, and in them only the helper of `kizz-threads` calls `std::thread::Builder`.
 * Source files carry the same copyright and SPDX header as cbork, with `AGPL-3.0-only`.
 * Anyone adding spelling words, parallel subagents included, only appends lines to `.config/dictionaries/project.dic`.
   `fix` and `check-ci` sort the file case-insensitively and remove duplicates, so concurrent appends never conflict.
   Case variants collapse into one entry, so add only the canonical form.
 * Tests never use the real cache: every test that runs the engine sets `KIZZ_CACHE_DIR` to a temporary directory.
 * `Cargo.lock` is committed, unlike in cbork, because kizz is a binary.
+* `vendor/surrealkv` holds SurrealKV 1.0.0 with kizz's patch, which `[patch.crates-io]` uses instead of the published crate.
+  The workspace excludes it, and the format, Markdown and spelling checks skip it.
+  Only the changes that `vendor/surrealkv/KIZZ-PATCHES.md` lists may differ from the published crate.
 
 The planned Justfile:
 
@@ -1171,6 +1231,7 @@ Depends on phases 7 and 8.
 * A `coverage-incomplete` task runs the program once for each system call that marks a run as incompletely traced,
   and once for each of two numbers that the tracer does not know, 400 and 1,000,000.
 * `coverage.c` also binds, connects and sends to Unix sockets, and connects and sends to loopback addresses.
+* Another test runs the program through the Linux tracer with the process tree, without a cache.
 
 Acceptance, end to end with the real tracer and a temporary cache:
 
@@ -1185,13 +1246,18 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * With `kizz build --cache-unknown-syscalls`, the steps of the two numbers are cached and their records list them.
 * Each expected connection for the platform is recorded, and no other connection.
 * The step's record holds every part of the machine state, with the kernel release that the test reads itself.
+* The process tree combines to exactly the run's accesses, holds each child under its parent, and no process for a thread.
+* For each expected path, the tree records exactly the outcomes that the entry's sources give each of its kinds.
+* Each `coverage-incomplete` call and unknown number appears in the tree as a reason of the program that made it.
 
 ## Testing
 
 * Each crate has unit tests.
 * `kizz-trace-linux` tests trace real processes, so they need `ptrace` and seccomp to be allowed where the tests run.
 * `kizz-core` tests use a fake tracer that performs scripted file operations and reports them.
+* The tracer's bookkeeping of processes has unit tests that replay forks, threads, `exec` calls, exits and reused IDs.
 * End-to-end tests run the `kizz` binary on fixture trees with `KIZZ_CACHE_DIR` set to a temporary directory.
+* Tests make thread starts fail on purpose, through a test switch that release builds lack, to check the retries and errors.
 * Explanations have golden-output tests.
 * The tracer conformance test of phase 10 needs a C compiler, `cc`, where the tests run.
   Every tracer must pass it: the x86_64 Linux tracer now, and any later one, for aarch64, macOS or Windows.

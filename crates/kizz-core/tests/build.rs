@@ -44,7 +44,8 @@ use std::{
 
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, INTERRUPTED, Pass, PrintSink,
-    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, UncheckedStep, build, load, task_id,
+    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, UncheckedStep, WorkerPool, build, load,
+    task_id,
 };
 use kizz_store::{
     BuildId, Change, LearnedOrder, MachineChange, Reason, Store, TaskId, TaskLabel, TaskRecord,
@@ -52,7 +53,8 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CapturedOutput, EchoSink, FirstReads,
-    MachineState, Memory, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    MachineState, Memory, OutputStream, ProcessTree, RunRequest, RunResult, Termination,
+    TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -136,6 +138,9 @@ fn script(
     Ok(RunResult {
         termination,
         output: CapturedOutput::empty(request.capture),
+        tree: request
+            .tree
+            .then(|| ProcessTree::of_request(request, &accesses, Some(termination))),
         accesses,
         incomplete: None,
         first_reads,
@@ -394,7 +399,7 @@ impl Fixture {
 
     /// The tasks of target `ci`, in the default order.
     fn tasks(&self) -> TestResult<Vec<TaskInfo>> {
-        let project = load(self.project.path())?;
+        let project = load(self.project.path(), &WorkerPool::new()?)?;
         let target: TargetExpr = "ci".parse()?;
         let mut tasks = Vec::new();
         for selected in target.select(&project.tasks) {
@@ -439,7 +444,7 @@ impl Fixture {
             caller.insert((*name).to_owned(), (*value).to_owned());
         }
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None);
+        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None, &WorkerPool::new()?);
         let report = build(&engine, &tasks, &caller, &NoPrint, events)?;
         let id = engine.build();
         drop(engine);
@@ -516,8 +521,15 @@ impl Fixture {
         )]
         .into();
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None)
-            .with_fail_unchecked(fail);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        )
+        .with_fail_unchecked(fail);
         assert_eq!(engine.fails_unchecked(), fail);
         let report = build(&engine, &tasks, &caller, &NoPrint, &Events::default())?;
         drop(engine);

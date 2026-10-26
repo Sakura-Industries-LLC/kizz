@@ -27,7 +27,7 @@ use std::{
 
 use kizz_core::{
     Engine, PrintSink, ProgramHash, StepError, StepExecutor, StepOutcome, StepSpec, TaskInfo,
-    TaskProgram, find_program, parse_tasks, step_key,
+    TaskProgram, WorkerPool, find_program, parse_tasks, step_key,
 };
 use kizz_store::{
     AccessBits, Capture, ContentHash, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
@@ -36,9 +36,25 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, OutputStream, ProcessTree, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
+
+/// An engine for one build with `tracer` and `store`, which echoes nothing, is not
+/// cancelled, knows no home directory, and runs its parallel work on a new pool.
+fn new_engine<'a>(
+    tracer: &'a dyn Tracer,
+    store: &'a Store,
+) -> TestResult<Engine<'a>> {
+    Ok(Engine::new(
+        tracer,
+        store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    ))
+}
 
 /// The result of a test or a test helper.
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -145,6 +161,9 @@ fn finished(
     Ok(RunResult {
         termination,
         output: CapturedOutput::empty(request.capture),
+        tree: request
+            .tree
+            .then(|| ProcessTree::of_request(request, &reported, Some(termination))),
         accesses: reported,
         incomplete: None,
         first_reads,
@@ -476,7 +495,7 @@ fn a_repeated_command_gets_one_key_per_occurrence() -> TestResult {
     let fixture = Fixture::new()?;
     let store = fixture.store()?;
     let tracer = FakeTracer::quiet();
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let repeated = fixture.step(&["tool", "again"]);
     let other = fixture.step(&["tool", "other"]);
 
@@ -521,7 +540,7 @@ for _ in range(2):
 
     let store = fixture.store()?;
     let tracer = FakeTracer::quiet();
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(hash, fixture.dir());
     program
         .run(&BTreeMap::new(), &steps, &NoPrint)
@@ -552,7 +571,7 @@ fn program_lookup_records_every_checked_location() -> TestResult {
     fixture.chmod("later/tool", 0o755)?;
     let store = fixture.store()?;
     let tracer = FakeTracer::quiet();
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
 
     let mut step = fixture.step(&["tool"]);
     let search = ["first", "second", "missing", "bin", "later"]
@@ -600,6 +619,27 @@ fn program_lookup_records_every_checked_location() -> TestResult {
     Ok(())
 }
 
+/// A build never asks the tracer for the process tree, so the tracer does no more
+/// work than before, and the step records the combined accesses as before.
+#[test]
+fn builds_never_ask_for_the_process_tree() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("bin/tool", "#!/bin/sh\n")?;
+    fixture.chmod("bin/tool", 0o755)?;
+    let store = fixture.store()?;
+    let tracer = FakeTracer::quiet();
+    let engine = new_engine(&tracer, &store)?;
+    let steps = engine.task(PROGRAM, fixture.dir());
+    steps.execute(&fixture.step(&["./bin/tool"]))?;
+    let requests = tracer.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests.iter().all(|request| !request.tree));
+    let stored = record(&store, &steps.keys()[0])?;
+    let run = observation(&stored, &fixture.path("bin/tool"))?;
+    assert_eq!(run.access, AccessBits(AccessBits::EXEC));
+    Ok(())
+}
+
 /// A bare program name without `PATH` in the task environment is an error that
 /// says to set or inherit `PATH`; nothing runs and nothing is recorded.
 #[test]
@@ -607,7 +647,7 @@ fn a_bare_program_name_without_path_is_an_error() -> TestResult {
     let fixture = Fixture::new()?;
     let store = fixture.store()?;
     let tracer = FakeTracer::quiet();
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let mut step = fixture.step(&["tool"]);
     step.env.clear();
 
@@ -636,7 +676,7 @@ fn a_missing_or_non_executable_program_fails_and_is_recorded() -> TestResult {
     fixture.chmod("plain/data", 0o644)?;
     let store = fixture.store()?;
     let tracer = FakeTracer::quiet();
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     let mut step = fixture.step(&["absent"]);
     let search = format!(
@@ -699,10 +739,13 @@ fn a_program_path_the_tracer_cannot_find_is_recorded() -> TestResult {
         accesses.record(request.program.clone(), AccessKind::Probe);
         Err(TraceError::ProgramNotFound {
             program: request.program.clone(),
+            tree: request
+                .tree
+                .then(|| ProcessTree::of_request(request, &accesses, None)),
             accesses,
         })
     });
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     let error = steps.execute(&fixture.step(&["./out/./gone"])).unwrap_err();
     let gone = fixture.path("out/gone");
@@ -753,7 +796,7 @@ fn each_path_state_is_recorded_as_specified() -> TestResult {
         Ok(result)
     });
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     steps.execute(&fixture.step(&["tool"]))?;
     let stored = record(&store, &steps.keys()[0])?;
@@ -837,7 +880,7 @@ fn a_file_that_was_only_checked_is_never_hashed() -> TestResult {
         )
     });
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     for _ in 0..3 {
         steps.execute(&fixture.step(&["tool"]))?;
@@ -872,7 +915,7 @@ fn large_files_that_were_read_are_hashed() -> TestResult {
         )
     });
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     steps.execute(&fixture.step(&["tool"]))?;
     let stored = record(&store, &steps.keys()[0])?;
@@ -915,7 +958,7 @@ fn a_fifo_is_recorded_by_type_only_and_never_hashed() -> TestResult {
         )
     });
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     steps.execute(&fixture.step(&["tool"]))?;
     // Only the program was hashed: the FIFO was read, but it is never opened or
@@ -964,7 +1007,7 @@ fn directory_entry_names_are_kept_up_to_the_limit() -> TestResult {
         )
     });
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     steps.execute(&fixture.step(&["tool"]))?;
     let stored = record(&store, &steps.keys()[0])?;
@@ -1032,7 +1075,7 @@ fn proc_and_sys_accesses_are_recorded_and_tracked_ones_hashed() -> TestResult {
         )
     });
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     let mut step = fixture.step(&["tool"]);
     step.track.push("/proc/vers*".to_owned());
@@ -1082,7 +1125,7 @@ fn paths_that_links_lead_into_proc_or_sys_keep_only_their_links() -> TestResult 
     let tracer =
         FakeTracer::new(move |request| finished(request, &accesses, Termination::Exited(0)));
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let steps = engine.task(PROGRAM, fixture.dir());
     steps.execute(&fixture.step(&["tool"]))?;
     let stored = record(&store, &steps.keys()[0])?;
@@ -1176,6 +1219,7 @@ fn each_ignore_pattern_form_leaves_out_and_counts_its_matches() -> TestResult {
         &NoEcho,
         Cancellation::new(),
         Some(home.clone()),
+        &WorkerPool::new()?,
     );
     let steps = engine.task(PROGRAM, fixture.dir());
     let mut step = fixture.step(&["tool"]);
@@ -1206,7 +1250,7 @@ fn each_ignore_pattern_form_leaves_out_and_counts_its_matches() -> TestResult {
 
     let mut no_home = fixture.step(&["tool"]);
     no_home.ignore.push("~/x".to_owned());
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let error = engine
         .task(PROGRAM, fixture.dir())
         .execute(&no_home)
@@ -1248,7 +1292,7 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
     let before = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let key = {
         let store = fixture.store()?;
-        let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = new_engine(&tracer, &store)?;
         let steps = engine.task(PROGRAM, fixture.dir());
         let outcome: StepOutcome = steps.execute(&step)?;
         assert_eq!(outcome.termination, Termination::Exited(3));
@@ -1299,7 +1343,7 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
 
     // A new build with the same specification and unchanged inputs is a cache hit:
     // nothing runs, and the record keeps why the step last ran.
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let replayed = engine.task(PROGRAM, fixture.dir()).execute(&step)?;
     assert!(replayed.cached);
     assert_eq!(replayed.termination, Termination::Exited(3));
@@ -1308,7 +1352,7 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
     // `always` is not in the key, so the same record is found, and the step runs
     // in a new build for that reason.
     step.always = true;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     engine.task(PROGRAM, fixture.dir()).execute(&step)?;
     assert_eq!(tracer.requests().len(), 2);
     assert_eq!(record(&store, &key)?.reason, RunReason::Always);
@@ -1322,7 +1366,7 @@ fn malformed_patterns_fail_the_step_without_a_record() -> TestResult {
     let fixture = Fixture::new()?;
     let store = fixture.store()?;
     let tracer = FakeTracer::quiet();
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = new_engine(&tracer, &store)?;
     let mut step = fixture.step(&["tool"]);
     step.track.push("re:(".to_owned());
     let error: StepError = engine

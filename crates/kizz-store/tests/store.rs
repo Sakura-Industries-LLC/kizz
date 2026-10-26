@@ -11,6 +11,11 @@
 //! that its explicit environment names when started with the helper variable set. It
 //! reports on its standard output, in lines that start with [`MARK`].
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads of a scope share the store"
+)]
+
 use std::{
     collections::BTreeSet,
     ffi::CStr,

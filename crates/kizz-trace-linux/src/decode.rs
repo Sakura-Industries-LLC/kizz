@@ -9,7 +9,7 @@
 //! flags, and resolves every path to an absolute one: a relative path against the
 //! thread's working directory or the directory descriptor the call used, and a call
 //! that acts on a descriptor to the path behind that descriptor. At the stop after
-//! the call returns, [`Call::finish`] records each path with its access kinds:
+//! the call returns, [`Call::finish_observed`] records each path with its access kinds:
 //!
 //! * a call that succeeded records the kinds of its rule in [`SYSTEM_CALLS`];
 //! * a call that failed records a probe for each path: it checked the path's existence or
@@ -75,19 +75,34 @@
 //! unless the call failed with `ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG` or
 //! `EACCES`, which say that its path was not found. A null address, a family other
 //! than these, and an address that the kernel rejects for its length name nothing.
+//!
+//! When the request asks for the process tree, [`Call::finish_observed`] also
+//! records each path into the observations of the program that made the call, each
+//! kind with the call's [`Outcome`]: `ok` for a success, the name of its error for a
+//! failure, as [`errors::name`] gives it, `EINTR` and the kernel's restart errors
+//! included, and `unknown` when the result was never seen. At the entry of
+//! `execve` and `execveat`, [`argument_vector`] reads the arguments that the call
+//! passes, which name the program that it starts with [`Call::program`]. Without
+//! the process tree, as in a build, no outcome is built and no error is named.
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io,
     net::{SocketAddr, SocketAddrV6},
-    os::unix::ffi::OsStrExt as _,
+    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
     path::{Path, PathBuf},
 };
 
-use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses, Connection, FileMetadata};
+use kizz_trace::{
+    AbsolutePath, AccessKind, AccessKinds, Accesses, Connection, FileMetadata, Observations,
+    Outcome,
+};
 use libc::{c_int, c_long};
 
-use crate::filter::{UNTRACEABLE_SYSTEM_CALLS, numbers};
+use crate::{
+    errors,
+    filter::{UNTRACEABLE_SYSTEM_CALLS, numbers},
+};
 
 /// The six argument registers of a system call, in order.
 pub(crate) type Arguments = [u64; 6];
@@ -909,7 +924,7 @@ impl Call {
 
     /// Record what the kernel loads to run the program of an `execve` or
     /// `execveat` that returned `result`, or whose result was never seen, with the
-    /// kinds of the program's own path, so [`Call::finish`] records them as it
+    /// kinds of the program's own path, so [`Call::finish_observed`] records them as it
     /// records that path. Any other call is left as it is.
     ///
     /// The tracer reads the program's files as the kernel does: a `#!` line names
@@ -1024,10 +1039,17 @@ impl Call {
     /// unless the call failed with the error the kernel gives that same input
     /// before it looks anything up: a bad address, a bad descriptor, or a path that
     /// is too long.
-    pub(crate) fn finish(
+    ///
+    /// With `observations`, each path is also recorded into them, with the same
+    /// kinds, each kind with the call's outcome, which [`Call::outcome`] gives.
+    /// Without them, as for a build, the outcome is never built, so its error name
+    /// is neither looked up nor allocated, and the call costs what it did before
+    /// the process tree existed.
+    pub(crate) fn finish_observed(
         self,
         result: Option<i64>,
         accesses: &mut Accesses,
+        observations: Option<&mut Observations>,
     ) -> Option<String> {
         let errno = result
             .filter(|result| (LOWEST_ERROR_RESULT..0).contains(result))
@@ -1045,6 +1067,7 @@ impl Call {
                 .into_iter()
                 .any(|code| i64::from(code) == errno)
         });
+        let mut observed = observations.map(|observations| (observations, Self::outcome(result)));
         for (path, kinds) in self.operands {
             let recorded = match (result, errno) {
                 (Some(_), Some(_)) if answered && kinds.contains(AccessKind::Xattr) => {
@@ -1054,12 +1077,119 @@ impl Call {
                 (Some(_), None) => kinds,
                 (None, _) => kinds.with(AccessKind::Probe),
             };
+            if let Some((observations, outcome)) = observed.as_mut() {
+                observations.record_kinds(path.clone(), recorded, outcome);
+            }
             accesses.record_kinds(path, recorded);
         }
         if let Some(problem) = self.problem {
             return Some(format!("could not decode {}: {problem}", self.name));
         }
         self.unfollowed
+    }
+
+    /// Record the paths of the call as [`Call::finish_observed`] does, without
+    /// observations, as a build's tracer records them.
+    #[cfg(test)]
+    pub(crate) fn finish(
+        self,
+        result: Option<i64>,
+        accesses: &mut Accesses,
+    ) -> Option<String> {
+        self.finish_observed(result, accesses, None)
+    }
+
+    /// The outcome of a call that returned `result`, or whose result was never
+    /// seen: `ok` for a success, the name of the error for a failure, and `unknown`
+    /// for a result never seen.
+    pub(crate) fn outcome(result: Option<i64>) -> Outcome {
+        #[cfg(test)]
+        OUTCOMES_BUILT.with(|built| built.set(built.get().saturating_add(1)));
+        match result {
+            None => Outcome::Unknown,
+            Some(result) if (LOWEST_ERROR_RESULT..0).contains(&result) => {
+                Outcome::Error(errors::name(result.saturating_neg()))
+            },
+            Some(_) => Outcome::Ok,
+        }
+    }
+
+    /// The path of the program that an `execve` or `execveat` names, resolved as
+    /// its observation is, or `None` for any other call, or when the path could not
+    /// be decoded.
+    pub(crate) fn program(&self) -> Option<&AbsolutePath> {
+        self.operands
+            .first()
+            .filter(|_| self.first_read == FirstRead::Ran)
+            .map(|(path, _)| path)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The number of outcomes that [`Call::outcome`] has built on this thread, so
+    /// a test can prove that a call recorded without observations builds none.
+    static OUTCOMES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The most bytes of one argument, its terminating NUL byte included, that the
+/// kernel copies for an `exec`: `MAX_ARG_STRLEN`, 32 pages.
+const MAX_ARGUMENT: usize = 131_072;
+
+/// The most arguments that the kernel accepts in one vector: `MAX_ARG_STRINGS`.
+const MAX_ARGUMENTS: usize = 0x7FFF_FFFF;
+
+/// The size of a pointer in an argument vector.
+const POINTER_SIZE: u64 = 8;
+
+/// The argument vector that the `execve` or `execveat` call `number` with
+/// `arguments` passes, read from the stopped thread at the call's entry, as the
+/// kernel reads it: a null-terminated array of pointers to NUL-terminated strings,
+/// and a null array is empty. A vector that cannot be read, or that the kernel
+/// would refuse for an argument that is too long, is left empty, and so is any
+/// other call's.
+pub(crate) fn argument_vector(
+    number: c_long,
+    arguments: Arguments,
+    inspect: &(impl Inspect + ?Sized),
+) -> Vec<OsString> {
+    let address = match number {
+        libc::SYS_execve => arguments[1],
+        libc::SYS_execveat => arguments[2],
+        _ => return Vec::new(),
+    };
+    read_argument_vector(inspect, address).unwrap_or_default()
+}
+
+/// The argument vector at `address`, as [`argument_vector`] describes it, or `None`
+/// when it cannot be read.
+fn read_argument_vector(
+    inspect: &(impl Inspect + ?Sized),
+    address: u64,
+) -> Option<Vec<OsString>> {
+    let mut vector = Vec::new();
+    if address == 0 {
+        return Some(vector);
+    }
+    let mut buffer = vec![0_u8; MAX_ARGUMENT];
+    let mut slot = address;
+    loop {
+        let mut pointer = [0_u8; 8];
+        if read_memory(inspect, slot, &mut pointer, false).ok()? != pointer.len() {
+            return None;
+        }
+        let pointer = u64::from_ne_bytes(pointer);
+        if pointer == 0 {
+            return Some(vector);
+        }
+        if vector.len() >= MAX_ARGUMENTS {
+            return None;
+        }
+        let filled = read_memory(inspect, pointer, &mut buffer, true).ok()?;
+        let bytes = buffer.get(..filled)?;
+        let end = bytes.iter().position(|byte| *byte == 0)?;
+        vector.push(OsString::from_vec(bytes.get(..end)?.to_vec()));
+        slot = slot.checked_add(POINTER_SIZE)?;
     }
 }
 
@@ -5201,5 +5331,257 @@ mod tests {
         assert_eq!(socket_name(&family(libc::AF_INET6)), None);
         assert_eq!(socket_name(&[]), None);
         assert_eq!(socket_name(&[1]), None);
+    }
+
+    /// The observations of the call `name` with `arguments` in `fake` when it
+    /// returns `result`, each path with each kind and its outcomes, joined with
+    /// `,`; the observations must combine to exactly the accesses that the call
+    /// records.
+    fn observe_in(
+        fake: &Fake,
+        name: &str,
+        arguments: &[u64],
+        result: Option<i64>,
+    ) -> Vec<(String, String, String)> {
+        let mut accesses = Accesses::new();
+        let mut observations = Observations::new();
+        decode(fake, name, arguments).finish_observed(
+            result,
+            &mut accesses,
+            Some(&mut observations),
+        );
+        assert_eq!(observations.accesses(), accesses, "{name}");
+        let mut flat = Vec::new();
+        for (path, kinds) in &observations {
+            for (kind, outcomes) in kinds {
+                let outcomes: Vec<String> = outcomes.iter().map(ToString::to_string).collect();
+                flat.push((path.to_string(), kind.to_string(), outcomes.join(",")));
+            }
+        }
+        flat
+    }
+
+    /// The expected observations, from triples of a path, a kind and outcomes.
+    fn observed(triples: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+        triples
+            .iter()
+            .map(|(path, kind, outcomes)| {
+                (
+                    (*path).to_owned(),
+                    (*kind).to_owned(),
+                    (*outcomes).to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// A success carries `ok` on every kind it records, and a failure its error's
+    /// name on its probe, `EINTR` and the kernel's restart errors included.
+    #[test]
+    fn calls_carry_their_outcome_on_every_kind() {
+        let fake = Fake::new();
+        let open = [CWD, REL, 0];
+        assert_eq!(
+            observe_in(&fake, "openat", &open, Some(3)),
+            observed(&[("/work/rel", "read", "ok")])
+        );
+        for (errno, name) in [
+            (libc::ENOENT, "ENOENT"),
+            (libc::EACCES, "EACCES"),
+            (libc::EINTR, "EINTR"),
+            (512, "ERESTARTSYS"),
+            (513, "ERESTARTNOINTR"),
+            (514, "ERESTARTNOHAND"),
+            (516, "ERESTART_RESTARTBLOCK"),
+            (4000, "errno 4000"),
+        ] {
+            assert_eq!(
+                observe_in(&fake, "openat", &open, failed(errno)),
+                observed(&[("/work/rel", "probe", name)]),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            observe_in(&fake, "renameat", &[CWD, REL, CWD, OTHER], Some(0)),
+            observed(&[("/work/other", "write", "ok"), ("/work/rel", "write", "ok")])
+        );
+    }
+
+    /// A call that reads extended attributes and fails with an answer of the
+    /// attributes carries the error's name on the xattr kind, and any other failure
+    /// on a probe.
+    #[test]
+    fn attribute_answers_carry_their_error_on_the_xattr_kind() {
+        let fake = Fake::new();
+        for (errno, name) in [
+            (libc::ENODATA, "ENODATA"),
+            (libc::ERANGE, "ERANGE"),
+            (libc::EOPNOTSUPP, "EOPNOTSUPP"),
+        ] {
+            assert_eq!(
+                observe_in(&fake, "getxattr", &[REL], failed(errno)),
+                observed(&[("/work/rel", "xattr", name)]),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            observe_in(&fake, "getxattr", &[REL], failed(libc::ENOENT)),
+            observed(&[("/work/rel", "probe", "ENOENT")])
+        );
+        assert_eq!(
+            observe_in(&fake, "getxattr", &[REL], Some(4)),
+            observed(&[("/work/rel", "xattr", "ok")])
+        );
+    }
+
+    /// A call whose result was never seen carries `unknown` on every kind it
+    /// records: those of its rule and the probe.
+    #[test]
+    fn an_unseen_result_carries_unknown_on_every_kind() {
+        let fake = Fake::new();
+        assert_eq!(
+            observe_in(&fake, "openat", &[CWD, REL, 0], None),
+            observed(&[
+                ("/work/rel", "read", "unknown"),
+                ("/work/rel", "probe", "unknown")
+            ])
+        );
+        assert_eq!(Call::outcome(None), Outcome::Unknown);
+        assert_eq!(Call::outcome(Some(0)), Outcome::Ok);
+        assert_eq!(Call::outcome(Some(-4096)), Outcome::Ok);
+        assert_eq!(
+            Call::outcome(Some(-4095)),
+            Outcome::Error("errno 4095".to_owned())
+        );
+    }
+
+    /// The number of outcomes that [`Call::outcome`] has built on this thread.
+    fn outcomes_built() -> usize {
+        OUTCOMES_BUILT.with(std::cell::Cell::get)
+    }
+
+    /// A call recorded without observations, as a build records it, builds no
+    /// outcome, so no error name is looked up, and it records the same accesses
+    /// and gives the same reason as with observations, which build one outcome
+    /// per call that records its paths: for a success, failures, an attribute
+    /// answer, a result never seen, a call that could not be decoded, and one whose
+    /// error says the kernel refused that input, which records nothing either way.
+    #[test]
+    fn calls_without_observations_build_no_outcome() {
+        /// A call's name, arguments and result, the outcomes that recording it with
+        /// observations builds, and whether it makes the trace incomplete.
+        type Case = (&'static str, &'static [u64], Option<i64>, usize, bool);
+        let fake = Fake::new();
+        let cases: [Case; 7] = [
+            ("openat", &[CWD, REL, 0], Some(3), 1, false),
+            ("openat", &[CWD, REL, 0], failed(libc::ENOENT), 1, false),
+            ("openat", &[CWD, REL, 0], failed(libc::EINTR), 1, false),
+            ("openat", &[CWD, REL, 0], None, 1, false),
+            ("getxattr", &[REL], failed(libc::ENODATA), 1, false),
+            ("rename", &[REL, UNMAPPED], Some(0), 1, true),
+            ("rename", &[REL, UNMAPPED], failed(libc::EFAULT), 0, false),
+        ];
+        for (name, arguments, result, observed, incomplete) in cases {
+            let before = outcomes_built();
+            let mut built = Accesses::new();
+            let built_reason = decode(&fake, name, arguments).finish(result, &mut built);
+            assert_eq!(outcomes_built(), before, "{name} {result:?}");
+            let mut accesses = Accesses::new();
+            let mut observations = Observations::new();
+            let reason = decode(&fake, name, arguments).finish_observed(
+                result,
+                &mut accesses,
+                Some(&mut observations),
+            );
+            assert_eq!(
+                outcomes_built(),
+                before.saturating_add(observed),
+                "{name} {result:?}"
+            );
+            assert_eq!(built, accesses, "{name} {result:?}");
+            assert_eq!(built_reason, reason, "{name} {result:?}");
+            assert_eq!(reason.is_some(), incomplete, "{name} {result:?}");
+        }
+    }
+
+    /// The address of an argument vector in the fake thread's memory.
+    const VECTOR: u64 = 0x20000;
+    /// The address of an argument vector whose second pointer is unmapped.
+    const BROKEN_VECTOR: u64 = 0x28000;
+
+    /// The fake thread with an argument vector at [`VECTOR`]: a word, an empty
+    /// string, a string with spaces, and bytes that are not UTF-8.
+    fn with_vector() -> Fake {
+        let mut fake = Fake::new();
+        let strings: [(u64, &[u8]); 4] = [
+            (0x21000, b"prog\0"),
+            (0x22000, b"\0"),
+            (0x23000, b"two  words\0"),
+            (0x24000, b"\xFF\xFEraw\0"),
+        ];
+        let mut pointers = Vec::new();
+        for (address, bytes) in strings {
+            fake.memory.insert(address, bytes.to_vec());
+            pointers.extend_from_slice(&address.to_ne_bytes());
+        }
+        pointers.extend_from_slice(&0_u64.to_ne_bytes());
+        fake.memory.insert(VECTOR, pointers);
+        let broken: Vec<u8> = [0x21000, UNMAPPED, 0]
+            .iter()
+            .flat_map(|pointer: &u64| pointer.to_ne_bytes())
+            .collect();
+        fake.memory.insert(BROKEN_VECTOR, broken);
+        fake
+    }
+
+    /// The argument vector of `execve` and `execveat` is read exactly as the
+    /// kernel reads it, and a vector that cannot be read is left empty, as is any
+    /// other call's.
+    #[test]
+    fn exec_argument_vectors_are_read_exactly() {
+        let fake = with_vector();
+        let expected = vec![
+            OsString::from("prog"),
+            OsString::new(),
+            OsString::from("two  words"),
+            OsString::from_vec(b"\xFF\xFEraw".to_vec()),
+        ];
+        assert_eq!(
+            argument_vector(libc::SYS_execve, [ABS, VECTOR, 0, 0, 0, 0], &fake),
+            expected
+        );
+        assert_eq!(
+            argument_vector(libc::SYS_execveat, [CWD, ABS, VECTOR, 0, 0, 0], &fake),
+            expected
+        );
+        for vector in [0, UNMAPPED, BROKEN_VECTOR] {
+            assert_eq!(
+                argument_vector(libc::SYS_execve, [ABS, vector, 0, 0, 0, 0], &fake),
+                Vec::<OsString>::new(),
+                "{vector:#x}"
+            );
+        }
+        assert_eq!(
+            argument_vector(libc::SYS_openat, [CWD, ABS, VECTOR, 0, 0, 0], &fake),
+            Vec::<OsString>::new()
+        );
+    }
+
+    /// An `exec` names the program that it starts, the path of its first operand,
+    /// and any other call names none.
+    #[test]
+    fn execs_name_their_program() {
+        let fake = Fake::new();
+        let execve = decode(&fake, "execve", &[ABS, 0, 0]);
+        assert_eq!(
+            execve.program().map(ToString::to_string),
+            Some("/abs/x/y".to_owned())
+        );
+        let execveat = decode(&fake, "execveat", &[CWD, REL, 0, 0, 0]);
+        assert_eq!(
+            execveat.program().map(ToString::to_string),
+            Some("/work/rel".to_owned())
+        );
+        assert_eq!(decode(&fake, "openat", &[CWD, REL, 0]).program(), None);
     }
 }

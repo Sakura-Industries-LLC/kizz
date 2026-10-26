@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kizz_core::{clean, plan_reset};
+use kizz_core::{WorkerPool, clean, plan_reset};
 use kizz_store::{
     AccessBits, BuildId, Capture, ContentHash, EntryCounts, FileMeta, LastWriter, LearnedOrder,
     Observation, Owner, PathKey, PathState, PositionKey, RecordedOutput, RunReason, StepExit,
@@ -323,7 +323,7 @@ fn clean_removes_entries_about_gone_paths_and_keeps_the_rest() -> TestResult {
 
     fs::remove_dir_all(&gone)?;
     fs::remove_file(keep.join("deleted.txt"))?;
-    let cleaned = clean(&store)?;
+    let cleaned = clean(&store, &WorkerPool::new()?)?;
     assert_eq!(cleaned.removed, EntryCounts {
         tasks: 1,
         steps: 3,
@@ -365,7 +365,10 @@ fn clean_removes_entries_about_gone_paths_and_keeps_the_rest() -> TestResult {
     assert_eq!(files, [keep.join("in.txt"), keep.join("kizz.md")]);
 
     // Nothing is left to clean.
-    assert_eq!(clean(&store)?.removed, EntryCounts::default());
+    assert_eq!(
+        clean(&store, &WorkerPool::new()?)?.removed,
+        EntryCounts::default()
+    );
     store.close()?;
     Ok(())
 }

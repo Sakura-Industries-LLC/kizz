@@ -429,6 +429,10 @@ fn format_utc(nanos: u64) -> String {
 
 /// Unit tests for the lock file within one process.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: a thread of a scope waits for the lock"
+)]
 mod tests {
     use std::cell::Cell;
 

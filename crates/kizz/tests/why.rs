@@ -21,12 +21,14 @@ use std::{
     process::{Command, Stdio},
 };
 
-use kizz_core::{Engine, ProgramHash, ProgramParts, StepExecutor as _, StepSpec, TaskIdentity};
+use kizz_core::{
+    Engine, ProgramHash, ProgramParts, StepExecutor as _, StepSpec, TaskIdentity, WorkerPool,
+};
 use kizz_store::{CacheLock, LockDetails, Store, TaskId};
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Disk, EchoSink,
-    FileSystem, FirstReads, Kernel, MachineState, Memory, OutputStream, ResourceLimit, RunRequest,
-    RunResult, Termination, TraceError, Tracer,
+    FileSystem, FirstReads, Kernel, MachineState, Memory, OutputStream, ProcessTree, ResourceLimit,
+    RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -102,6 +104,9 @@ impl Tracer for FakeTracer {
         Ok(RunResult {
             termination: Termination::Exited(0),
             output: CapturedOutput::empty(request.capture),
+            tree: request
+                .tree
+                .then(|| ProcessTree::of_request(request, &accesses, Some(Termination::Exited(0)))),
             accesses,
             incomplete: None,
             first_reads,
@@ -270,7 +275,14 @@ impl Fixture {
             dir: AbsolutePath::new(&self.root)?,
         };
         let store = Store::open(self.cache.path())?;
-        let engine = Engine::new(&FakeTracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            &FakeTracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let steps = engine.task_for(identity);
         steps.execute(&self.step(env)?)?;
         steps.finish(true)?;

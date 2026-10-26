@@ -65,4 +65,4 @@ condense_wildcard_suffixes = true
 hex_literal_case = "Upper"
 
 # Ignored files:
-ignore = []
+ignore = ["vendor"]

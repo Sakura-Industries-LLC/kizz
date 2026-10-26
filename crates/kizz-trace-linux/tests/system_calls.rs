@@ -44,6 +44,11 @@
 //! recorded like any path. Every socket call exists on every kernel that the
 //! tracer runs on, so none is gated.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: helper processes start plain std threads"
+)]
+
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -178,6 +183,7 @@ fn request(
         stdin: None,
         capture: CaptureMode::Split,
         echo: false,
+        tree: false,
     })
 }
 
@@ -2774,6 +2780,7 @@ fn finished(
         first_reads: FirstReads::default(),
         unknown_system_calls: unknown.iter().copied().collect(),
         connections: std::collections::BTreeSet::new(),
+        tree: None,
     }
 }
 

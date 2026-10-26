@@ -30,11 +30,13 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-use kizz_core::{Engine, ProgramHash, Render, StepDecision, StepExecutor as _, StepSpec, step_key};
+use kizz_core::{
+    Engine, ProgramHash, Render, StepDecision, StepExecutor as _, StepSpec, WorkerPool, step_key,
+};
 use kizz_store::{ChangedRead, NotCachedReason, RunReason, StepKey, StepRecord, Store, Verdict};
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, OutputStream, ProcessTree, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -98,6 +100,9 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
     Ok(RunResult {
         termination: Termination::Exited(0),
         output: CapturedOutput::empty(request.capture),
+        tree: request
+            .tree
+            .then(|| ProcessTree::of_request(request, &accesses, Some(Termination::Exited(0)))),
         accesses,
         incomplete: None,
         first_reads,
@@ -252,7 +257,14 @@ impl Fixture {
         step: &StepSpec,
     ) -> TestResult<Built> {
         let store = Store::open(self.cache.path())?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let task = engine.task(PROGRAM, AbsolutePath::new(self.project.path())?);
         let outcome = task.execute(step).map_err(|error| error.message)?;
         let decision = task

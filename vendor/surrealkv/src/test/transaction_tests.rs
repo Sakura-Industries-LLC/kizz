@@ -1,0 +1,2709 @@
+use std::mem::size_of;
+use std::sync::Arc;
+
+use tempdir::TempDir;
+use test_log::test;
+
+use crate::lsm::Tree;
+use crate::test::{collect_transaction_all, collect_transaction_reverse};
+use crate::{Error, LSMIterator, Mode, TreeBuilder};
+
+fn create_temp_directory() -> TempDir {
+	TempDir::new("test").unwrap()
+}
+
+// Common setup logic for creating a store
+fn create_store() -> (Tree, TempDir) {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let tree = TreeBuilder::new().with_path(path).build().unwrap();
+	(tree, temp_dir)
+}
+
+#[test(tokio::test)]
+async fn basic_transaction() {
+	let (store, _temp_dir) = create_store();
+
+	// Define key-value pairs for the test
+	let key1 = Vec::from("foo1");
+	let key2 = Vec::from("foo2");
+	let value1 = Vec::from("baz");
+	let value2 = Vec::from("bar");
+
+	{
+		// Start a new read-write transaction (txn1)
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&key1, &value1).unwrap();
+		txn1.set(&key2, &value1).unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	{
+		// Start a read-only transaction (txn3)
+		let txn3 = store.begin().unwrap();
+		let val = txn3.get(&key1).unwrap().unwrap();
+		assert_eq!(&val, &value1);
+	}
+
+	{
+		// Start another read-write transaction (txn2)
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key1, &value2).unwrap();
+		txn2.set(&key2, &value2).unwrap();
+		txn2.commit().await.unwrap();
+	}
+
+	// Start a read-only transaction (txn4)
+	let txn4 = store.begin().unwrap();
+	let val = txn4.get(&key1).unwrap().unwrap();
+
+	// Assert that the value retrieved in txn4 matches value2
+	assert_eq!(&val, &value2);
+}
+
+#[test(tokio::test)]
+async fn mvcc_snapshot_isolation() {
+	let (store, _) = create_store();
+
+	let key1 = Vec::from("key1");
+	let key2 = Vec::from("key2");
+	let value1 = Vec::from("baz");
+	let value2 = Vec::from("bar");
+
+	// no conflict
+	{
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		txn1.set(&key1, &value1).unwrap();
+		txn1.commit().await.unwrap();
+
+		assert!(txn2.get(&key2).unwrap().is_none());
+		txn2.set(&key2, &value2).unwrap();
+		txn2.commit().await.unwrap();
+	}
+
+	// blind writes should succeed if key wasn't read first
+	{
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		txn1.set(&key1, &value1).unwrap();
+		txn2.set(&key1, &value2).unwrap();
+
+		txn1.commit().await.unwrap();
+		assert!(match txn2.commit().await {
+			Err(err) => {
+				matches!(err, Error::TransactionWriteConflict)
+			}
+			_ => {
+				false
+			}
+		});
+	}
+
+	// conflict when the read key was updated by another transaction
+	{
+		let key = Vec::from("key3");
+
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		txn1.set(&key, &value1).unwrap();
+		txn1.commit().await.unwrap();
+
+		assert!(txn2.get(&key).unwrap().is_none());
+		txn2.set(&key, &value1).unwrap();
+		assert!(match txn2.commit().await {
+			Err(err) => {
+				matches!(err, Error::TransactionWriteConflict)
+			}
+			_ => false,
+		});
+	}
+}
+
+#[test(tokio::test)]
+async fn ryow() {
+	let (store, _) = create_store();
+
+	let key1 = Vec::from("k1");
+	let key2 = Vec::from("k2");
+	let key3 = Vec::from("k3");
+	let value1 = Vec::from("v1");
+	let value2 = Vec::from("v2");
+
+	// Set a key, delete it and read it in the same transaction. Should return None.
+	{
+		// Start a new read-write transaction (txn1)
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&key1, &value1).unwrap();
+		txn1.delete(&key1).unwrap();
+		let res = txn1.get(&key1).unwrap();
+		assert!(res.is_none());
+		txn1.commit().await.unwrap();
+	}
+
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(&key1, &value1).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	{
+		// Start a new read-write transaction (txn)
+		let mut txn = store.begin().unwrap();
+		txn.set(&key1, &value2).unwrap();
+		assert_eq!(&txn.get(&key1).unwrap().unwrap(), &value2);
+		assert!(txn.get(&key3).unwrap().is_none());
+		txn.set(&key2, &value1).unwrap();
+		assert_eq!(&txn.get(&key2).unwrap().unwrap(), &value1);
+		txn.commit().await.unwrap();
+	}
+}
+
+// Common setup logic for creating a store
+async fn create_hermitage_store() -> Tree {
+	let (store, _) = create_store();
+
+	let key1 = Vec::from("k1");
+	let key2 = Vec::from("k2");
+	let value1 = Vec::from("v1");
+	let value2 = Vec::from("v2");
+	// Start a new read-write transaction (txn)
+	let mut txn = store.begin().unwrap();
+	txn.set(&key1, &value1).unwrap();
+	txn.set(&key2, &value2).unwrap();
+	txn.commit().await.unwrap();
+
+	store
+}
+
+// The following tests are taken from hermitage (https://github.com/ept/hermitage)
+// Specifically, the tests are derived from FoundationDB tests: https://github.com/ept/hermitage/blob/master/foundationdb.md
+
+// G0: Write Cycles (dirty writes)
+#[test(tokio::test)]
+async fn g0_tests() {
+	let store = create_hermitage_store().await;
+	let key1 = Vec::from("k1");
+	let key2 = Vec::from("k2");
+	let value3 = Vec::from("v3");
+	let value4 = Vec::from("v4");
+	let value5 = Vec::from("v5");
+	let value6 = Vec::from("v6");
+
+	{
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		assert!(txn1.get(&key1).is_ok());
+		assert!(txn1.get(&key2).is_ok());
+		assert!(txn2.get(&key1).is_ok());
+		assert!(txn2.get(&key2).is_ok());
+
+		txn1.set(&key1, &value3).unwrap();
+		txn2.set(&key1, &value4).unwrap();
+
+		txn1.set(&key2, &value5).unwrap();
+
+		txn1.commit().await.unwrap();
+
+		txn2.set(&key2, &value6).unwrap();
+		assert!(match txn2.commit().await {
+			Err(err) => {
+				matches!(err, Error::TransactionWriteConflict)
+			}
+			_ => false,
+		});
+	}
+
+	{
+		let txn3 = store.begin().unwrap();
+		let val1 = txn3.get(&key1).unwrap().unwrap();
+		assert_eq!(&val1, &value3);
+		let val2 = txn3.get(&key2).unwrap().unwrap();
+		assert_eq!(&val2, &value5);
+	}
+}
+
+// P4: Lost Update
+#[test(tokio::test)]
+async fn p4() {
+	let store = create_hermitage_store().await;
+
+	let key1 = Vec::from("k1");
+	let value3 = Vec::from("v3");
+
+	{
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		assert!(txn1.get(&key1).is_ok());
+		assert!(txn2.get(&key1).is_ok());
+
+		txn1.set(&key1, &value3).unwrap();
+		txn2.set(&key1, &value3).unwrap();
+
+		txn1.commit().await.unwrap();
+
+		assert!(match txn2.commit().await {
+			Err(err) => {
+				matches!(err, Error::TransactionWriteConflict)
+			}
+			_ => false,
+		});
+	}
+}
+
+// G-single: Single Anti-dependency Cycles (read skew)
+async fn g_single_tests() {
+	let store = create_hermitage_store().await;
+
+	let key1 = Vec::from("k1");
+	let key2 = Vec::from("k2");
+	let value1 = Vec::from("v1");
+	let value2 = Vec::from("v2");
+	let value3 = Vec::from("v3");
+	let value4 = Vec::from("v4");
+
+	{
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+		assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
+		assert_eq!(txn2.get(&key2).unwrap().unwrap(), value2);
+		txn2.set(&key1, &value3).unwrap();
+		txn2.set(&key2, &value4).unwrap();
+
+		txn2.commit().await.unwrap();
+
+		assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
+		txn1.commit().await.unwrap();
+	}
+}
+
+#[test(tokio::test)]
+async fn g_single() {
+	g_single_tests().await;
+}
+
+fn require_send<T: Send>(_: T) {}
+fn require_sync<T: Sync + Send>(_: T) {}
+
+#[test(tokio::test)]
+async fn is_send_sync() {
+	let (db, _) = create_store();
+
+	let txn = db.begin().unwrap();
+	require_send(txn);
+
+	let txn = db.begin().unwrap();
+	require_sync(txn);
+}
+
+const ENTRIES: usize = 400_000;
+const KEY_SIZE: usize = 24;
+const VALUE_SIZE: usize = 150;
+const RNG_SEED: u64 = 3;
+
+fn fill_slice(slice: &mut [u8], rng: &mut fastrand::Rng) {
+	let mut i = 0;
+	while i + size_of::<u128>() < slice.len() {
+		let tmp = rng.u128(..);
+		slice[i..(i + size_of::<u128>())].copy_from_slice(&tmp.to_be_bytes());
+		i += size_of::<u128>()
+	}
+	if i + size_of::<u64>() < slice.len() {
+		let tmp = rng.u64(..);
+		slice[i..(i + size_of::<u64>())].copy_from_slice(&tmp.to_be_bytes());
+		i += size_of::<u64>()
+	}
+	if i + size_of::<u32>() < slice.len() {
+		let tmp = rng.u32(..);
+		slice[i..(i + size_of::<u32>())].copy_from_slice(&tmp.to_be_bytes());
+		i += size_of::<u32>()
+	}
+	if i + size_of::<u16>() < slice.len() {
+		let tmp = rng.u16(..);
+		slice[i..(i + size_of::<u16>())].copy_from_slice(&tmp.to_be_bytes());
+		i += size_of::<u16>()
+	}
+	if i + size_of::<u8>() < slice.len() {
+		slice[i] = rng.u8(..);
+	}
+}
+
+fn gen_pair(rng: &mut fastrand::Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
+	let mut key = [0u8; KEY_SIZE];
+	fill_slice(&mut key, rng);
+	let mut value = vec![0u8; VALUE_SIZE];
+	fill_slice(&mut value, rng);
+
+	(key, value)
+}
+
+fn make_rng() -> fastrand::Rng {
+	fastrand::Rng::with_seed(RNG_SEED)
+}
+
+#[test(tokio::test)]
+#[ignore]
+async fn insert_large_txn_and_get() {
+	let store = create_hermitage_store().await;
+
+	let mut rng = make_rng();
+
+	let mut txn = store.begin().unwrap();
+	for _ in 0..ENTRIES {
+		let (key, value) = gen_pair(&mut rng);
+		txn.set(&key, &value).unwrap();
+	}
+	txn.commit().await.unwrap();
+	drop(txn);
+
+	// Read the keys from the store
+	let mut rng = make_rng();
+	let txn = store.begin_with_mode(Mode::ReadOnly).unwrap();
+	for _i in 0..ENTRIES {
+		let (key, _) = gen_pair(&mut rng);
+		txn.get(&key).unwrap();
+	}
+}
+
+#[test(tokio::test)]
+async fn sdb_delete_record_id_bug() {
+	let (store, _) = create_store();
+
+	// Define key-value pairs for the test
+	let key1 = Vec::from(&[
+		47, 33, 110, 100, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72, 52,
+	]);
+	let key2 = Vec::from(&[
+		47, 33, 104, 98, 0, 0, 1, 141, 141, 42, 113, 8, 47, 166, 192, 229, 30, 101, 24, 73, 242,
+		185, 36, 233, 242, 54, 96, 72, 52,
+	]);
+	let value1 = Vec::from("baz");
+
+	{
+		// Start a new read-write transaction (txn)
+		let mut txn = store.begin().unwrap();
+		txn.set(&key1, &value1).unwrap();
+		txn.set(&key2, &value1).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let key3 = Vec::from(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
+	{
+		// Start a new read-write transaction (txn)
+		let mut txn = store.begin().unwrap();
+		txn.set(&key3, &value1).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let key4 = Vec::from(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
+	let txn1 = store.begin().unwrap();
+	txn1.get(&key4).unwrap();
+
+	{
+		let mut txn2 = store.begin().unwrap();
+		txn2.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50,
+			50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98,
+			117, 115, 101, 114, 0,
+		]))
+		.unwrap();
+		txn2.get(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+		txn2.get(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+		txn2.set(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]), &value1)
+			.unwrap();
+
+		txn2.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71,
+			72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+		]))
+		.unwrap();
+		txn2.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71,
+			72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+		]))
+		.unwrap();
+		txn2.set(
+			Vec::from(&[
+				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
+				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+			]),
+			&value1,
+		)
+		.unwrap();
+
+		txn2.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50,
+			50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98,
+			117, 115, 101, 114, 0,
+		]))
+		.unwrap();
+		txn2.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50,
+			50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115,
+			101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+		]))
+		.unwrap();
+		txn2.set(
+			Vec::from(&[
+				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
+				115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+			]),
+			&value1,
+		)
+		.unwrap();
+
+		txn2.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71,
+			72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+		]))
+		.unwrap();
+
+		txn2.commit().await.unwrap();
+	}
+
+	{
+		let mut txn3 = store.begin().unwrap();
+		txn3.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50,
+			50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115,
+			101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+		]))
+		.unwrap();
+		txn3.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50,
+			50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98,
+			117, 115, 101, 114, 0,
+		]))
+		.unwrap();
+		txn3.delete(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50,
+			50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115,
+			101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+		]))
+		.unwrap();
+		txn3.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71,
+			72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+		]))
+		.unwrap();
+		txn3.get(Vec::from(&[
+			47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71,
+			72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+		]))
+		.unwrap();
+		txn3.set(
+			Vec::from(&[
+				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
+				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+			]),
+			&value1,
+		)
+		.unwrap();
+		txn3.commit().await.unwrap();
+	}
+}
+
+#[test(tokio::test)]
+async fn transaction_delete_from_index() {
+	let (store, _) = create_store();
+
+	// Define key-value pairs for the test
+	let key1 = Vec::from("foo1");
+	let value = Vec::from("baz");
+	let key2 = Vec::from("foo2");
+
+	{
+		// Start a new read-write transaction (txn1)
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&key1, &value).unwrap();
+		txn1.set(&key2, &value).unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	{
+		// Start another read-write transaction (txn2)
+		let mut txn2 = store.begin().unwrap();
+		txn2.delete(&key1).unwrap();
+		txn2.commit().await.unwrap();
+	}
+
+	{
+		// Start a read-only transaction (txn3)
+		let txn3 = store.begin().unwrap();
+		let val = txn3.get(&key1).unwrap();
+		assert!(val.is_none());
+		let val = txn3.get(&key2).unwrap().unwrap();
+		assert_eq!(&val, &value);
+	}
+
+	// Start a read-only transaction (txn4)
+	let txn4 = store.begin().unwrap();
+	let val = txn4.get(&key1).unwrap();
+	assert!(val.is_none());
+	let val = txn4.get(&key2).unwrap().unwrap();
+	assert_eq!(&val, &value);
+}
+
+#[test(tokio::test)]
+async fn test_insert_delete_read_key() {
+	let (store, _) = create_store();
+
+	// Key-value pair for the test
+	let key = Vec::from("test_key");
+	let value1 = Vec::from("test_value1");
+	let value2 = Vec::from("test_value2");
+
+	// Insert key-value pair in a new transaction
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(&key, &value1).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(&key, &value2).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Clear the key in a separate transaction
+	{
+		let mut txn = store.begin().unwrap();
+		txn.delete(&key).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Read the key in a new transaction to verify it does not exist
+	{
+		let txn = store.begin().unwrap();
+		assert!(txn.get(&key).unwrap().is_none());
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_basic_functionality() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert some initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.set(b"key5", b"value5").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test basic range scan
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"key2", b"key4").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
+		assert_eq!(&range[0].0, b"key2");
+		assert_eq!(&range[0].1.as_slice(), b"value2");
+		assert_eq!(&range[1].0, b"key3");
+		assert_eq!(&range[1].1.as_slice(), b"value3");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_with_bounds() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert some initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.set(b"key5", b"value5").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test range with start bound as empty
+	{
+		let tx = store.begin().unwrap();
+		let beg = b"".as_slice();
+		let range = collect_transaction_all(&mut tx.range(beg, b"key4").unwrap()).unwrap();
+		assert_eq!(range.len(), 3); // key1, key2, key3 (key4 is exclusive)
+		assert_eq!(&range[0].0, b"key1");
+		assert_eq!(&range[1].0, b"key2");
+		assert_eq!(&range[2].0, b"key3");
+	}
+
+	// Test range with both bounds as empty
+	{
+		let tx = store.begin().unwrap();
+		let beg = b"".as_slice();
+		let end = b"".as_slice();
+		let range = collect_transaction_all(&mut tx.range(beg, end).unwrap()).unwrap();
+		assert_eq!(range.len(), 0);
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_with_limit() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert test data
+	{
+		let mut tx = store.begin().unwrap();
+		for i in 1..=10 {
+			let key = format!("key{i:02}");
+			let value = format!("value{i}");
+			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	// Test with .take()
+	{
+		let tx = store.begin().unwrap();
+		let all_range =
+			collect_transaction_all(&mut tx.range(b"key01", b"key10").unwrap()).unwrap();
+		let range: Vec<_> = all_range.into_iter().take(3).collect::<Vec<_>>();
+
+		assert_eq!(range.len(), 3);
+		assert_eq!(&range[0].0, b"key01");
+		assert_eq!(&range[1].0, b"key02");
+		assert_eq!(&range[2].0, b"key03");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_read_your_own_writes() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"a", b"1").unwrap();
+		tx.set(b"c", b"3").unwrap();
+		tx.set(b"e", b"5").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test RYOW - uncommitted writes should be visible in range
+	{
+		let mut tx = store.begin().unwrap();
+
+		// Add new keys
+		tx.set(b"b", b"2").unwrap();
+		tx.set(b"d", b"4").unwrap();
+
+		// Modify existing key
+		tx.set(b"c", b"3_modified").unwrap();
+
+		// Range should see all changes ([a, f) to include e)
+		let range = collect_transaction_all(&mut tx.range(b"a", b"f").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 5);
+		assert_eq!(range[0], (Vec::from(b"a"), Vec::from(b"1")));
+		assert_eq!(range[1], (Vec::from(b"b"), Vec::from(b"2")));
+		assert_eq!(range[2], (Vec::from(b"c"), Vec::from(b"3_modified")));
+		assert_eq!(range[3], (Vec::from(b"d"), Vec::from(b"4")));
+		assert_eq!(range[4], (Vec::from(b"e"), Vec::from(b"5")));
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_with_deletes() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.set(b"key5", b"value5").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test range with deletes in write set
+	{
+		let mut tx = store.begin().unwrap();
+
+		// Delete some keys
+		tx.delete(b"key2").unwrap();
+		tx.delete(b"key4").unwrap();
+
+		// Range should not see deleted keys ([key1, key6) to include key5)
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 3);
+		assert_eq!(&range[0].0, b"key1");
+		assert_eq!(&range[1].0, b"key3");
+		assert_eq!(&range[2].0, b"key5");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_delete_then_set() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test delete followed by set
+	{
+		let mut tx = store.begin().unwrap();
+
+		// Delete then re-add with new value
+		tx.delete(b"key2").unwrap();
+		tx.set(b"key2", b"new_value2").unwrap();
+
+		// Range should see the new value ([key1, key4) to include key3)
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 3);
+		assert_eq!(range[1], (Vec::from(b"key2"), Vec::from(b"new_value2")));
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_empty_result() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert data outside the range we'll query
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"a", b"1").unwrap();
+		tx.set(b"z", b"26").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query range with no data
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"m", b"n").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 0);
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_ordering() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert data in non-sequential order
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key5", b"value5").unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify correct ordering in range ([key1, key6) to include key5)
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 5);
+		for (i, item) in range.iter().enumerate().take(5) {
+			let expected_key = format!("key{}", i + 1);
+			assert_eq!(&item.0, expected_key.as_bytes());
+		}
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_boundary_conditions() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert test data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test range boundaries ([key1, key4) to include key3)
+	{
+		let tx = store.begin().unwrap();
+
+		// Range includes start but excludes end
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 3);
+		assert_eq!(&range[0].0, b"key1");
+		assert_eq!(&range[2].0, b"key3");
+	}
+
+	// Test single key range ([key2, key3) to include only key2)
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"key2", b"key3").unwrap()).unwrap();
+
+		assert_eq!(range.len(), 1);
+		assert_eq!(&range[0].0, b"key2");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_write_sequence_order() {
+	let (store, _temp_dir) = create_store();
+
+	// Test that multiple writes to same key show latest value
+	{
+		let mut tx = store.begin().unwrap();
+
+		tx.set(b"key", b"value1").unwrap();
+		tx.set(b"key", b"value2").unwrap();
+		tx.set(b"key", b"value3").unwrap();
+
+		let end_key = b"key\x01";
+		let range =
+			collect_transaction_all(&mut tx.range(b"key".as_slice(), end_key.as_slice()).unwrap())
+				.unwrap();
+
+		assert_eq!(range.len(), 1);
+		assert_eq!(range[0].1.as_slice(), b"value3"); // Latest value
+	}
+}
+
+#[test(tokio::test)]
+async fn test_keys_method() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert test data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.set(b"key5", b"value5").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test with RYOW - add a key in the current transaction
+	{
+		let mut tx = store.begin().unwrap();
+
+		// Add a key in the transaction (not yet committed)
+		tx.set(b"key6", b"value6").unwrap();
+
+		// Get keys only
+		let all_range = collect_transaction_all(&mut tx.range(b"key1", b"key9").unwrap()).unwrap();
+		let keys_only: Vec<_> = all_range.into_iter().map(|(k, _)| k).collect();
+
+		// Verify we got all 6 keys (5 from storage + 1 from write set)
+		assert_eq!(keys_only.len(), 6);
+
+		// Check the keys are in order
+		for (i, key) in keys_only.iter().enumerate().take(6) {
+			let expected_key = format!("key{}", i + 1);
+			assert_eq!(key.as_slice(), expected_key.as_bytes());
+		}
+
+		// Compare with regular range
+		let regular_range =
+			collect_transaction_all(&mut tx.range(b"key1", b"key9").unwrap()).unwrap();
+
+		// Should have same number of items
+		assert_eq!(regular_range.len(), keys_only.len());
+
+		// Keys should match and regular range values should be correct
+		for i in 0..keys_only.len() {
+			assert_eq!(keys_only[i], regular_range[i].0, "Keys should match");
+
+			if i < 5 {
+				// For keys from storage, check regular values are correct
+				assert_eq!(
+					regular_range[i].1.as_slice(),
+					format!("value{}", i + 1).as_bytes(),
+					"Regular range should have correct values from storage"
+				);
+			} else {
+				// For the key from write set
+				assert_eq!(
+					regular_range[i].1.as_slice(),
+					b"value6",
+					"Regular range should have correct value from write set"
+				);
+			}
+		}
+
+		// Test with a deleted key
+		tx.delete(b"key3").unwrap();
+
+		let all_range_after_delete =
+			collect_transaction_all(&mut tx.range(b"key1", b"key9").unwrap()).unwrap();
+		let keys_after_delete: Vec<_> =
+			all_range_after_delete.into_iter().map(|(k, _)| k).collect();
+
+		// Should have 5 keys now (key3 is deleted)
+		assert_eq!(keys_after_delete.len(), 5);
+
+		// Verify key3 is not in the results
+		let key_names: Vec<_> = keys_after_delete
+			.iter()
+			.map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+			.collect();
+
+		assert!(!key_names.contains(&"key3".to_string()), "key3 should be removed");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_range_value_pointer_resolution_bug() {
+	let temp_dir = create_temp_directory();
+
+	let tree = TreeBuilder::new()
+		.with_path(temp_dir.path().to_path_buf())
+		.with_max_memtable_size(64 * 1024)
+		.build()
+		.unwrap();
+
+	// Create values that will be stored in VLog (> 50 bytes)
+	let key1 = b"key1";
+	let key2 = b"key2";
+	let key3 = b"key3";
+
+	let large_value1 = "X".repeat(100); // > 50 bytes, goes to VLog
+	let large_value2 = "Y".repeat(100); // > 50 bytes, goes to VLog
+	let large_value3 = "Z".repeat(100); // > 50 bytes, goes to VLog
+
+	// Insert the values
+	{
+		let mut txn = tree.begin().unwrap();
+		txn.set(key1, large_value1.as_bytes()).unwrap();
+		txn.set(key2, large_value2.as_bytes()).unwrap();
+		txn.set(key3, large_value3.as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Force flush to ensure data goes to SSTables (and VLog)
+	tree.flush().unwrap();
+
+	// Test 1: Verify get() works correctly
+	{
+		let txn = tree.begin().unwrap();
+
+		let retrieved1 = txn.get(key1).unwrap().unwrap();
+		let retrieved2 = txn.get(key2).unwrap().unwrap();
+		let retrieved3 = txn.get(key3).unwrap().unwrap();
+
+		assert_eq!(
+			retrieved1.as_slice(),
+			large_value1.as_bytes(),
+			"get() should resolve value pointers correctly"
+		);
+		assert_eq!(
+			retrieved2.as_slice(),
+			large_value2.as_bytes(),
+			"get() should resolve value pointers correctly"
+		);
+		assert_eq!(
+			retrieved3.as_slice(),
+			large_value3.as_bytes(),
+			"get() should resolve value pointers correctly"
+		);
+	}
+
+	// Test 2: Verify range() also works correctly
+	{
+		let txn = tree.begin().unwrap();
+
+		let range_results =
+			collect_transaction_all(&mut txn.range(b"key1", b"key4").unwrap()).unwrap();
+
+		assert_eq!(range_results.len(), 3, "Should get 3 items from range query");
+
+		// Check that all values are correctly resolved (not value pointers)
+		for (i, (returned_key, returned_value)) in range_results.iter().enumerate() {
+			let expected_key = match i {
+				0 => key1,
+				1 => key2,
+				2 => key3,
+				_ => panic!("Unexpected index"),
+			};
+			let expected_value = match i {
+				0 => &large_value1,
+				1 => &large_value2,
+				2 => &large_value3,
+				_ => panic!("Unexpected index"),
+			};
+
+			assert_eq!(returned_key.as_slice(), expected_key, "Key mismatch in range result");
+
+			// The returned value should be the actual value, not a value pointer
+			assert_eq!(
+				returned_value.as_slice(),
+				expected_value.as_bytes(),
+				"Range should return resolved values, not value pointers. \
+                     Expected actual value of {} bytes, but got a different value",
+				expected_value.len(),
+			);
+		}
+	}
+}
+
+// Double-ended iterator tests
+mod double_ended_iterator_tests {
+	use test_log::test;
+
+	use super::*;
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_basic() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert test data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration
+		{
+			let tx = store.begin().unwrap();
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
+
+			// Should get results in reverse key order
+			assert_eq!(reverse_results.len(), 5);
+
+			// Check that keys are in reverse order
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
+
+			assert_eq!(keys[0], b"key5");
+			assert_eq!(keys[1], b"key4");
+			assert_eq!(keys[2], b"key3");
+			assert_eq!(keys[3], b"key2");
+			assert_eq!(keys[4], b"key1");
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_with_writes() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration with transaction writes
+		{
+			let mut tx = store.begin().unwrap();
+
+			// Add some writes to the transaction
+			tx.set(b"key2", b"new_value2").unwrap();
+			tx.set(b"key4", b"new_value4").unwrap();
+			tx.set(b"key6", b"new_value6").unwrap();
+
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key7").unwrap()).unwrap();
+
+			// Should get results in reverse key order including transaction writes
+			assert_eq!(reverse_results.len(), 6);
+
+			// Check that keys are in reverse order
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
+
+			assert_eq!(keys[0], b"key6");
+			assert_eq!(keys[1], b"key5");
+			assert_eq!(keys[2], b"key4");
+			assert_eq!(keys[3], b"key3");
+			assert_eq!(keys[4], b"key2");
+			assert_eq!(keys[5], b"key1");
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_with_deletes() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration with deletes in transaction
+		{
+			let mut tx = store.begin().unwrap();
+
+			// Delete some keys
+			tx.delete(b"key2").unwrap();
+			tx.delete(b"key4").unwrap();
+
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
+
+			// Should get results in reverse key order, excluding deleted keys
+			assert_eq!(reverse_results.len(), 3);
+
+			// Check that keys are in reverse order and deleted keys are excluded
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
+
+			assert_eq!(keys[0], b"key5");
+			assert_eq!(keys[1], b"key3");
+			assert_eq!(keys[2], b"key1");
+
+			// Ensure deleted keys are not present
+			assert!(!keys.contains(&b"key2".to_vec()));
+			assert!(!keys.contains(&b"key4".to_vec()));
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_with_soft_deletes() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration with soft deletes in transaction
+		{
+			let mut tx = store.begin().unwrap();
+
+			// Soft delete some keys
+			tx.soft_delete(b"key2").unwrap();
+			tx.soft_delete(b"key4").unwrap();
+
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
+
+			// Should get results in reverse key order, excluding soft deleted keys
+			assert_eq!(reverse_results.len(), 3);
+
+			// Check that keys are in reverse order and soft deleted keys are excluded
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
+
+			assert_eq!(keys[0], b"key5");
+			assert_eq!(keys[1], b"key3");
+			assert_eq!(keys[2], b"key1");
+
+			// Ensure soft deleted keys are not present
+			assert!(!keys.contains(&b"key2".to_vec()));
+			assert!(!keys.contains(&b"key4".to_vec()));
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_with_limits() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert test data
+		{
+			let mut tx = store.begin().unwrap();
+			for i in 1..=10 {
+				let key = format!("key{:02}", i);
+				let value = format!("value{}", i);
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration with take
+		{
+			let tx = store.begin().unwrap();
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key01", b"key11").unwrap()).unwrap();
+
+			// Take only first 3 results (which are the highest keys in reverse order)
+			let limited_results: Vec<_> = reverse_results.into_iter().take(3).collect();
+
+			// Should get exactly 3 results in reverse order
+			assert_eq!(limited_results.len(), 3);
+
+			// Check that keys are in reverse order
+			let keys: Vec<Vec<u8>> = limited_results.into_iter().map(|(k, _)| k).collect();
+
+			assert_eq!(keys[0], b"key10");
+			assert_eq!(keys[1], b"key09");
+			assert_eq!(keys[2], b"key08");
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_keys_only() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert test data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration with keys only
+		{
+			let tx = store.begin().unwrap();
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
+
+			// Should get results in reverse key order
+			assert_eq!(reverse_results.len(), 3);
+
+			// Check that keys are in reverse order
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
+
+			assert_eq!(keys[0], b"key3");
+			assert_eq!(keys[1], b"key2");
+			assert_eq!(keys[2], b"key1");
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_mixed_operations() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration with mixed operations in transaction
+		{
+			let mut tx = store.begin().unwrap();
+
+			// Mix of operations
+			tx.set(b"key0", b"new_value0").unwrap(); // New key
+			tx.set(b"key2", b"updated_value2").unwrap(); // Update existing
+			tx.delete(b"key3").unwrap(); // Delete existing
+			tx.soft_delete(b"key4").unwrap(); // Soft delete existing
+			tx.set(b"key6", b"new_value6").unwrap(); // New key
+
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key0", b"key7").unwrap()).unwrap();
+
+			// Should get results in reverse key order
+			assert_eq!(reverse_results.len(), 5);
+
+			// Check that keys are in reverse order
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
+
+			assert_eq!(keys[0], b"key6");
+			assert_eq!(keys[1], b"key5");
+			assert_eq!(keys[2], b"key2");
+			assert_eq!(keys[3], b"key1");
+			assert_eq!(keys[4], b"key0");
+
+			// Ensure deleted keys are not present
+			assert!(!keys.contains(&b"key3".to_vec()));
+			assert!(!keys.contains(&b"key4".to_vec()));
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_empty_range() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert data outside the range we'll query
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test reverse iteration on empty range
+		{
+			let tx = store.begin().unwrap();
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key2", b"key5").unwrap()).unwrap();
+
+			// Should get no results
+			assert_eq!(reverse_results.len(), 0);
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_reverse_iteration_consistency_with_forward() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert test data
+		{
+			let mut tx = store.begin().unwrap();
+			for i in 1..=5 {
+				let key = format!("key{}", i);
+				let value = format!("value{}", i);
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		// Test that reverse iteration gives same results as forward iteration reversed
+		{
+			let tx = store.begin().unwrap();
+
+			// Forward iteration
+			let forward_results =
+				collect_transaction_all(&mut tx.range(b"key1", b"key5").unwrap()).unwrap();
+
+			// Reverse iteration
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key5").unwrap()).unwrap();
+
+			// Reverse the forward results
+			let mut forward_reversed = forward_results;
+			forward_reversed.reverse();
+
+			// Results should be identical
+			assert_eq!(forward_reversed.len(), reverse_results.len());
+			for (forward, reverse) in forward_reversed.iter().zip(reverse_results.iter()) {
+				assert_eq!(forward.0, reverse.0);
+				assert_eq!(forward.1, reverse.1);
+			}
+		}
+	}
+}
+
+// Savepoint tests
+mod savepoint_tests {
+	use test_log::test;
+
+	use super::*;
+
+	#[test(tokio::test)]
+	async fn multiple_savepoints() {
+		let (store, _) = create_store();
+
+		// Key-value pair for the test
+		let key1 = Vec::from("test_key1");
+		let value1 = Vec::from("test_value1");
+		let key2 = Vec::from("test_key2");
+		let value2 = Vec::from("test_value2");
+		let key3 = Vec::from("test_key3");
+		let value3 = Vec::from("test_value3");
+
+		// Start the transaction and write key1.
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&key1, &value1).unwrap();
+
+		// Set the first savepoint.
+		txn1.set_savepoint().unwrap();
+
+		// Write key2 after the savepoint.
+		txn1.set(&key2, &value2).unwrap();
+
+		// Set another savepoint, stacking it onto the first one.
+		txn1.set_savepoint().unwrap();
+
+		txn1.set(&key3, &value3).unwrap();
+
+		// Just a sanity check that all three keys are present.
+		assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
+		assert_eq!(&txn1.get(&key2).unwrap().unwrap(), &value2);
+		assert_eq!(&txn1.get(&key3).unwrap().unwrap(), &value3);
+
+		// Rollback to the latest (second) savepoint. This should make key3
+		// go away while keeping key1 and key2.
+		txn1.rollback_to_savepoint().unwrap();
+		assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
+		assert_eq!(&txn1.get(&key2).unwrap().unwrap(), &value2);
+		assert!(txn1.get(&key3).unwrap().is_none());
+
+		// Now roll back to the first savepoint. This should only
+		// keep key1 around.
+		txn1.rollback_to_savepoint().unwrap();
+		assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
+		assert!(txn1.get(&key2).unwrap().is_none());
+		assert!(txn1.get(&key3).unwrap().is_none());
+
+		// Check that without any savepoints set the error is returned.
+		assert!(matches!(txn1.rollback_to_savepoint(), Err(Error::TransactionWithoutSavepoint)));
+
+		// Commit the transaction.
+		txn1.commit().await.unwrap();
+		drop(txn1);
+
+		// Start another transaction and check again for the keys.
+		let txn2 = store.begin().unwrap();
+		assert_eq!(&txn2.get(&key1).unwrap().unwrap(), &value1);
+		assert!(txn2.get(&key2).unwrap().is_none());
+		assert!(txn2.get(&key3).unwrap().is_none());
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_on_updated_key() {
+		let (store, _) = create_store();
+
+		let k1 = Vec::from("k1");
+		let value1 = Vec::from("value1");
+		let value2 = Vec::from("value2");
+		let value3 = Vec::from("value3");
+
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&k1, &value1).unwrap();
+		txn1.set(&k1, &value2).unwrap();
+		txn1.set_savepoint().unwrap();
+		txn1.set(&k1, &value3).unwrap();
+		txn1.rollback_to_savepoint().unwrap();
+
+		// The read value should be the one before the savepoint.
+		assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value2);
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_with_range_scan() {
+		let (store, _) = create_store();
+
+		let k1 = Vec::from("k1");
+		let value = Vec::from("value1");
+		let value2 = Vec::from("value2");
+
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&k1, &value).unwrap();
+		txn1.set_savepoint().unwrap();
+		txn1.set(&k1, &value2).unwrap();
+		txn1.rollback_to_savepoint().unwrap();
+
+		// The scanned value should be the one before the savepoint.
+		let range = collect_transaction_all(&mut txn1.range(b"k1", b"k3").unwrap()).unwrap();
+		assert_eq!(range.len(), 1);
+		assert_eq!(&range[0].0, &k1);
+		assert_eq!(&range[0].1, &value);
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_with_deletes() {
+		let (store, _) = create_store();
+
+		let k1 = Vec::from("k1");
+		let k2 = Vec::from("k2");
+		let value1 = Vec::from("value1");
+		let value2 = Vec::from("value2");
+
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&k1, &value1).unwrap();
+		txn1.set(&k2, &value2).unwrap();
+		txn1.set_savepoint().unwrap();
+
+		// Delete k1 and modify k2
+		txn1.delete(&k1).unwrap();
+		txn1.set(&k2, b"modified").unwrap();
+
+		// Verify the changes
+		assert!(txn1.get(&k1).unwrap().is_none());
+		assert_eq!(txn1.get(&k2).unwrap().unwrap(), b"modified");
+
+		// Rollback to savepoint
+		txn1.rollback_to_savepoint().unwrap();
+
+		// Verify original values are restored
+		assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
+		assert_eq!(&txn1.get(&k2).unwrap().unwrap(), &value2);
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_nested_operations() {
+		let (store, _) = create_store();
+
+		let k1 = Vec::from("k1");
+		let k2 = Vec::from("k2");
+		let k3 = Vec::from("k3");
+		let value1 = Vec::from("value1");
+		let value2 = Vec::from("value2");
+		let value3 = Vec::from("value3");
+
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(&k1, &value1).unwrap();
+
+		// First savepoint
+		txn1.set_savepoint().unwrap();
+		txn1.set(&k2, &value2).unwrap();
+
+		// Second savepoint
+		txn1.set_savepoint().unwrap();
+		txn1.set(&k3, &value3).unwrap();
+
+		// Rollback to second savepoint (should remove k3)
+		txn1.rollback_to_savepoint().unwrap();
+		assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
+		assert_eq!(&txn1.get(&k2).unwrap().unwrap(), &value2);
+		assert!(txn1.get(&k3).unwrap().is_none());
+
+		// Rollback to first savepoint (should remove k2)
+		txn1.rollback_to_savepoint().unwrap();
+		assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
+		assert!(txn1.get(&k2).unwrap().is_none());
+		assert!(txn1.get(&k3).unwrap().is_none());
+
+		// Final rollback should fail
+		assert!(matches!(txn1.rollback_to_savepoint(), Err(Error::TransactionWithoutSavepoint)));
+	}
+}
+
+mod get_for_update_tests {
+	use test_log::test;
+
+	use super::*;
+
+	#[test(tokio::test)]
+	async fn conflict_when_locked_key_written_by_other_txn() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		// Another transaction commits a write to the locked key.
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// txn1 writes a different key; the locked read still conflicts.
+		txn1.set(&other, b"v1").unwrap();
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn no_conflict_when_other_txn_writes_unrelated_key() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+		let unrelated = Vec::from("k3");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		// Another transaction commits a write to a key txn1 never locked.
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&unrelated, b"v3").unwrap();
+		txn2.commit().await.unwrap();
+
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn locked_key_also_written_still_conflicts() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The locked key is also written, so the write-set key alone
+		// carries the conflict.
+		txn1.set(&key, b"v1").unwrap();
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn check_only_commit_conflicts_on_locked_key() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		// txn1 locks the key but writes nothing.
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn check_only_commit_succeeds_without_concurrent_writer() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let value = Vec::from("v1");
+
+		let mut txn = store.begin().unwrap();
+		txn.set(&key, &value).unwrap();
+		txn.commit().await.unwrap();
+
+		// A locked read with no writes and no concurrent writer commits fine.
+		let mut txn1 = store.begin().unwrap();
+		assert_eq!(&txn1.get_for_update(&key).unwrap().unwrap(), &value);
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn reads_match_get_including_ryow() {
+		let (store, _) = create_store();
+
+		let key1 = Vec::from("k1");
+		let key2 = Vec::from("k2");
+		let value1 = Vec::from("v1");
+		let value2 = Vec::from("v2");
+
+		let mut txn = store.begin().unwrap();
+		txn.set(&key1, &value1).unwrap();
+		txn.commit().await.unwrap();
+
+		let mut txn1 = store.begin().unwrap();
+
+		// Committed value.
+		assert_eq!(txn1.get(&key1).unwrap(), txn1.get_for_update(&key1).unwrap());
+		assert_eq!(&txn1.get_for_update(&key1).unwrap().unwrap(), &value1);
+
+		// Missing key.
+		assert!(txn1.get_for_update(&key2).unwrap().is_none());
+
+		// RYOW: a pending write is visible.
+		txn1.set(&key2, &value2).unwrap();
+		assert_eq!(&txn1.get_for_update(&key2).unwrap().unwrap(), &value2);
+
+		// RYOW: a pending delete reads as None.
+		txn1.delete(&key1).unwrap();
+		assert!(txn1.get_for_update(&key1).unwrap().is_none());
+	}
+
+	#[test(tokio::test)]
+	async fn plain_get_does_not_register_for_validation() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// A plain get takes no lock, so txn1 commits fine.
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_releases_locks_taken_after_savepoint() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		txn1.set_savepoint().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.rollback_to_savepoint().unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The lock was rolled back with the savepoint, so no conflict.
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_keeps_locks_taken_before_savepoint() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.set_savepoint().unwrap();
+		// Re-locking after the savepoint must not downgrade the earlier lock.
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.rollback_to_savepoint().unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn rejected_in_read_only_and_write_only_modes() {
+		let (store, _) = create_store();
+
+		let mut ro = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		assert!(matches!(ro.get_for_update(b"k1"), Err(Error::TransactionReadOnly)));
+
+		let mut wo = store.begin_with_mode(Mode::WriteOnly).unwrap();
+		assert!(matches!(wo.get_for_update(b"k1"), Err(Error::TransactionWriteOnly)));
+	}
+
+	#[test(tokio::test)]
+	async fn failed_check_only_commit_is_terminal() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The conflicting commit closes the transaction; a retry must fail
+		// loudly rather than report an unvalidated success.
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionClosed)));
+	}
+
+	#[test(tokio::test)]
+	async fn failed_write_commit_is_terminal() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.set(&other, b"v1").unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The conflicting commit closes the transaction; a retry must fail
+		// loudly rather than report an unvalidated success.
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionClosed)));
+
+		// The failed commit persisted nothing.
+		let txn3 = store.begin().unwrap();
+		assert!(txn3.get(&other).unwrap().is_none());
+	}
+
+	#[test(tokio::test)]
+	async fn concurrent_lockers_of_same_key_both_commit() {
+		let (store, _) = create_store();
+
+		let shared = Vec::from("shared");
+
+		// A locked read publishes nothing, so it is invisible to the other
+		// transaction's conflict check: locking is snapshot validation, not
+		// mutual exclusion.
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		assert!(txn1.get_for_update(&shared).unwrap().is_none());
+		assert!(txn2.get_for_update(&shared).unwrap().is_none());
+
+		txn1.set(b"out1", b"a").unwrap();
+		txn2.set(b"out2", b"b").unwrap();
+
+		txn1.commit().await.unwrap();
+		txn2.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn cancelled_commit_success_on_retry() {
+		let temp_dir = create_temp_directory();
+		let store = TreeBuilder::new()
+			.with_path(temp_dir.path().to_path_buf())
+			.with_memtable_stall_threshold(2)
+			.build()
+			.unwrap();
+		// Force commit to wait before writing.
+		{
+			let mut immutables = store.core.inner.immutable_memtables.write().unwrap();
+			immutables.add(1, 0, Arc::new(crate::memtable::MemTable::new(1024)));
+			immutables.add(2, 0, Arc::new(crate::memtable::MemTable::new(1024)));
+		}
+
+		let locked = Vec::from("locked");
+		let written = Vec::from("written");
+
+		let mut txn = store.begin().unwrap();
+		assert!(txn.get_for_update(&locked).unwrap().is_none());
+		txn.set(&written, b"value").unwrap();
+
+		let result = tokio::time::timeout(std::time::Duration::from_millis(20), txn.commit()).await;
+		assert!(result.is_err(), "the deliberately stalled commit should time out");
+
+		// A cancelled commit must close the transaction.
+		assert!(txn.read_set.is_empty(), "cancelled commit drained the locked reads");
+		assert!(txn.write_set.is_empty(), "cancelled commit drained the pending writes");
+		let post_cancel_read = txn.get(&locked);
+		let retry_result = txn.commit().await;
+		let reader = store.begin().unwrap();
+		assert!(reader.get(&written).unwrap().is_none(), "cancelled write unexpectedly persisted");
+		assert!(
+			matches!(&post_cancel_read, Err(Error::TransactionClosed))
+				&& matches!(&retry_result, Err(Error::TransactionClosed)),
+			"cancelled commit must close the transaction: post_cancel_read={post_cancel_read:?}, retry_result={retry_result:?}"
+		);
+	}
+}
+
+#[test(tokio::test)]
+async fn test_soft_delete_basic_functionality() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify data is visible
+	{
+		let tx = store.begin().unwrap();
+		assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
+		assert_eq!(tx.get(b"key2").unwrap().unwrap(), b"value2");
+		assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
+	}
+
+	// Soft delete key2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.soft_delete(b"key2").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify soft deleted key is not visible in reads
+	{
+		let tx = store.begin().unwrap();
+		assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
+		assert!(tx.get(b"key2").unwrap().is_none()); // Should be None after soft delete
+		assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
+	}
+
+	// Verify soft deleted key is not visible in range scans ([key1, key4) to
+	// include key3)
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
+		assert_eq!(range.len(), 2); // Only key1 and key3, key2 is filtered out
+		assert_eq!(&range[0].0, b"key1");
+		assert_eq!(&range[1].0, b"key3");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_soft_delete_vs_hard_delete() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Soft delete key1, hard delete key2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.soft_delete(b"key1").unwrap();
+		tx.delete(b"key2").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Both should be invisible to reads
+	{
+		let tx = store.begin().unwrap();
+		assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
+		assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
+		assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
+	}
+
+	// Both should be invisible to range scans ([key1, key4) to include key3)
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
+		assert_eq!(range.len(), 1); // Only key3
+		assert_eq!(&range[0].0, b"key3");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_soft_delete_in_transaction_write_set() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Start a transaction and soft delete within it
+	{
+		let mut tx = store.begin().unwrap();
+
+		// Soft delete key1 within the transaction
+		tx.soft_delete(b"key1").unwrap();
+
+		// Within the same transaction, the soft delete should NOT be visible
+		// The key should appear as if it doesn't exist
+		assert!(tx.get(b"key1").unwrap().is_none());
+
+		// Range scan within transaction should not see soft deleted key ([key1, key3)
+		// to include key2)
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key3").unwrap()).unwrap();
+		assert_eq!(range.len(), 1); // Only key2
+		assert_eq!(&range[0].0, b"key2");
+
+		tx.commit().await.unwrap();
+	}
+
+	// After commit, soft deleted key should still be invisible
+	{
+		let tx = store.begin().unwrap();
+		assert!(tx.get(b"key1").unwrap().is_none());
+		assert_eq!(tx.get(b"key2").unwrap().unwrap(), b"value2");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_soft_delete_then_reinsert() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Soft delete the key
+	{
+		let mut tx = store.begin().unwrap();
+		tx.soft_delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify it's not visible
+	{
+		let tx = store.begin().unwrap();
+		assert!(tx.get(b"key1").unwrap().is_none());
+	}
+
+	// Re-insert the same key with a new value
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1_new").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify the new value is visible
+	{
+		let tx = store.begin().unwrap();
+		assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1_new");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_soft_delete_range_scan_filtering() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert multiple keys
+	{
+		let mut tx = store.begin().unwrap();
+		for i in 1..=10 {
+			let key = format!("key{i:02}");
+			let value = format!("value{i}");
+			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	// Soft delete some keys
+	{
+		let mut tx = store.begin().unwrap();
+		tx.soft_delete(b"key02").unwrap();
+		tx.soft_delete(b"key05").unwrap();
+		tx.soft_delete(b"key08").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Range scan should not include soft deleted keys ([key01, key11) to include
+	// key10)
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"key01", b"key11").unwrap()).unwrap();
+
+		// Should have 7 keys (10 - 3 soft deleted)
+		assert_eq!(range.len(), 7);
+
+		// Verify specific keys are present/absent
+		let keys: std::collections::HashSet<_> = range.iter().map(|(k, _)| k.as_slice()).collect();
+		assert!(keys.contains(&b"key01".as_ref()));
+		assert!(!keys.contains(&b"key02".as_ref())); // Soft deleted
+		assert!(keys.contains(&b"key03".as_ref()));
+		assert!(keys.contains(&b"key04".as_ref()));
+		assert!(!keys.contains(&b"key05".as_ref())); // Soft deleted
+		assert!(keys.contains(&b"key06".as_ref()));
+		assert!(keys.contains(&b"key07".as_ref()));
+		assert!(!keys.contains(&b"key08".as_ref())); // Soft deleted
+		assert!(keys.contains(&b"key09".as_ref()));
+		assert!(keys.contains(&b"key10".as_ref()));
+	}
+}
+
+#[test(tokio::test)]
+async fn test_soft_delete_mixed_with_other_operations() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Mix of operations in one transaction
+	{
+		let mut tx = store.begin().unwrap();
+		tx.soft_delete(b"key1").unwrap(); // Soft delete
+		tx.delete(b"key2").unwrap(); // Hard delete
+		tx.set(b"key3", b"value3_updated").unwrap(); // Update
+													 // key4 remains unchanged
+		tx.commit().await.unwrap();
+	}
+
+	// Verify results
+	{
+		let tx = store.begin().unwrap();
+		assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
+		assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
+		assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3_updated"); // Updated
+		assert_eq!(tx.get(b"key4").unwrap().unwrap(), b"value4"); // Unchanged
+	}
+
+	// Range scan should only see updated and unchanged keys ([key1, key5) to
+	// include key4)
+	{
+		let tx = store.begin().unwrap();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key5").unwrap()).unwrap();
+		assert_eq!(range.len(), 2); // Only key3 and key4
+		assert_eq!(&range[0].0, b"key3");
+		assert_eq!(&range[1].0, b"key4");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_soft_delete_rollback() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Start transaction and soft delete, then rollback
+	{
+		let mut tx = store.begin().unwrap();
+		tx.soft_delete(b"key1").unwrap();
+
+		// Within transaction, key should be invisible
+		assert!(tx.get(b"key1").unwrap().is_none());
+
+		// Rollback the transaction
+		tx.rollback();
+	}
+
+	// After rollback, key should be visible again
+	{
+		let tx = store.begin().unwrap();
+		assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_conflict_detection_basic() {
+	let (store, _temp_dir) = create_store();
+
+	let key = b"conflict_key";
+	let value1 = b"value1";
+	let value2 = b"value2";
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let mut txn2 = store.begin().unwrap();
+
+	// Both write to the same key
+	txn1.set(key, value1).unwrap();
+	txn2.set(key, value2).unwrap();
+
+	// First commit succeeds
+	txn1.commit().await.unwrap();
+
+	// Second commit should fail with write conflict
+	let result = txn2.commit().await;
+	assert!(
+		matches!(result, Err(Error::TransactionWriteConflict)),
+		"Expected TransactionWriteConflict, got: {:?}",
+		result
+	);
+}
+
+/// Test that non-overlapping writes don't conflict.
+#[test(tokio::test)]
+async fn test_no_conflict_different_keys() {
+	let (store, _temp_dir) = create_store();
+
+	let key1 = b"key1";
+	let key2 = b"key2";
+	let value = b"value";
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let mut txn2 = store.begin().unwrap();
+
+	// Write to different keys
+	txn1.set(key1, value).unwrap();
+	txn2.set(key2, value).unwrap();
+
+	// Both should succeed
+	txn1.commit().await.unwrap();
+	txn2.commit().await.unwrap();
+
+	// Verify both writes are visible
+	let txn3 = store.begin().unwrap();
+	assert_eq!(txn3.get(key1).unwrap().unwrap(), value.to_vec());
+	assert_eq!(txn3.get(key2).unwrap().unwrap(), value.to_vec());
+}
+
+/// Test that reading a key doesn't create a conflict for writes to that key.
+/// (We implement write-write conflict detection, not read-write)
+#[test(tokio::test)]
+async fn test_read_write_no_conflict() {
+	let (store, _temp_dir) = create_store();
+
+	let key = b"read_write_key";
+	let value1 = b"value1";
+	let value2 = b"value2";
+
+	// Pre-populate the key
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(key, value1).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let txn2 = store.begin().unwrap();
+
+	// txn1 writes to the key
+	txn1.set(key, value2).unwrap();
+
+	// txn2 only reads the key (read-only transaction doesn't conflict)
+	let read_value = txn2.get(key).unwrap().unwrap();
+	assert_eq!(read_value, value1.to_vec()); // Should see old value (snapshot isolation)
+
+	// txn1 commits successfully
+	txn1.commit().await.unwrap();
+
+	// txn2 can still read its snapshot
+	assert_eq!(txn2.get(key).unwrap().unwrap(), value1.to_vec());
+}
+
+/// Test that a transaction that starts after another commits doesn't conflict.
+#[test(tokio::test)]
+async fn test_sequential_no_conflict() {
+	let (store, _temp_dir) = create_store();
+
+	let key = b"seq_key";
+	let value1 = b"value1";
+	let value2 = b"value2";
+
+	// First transaction
+	{
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(key, value1).unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	// Second transaction starts AFTER first commits - no conflict
+	{
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(key, value2).unwrap();
+		txn2.commit().await.unwrap();
+	}
+
+	// Verify final value
+	let txn3 = store.begin().unwrap();
+	assert_eq!(txn3.get(key).unwrap().unwrap(), value2.to_vec());
+}
+
+/// Test conflict detection with multiple keys where only one conflicts.
+#[test(tokio::test)]
+async fn test_partial_overlap_conflict() {
+	let (store, _temp_dir) = create_store();
+
+	let key1 = b"key1";
+	let key2 = b"key2";
+	let key3 = b"key3";
+	let value = b"value";
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let mut txn2 = store.begin().unwrap();
+
+	// txn1 writes to key1 and key2
+	txn1.set(key1, value).unwrap();
+	txn1.set(key2, value).unwrap();
+
+	// txn2 writes to key2 and key3 (key2 overlaps)
+	txn2.set(key2, value).unwrap();
+	txn2.set(key3, value).unwrap();
+
+	// First commit succeeds
+	txn1.commit().await.unwrap();
+
+	// Second commit should fail due to key2 conflict
+	let result = txn2.commit().await;
+	assert!(
+		matches!(result, Err(Error::TransactionWriteConflict)),
+		"Expected TransactionWriteConflict, got: {:?}",
+		result
+	);
+}
+
+#[test(tokio::test)]
+async fn test_delete_range_basic() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys k1, k2, k3, k4, k5
+	let mut tx = store.begin().unwrap();
+	tx.set(b"k1", b"v1").unwrap();
+	tx.set(b"k2", b"v2").unwrap();
+	tx.set(b"k3", b"v3").unwrap();
+	tx.set(b"k4", b"v4").unwrap();
+	tx.set(b"k5", b"v5").unwrap();
+	tx.commit().await.unwrap();
+
+	// Delete range [k2, k4)
+	let mut tx = store.begin().unwrap();
+	tx.delete_range(b"k2", b"k4").unwrap();
+	tx.commit().await.unwrap();
+
+	// Verify outside keys still exist
+	let tx = store.begin().unwrap();
+	assert_eq!(tx.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+	assert_eq!(tx.get(b"k4").unwrap(), Some(b"v4".to_vec()));
+	assert_eq!(tx.get(b"k5").unwrap(), Some(b"v5".to_vec()));
+}
+
+// =============================================================================
+// TransactionRangeIterator Direction-Switching Tests
+// =============================================================================
+// These tests verify the behavior of direction switching (forward <-> backward)
+// in TransactionRangeIterator. The expected behavior is that switching direction
+// should move to the element immediately before/after the current position,
+// NOT reset to the absolute first/last element.
+
+/// Test 1: Forward-to-backward direction switch with empty write-set
+/// When iterating forward to "c" and calling prev(), should return "b", not "e"
+#[test(tokio::test)]
+async fn test_direction_switch_forward_to_backward_empty_writeset() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys ["a", "b", "c", "d", "e"] via committed transaction
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Start new read-only transaction (empty write-set)
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward iterate to "c": seek_first() -> next() -> next()
+	assert!(iter.seek_first().unwrap(), "seek_first should succeed");
+	assert_eq!(iter.key().user_key(), b"a", "Should be at 'a' after seek_first");
+
+	assert!(iter.next().unwrap(), "next to 'b' should succeed");
+	assert_eq!(iter.key().user_key(), b"b", "Should be at 'b' after first next");
+
+	assert!(iter.next().unwrap(), "next to 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"c", "Should be at 'c' after second next");
+
+	// Call prev() - EXPECTED: should return "b"
+	// CURRENT BUG: returns "e" (calls seek_last() instead of moving backward)
+	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"b", "After prev() from 'c', should be at 'b', not 'e'");
+
+	// Continue backward to verify correct behavior
+	assert!(iter.prev().unwrap(), "prev from 'b' should succeed");
+	assert_eq!(iter.key().user_key(), b"a", "Should be at 'a'");
+
+	// No more elements backward
+	assert!(!iter.prev().unwrap(), "prev from 'a' should return false (no more elements)");
+}
+
+/// Test 2: Forward-to-backward at end of range
+/// When at last element "e" and calling prev(), should return "d"
+#[test(tokio::test)]
+async fn test_direction_switch_forward_to_backward_at_end() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward iterate to the last element "e"
+	iter.seek_first().unwrap();
+	while iter.valid() && iter.key().user_key() != b"e" {
+		iter.next().unwrap();
+	}
+	assert_eq!(iter.key().user_key(), b"e", "Should be at 'e'");
+
+	// Call prev() - should return "d", not stay at "e" or behave incorrectly
+	assert!(iter.prev().unwrap(), "prev from 'e' should succeed");
+	assert_eq!(iter.key().user_key(), b"d", "After prev() from 'e', should be at 'd'");
+}
+
+/// Test 3: Backward-to-forward direction switch
+/// When iterating backward to "c" and calling next(), should return "d"
+#[test(tokio::test)]
+async fn test_direction_switch_backward_to_forward() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Backward iterate: seek_last() to "e", then prev() -> prev() to reach "c"
+	assert!(iter.seek_last().unwrap(), "seek_last should succeed");
+	assert_eq!(iter.key().user_key(), b"e", "Should be at 'e' after seek_last");
+
+	assert!(iter.prev().unwrap(), "prev to 'd' should succeed");
+	assert_eq!(iter.key().user_key(), b"d", "Should be at 'd'");
+
+	assert!(iter.prev().unwrap(), "prev to 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"c", "Should be at 'c'");
+
+	// Call next() - EXPECTED: should return "d"
+	// Potential bug: next() might not handle direction switching correctly
+	assert!(iter.next().unwrap(), "next from 'c' should succeed");
+	assert_eq!(
+		iter.key().user_key(),
+		b"d",
+		"After next() from 'c' (backward mode), should be at 'd'"
+	);
+
+	// Continue forward to verify
+	assert!(iter.next().unwrap(), "next to 'e' should succeed");
+	assert_eq!(iter.key().user_key(), b"e", "Should be at 'e'");
+
+	// No more elements forward
+	assert!(!iter.next().unwrap(), "next from 'e' should return false");
+}
+
+/// Test 4: Direction switch with RYOW (non-empty write-set)
+/// Tests the complex case where snapshot was advanced past the logical position due to RYOW
+#[test(tokio::test)]
+async fn test_direction_switch_with_ryow() {
+	let (store, _temp_dir) = create_store();
+
+	// Commit keys ["a", "c", "e"]
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a_committed").unwrap();
+		txn.set(b"c", b"val_c_committed").unwrap();
+		txn.set(b"e", b"val_e_committed").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Start write transaction, add key "b" (uncommitted - in write-set)
+	let mut tx = store.begin().unwrap();
+	tx.set(b"b", b"val_b_uncommitted").unwrap();
+
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward iterate: a -> b -> c
+	assert!(iter.seek_first().unwrap());
+	assert_eq!(iter.key().user_key(), b"a");
+
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"b", "Should see uncommitted 'b' from write-set");
+
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"c");
+
+	// Now at "c", call prev() - should return "b"
+	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
+	assert_eq!(
+		iter.key().user_key(),
+		b"b",
+		"After prev() from 'c', should be at 'b' (from write-set)"
+	);
+
+	// Continue backward to "a"
+	assert!(iter.prev().unwrap(), "prev from 'b' should succeed");
+	assert_eq!(iter.key().user_key(), b"a");
+}
+
+/// Test 5: Multiple direction switches
+/// Iterate forward, switch to backward, switch to forward again
+#[test(tokio::test)]
+async fn test_multiple_direction_switches() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward: a -> b -> c
+	iter.seek_first().unwrap();
+	assert_eq!(iter.key().user_key(), b"a");
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), b"b");
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), b"c");
+
+	// Switch to backward: c -> b
+	assert!(iter.prev().unwrap());
+	assert_eq!(iter.key().user_key(), b"b", "First backward: should be at 'b'");
+
+	// Switch to forward again: b -> c
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"c", "Forward again: should be at 'c'");
+
+	// Continue forward: c -> d -> e
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"d");
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"e");
+
+	// Switch to backward again: e -> d
+	assert!(iter.prev().unwrap());
+	assert_eq!(iter.key().user_key(), b"d", "Second backward: should be at 'd'");
+
+	// And back to forward: d -> e
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"e", "Forward from 'd': should be at 'e'");
+}
+
+/// Test 6: Direction switch after seek (not seek_first/seek_last)
+/// Tests that seek() followed by prev() works correctly
+#[test(tokio::test)]
+async fn test_direction_switch_after_seek() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Seek directly to "c"
+	assert!(iter.seek(b"c").unwrap(), "seek to 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"c", "Should be at 'c' after seek");
+
+	// Call prev() - should return "b", not "e"
+	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"b", "After prev() from seek('c'), should be at 'b'");
+}
+
+// A `ReadOptions` side left at `None` is documented as unbounded, so the scan
+// must run to the end of the keyspace on that side, and must see keys written
+// in this transaction there as well as committed ones.
+#[test(tokio::test)]
+async fn range_with_options_treats_missing_bounds_as_unbounded() {
+	use crate::ReadOptions;
+
+	let (store, _temp_dir) = create_store();
+	{
+		let mut txn = store.begin().unwrap();
+		for k in [&b"a"[..], b"m1", b"m2", b"z"] {
+			txn.set(k, b"committed").unwrap();
+		}
+		txn.commit().await.unwrap();
+	}
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"zz", b"uncommitted").unwrap();
+
+	let keys = |txn: &crate::Transaction, lower: Option<&[u8]>, upper: Option<&[u8]>| {
+		let mut options = ReadOptions::default();
+		options.set_iterate_lower_bound(lower.map(<[u8]>::to_vec));
+		options.set_iterate_upper_bound(upper.map(<[u8]>::to_vec));
+		let forward = collect_transaction_all(&mut txn.range_with_options(&options).unwrap())
+			.unwrap()
+			.into_iter()
+			.map(|(k, _)| k)
+			.collect::<Vec<_>>();
+		let mut reverse =
+			collect_transaction_reverse(&mut txn.range_with_options(&options).unwrap())
+				.unwrap()
+				.into_iter()
+				.map(|(k, _)| k)
+				.collect::<Vec<_>>();
+		reverse.reverse();
+		assert_eq!(forward, reverse, "forward and reverse scans disagree");
+		forward
+	};
+	let expect = |ks: &[&[u8]]| ks.iter().map(|k| k.to_vec()).collect::<Vec<_>>();
+
+	assert_eq!(keys(&txn, Some(b"m"), None), expect(&[b"m1", b"m2", b"z", b"zz"]));
+	assert_eq!(keys(&txn, None, Some(b"m2")), expect(&[b"a", b"m1"]));
+	assert_eq!(keys(&txn, None, None), expect(&[b"a", b"m1", b"m2", b"z", b"zz"]));
+}
+
+#[test(tokio::test)]
+async fn test_transaction_iter_and_scan_api() {
+	let (store, _temp_dir) = create_store();
+	{
+		let mut txn = store.begin().unwrap();
+		for k in [&b"k1"[..], b"k2", b"k3", b"k4", b"k5"] {
+			txn.set(k, b"val").unwrap();
+		}
+		txn.commit().await.unwrap();
+	}
+
+	let txn = store.begin().unwrap();
+	let expect = |ks: &[&[u8]]| ks.iter().map(|k| k.to_vec()).collect::<Vec<_>>();
+
+	// 1. tx.iter() full scan
+	let mut it = txn.iter().unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k1", b"k2", b"k3", b"k4", b"k5"]));
+
+	// 2. tx.scan(..) full scan
+	let mut it = txn.scan(..).unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k1", b"k2", b"k3", b"k4", b"k5"]));
+
+	// 3. tx.scan(start..end) half-open
+	let mut it = txn.scan(b"k2"..b"k4").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k2", b"k3"]));
+
+	// 4. tx.scan(start..=end) inclusive
+	let mut it = txn.scan(b"k2"..=b"k4").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k2", b"k3", b"k4"]));
+
+	// 5. tx.scan(start..) from
+	let mut it = txn.scan(b"k3"..).unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k3", b"k4", b"k5"]));
+
+	// 6. tx.scan(..end) to
+	let mut it = txn.scan(..b"k3").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k1", b"k2"]));
+
+	// 7. tx.scan with &str
+	let mut it = txn.scan("k2".."k4").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k2", b"k3"]));
+}

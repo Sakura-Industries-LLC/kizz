@@ -143,6 +143,7 @@ use crate::{
     lookup::{ProgramLookup, find_program},
     observe::{changed_after_read, observe},
     patterns::PathPatterns,
+    pool::WorkerPool,
     runtime::ProgramHash,
     states::FileStates,
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
@@ -281,7 +282,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl<'a> Engine<'a> {
     /// An engine for one build that runs commands with `tracer`, echoes live output
     /// to `echo`, stops commands when `cancel` is set, stores records in `store`,
-    /// and expands `~/` in patterns to `home`, the caller's home directory.
+    /// expands `~/` in patterns to `home`, the caller's home directory, and runs its
+    /// parallel work, hashing included, on `pool`.
     #[must_use]
     pub fn new(
         tracer: &'a dyn Tracer,
@@ -289,6 +291,7 @@ impl<'a> Engine<'a> {
         echo: &'a dyn EchoSink,
         cancel: Cancellation,
         home: Option<AbsolutePath>,
+        pool: &WorkerPool,
     ) -> Self {
         Self {
             tracer,
@@ -296,7 +299,7 @@ impl<'a> Engine<'a> {
             echo,
             cancel,
             home,
-            states: FileStates::new(),
+            states: FileStates::new(pool.clone()),
             always_ran: Mutex::new(HashMap::new()),
             not_cached: Mutex::new(HashMap::new()),
             build: next_build(),
@@ -814,7 +817,8 @@ const fn step_exit(termination: Termination) -> StepExit {
 }
 
 /// The request that runs `step` with the found program `program`: its exact
-/// arguments, environment, working directory, `stdin`, capture mode and echo.
+/// arguments, environment, working directory, `stdin`, capture mode and echo,
+/// without the process tree, which a build never asks for.
 fn run_request(
     step: &StepSpec,
     program: AbsolutePath,
@@ -831,6 +835,7 @@ fn run_request(
         stdin: step.stdin.as_ref().map(|text| text.as_bytes().to_vec()),
         capture: step.capture,
         echo: step.stream,
+        tree: false,
     }
 }
 

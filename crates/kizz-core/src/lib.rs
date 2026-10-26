@@ -42,6 +42,8 @@
 //!   learned order, until a pass does no work, with failure handling and the pass limit.
 //! * [`cleanup`]: the entries `kizz cache clean` removes because their files are gone,
 //!   and the entries `kizz cache reset` wipes for the tasks under a path.
+//! * [`pool`]: the worker pool that runs a command's parallel work, whose threads start
+//!   through `kizz_threads`, so `rayon`'s global pool never starts.
 
 pub mod build;
 pub mod check;
@@ -55,6 +57,7 @@ pub mod key;
 pub mod lookup;
 pub mod observe;
 pub mod patterns;
+pub mod pool;
 pub mod project;
 pub mod render;
 pub mod runtime;
@@ -86,6 +89,7 @@ pub use observe::{
     path_state, reaches_kernel, record_attributes,
 };
 pub use patterns::{PathPatterns, PatternError, REGEX_PREFIX};
+pub use pool::{MAX_WORKERS, PoolError, WorkerPool};
 pub use project::{ConfigError, LoadError, Project, load};
 pub use render::{CACHED, Render, access_kinds};
 pub use runtime::{

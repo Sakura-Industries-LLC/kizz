@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 kizz-core = { path = "../kizz-core", version = "0.0.1" }
 kizz-store = { path = "../kizz-store", version = "0.0.1" }
+kizz-threads = { path = "../kizz-threads", version = "0.0.1" }
 kizz-trace = { path = "../kizz-trace", version = "0.0.1" }
 kizz-trace-linux = { path = "../kizz-trace-linux", version = "0.0.1" }
 bpaf = { version = "0.9.28", features = ["derive"] }

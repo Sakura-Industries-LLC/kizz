@@ -16,7 +16,8 @@ use std::{
 use kizz_trace::{
     AbsolutePath, AccessKind, AccessKinds, Accesses, Cancellation, CaptureMode, CapturedOutput,
     Connection, Disk, EchoSink, ExtendedAttributes, FileSystem, FirstReads, Kernel, MachineState,
-    Memory, OutputStream, ResourceLimit, RunRequest, RunResult, Termination, TraceError, Tracer,
+    Memory, OutputStream, ProcessTree, ResourceLimit, RunRequest, RunResult, Termination,
+    TraceError, Tracer,
 };
 
 /// The signal number the fake reports for a cancelled request.
@@ -95,6 +96,9 @@ impl Tracer for FakeTracer {
             accesses.record(request.program.clone(), AccessKind::Probe);
             return Err(TraceError::ProgramNotFound {
                 program: request.program.clone(),
+                tree: request
+                    .tree
+                    .then(|| ProcessTree::of_request(request, &accesses, None)),
                 accesses,
             });
         };
@@ -107,6 +111,13 @@ impl Tracer for FakeTracer {
             return Ok(RunResult {
                 termination: Termination::Signaled(SIGKILL),
                 output: CapturedOutput::empty(request.capture),
+                tree: request.tree.then(|| {
+                    ProcessTree::of_request(
+                        request,
+                        &accesses,
+                        Some(Termination::Signaled(SIGKILL)),
+                    )
+                }),
                 accesses,
                 incomplete: None,
                 first_reads,
@@ -148,6 +159,9 @@ impl Tracer for FakeTracer {
         Ok(RunResult {
             termination: script.termination,
             output,
+            tree: request
+                .tree
+                .then(|| ProcessTree::of_request(request, &accesses, Some(script.termination))),
             accesses,
             incomplete: None,
             first_reads,
@@ -251,6 +265,7 @@ fn request(
         stdin: Some(b"input".to_vec()),
         capture,
         echo,
+        tree: false,
     })
 }
 
@@ -347,6 +362,38 @@ fn fake_tracer_reports_a_missing_program() {
             .and_then(|accesses| accesses.get(&path("/bin/missing").unwrap())),
         Some(AccessKinds::only(AccessKind::Probe))
     );
+}
+
+/// The fake gives the tree of one process only when the request asks for it, and
+/// that tree combines to the run's accesses; a missing program's tree has no status.
+#[test]
+fn fake_tracer_gives_the_tree_that_a_request_asks_for() {
+    let fake =
+        FakeTracer::default().with_script(path("/bin/tool").unwrap(), tool_script().unwrap());
+    let mut request = request("/bin/tool", CaptureMode::Split, false).unwrap();
+    let without = fake
+        .run(&request, &RecordingEcho::default(), &Cancellation::new())
+        .unwrap();
+    assert_eq!(without.tree, None);
+    request.tree = true;
+    let with = fake
+        .run(&request, &RecordingEcho::default(), &Cancellation::new())
+        .unwrap();
+    let tree = with.tree.as_ref().unwrap();
+    assert_eq!(tree.accesses(), with.accesses);
+    assert_eq!(with.accesses, without.accesses);
+    assert_eq!(
+        tree.process(1).and_then(|process| process.status),
+        Some(Termination::Exited(3))
+    );
+
+    request.program = path("/bin/missing").unwrap();
+    let error = fake
+        .run(&request, &RecordingEcho::default(), &Cancellation::new())
+        .unwrap_err();
+    let tree = error.tree().unwrap();
+    assert_eq!(Some(&tree.accesses()), error.accesses());
+    assert_eq!(tree.process(1).map(|process| process.status), Some(None));
 }
 
 /// A cancelled request ends with a signal and no exit code.

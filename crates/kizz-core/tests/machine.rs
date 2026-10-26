@@ -27,7 +27,7 @@ use std::{
 
 use kizz_core::{
     Engine, ProgramHash, ProgramParts, Render, StepDecision, StepExecutor as _, StepSpec,
-    TaskIdentity, TaskSteps, why,
+    TaskIdentity, TaskSteps, WorkerPool, why,
 };
 use kizz_store::{
     DiskRecord, Explanation, FileSystemRecord, KernelRecord, LimitRecord, MachineChange,
@@ -37,7 +37,7 @@ use kizz_store::{
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Disk, EchoSink,
     ExtendedAttributes, FileSystem, FirstReads, Kernel, MachineState, Memory, OutputStream,
-    ResourceLimit, RunRequest, RunResult, Termination, TraceError, Tracer,
+    ProcessTree, ResourceLimit, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -160,6 +160,9 @@ impl Tracer for FakeTracer {
         Ok(RunResult {
             termination: Termination::Exited(0),
             output: CapturedOutput::empty(request.capture),
+            tree: request
+                .tree
+                .then(|| ProcessTree::of_request(request, &accesses, Some(Termination::Exited(0)))),
             accesses,
             incomplete: None,
             first_reads,
@@ -309,7 +312,14 @@ impl Fixture {
         steps: &[&StepSpec],
     ) -> TestResult<Built> {
         let store = Store::open(self.cache.path())?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let run: TaskSteps<'_> = engine.task_for(self.task()?);
         for step in steps {
             run.execute(step)?;
@@ -531,7 +541,14 @@ fn the_state_is_recorded_for_every_step_that_runs_and_queried_for_no_hit() -> Te
     ]);
 
     let store = Store::open(fixture.cache.path())?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        &tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     let run = engine.task(ProgramHash::from_bytes([7; 32]), fixture.task()?.dir);
     assert!(run.execute(&missing).is_err());
     let missing_key = *run.keys().first().ok_or("no key")?;

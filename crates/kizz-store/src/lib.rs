@@ -9,7 +9,7 @@
 //! * [`lock`]: one process at a time holds `kizz.lock` in the cache directory, and any
 //!   other waits and says what it is waiting for.
 //! * [`store`]: the records live in `SurrealKV`, embedded, in the `db` directory of the
-//!   cache, as CBOR encoded with `minicbor`.
+//!   cache, as CBOR encoded with `minicbor`; the store starts no thread of its own.
 //! * [`identity`]: the stamp of the machine and user that the cache belongs to, which the
 //!   store writes into a new database and compares on every later open.
 //! * [`records`]: the record families, their key layout, and their typed records.
@@ -54,4 +54,6 @@ pub use step::{
     SpecialKind, StepExit, StepRecord, StepSpecRecord, Times, changed_reads_text, connections_text,
     permission_bits, system_call_numbers,
 };
-pub use store::{DATABASE_DIR, EntryCounts, Inventory, SCHEMA_VERSION, Store, StoreError, Txn};
+pub use store::{
+    DATABASE_DIR, EntryCounts, Inventory, SCHEMA_VERSION, STALL_THRESHOLD, Store, StoreError, Txn,
+};

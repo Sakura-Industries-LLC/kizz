@@ -1,0 +1,788 @@
+use std::fs::File as SysFile;
+use std::ops::Bound;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use artmap::arena::{ArenaVersionedArtMap, ArenaVersionedEntryRef, ArenaVersionedRange};
+
+/// Upper bound on what one entry costs a memtable: the worst-case arena bytes
+/// of one insert (as reported by artmap) plus the value length. Keys and
+/// values live on the heap, so the value term is not arena space; it keeps
+/// the estimate proportional to the logical batch size, which is what the
+/// direct-to-L0 cutoff for oversized batches compares against.
+#[inline]
+pub(crate) const fn max_entry_bytes(key_len: usize, value_len: usize) -> u64 {
+	ArenaVersionedArtMap::<Key, Value>::max_insert_bytes(key_len) as u64 + value_len as u64
+}
+
+use crate::batch::Batch;
+use crate::error::Result;
+use crate::sstable::table::{Table, TableWriter};
+use crate::vfs::File;
+use crate::vlog::{VLog, ValueLocation, ValuePointer};
+use crate::{
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRef,
+	Key,
+	LSMIterator,
+	Options,
+	Value,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+};
+
+/// Encoded bplustree entries: Vec of (encoded_key, encoded_value) pairs.
+pub(crate) type BPTreeEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Entry in the immutable memtables list, tracking both the table ID
+/// and the WAL number that contains this memtable's data.
+#[derive(Clone)]
+pub(crate) struct ImmutableEntry {
+	/// The table ID that will be used for the SST file
+	pub table_id: u64,
+	/// The WAL segment this memtable is tagged with: every record applied to it
+	/// lies in this segment (the commit pipeline checks that before applying a
+	/// batch), so flushing it makes every segment up to this one deletable.
+	pub wal_number: u64,
+	/// The memtable data
+	pub memtable: Arc<MemTable>,
+}
+
+#[derive(Default)]
+pub(crate) struct ImmutableMemtables(Vec<ImmutableEntry>);
+
+impl ImmutableMemtables {
+	/// Adds an immutable memtable entry with its associated table ID and WAL
+	/// number.
+	pub(crate) fn add(&mut self, table_id: u64, wal_number: u64, memtable: Arc<MemTable>) {
+		self.0.push(ImmutableEntry {
+			table_id,
+			wal_number,
+			memtable,
+		});
+		self.0.sort_by_key(|entry| entry.table_id); // Maintain sorted order by ID
+	}
+
+	pub(crate) fn remove(&mut self, id_to_remove: u64) {
+		if let Ok(index) = self.0.binary_search_by_key(&id_to_remove, |entry| entry.table_id) {
+			self.0.remove(index);
+		}
+	}
+
+	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &ImmutableEntry> {
+		self.0.iter()
+	}
+
+	/// Returns the total memory size of all immutable memtables.
+	pub(crate) fn total_size(&self) -> usize {
+		self.0.iter().map(|e| e.memtable.size()).sum()
+	}
+
+	pub(crate) fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	/// The log number to record once the memtable written to WAL segment `wal_number` is in a
+	/// table: `wal_number + 1`, held back to the oldest segment of any other queued memtable (the
+	/// one with table id `flushed`, if it is queued, does not count).
+	pub(crate) fn log_number_after(&self, flushed: Option<u64>, wal_number: u64) -> u64 {
+		self.0
+			.iter()
+			.filter(|entry| Some(entry.table_id) != flushed)
+			.map(|entry| entry.wal_number)
+			.fold(wal_number + 1, u64::min)
+	}
+
+	/// Returns the oldest (first) immutable memtable entry.
+	/// Entries are sorted by table_id, so the first entry is the oldest.
+	pub(crate) fn first(&self) -> Option<&ImmutableEntry> {
+		self.0.first()
+	}
+}
+
+pub(crate) struct MemTable {
+	map: ArenaVersionedArtMap<Key, Value>,
+	latest_seq_num: AtomicU64,
+	/// The WAL segment this memtable is tagged with. A batch is applied to a
+	/// memtable only if its WAL record was appended to this segment, verified
+	/// under the active-memtable lock that rotation also needs, so a flush that
+	/// moves the manifest's `log_number` past the tag never deletes a segment that
+	/// holds the only record of a batch still in a newer memtable. Used to
+	/// determine which WALs can be safely deleted after flush. (The memtable
+	/// recovered at startup is the exception: it may hold records of older
+	/// segments, but it is the oldest memtable and is flushed as a unit.)
+	wal_number: AtomicU64,
+	/// The smallest value log file id any value of this memtable points into, `u32::MAX` while
+	/// none does. Lowered before the values of a batch are inserted, never raised.
+	min_vlog_file_id: AtomicU32,
+	/// Bytes reserved by in-flight `add` calls but not yet allocated in the
+	/// arena. Atomically updated by `try_reserve` / `release_reservation`
+	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
+	/// succeeds) or the memtable is left unchanged (reservation fails with ArenaFull).
+	reserved: AtomicU64,
+	/// Tracked range tombstones: (start_key, end_key, seq_num)
+	pub(crate) range_deletions: parking_lot::RwLock<Vec<(Key, Key, u64)>>,
+	pub(crate) has_range_deletions: std::sync::atomic::AtomicBool,
+}
+
+impl Default for MemTable {
+	fn default() -> Self {
+		Self::new(1024 * 1024)
+	}
+}
+
+/// Releases a `MemTable` reservation on drop. Used by `MemTable::add` to ensure
+/// the reservation is freed even if `apply_batch_to_memtable` returns an error
+/// (which should not happen after a successful `try_reserve`, but the guard
+/// keeps the contract panic-safe and `?`-safe).
+struct ReservationGuard<'a> {
+	memtable: &'a MemTable,
+	bytes: u64,
+}
+
+impl Drop for ReservationGuard<'_> {
+	fn drop(&mut self) {
+		self.memtable.release_reservation(self.bytes);
+	}
+}
+
+impl MemTable {
+	pub(crate) fn new(arena_capacity: usize) -> Self {
+		let map = ArenaVersionedArtMap::with_capacity(arena_capacity);
+		MemTable {
+			map,
+			latest_seq_num: AtomicU64::new(0),
+			wal_number: AtomicU64::new(0),
+			min_vlog_file_id: AtomicU32::new(u32::MAX),
+			reserved: AtomicU64::new(0),
+			range_deletions: parking_lot::RwLock::new(Vec::new()),
+			has_range_deletions: std::sync::atomic::AtomicBool::new(false),
+		}
+	}
+
+	/// Sets the WAL number associated with this memtable.
+	/// This should be called when the memtable starts receiving writes
+	/// to track which WAL contains its data.
+	pub(crate) fn set_wal_number(&self, wal_number: u64) {
+		self.wal_number.store(wal_number, Ordering::Release);
+	}
+
+	/// Gets the WAL number associated with this memtable.
+	/// Returns 0 if the WAL number has not been set.
+	pub(crate) fn get_wal_number(&self) -> u64 {
+		self.wal_number.load(Ordering::Acquire)
+	}
+
+	/// The smallest value log file any value of this memtable points into, if one does. A value
+	/// log file is deleted only once no table and no memtable has a pointer into it.
+	pub(crate) fn min_vlog_file_id(&self) -> Option<u32> {
+		match self.min_vlog_file_id.load(Ordering::Acquire) {
+			u32::MAX => None,
+			file_id => Some(file_id),
+		}
+	}
+
+	pub(crate) fn has_range_deletions(&self) -> bool {
+		self.has_range_deletions.load(Ordering::Relaxed)
+	}
+
+	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
+		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
+		let max_trailer = (max_seq << 8) | 0xFF;
+
+		// Check if covered by any range tombstone
+		let mut range_tombstone_seq: Option<u64> = None;
+		if self.has_range_deletions.load(Ordering::Relaxed) {
+			for (start, end, seq) in self.range_deletions.read().iter() {
+				if *seq <= max_seq && key >= start.as_slice() && key < end.as_slice() {
+					range_tombstone_seq = Some(range_tombstone_seq.map_or(*seq, |s| s.max(*seq)));
+				}
+			}
+		}
+
+		let mut point_res: Option<(InternalKey, Value)> = None;
+		if let Some((found_trailer, val)) = self.map.get_version_le(key, max_trailer) {
+			let internal_key = InternalKey {
+				user_key: key.to_vec(),
+				trailer: found_trailer,
+			};
+			point_res = Some((internal_key, val));
+		}
+
+		if let Some(rseq) = range_tombstone_seq {
+			if let Some(ref res) = point_res {
+				if res.0.seq_num() > rseq {
+					return point_res;
+				}
+			}
+			return None;
+		}
+
+		point_res
+	}
+
+	pub(crate) fn is_empty(&self) -> bool {
+		self.map.is_empty()
+	}
+
+	pub(crate) fn size(&self) -> usize {
+		self.map.arena().size()
+	}
+
+	/// Arena capacity in bytes (total, including artmap's 64-byte null region).
+	pub(crate) fn arena_capacity(&self) -> usize {
+		self.map.arena().capacity()
+	}
+
+	/// Whether `bytes` more fit in the arena next to the `reserved` bytes already
+	/// claimed by in-flight inserts.
+	fn fits(&self, bytes: u64, reserved: u64) -> bool {
+		let used = self.size() as u64;
+		let avail = (self.arena_capacity() as u64).saturating_sub(used).saturating_sub(reserved);
+		bytes <= avail
+	}
+
+	/// Whether a batch needing `bytes` would be accepted by `add` right now.
+	///
+	/// Exact when nothing else is inserting concurrently, which is the case for the
+	/// commit flusher: it is the only writer of the active memtable.
+	pub(crate) fn can_fit(&self, bytes: u64) -> bool {
+		self.fits(bytes, self.reserved.load(Ordering::Acquire))
+	}
+
+	/// Atomically reserve `bytes` of arena space for an upcoming batch insertion.
+	///
+	/// On `Ok(())`, the caller has exclusive claim to `bytes` of arena space and
+	/// MUST eventually call `release_reservation(bytes)`. On `Err(ArenaFull)`,
+	/// the memtable state is unchanged and the caller should rotate to a fresh
+	/// memtable and retry.
+	///
+	/// This is a CAS loop; spurious failures retry until either the reservation
+	/// succeeds or `ArenaFull` is observed against the freshest `reserved` value.
+	pub(crate) fn try_reserve(&self, bytes: u64) -> Result<()> {
+		loop {
+			let current = self.reserved.load(Ordering::Acquire);
+			if !self.fits(bytes, current) {
+				return Err(crate::Error::ArenaFull);
+			}
+			if self
+				.reserved
+				.compare_exchange_weak(
+					current,
+					current + bytes,
+					Ordering::AcqRel,
+					Ordering::Acquire,
+				)
+				.is_ok()
+			{
+				return Ok(());
+			}
+		}
+	}
+
+	/// Release `bytes` previously claimed by `try_reserve`.
+	pub(crate) fn release_reservation(&self, bytes: u64) {
+		self.reserved.fetch_sub(bytes, Ordering::AcqRel);
+	}
+
+	/// Applies a batch of operations to the memtable **atomically**.
+	///
+	/// Returns `Err(ArenaFull)` if the batch will not fit; in that case the
+	/// memtable state is unchanged and the caller may rotate and retry on a
+	/// fresh memtable. On `Ok(())` every entry has been inserted.
+	///
+	/// The atomicity is provided by an upfront `try_reserve` call using a
+	/// worst-case upper bound (`Batch::memtable_size_estimate`); after the
+	/// reservation succeeds, the per-entry inserts cannot run out of space.
+	///
+	/// # Arguments
+	/// * `batch` - The batch of operations to apply
+	pub(crate) fn add(&self, batch: &Batch) -> Result<()> {
+		let needed = batch.memtable_size_estimate();
+		self.try_reserve(needed)?;
+		let _guard = ReservationGuard {
+			memtable: self,
+			bytes: needed,
+		};
+		self.note_vlog_pointers(batch);
+		let highest_seq_num = self.apply_batch_to_memtable(batch)?;
+		self.update_latest_sequence_number(highest_seq_num);
+		Ok(())
+	}
+
+	/// As [`add`](Self::add), but moves the keys and values of `batch` into the memtable
+	/// instead of cloning them, and takes the batch's `memtable_size_estimate` from the caller,
+	/// which has already computed it.
+	///
+	/// On `Err(ArenaFull)` the batch is untouched, as with `add`. On `Ok(())` its entries are
+	/// spent: their keys are empty and their values `None`, and only `count()` is still
+	/// meaningful. Any other error means the estimate drifted from the arena after a successful
+	/// reservation, which cannot happen. It is `Error::Other`, not `ArenaFull`: the pipeline
+	/// retries `ArenaFull` with the same batch, and a batch that is partly spent would insert
+	/// empty keys.
+	pub(crate) fn add_owned(&self, batch: &mut Batch, needed: u64) -> Result<()> {
+		self.try_reserve(needed)?;
+		let _guard = ReservationGuard {
+			memtable: self,
+			bytes: needed,
+		};
+		self.note_vlog_pointers(batch);
+		let start_seq_num = batch.starting_seq_num;
+		for (i, entry) in batch.entries.iter_mut().enumerate() {
+			let seq_num = start_seq_num + i as u64;
+			if entry.kind == InternalKeyKind::RangeDelete {
+				let end_key = entry.value.clone().unwrap_or_default();
+				self.range_deletions.write().push((entry.key.clone(), end_key, seq_num));
+				self.has_range_deletions.store(true, Ordering::Release);
+			}
+
+			let trailer = (seq_num << 8) | (entry.kind as u64);
+			let value = entry.value.take();
+			let has_value = value.is_some();
+			// A delete stores an empty value.
+			let inserted = self.map.try_insert(
+				std::mem::take(&mut entry.key),
+				trailer,
+				value.unwrap_or_default(),
+			);
+			if let Err(full) = inserted {
+				entry.key = full.key;
+				entry.value = has_value.then_some(full.value);
+				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
+				return Err(crate::Error::Other("memtable size estimate drift".to_string()));
+			}
+		}
+		self.update_latest_sequence_number(batch.get_highest_seq_num());
+		Ok(())
+	}
+
+	/// Lowers `min_vlog_file_id` to the smallest file `batch` points into. `add` and `add_owned`
+	/// run it before the entries are inserted, so a pointer is never in the memtable without the
+	/// minimum covering it. The commit pipeline runs it for a batch it logged and did not apply:
+	/// recovery replays the record, and the memtable keeps the files it points into for as long
+	/// as the WAL segment of that record may be replayed. The end key of a range delete is not a
+	/// value.
+	pub(crate) fn note_vlog_pointers(&self, batch: &Batch) {
+		let files = batch
+			.entries
+			.iter()
+			.filter(|entry| entry.kind != InternalKeyKind::RangeDelete)
+			.filter_map(|entry| ValueLocation::peek_pointer_payload(entry.value.as_deref()?))
+			.filter_map(|payload| ValuePointer::decode(payload).ok())
+			.map(|pointer| pointer.file_id);
+		if let Some(file_id) = files.min() {
+			self.min_vlog_file_id.fetch_min(file_id, Ordering::Release);
+		}
+	}
+
+	/// Applies the batch of operations to the in-memory table (memtable).
+	/// Returns (total_record_size, highest_seq_num_used).
+	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<u64> {
+		// Pre-allocate empty value Bytes for delete operations to avoid repeated
+		// allocations
+		let empty_val = Value::new();
+
+		// Process entries with pre-encoded ValueLocations
+		for (_i, entry, current_seq_num, _timestamp) in batch.entries_with_seq_nums()? {
+			if entry.kind == InternalKeyKind::RangeDelete {
+				let end_key = entry.value.clone().unwrap_or_default();
+				self.range_deletions.write().push((
+					entry.key.clone(),
+					end_key.clone(),
+					current_seq_num,
+				));
+				self.has_range_deletions.store(true, Ordering::Release);
+			}
+
+			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind);
+
+			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
+			let val = if let Some(encoded_value) = &entry.value {
+				encoded_value.clone()
+			} else {
+				// For delete operations, reuse the pre-allocated empty value
+				empty_val.clone()
+			};
+
+			self.insert_into_memtable(&ikey, &val)?;
+		}
+
+		// Get the highest sequence number used from the batch
+		let highest_seq_num = batch.get_highest_seq_num();
+
+		Ok(highest_seq_num)
+	}
+
+	/// Inserts a key-value pair into the memtable.
+	///
+	/// `MemTable::add` reserves arena space via `try_reserve` before calling this,
+	/// so `ArenaFull` here would indicate the size estimator drifted from
+	/// artmap's `max_insert_bytes`. We assert in debug, and fall through to
+	/// returning `ArenaFull` in release so the upstream rotate-and-retry path stays
+	/// as a safety net rather than corrupting state via panic.
+	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
+		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
+		match self.map.try_insert(key.user_key.clone(), trailer, value.clone()) {
+			Ok(()) => Ok(()),
+			Err(_) => {
+				debug_assert!(
+					false,
+					"ArenaFull inside insert_into_memtable after a successful try_reserve; \
+					memtable_size_estimate is out of sync with the artmap arena"
+				);
+				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
+				Err(crate::Error::ArenaFull)
+			}
+		}
+	}
+
+	/// Updates the latest sequence number in the memtable.
+	/// This ensures that the memtable always has the highest sequence number of
+	/// the operations it contains.
+	fn update_latest_sequence_number(&self, current_seq_num: u64) {
+		let mut prev_seq_num = self.latest_seq_num.load(Ordering::Acquire);
+		while current_seq_num > prev_seq_num {
+			match self.latest_seq_num.compare_exchange_weak(
+				prev_seq_num,
+				current_seq_num,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => break,
+				Err(x) => prev_seq_num = x,
+			}
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn lsn(&self) -> u64 {
+		self.latest_seq_num.load(Ordering::Acquire)
+	}
+
+	pub(crate) fn flush(
+		&self,
+		table_id: u64,
+		lsm_opts: Arc<Options>,
+		vlog: Option<&Arc<VLog>>,
+		vlog_threshold: usize,
+		collect_bptree_entries: bool,
+	) -> Result<(Arc<Table>, BPTreeEntries)> {
+		let table_file_path = lsm_opts.sstable_file_path(table_id);
+		let mut bptree_entries = Vec::new();
+
+		// Values above the threshold go to the VLog while the table is written, into the file
+		// that is active now or a newer one, and no table points into them until it is
+		// registered: the memtable stays counted for those files until then.
+		if let Some(vlog) = vlog {
+			self.min_vlog_file_id
+				.fetch_min(vlog.active_writer_id.load(Ordering::SeqCst), Ordering::Release);
+		}
+
+		{
+			let file = SysFile::create(&table_file_path)?;
+			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
+
+			let mut iter = self.iter();
+			iter.seek_first()?;
+			while iter.valid() {
+				let key = iter.key().to_owned();
+				let raw_encoded = iter.value_encoded()?;
+
+				// Separate large values to VLog during flush
+				let sst_value = maybe_separate_to_vlog(raw_encoded, &key, vlog, vlog_threshold)?;
+
+				if collect_bptree_entries {
+					bptree_entries.push((key.encode(), sst_value.clone()));
+				}
+
+				table_writer.add(key, &sst_value)?;
+				iter.next()?;
+			}
+
+			// Flush range deletions into the SSTable metadata so they persist across restarts
+			let rd = self.range_deletions.read();
+			for (start, end, seq) in rd.iter() {
+				table_writer.add_range_deletion(start.clone(), end.clone(), *seq);
+			}
+
+			table_writer.finish()?;
+		}
+
+		// Sync VLog after all entries written (one fsync for the entire flush)
+		if let Some(vlog) = vlog {
+			vlog.sync()?;
+		}
+
+		// Durability fix: the SST's data and its directory entry must be
+		// durable before the manifest references this table.
+		crate::vfs::fsync_file(&table_file_path)?;
+		crate::lsm::fsync_directory(lsm_opts.sstable_dir())?;
+		let file: Arc<dyn File> = Arc::new(SysFile::open(&table_file_path)?);
+		let file_size = file.size()?;
+
+		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
+		let rd = self.range_deletions.read();
+		if !rd.is_empty() {
+			created_table.range_deletions.write().extend(rd.clone());
+			created_table.has_range_deletions.store(true, Ordering::Release);
+		}
+		Ok((created_table, bptree_entries))
+	}
+
+	pub(crate) fn iter(&self) -> MemTableIterator<'_> {
+		self.range(None, None)
+	}
+
+	/// Returns an iterator over keys in [lower, upper)
+	/// Lower is inclusive, upper is exclusive
+	pub(crate) fn range(
+		&self,
+		lower: Option<&[u8]>, // Inclusive, None = unbounded
+		upper: Option<&[u8]>, // Exclusive, None = unbounded
+	) -> MemTableIterator<'_> {
+		let range = self.map.range::<_, [u8]>((
+			lower.map_or(Bound::Unbounded, Bound::Included),
+			upper.map_or(Bound::Unbounded, Bound::Excluded),
+		));
+
+		let mut miter = MemTableIterator {
+			map: &self.map,
+			lower: lower.map(|l| l.to_vec()),
+			upper: upper.map(|u| u.to_vec()),
+			range,
+			direction: IterDirection::Forward,
+			current_key: None,
+			current_versions: Vec::new(),
+			version_idx: 0,
+			encoded_key_buf: Vec::new(),
+		};
+
+		let _ = miter.seek_first();
+		miter
+	}
+}
+
+/// During flush, decide whether to separate a value to VLog or keep inline in SST.
+/// Handles backward compat: entries already containing VLog pointers pass through.
+///
+/// The value of a range delete is its raw end key, not an encoded value: it is never decoded or
+/// separated. Decoding needs two bytes, so a one-byte end key would fail the flush for good, and
+/// an end key longer than the threshold would be moved to the VLog and lose its meaning.
+pub(crate) fn maybe_separate_to_vlog(
+	encoded_value: &[u8],
+	key: &InternalKey,
+	vlog: Option<&Arc<VLog>>,
+	vlog_threshold: usize,
+) -> Result<Vec<u8>> {
+	if encoded_value.is_empty() || key.kind() == InternalKeyKind::RangeDelete {
+		return Ok(encoded_value.to_vec());
+	}
+
+	let location = ValueLocation::decode(encoded_value)?;
+
+	// Already a VLog pointer (e.g. from pre-upgrade WAL recovery) — pass through
+	if location.is_value_pointer() {
+		return Ok(encoded_value.to_vec());
+	}
+
+	// Separate large values to VLog
+	let value = &location.value;
+	if let Some(vlog) = vlog {
+		if value.len() > vlog_threshold {
+			let encoded_key = key.encode();
+			let pointer = vlog.append(&encoded_key, value)?;
+			return Ok(ValueLocation::with_pointer(pointer)
+				.with_timestamp(location.timestamp)
+				.encode());
+		}
+	}
+
+	// Keep inline
+	Ok(encoded_value.to_vec())
+}
+
+#[derive(Clone, Copy)]
+enum IterDirection {
+	Forward,
+	Backward,
+}
+
+fn lower_bound(lower: &Option<Vec<u8>>) -> Bound<&[u8]> {
+	lower.as_deref().map_or(Bound::Unbounded, Bound::Included)
+}
+
+fn upper_bound(upper: &Option<Vec<u8>>) -> Bound<&[u8]> {
+	upper.as_deref().map_or(Bound::Unbounded, Bound::Excluded)
+}
+
+/// Iterates a memtable in internal-key order: user keys ascending, and each
+/// key's versions by trailer descending.
+///
+/// The artmap range yields one entry per user key; the cursor expands it into
+/// that key's version chain (captured when the entry was read, so concurrent
+/// inserts never reorder it) and steps through the versions before moving to
+/// the neighbouring key. Changing direction re-anchors the range just past the
+/// current key.
+pub(crate) struct MemTableIterator<'a> {
+	map: &'a ArenaVersionedArtMap<Key, Value>,
+	lower: Option<Vec<u8>>,
+	upper: Option<Vec<u8>>,
+	range: ArenaVersionedRange<'a, Key, Value>,
+	direction: IterDirection,
+	current_key: Option<&'a Key>,
+	/// `(trailer, value)` for each version of `current_key`, newest first.
+	current_versions: Vec<(u64, &'a Value)>,
+	version_idx: usize,
+	encoded_key_buf: Vec<u8>,
+}
+
+impl<'a> MemTableIterator<'a> {
+	/// Positions the cursor on `entry`: on its newest version when moving
+	/// forward, its oldest when moving backward. Clears the cursor on `None`.
+	fn position(&mut self, entry: Option<ArenaVersionedEntryRef<'a, Key, Value>>) -> bool {
+		let Some(entry) = entry else {
+			self.clear_cursor();
+			return false;
+		};
+		self.current_key = Some(entry.key());
+		self.current_versions.clear();
+		// Deletes are encoded in the trailer and stored as ordinary values, so
+		// the chain never holds an artmap tombstone; the filter is only a guard.
+		self.current_versions
+			.extend(entry.versions().filter_map(|v| v.value.map(|val| (v.version, val))));
+		self.version_idx = match self.direction {
+			IterDirection::Forward => 0,
+			IterDirection::Backward => self.current_versions.len().saturating_sub(1),
+		};
+		self.populate_encoded_key();
+		self.valid()
+	}
+
+	fn populate_encoded_key(&mut self) {
+		self.encoded_key_buf.clear();
+		if let (Some(key), Some(&(trailer, _))) =
+			(self.current_key, self.current_versions.get(self.version_idx))
+		{
+			self.encoded_key_buf.extend_from_slice(key);
+			self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
+		}
+	}
+
+	fn clear_cursor(&mut self) {
+		self.current_key = None;
+		self.current_versions.clear();
+		self.version_idx = 0;
+		self.encoded_key_buf.clear();
+	}
+}
+
+impl LSMIterator for MemTableIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		let target_user_key = InternalKey::user_key_from_encoded(target);
+		let target_trailer = if target.len() >= 8 {
+			u64::from_be_bytes(target[target.len() - 8..].try_into().unwrap_or([0xFF; 8]))
+		} else {
+			u64::MAX
+		};
+
+		let start = match self.lower.as_deref() {
+			Some(l) if target_user_key < l => l,
+			_ => target_user_key,
+		};
+		self.range = self.map.range::<_, [u8]>((Bound::Included(start), upper_bound(&self.upper)));
+		self.direction = IterDirection::Forward;
+
+		while let Some(entry) = self.range.next() {
+			self.position(Some(entry));
+			if entry.key().as_slice() != target_user_key {
+				return Ok(true);
+			}
+			// Same user key: skip versions newer than the target trailer.
+			if let Some(idx) = self.current_versions.iter().position(|&(t, _)| t <= target_trailer)
+			{
+				self.version_idx = idx;
+				self.populate_encoded_key();
+				return Ok(true);
+			}
+		}
+
+		self.clear_cursor();
+		Ok(false)
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.range =
+			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
+		self.direction = IterDirection::Forward;
+		let entry = self.range.next();
+		Ok(self.position(entry))
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.range =
+			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
+		self.direction = IterDirection::Backward;
+		let entry = self.range.next_back();
+		Ok(self.position(entry))
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		if !self.valid() {
+			return Ok(false);
+		}
+
+		if self.version_idx + 1 < self.current_versions.len() {
+			self.version_idx += 1;
+			self.populate_encoded_key();
+			return Ok(true);
+		}
+
+		if matches!(self.direction, IterDirection::Backward) {
+			let cur = self.current_key.expect("a valid cursor has a key");
+			self.range = self
+				.map
+				.range::<_, [u8]>((Bound::Excluded(cur.as_slice()), upper_bound(&self.upper)));
+			self.direction = IterDirection::Forward;
+		}
+
+		let entry = self.range.next();
+		Ok(self.position(entry))
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		if !self.valid() {
+			return Ok(false);
+		}
+
+		if self.version_idx > 0 {
+			self.version_idx -= 1;
+			self.populate_encoded_key();
+			return Ok(true);
+		}
+
+		if matches!(self.direction, IterDirection::Forward) {
+			let cur = self.current_key.expect("a valid cursor has a key");
+			self.range = self
+				.map
+				.range::<_, [u8]>((lower_bound(&self.lower), Bound::Excluded(cur.as_slice())));
+			self.direction = IterDirection::Backward;
+		}
+
+		let entry = self.range.next_back();
+		Ok(self.position(entry))
+	}
+
+	fn valid(&self) -> bool {
+		self.version_idx < self.current_versions.len()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		InternalKeyRef::from_encoded(&self.encoded_key_buf)
+	}
+
+	fn value_encoded(&self) -> Result<&[u8]> {
+		debug_assert!(self.valid());
+		Ok(self.current_versions[self.version_idx].1)
+	}
+}

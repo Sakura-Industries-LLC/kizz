@@ -36,10 +36,10 @@ use std::{
     ptr,
 };
 
-use kizz_trace::{Accesses, RunRequest, TraceError};
+use kizz_trace::{Accesses, ProcessTree, RunRequest, TraceError};
 use libc::{c_char, c_int, pid_t, sock_filter, sock_fprog};
 
-use crate::sys;
+use crate::{processes, sys};
 
 /// The options set on the first traced process, which every process and thread it
 /// starts inherits: stop at seccomp `SECCOMP_RET_TRACE` actions, mark the stop at
@@ -140,23 +140,30 @@ pub(crate) struct ChildFailure {
 
 impl ChildFailure {
     /// The error for a request whose child failed this way, with the paths it
-    /// touched while it tried to start the program.
+    /// touched while it tried to start the program and, when the request asked for
+    /// it, the tree of that one process.
     pub(crate) fn into_error(
         self,
         request: &RunRequest,
         accesses: Accesses,
+        tree: Option<ProcessTree>,
     ) -> TraceError {
         let source = io::Error::from_raw_os_error(self.errno);
         let program = request.program.clone();
         match self.step {
             Step::Exec if matches!(self.errno, libc::ENOENT | libc::ENOTDIR) => {
-                TraceError::ProgramNotFound { program, accesses }
+                TraceError::ProgramNotFound {
+                    program,
+                    accesses,
+                    tree,
+                }
             },
             Step::Exec if matches!(self.errno, libc::EACCES | libc::ENOEXEC | libc::EISDIR) => {
                 TraceError::ProgramNotExecutable {
                     program,
                     source,
                     accesses,
+                    tree,
                 }
             },
             Step::Stdio | Step::Signals | Step::WorkingDirectory | Step::Exec => {
@@ -164,6 +171,7 @@ impl ChildFailure {
                     program,
                     source,
                     accesses,
+                    tree,
                 }
             },
             Step::NoNewPrivileges
@@ -407,8 +415,9 @@ pub(crate) fn read_failure(report: OwnedFd) -> io::Result<Option<ChildFailure>> 
 pub(crate) enum Started {
     /// The child is traced and running towards its program.
     Running(pid_t),
-    /// The child exited before it came under `ptrace`; the failure pipe says why.
-    Exited,
+    /// The child, with this process ID, exited before it came under `ptrace`; the
+    /// failure pipe says why.
+    Exited(pid_t),
 }
 
 /// Fork the child for `request`, bring it under `ptrace`, set the options, and
@@ -472,12 +481,15 @@ pub(crate) fn start(
             program: request.program.clone(),
             source,
             accesses: Accesses::new(),
+            tree: request
+                .tree
+                .then(|| processes::failed_start(None, request, None)),
         });
     }
     let status = sys::wait_for(pid)
         .map_err(|error| tracer_error("could not wait for the child to stop", error))?;
     if !libc::WIFSTOPPED(status) {
-        return Ok(Started::Exited);
+        return Ok(Started::Exited(pid));
     }
     if libc::WSTOPSIG(status) != libc::SIGSTOP {
         abandon(pid);
@@ -519,6 +531,7 @@ mod tests {
             stdin: None,
             capture: CaptureMode::Split,
             echo: false,
+            tree: false,
         }
     }
 
@@ -534,7 +547,7 @@ mod tests {
     fn failures_map_to_the_interface_errors() {
         let request = request("/missing");
         let failure =
-            |step, errno| ChildFailure { step, errno }.into_error(&request, Accesses::new());
+            |step, errno| ChildFailure { step, errno }.into_error(&request, Accesses::new(), None);
         assert!(matches!(
             failure(Step::Exec, libc::ENOENT),
             TraceError::ProgramNotFound { .. }
@@ -566,8 +579,14 @@ mod tests {
             (Step::Exec, libc::EACCES),
             (Step::Exec, libc::E2BIG),
         ] {
-            let error = ChildFailure { step, errno }.into_error(&request, accesses.clone());
+            let tree = processes::failed_start(None, &request, Some(7));
+            let error = ChildFailure { step, errno }.into_error(
+                &request,
+                accesses.clone(),
+                Some(tree.clone()),
+            );
             assert_eq!(error.accesses(), Some(&accesses), "{error}");
+            assert_eq!(error.tree(), Some(&tree), "{error}");
         }
     }
 

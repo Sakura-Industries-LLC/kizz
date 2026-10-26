@@ -788,6 +788,10 @@ pub(crate) fn machine_state(cwd: &Path) -> MachineState {
 
 /// Unit tests for the wrappers that need no traced process.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: a plain std thread gives the test a thread to read"
+)]
 mod tests {
     use std::{
         os::{fd::AsRawFd, unix::fs::symlink},

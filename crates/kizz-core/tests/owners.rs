@@ -28,7 +28,7 @@ use std::{
 
 use kizz_core::{
     Engine, ProgramHash, ProgramParts, StepExecutor as _, StepSpec, TaskIdentity, TaskSteps,
-    plan_reset,
+    WorkerPool, plan_reset,
 };
 use kizz_store::{
     EntryCounts, LearnedOrder, StepKey, StepPosition, StepRecord, Store, TaskId, TaskRecord,
@@ -36,7 +36,7 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    FirstReads, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, OutputStream, ProcessTree, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -97,6 +97,9 @@ impl Tracer for FakeTracer {
         Ok(RunResult {
             termination,
             output: CapturedOutput::empty(request.capture),
+            tree: request
+                .tree
+                .then(|| ProcessTree::of_request(request, &accesses, Some(termination))),
             accesses,
             incomplete: None,
             first_reads,
@@ -281,7 +284,14 @@ impl Fixture {
         tasks: &[(&TaskIdentity, &[&StepSpec])],
     ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let mut built = Built {
             ran: Vec::new(),
             keys: Vec::new(),
@@ -314,7 +324,14 @@ impl Fixture {
         step: &StepSpec,
     ) -> TestResult<StepKey> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let run = engine.task(
             ProgramHash::from_bytes(PROGRAM),
             AbsolutePath::new(&self.root)?,
