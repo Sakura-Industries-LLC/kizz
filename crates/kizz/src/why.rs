@@ -64,7 +64,7 @@ pub(crate) fn run(
     };
     let render = Render {
         base: cwd,
-        home: env::var_os("HOME")
+        home: env::var_os(kizz_store::location::HOME)
             .map(PathBuf::from)
             .filter(|home| home.is_absolute()),
         verbose,

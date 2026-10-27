@@ -1485,6 +1485,10 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * End-to-end tests run the `kizz` binary on fixture trees with `KIZZ_CACHE_DIR` set to a temporary directory.
 * Tests make thread starts fail on purpose, through a test switch that release builds lack, to check the retries and errors.
 * Explanations have golden-output tests.
+* A documentation test requires a reference entry for every Starlark global and every member of `env`, `fs` and `task`.
+ It also requires one for every `run()` parameter and result attribute, task option, and environment variable that kizz reads.
+ It also requires one for every command and option of the command line, and for every field of the observation report.
+ It reads these lists from the code, so a new item without an entry fails it.
 * The tracer conformance test of phase 10 needs a C compiler, `cc`, where the tests run.
   Every tracer must pass it: the x86_64 Linux tracer now, and any later one, for aarch64, macOS or Windows.
   Calls that only some platforms have are compiled only there, and their expected entries name those platforms.

@@ -13,9 +13,8 @@
 
 use std::process::ExitCode;
 
-/// The variable that makes thread starts fail on purpose, in test builds only.
 #[cfg(debug_assertions)]
-const FAIL_THREAD_STARTS: &str = "KIZZ_TEST_FAIL_THREAD_STARTS";
+use kizz::environment::FAIL_THREAD_STARTS;
 
 /// Parse the command line, run the selected command, and exit with its status.
 fn main() -> ExitCode {

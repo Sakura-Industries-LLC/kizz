@@ -253,7 +253,7 @@ fn run_named(
             return USAGE_ERROR;
         },
     };
-    let home = env::var_os("HOME")
+    let home = env::var_os(kizz_store::location::HOME)
         .map(PathBuf::from)
         .filter(|home| home.is_absolute());
     let caller: BTreeMap<String, String> = env::vars_os()

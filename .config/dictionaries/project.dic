@@ -197,6 +197,7 @@ getaffinity
 getattr
 getdents
 getegid
+getenv
 geteuid
 GETEVENTMSG
 GETFMT
@@ -230,6 +231,7 @@ iovec
 JSET
 kibibytes
 kizz
+kwargs
 lchown
 ldflags
 lgetxattr
@@ -306,6 +308,7 @@ REMOVEDIR
 removexattr
 removexattrat
 renameat
+replacen
 RESTARTBLOCK
 retarget
 retargeted

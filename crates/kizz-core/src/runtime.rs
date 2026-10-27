@@ -63,6 +63,7 @@ use starlark::{
     PrintHandler,
     any::ProvidesStaticType,
     collections::SmallMap,
+    docs::{DocFunction, DocItem, DocMember},
     environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module},
     eval::{Evaluator, FileLoader},
     pagable::{
@@ -918,11 +919,41 @@ impl RunResult {
         }
     }
 
-    /// The names of the attributes, in the order the struct had them.
+    /// The names of the attributes, in the order the struct had them:
+    /// [`SPLIT_RESULT_ATTRIBUTES`] or [`MERGED_RESULT_ATTRIBUTES`], for the capture
+    /// mode.
     const fn attributes(&self) -> &'static [&'static str] {
         match self.output {
-            ResultOutput::Split { .. } => &["rc", "signal", "stdout", "stderr", "cached"],
-            ResultOutput::Merged { .. } => &["rc", "signal", "output", "cached"],
+            ResultOutput::Split { .. } => SPLIT_RESULT_ATTRIBUTES,
+            ResultOutput::Merged { .. } => MERGED_RESULT_ATTRIBUTES,
+        }
+    }
+
+    /// The value of the attribute `name`, or `None` for a name that
+    /// [`Self::attributes`] lacks: the constants decide which attributes a result
+    /// has, for `get_attr` and for the JSON encoding alike. Reading `rc` or `signal`
+    /// checks the result.
+    fn attribute(
+        &self,
+        name: &str,
+    ) -> Option<AttributeValue<'_>> {
+        if !self.attributes().contains(&name) {
+            return None;
+        }
+        match (name, &self.output) {
+            ("rc", _) => {
+                self.checked.store(true, Ordering::Relaxed);
+                Some(AttributeValue::Int(self.rc))
+            },
+            ("signal", _) => {
+                self.checked.store(true, Ordering::Relaxed);
+                Some(AttributeValue::Int(self.signal))
+            },
+            ("stdout", ResultOutput::Split { stdout, .. }) => Some(AttributeValue::Text(stdout)),
+            ("stderr", ResultOutput::Split { stderr, .. }) => Some(AttributeValue::Text(stderr)),
+            ("output", ResultOutput::Merged { output }) => Some(AttributeValue::Text(output)),
+            ("cached", _) => Some(AttributeValue::Bool(self.cached)),
+            _ => None,
         }
     }
 
@@ -973,30 +1004,45 @@ impl<'v> AllocValue<'v> for RunResult {
     }
 }
 
+/// The value of one attribute of a `run()` result, which `get_attr` turns into a
+/// Starlark value and the JSON encoding writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributeValue<'a> {
+    /// An integer or `None`, such as `rc` and `signal`.
+    Int(Option<i32>),
+    /// A string, such as `stdout`.
+    Text(&'a str),
+    /// A boolean, such as `cached`.
+    Bool(bool),
+}
+
 /// The JSON encoding of `json.encode` and `fs.write_json`: an object of the
-/// attributes in the order the struct had them, `rc`, `signal`, `stdout` and
-/// `stderr` or `output`, and `cached`, with the same values, as the struct that
-/// `run()` returned before encoded. Encoding the value checks it, because its exit
-/// status then leaves the program on purpose ("Exit codes and failure").
+/// attributes of [`RunResult::attributes`], in their order, `rc`, `signal`,
+/// `stdout` and `stderr` or `output`, and `cached`, with the same values, as the
+/// struct that `run()` returned before encoded. Encoding the value checks it,
+/// because its exit status then leaves the program on purpose ("Exit codes and
+/// failure"). A listed name without a value is an error, never a panic.
 impl serde::Serialize for RunResult {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap as _;
+        use serde::ser::{Error as _, SerializeMap as _};
 
         self.checked.store(true, Ordering::Relaxed);
         let mut map = serializer.serialize_map(Some(self.attributes().len()))?;
-        map.serialize_entry("rc", &self.rc)?;
-        map.serialize_entry("signal", &self.signal)?;
-        match &self.output {
-            ResultOutput::Split { stdout, stderr } => {
-                map.serialize_entry("stdout", stdout)?;
-                map.serialize_entry("stderr", stderr)?;
-            },
-            ResultOutput::Merged { output } => map.serialize_entry("output", output)?,
+        for &name in self.attributes() {
+            match self.attribute(name) {
+                Some(AttributeValue::Int(value)) => map.serialize_entry(name, &value)?,
+                Some(AttributeValue::Text(value)) => map.serialize_entry(name, value)?,
+                Some(AttributeValue::Bool(value)) => map.serialize_entry(name, &value)?,
+                None => {
+                    return Err(S::Error::custom(format!(
+                        "the run() result has no value for its attribute {name}"
+                    )));
+                },
+            }
         }
-        map.serialize_entry("cached", &self.cached)?;
         map.end()
     }
 }
@@ -1028,23 +1074,15 @@ impl<'v> StarlarkValue<'v> for RunResult {
         attribute: &str,
         heap: Heap<'v>,
     ) -> Option<Value<'v>> {
-        let int_or_none =
-            |value: Option<i32>| value.map_or_else(Value::new_none, |value| heap.alloc(value));
-        match (attribute, &self.output) {
-            ("rc", _) => {
-                self.checked.store(true, Ordering::Relaxed);
-                Some(int_or_none(self.rc))
-            },
-            ("signal", _) => {
-                self.checked.store(true, Ordering::Relaxed);
-                Some(int_or_none(self.signal))
-            },
-            ("stdout", ResultOutput::Split { stdout, .. }) => Some(heap.alloc(stdout.as_str())),
-            ("stderr", ResultOutput::Split { stderr, .. }) => Some(heap.alloc(stderr.as_str())),
-            ("output", ResultOutput::Merged { output }) => Some(heap.alloc(output.as_str())),
-            ("cached", _) => Some(Value::new_bool(self.cached)),
-            _ => None,
-        }
+        self.attribute(attribute).map(|value| {
+            match value {
+                AttributeValue::Int(value) => {
+                    value.map_or_else(Value::new_none, |value| heap.alloc(value))
+                },
+                AttributeValue::Text(value) => heap.alloc(value),
+                AttributeValue::Bool(value) => Value::new_bool(value),
+            }
+        })
     }
 
     fn has_attr(
@@ -1414,26 +1452,179 @@ fn globals() -> Globals {
         .build()
 }
 
-/// Set `task` in `module` to the values that describe `task`: `task.name` is the
-/// name that its `name=` option gives, or `None`, `task.heading` its heading, or
-/// `None`, and `task.args` its arguments.
+/// The name of the value that describes the running task, which every task
+/// program's module holds besides the globals.
+pub const TASK_VALUE: &str = "task";
+
+/// The members of [`TASK_VALUE`], in the order the value holds them, under which
+/// the runtime sets the values that describe the running task.
+pub const TASK_MEMBERS: [&str; 8] = [
+    "dir", "file", "line", "name", "heading", "targets", "selected", "args",
+];
+
+/// The attributes of a `run()` result with `capture = "split"`, in the order the
+/// struct that `run()` returned before had them.
+pub const SPLIT_RESULT_ATTRIBUTES: &[&str] = &["rc", "signal", "stdout", "stderr", "cached"];
+
+/// The attributes of a `run()` result with `capture = "merged"`, in the order the
+/// struct that `run()` returned before had them.
+pub const MERGED_RESULT_ATTRIBUTES: &[&str] = &["rc", "signal", "output", "cached"];
+
+/// What a name that task programs use is, which decides how documentation writes
+/// it: a function with `()`, such as `run()`, and a module or a value without, such
+/// as `env` or `task.args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NameKind {
+    /// A function, such as `run` or `env.inherit`.
+    Function,
+    /// A module of members, such as `env` or `task`.
+    Module,
+    /// A value, such as `task.args`.
+    Value,
+}
+
+/// A name that task programs use beyond Starlark's standard globals.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProgramName {
+    /// The name, after its module and a `.` for a member, such as `run`, `env` or
+    /// `env.inherit`.
+    pub name: String,
+    /// What the name is.
+    pub kind: NameKind,
+}
+
+impl ProgramName {
+    /// The name as documentation writes it: `run()` or `env.inherit()` for a
+    /// function, and `env` or `task.args` for a module or a value.
+    #[must_use]
+    pub fn written(&self) -> String {
+        match self.kind {
+            NameKind::Function => format!("{}()", self.name),
+            NameKind::Module | NameKind::Value => self.name.clone(),
+        }
+    }
+}
+
+/// Everything that task programs use beyond Starlark's standard globals, read from
+/// the runtime itself, so that the documentation can be checked against it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProgramNames {
+    /// The globals that kizz adds to Starlark's standard ones, [`TASK_VALUE`]
+    /// included, sorted.
+    pub globals: Vec<ProgramName>,
+    /// The members of the modules among the globals, `task`'s included, sorted.
+    pub members: Vec<ProgramName>,
+    /// The parameters of `run()`, in the order of its signature, the positional
+    /// arguments first.
+    pub run_parameters: Vec<String>,
+    /// The attributes of a `run()` result in either capture mode, each once.
+    pub result_attributes: Vec<String>,
+}
+
+/// What `item`, the documentation of a global or a member, says the name is.
+const fn name_kind(item: &DocItem) -> NameKind {
+    match item {
+        DocItem::Module(_) => NameKind::Module,
+        DocItem::Member(DocMember::Function(_)) => NameKind::Function,
+        DocItem::Type(_) | DocItem::Member(DocMember::Property(_)) => NameKind::Value,
+    }
+}
+
+/// The names of the parameters of `function`, in the order of its signature.
+fn parameter_names(function: &DocFunction) -> Vec<String> {
+    let params = &function.params;
+    params
+        .pos_only
+        .iter()
+        .chain(&params.pos_or_named)
+        .chain(&params.args)
+        .chain(&params.named_only)
+        .chain(&params.kwargs)
+        .map(|param| param.name.clone())
+        .collect()
+}
+
+/// Everything that task programs use beyond Starlark's standard globals: the
+/// globals of task programs that the standard ones lack, with the members of each
+/// module, `run()`'s parameters from its signature, `task` with [`TASK_MEMBERS`],
+/// and the result's attributes from [`SPLIT_RESULT_ATTRIBUTES`] and
+/// [`MERGED_RESULT_ATTRIBUTES`].
+#[must_use]
+pub fn program_names() -> ProgramNames {
+    let standard = GlobalsBuilder::standard().build();
+    let standard: Vec<&str> = standard.iter().map(|(name, _value)| name).collect();
+    let mut names = ProgramNames::default();
+    for (name, item) in globals().documentation().members {
+        if standard.contains(&name.as_str()) {
+            continue;
+        }
+        if let DocItem::Module(module) = &item {
+            for (member, member_item) in &module.members {
+                names.members.push(ProgramName {
+                    name: format!("{name}.{member}"),
+                    kind: name_kind(member_item),
+                });
+            }
+        }
+        if let DocItem::Member(DocMember::Function(function)) = &item
+            && name == "run"
+        {
+            names.run_parameters = parameter_names(function);
+        }
+        names.globals.push(ProgramName {
+            kind: name_kind(&item),
+            name,
+        });
+    }
+    names.globals.push(ProgramName {
+        name: TASK_VALUE.to_owned(),
+        kind: NameKind::Module,
+    });
+    names.members.extend(TASK_MEMBERS.iter().map(|member| {
+        ProgramName {
+            name: format!("{TASK_VALUE}.{member}"),
+            kind: NameKind::Value,
+        }
+    }));
+    names.globals.sort();
+    names.members.sort();
+    for attribute in SPLIT_RESULT_ATTRIBUTES
+        .iter()
+        .chain(MERGED_RESULT_ATTRIBUTES)
+    {
+        if !names
+            .result_attributes
+            .iter()
+            .any(|known| known == attribute)
+        {
+            names.result_attributes.push((*attribute).to_owned());
+        }
+    }
+    names
+}
+
+/// Set [`TASK_VALUE`] in `module` to the values that describe `task`, under the
+/// names of [`TASK_MEMBERS`]: `task.name` is the name that its `name=` option
+/// gives, or `None`, `task.heading` its heading, or `None`, and `task.args` its
+/// arguments.
 fn set_task_value(
     module: &Module<'_>,
     task: &TaskInfo,
 ) {
     let heap = module.heap();
     let optional = |text: Option<&str>| text.map_or_else(Value::new_none, |text| heap.alloc(text));
-    let value = heap.alloc(AllocStruct([
-        ("dir", heap.alloc(task.dir.to_string())),
-        ("file", heap.alloc(task.file.to_string())),
-        ("line", heap.alloc(task.line)),
-        ("name", optional(task.name.as_deref())),
-        ("heading", optional(task.heading.as_deref())),
-        ("targets", heap.alloc(task.targets.clone())),
-        ("selected", heap.alloc(task.selected.clone())),
-        ("args", heap.alloc(task.args.clone())),
-    ]));
-    module.set("task", value);
+    let values = [
+        heap.alloc(task.dir.to_string()),
+        heap.alloc(task.file.to_string()),
+        heap.alloc(task.line),
+        optional(task.name.as_deref()),
+        optional(task.heading.as_deref()),
+        heap.alloc(task.targets.clone()),
+        heap.alloc(task.selected.clone()),
+        heap.alloc(task.args.clone()),
+    ];
+    let value = heap.alloc(AllocStruct(TASK_MEMBERS.into_iter().zip(values)));
+    module.set(TASK_VALUE, value);
 }
 
 /// The directory that holds `path`, or `path` itself for the root.
@@ -2062,5 +2253,251 @@ mod tests {
         );
         assert_eq!(padded_source(2, "x").unwrap(), "\n\nx");
         assert_eq!(padded_source(0, "x").unwrap(), "x");
+    }
+}
+
+/// Unit tests of `program_names`, which the documentation coverage test reads, and
+/// of the result-attribute constants that it lists.
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and borrow cells"
+)]
+mod names_tests {
+    use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
+
+    use kizz_trace::{AbsolutePath, CapturedOutput, Termination};
+    use starlark::values::{Heap, StarlarkValue as _};
+
+    use super::{
+        MERGED_RESULT_ATTRIBUTES, PrintSink, ProgramName, ProgramNames, RunResult,
+        SPLIT_RESULT_ATTRIBUTES, TaskInfo, TaskProgram, program_names,
+    };
+    use crate::step::{StepError, StepExecutor, StepOutcome, StepSpec};
+
+    /// Answers every step with exit status 0 and no output.
+    struct Succeed;
+
+    impl StepExecutor for Succeed {
+        fn execute(
+            &self,
+            step: &StepSpec,
+        ) -> Result<StepOutcome, StepError> {
+            Ok(StepOutcome {
+                termination: Termination::Exited(0),
+                output: CapturedOutput::empty(step.capture),
+                cached: false,
+            })
+        }
+    }
+
+    /// Keeps the lines that programs print.
+    #[derive(Default)]
+    struct Lines {
+        /// The printed lines, in order, each with its prefix.
+        lines: RefCell<Vec<String>>,
+    }
+
+    impl PrintSink for Lines {
+        fn print_line(
+            &self,
+            line: &str,
+        ) {
+            self.lines.borrow_mut().push(line.to_owned());
+        }
+    }
+
+    /// The members of `module` among `names`, without the module's name, sorted.
+    fn members_of(
+        names: &ProgramNames,
+        module: &str,
+    ) -> Vec<String> {
+        let prefix = format!("{module}.");
+        let mut members: Vec<String> = names
+            .members
+            .iter()
+            .filter_map(|name| name.name.strip_prefix(&prefix).map(str::to_owned))
+            .collect();
+        members.sort();
+        members
+    }
+
+    /// `names` as owned strings, sorted.
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|&name| name.to_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// What a task program in `/work` sees, as `dir()` lists it, of `env`, `fs`,
+    /// `json`, `task`, and a `run()` result in each capture mode, each sorted.
+    fn seen_by_a_program() -> Vec<Vec<String>> {
+        let task = TaskInfo {
+            dir: AbsolutePath::new("/work").unwrap(),
+            file: AbsolutePath::new("/work/kizz.md").unwrap(),
+            relative_file: PathBuf::from("kizz.md"),
+            line: 1,
+            index: 0,
+            name: None,
+            heading: None,
+            targets: vec!["ci".to_owned()],
+            selected: vec!["ci".to_owned()],
+            args: Vec::new(),
+            cache_never: false,
+            source: "print(json.encode([dir(env), dir(fs), dir(json), dir(task), \
+                     dir(run(\"a\")), dir(run(\"a\", capture = \"merged\"))]))\n"
+                .to_owned(),
+        };
+        let lines = Lines::default();
+        let program = TaskProgram::load(task, &lines).program.unwrap();
+        program
+            .run(&BTreeMap::new(), &Succeed, &lines)
+            .result
+            .unwrap();
+        let printed = lines.lines.borrow();
+        let [line] = printed.as_slice() else {
+            panic!("the program printed {printed:?}");
+        };
+        let (_task, text) = line.split_once(": ").unwrap();
+        let seen: Vec<Vec<String>> = serde_json::from_str(text).unwrap();
+        seen.into_iter()
+            .map(|mut names| {
+                names.sort();
+                names
+            })
+            .collect()
+    }
+
+    /// The members, result attributes and `task` members that `program_names` lists
+    /// are those that a task program sees with `dir()`; the globals are those that
+    /// kizz adds to Starlark's standard ones, `task` included, and `run()`'s
+    /// parameters come from its signature, the positional arguments first.
+    #[test]
+    fn program_names_are_what_programs_see() {
+        let names = program_names();
+        assert_eq!(seen_by_a_program(), [
+            members_of(&names, "env"),
+            members_of(&names, "fs"),
+            members_of(&names, "json"),
+            members_of(&names, "task"),
+            sorted(SPLIT_RESULT_ATTRIBUTES),
+            sorted(MERGED_RESULT_ATTRIBUTES),
+        ]);
+        let globals: Vec<String> = names.globals.iter().map(ProgramName::written).collect();
+        assert_eq!(globals, ["env", "fs", "json", "print()", "run()", "task"]);
+        let members: Vec<String> = names.members.iter().map(ProgramName::written).collect();
+        assert!(members.contains(&"env.inherit()".to_owned()), "{members:?}");
+        assert!(members.contains(&"task.args".to_owned()), "{members:?}");
+        assert_eq!(names.run_parameters, [
+            "argv",
+            "stdin",
+            "env",
+            "cwd",
+            "capture",
+            "stream",
+            "always",
+            "ignore",
+            "track",
+            "timestamps",
+            "machine",
+            "expect",
+        ]);
+        assert_eq!(names.result_attributes, [
+            "rc", "signal", "stdout", "stderr", "cached", "output"
+        ]);
+    }
+
+    /// The keys of a JSON object, in the order its text has them.
+    struct Keys {
+        /// The keys, in order.
+        keys: Vec<String>,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Keys {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            /// Collects the keys of an object and skips its values.
+            struct KeysVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for KeysVisitor {
+                type Value = Keys;
+
+                fn expecting(
+                    &self,
+                    formatter: &mut std::fmt::Formatter<'_>,
+                ) -> std::fmt::Result {
+                    formatter.write_str("a JSON object")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Keys, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some((key, serde::de::IgnoredAny)) =
+                        map.next_entry::<String, serde::de::IgnoredAny>()?
+                    {
+                        keys.push(key);
+                    }
+                    Ok(Keys { keys })
+                }
+            }
+
+            deserializer.deserialize_map(KeysVisitor)
+        }
+    }
+
+    /// The attribute constants decide which attributes a `run()` result has: in
+    /// each capture mode, `get_attr` and `has_attr` answer every name of the mode's
+    /// constant and no other, the other mode's names and unknown names included, and
+    /// the JSON encoding writes exactly the constant's names, in its order.
+    #[test]
+    fn the_attribute_constants_decide_what_a_result_has() {
+        let modes = [
+            (
+                CapturedOutput::Split {
+                    stdout: b"out".to_vec(),
+                    stderr: b"err".to_vec(),
+                },
+                SPLIT_RESULT_ATTRIBUTES,
+            ),
+            (
+                CapturedOutput::Merged {
+                    output: b"both".to_vec(),
+                },
+                MERGED_RESULT_ATTRIBUTES,
+            ),
+        ];
+        let mut names: Vec<&str> = SPLIT_RESULT_ATTRIBUTES
+            .iter()
+            .chain(MERGED_RESULT_ATTRIBUTES)
+            .copied()
+            .collect();
+        names.extend(["duration", "checked", "RC", ""]);
+        for (output, attributes) in modes {
+            let result = RunResult::new(&StepOutcome {
+                termination: Termination::Exited(3),
+                output,
+                cached: true,
+            });
+            Heap::temp(|heap| {
+                for &name in &names {
+                    let listed = attributes.contains(&name);
+                    assert_eq!(
+                        result.get_attr(name, heap).is_some(),
+                        listed,
+                        "get_attr of {name:?} with {attributes:?}"
+                    );
+                    assert_eq!(
+                        result.has_attr(name, heap),
+                        listed,
+                        "has_attr of {name:?} with {attributes:?}"
+                    );
+                }
+            });
+            let encoded = serde_json::to_string(&result).unwrap();
+            let keys: Keys = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(keys.keys, attributes, "{encoded}");
+        }
     }
 }
