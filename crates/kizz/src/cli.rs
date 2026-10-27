@@ -6,12 +6,13 @@
 //!
 //! This module owns parsing and dispatch only. Every command is parsed with all of
 //! its options; `kizz build` runs in the `build` module, `kizz list` in the `list`
-//! module, `kizz why` in the `why` module, and `kizz cache` in the `cache` module,
-//! and the other commands are scaffolds until later phases implement them.
+//! module, `kizz why` in the `why` module, `kizz cache` in the `cache` module, and
+//! `kizz execute` in the `execute` module, and the other commands are scaffolds
+//! until later phases implement them. `kizz execute` never prints the banner.
 
-use std::{fmt, path::PathBuf, process::ExitCode, str::FromStr};
+use std::{ffi::OsString, fmt, path::PathBuf, process::ExitCode, str::FromStr};
 
-use bpaf::{Args, Bpaf, ParseFailure};
+use bpaf::{Args, Bpaf, ParseFailure, Parser};
 
 use crate::ui;
 
@@ -60,7 +61,8 @@ impl Cli {
     #[must_use]
     pub fn exec(self) -> ExitCode {
         self.color.apply();
-        if !self.quiet && !self.no_banner {
+        let execute = matches!(self.command, Command::Execute { .. });
+        if !self.quiet && !self.no_banner && !execute {
             ui::print_banner();
         }
 
@@ -93,6 +95,19 @@ impl Cli {
             Command::Cache(CacheCommand::Clean) => crate::cache::clean(),
             Command::Cache(CacheCommand::Reset { all, yes, path }) => {
                 crate::cache::reset(path.as_deref(), all, yes)
+            },
+            Command::Execute {
+                output,
+                compact,
+                json,
+                program,
+            } => {
+                crate::execute::run(crate::execute::Options {
+                    output,
+                    compact,
+                    json,
+                    program,
+                })
             },
             Command::Graph => stub("graph", "Show the learned task graph.", None),
             Command::Run => {
@@ -192,6 +207,36 @@ pub enum Command {
     #[bpaf(command)]
     Cache(#[bpaf(external(cache_command))] CacheCommand),
 
+    /// Run a program, trace its whole process tree, and write a report of what it
+    /// touched.
+    ///
+    /// The program gets kizz's environment, working directory, standard streams and
+    /// terminal, and kizz exits with its status: its exit code, or 128 plus the
+    /// signal that killed it; 127 when it is not found, 126 when it cannot be run,
+    /// 125 when kizz fails, and 2 for a command-line error. No kizz.md and no cache
+    /// are needed or used.
+    #[bpaf(command)]
+    Execute {
+        /// Write the observation report to this file, which is replaced once the
+        /// program's whole process tree has ended; required, in an existing
+        /// directory.
+        #[bpaf(long, argument("FILE"))]
+        output: PathBuf,
+
+        /// Combine the observations of every process into one set, instead of a
+        /// report for each process.
+        #[bpaf(long)]
+        compact: bool,
+
+        /// Write JSON instead of readable text.
+        #[bpaf(long)]
+        json: bool,
+
+        /// The program and its arguments, after the required `--`.
+        #[bpaf(external(program_and_arguments))]
+        program: Vec<OsString>,
+    },
+
     /// Show the learned task graph (not implemented yet).
     #[bpaf(command)]
     Graph,
@@ -203,6 +248,18 @@ pub enum Command {
     /// Build container images (not implemented yet).
     #[bpaf(command)]
     Image,
+}
+
+/// The program and its arguments of `kizz execute`: strict positional arguments,
+/// which come only after `--`, at least the program.
+fn program_and_arguments() -> impl Parser<Vec<OsString>> {
+    bpaf::positional::<OsString>("PROGRAM")
+        .help(
+            "The program to run, after `--`, and its arguments; a name without `/` is looked \
+             up in PATH",
+        )
+        .strict()
+        .some("kizz execute needs `--` and then the program to run")
 }
 
 /// How `kizz build` schedules tasks.
@@ -302,7 +359,7 @@ impl FromStr for ColorMode {
     reason = "test code: the tests assert and lock"
 )]
 mod tests {
-    use std::path::PathBuf;
+    use std::{ffi::OsString, path::PathBuf};
 
     use super::{CacheCommand, Cli, ColorMode, Command, Execution, USAGE_ERROR, cli};
 
@@ -451,6 +508,54 @@ mod tests {
         }
     }
 
+    /// `kizz execute` parses `--output`, `--compact` and `--json`, and the program
+    /// with its arguments after `--`, where words that look like options are
+    /// arguments of the program.
+    #[test]
+    fn parses_execute() {
+        let words =
+            |words: &[&str]| -> Vec<OsString> { words.iter().map(OsString::from).collect() };
+        match parse(&["execute", "--output=out.txt", "--", "make", "-j8", "--keep"]).command {
+            Command::Execute {
+                output,
+                compact,
+                json,
+                program,
+            } => {
+                assert_eq!(output, PathBuf::from("out.txt"));
+                assert!(!compact && !json);
+                assert_eq!(program, words(&["make", "-j8", "--keep"]));
+            },
+            other => panic!("expected execute, got {other:?}"),
+        }
+        match parse(&[
+            "--quiet",
+            "execute",
+            "--compact",
+            "--json",
+            "--output",
+            "r.json",
+            "--",
+            "sh",
+            "-c",
+            "echo hi",
+        ])
+        .command
+        {
+            Command::Execute {
+                output,
+                compact,
+                json,
+                program,
+            } => {
+                assert_eq!(output, PathBuf::from("r.json"));
+                assert!(compact && json);
+                assert_eq!(program, words(&["sh", "-c", "echo hi"]));
+            },
+            other => panic!("expected execute, got {other:?}"),
+        }
+    }
+
     /// Invalid command lines fail to parse with the usage-error status.
     #[test]
     fn rejects_invalid_command_lines() {
@@ -463,6 +568,11 @@ mod tests {
             &["--color", "sometimes", "graph"][..],
             &["cache"][..],
             &["cache", "nonexistent"][..],
+            &["execute"][..],
+            &["execute", "--", "make"][..],
+            &["execute", "--output=out.txt"][..],
+            &["execute", "--output=out.txt", "make"][..],
+            &["execute", "--output=out.txt", "--"][..],
         ] {
             let failure = cli().run_inner(args).unwrap_err();
             assert_eq!(
@@ -475,6 +585,7 @@ mod tests {
             &["--help"][..],
             &["--version"][..],
             &["build", "--help"][..],
+            &["execute", "--help"][..],
         ] {
             let failure = cli().run_inner(args).unwrap_err();
             assert_eq!(super::parse_failure_status(&failure), 0, "{args:?}");

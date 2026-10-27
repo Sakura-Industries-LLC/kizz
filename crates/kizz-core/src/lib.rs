@@ -5,10 +5,11 @@
 //! The kizz build engine.
 //!
 //! This crate holds discovery, Markdown parsing, the Starlark runtime, step keys,
-//! cache checks, explanations, ordering, and observation reports. It contains no
-//! Linux-specific code: it runs commands only through the tracer interface of
-//! `kizz_trace`, reads extended attributes only through that interface's attribute
-//! query, and keeps its records in `kizz_store`, so its tests use a fake tracer.
+//! cache checks, explanations, ordering, observation reports, and running
+//! `kizz execute`. It contains no Linux-specific code: it runs commands only through
+//! the tracer interface of `kizz_trace`, reads extended attributes only through that
+//! interface's attribute query, and keeps its records in `kizz_store`, so its tests
+//! use a fake tracer.
 //!
 //! * [`discovery`]: every `kizz.md` under the current directory, in the default order.
 //! * [`tasks`]: the task blocks of a `kizz.md`.
@@ -23,7 +24,8 @@
 //!   runtime hands it to.
 //! * [`warning`]: the warnings of discovery and parsing.
 //! * [`key`]: step keys, derived with BLAKE3 from a deterministic CBOR encoding.
-//! * [`lookup`]: program lookup through the task environment's `PATH`.
+//! * [`lookup`]: program lookup through the `PATH` of a task environment or of the caller
+//!   of `kizz execute`.
 //! * [`patterns`]: the path patterns of `ignore` and `track`.
 //! * [`observe`](mod@observe): the recorded state of every path a step touched.
 //! * [`states`]: the in-memory concurrent cache of file states and hashes of one build,
@@ -40,6 +42,9 @@
 //! * [`why`](mod@why): the report of `kizz why`, read from the cache.
 //! * [`report`]: observation reports, built from the tracer's process trees and the
 //!   commands' outcomes, and written as text or JSON, hierarchical or compact.
+//! * [`execute`](mod@execute): running one command for `kizz execute`, with the caller's
+//!   environment and working directory, the kept terminal and the process tree, and its
+//!   exit status and observation report, without the cache.
 //! * [`build`](mod@build): building the selected tasks in passes, in the default or
 //!   learned order, until a pass does no work, with failure handling and the pass limit.
 //! * [`cleanup`]: the entries `kizz cache clean` removes because their files are gone,
@@ -59,6 +64,7 @@ pub mod cleanup;
 pub mod discovery;
 pub mod dotenv;
 pub mod engine;
+pub mod execute;
 pub mod explain;
 pub mod files;
 pub mod key;
@@ -86,13 +92,19 @@ pub use cleanup::{Cleaned, ResetPlan, clean, plan_reset};
 pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
 pub use dotenv::DotenvError;
 pub use engine::{Engine, StepConnections, TaskSteps, UnknownCalls};
+pub use execute::{
+    ExecuteRequest, Executed, STATUS_FAILED, STATUS_NOT_EXECUTABLE, STATUS_NOT_FOUND, execute,
+    exit_status, not_executed,
+};
 pub use explain::{
     Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
     changed_inputs, spec_reasons,
 };
 pub use files::{ChangedFile, FileChanges, FileError, Files, stable_json};
 pub use key::{KeyError, Occurrences, STEP_KEY_CONTEXT, step_key};
-pub use lookup::{NoPathError, PATH_VARIABLE, ProgramLookup, find_program};
+pub use lookup::{
+    NoPathError, PATH_VARIABLE, ProgramLookup, ProgramSearch, find_program, search_program,
+};
 pub use observe::{
     HashCounter, Observed, access_bits, changed_after_read, is_kernel_path, kernel_links, observe,
     path_state, reaches_kernel, record_attributes,

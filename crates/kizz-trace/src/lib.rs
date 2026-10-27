@@ -81,7 +81,11 @@
 //! [`FirstReads::note_at`] as it reads or runs files, as the Linux tracer does,
 //! answers the attribute query from attributes that the test sets and the machine
 //! query with a state that the test scripts, and builds the tree of one process
-//! that a request asks for with [`ProcessTree::of_request`].
+//! that a request asks for with [`ProcessTree::of_request`]. A fake whose run a
+//! test builds an observation report from builds the tree of each of its results
+//! with [`ProcessTree::of_run`] instead, which also puts the run's reason, unknown
+//! system calls and connections on the one program, as the Linux tracer puts them
+//! on the program that made them, so the report says what the run reported.
 //! Nothing in the engine changes when the tracer does.
 
 use std::{
@@ -1361,6 +1365,35 @@ impl ProcessTree {
         }
     }
 
+    /// The tree of one process, the command of `request`, built from the run's
+    /// whole `result`, as [`ProcessTree::of_request`] builds it from the result's
+    /// accesses and termination, with the result's reason that the trace is
+    /// incomplete, when it has one, its unknown system calls and its connections
+    /// on the one program, where the Linux tracer puts them: on the program that
+    /// made them. So the tree carries everything that the run reports, and a report
+    /// built from it says what the run says. Fake tracers whose runs a test builds a
+    /// report from build their trees with it; the tree of a failed start, which
+    /// reports none of these, keeps the shape that `of_request` gives it.
+    #[must_use]
+    pub fn of_run(
+        request: &RunRequest,
+        result: &RunResult,
+    ) -> Self {
+        let mut tree = Self::of_request(request, &result.accesses, Some(result.termination));
+        for process in &mut tree.processes {
+            for program in &mut process.programs {
+                program.incomplete.extend(result.incomplete.iter().cloned());
+                program
+                    .unknown_system_calls
+                    .extend(result.unknown_system_calls.iter().copied());
+                program
+                    .connections
+                    .extend(result.connections.iter().cloned());
+            }
+        }
+        tree
+    }
+
     /// The process numbered `number`, if there is one.
     #[must_use]
     pub fn process(
@@ -2341,6 +2374,67 @@ mod tests {
         let empty = ProcessTree::of_request(&request, &Accesses::new(), None);
         assert!(empty.accesses().is_empty());
         assert_eq!(empty.process(1).map(|process| process.status), Some(None));
+    }
+
+    /// The tree that the helper builds from a whole run holds the run's reason,
+    /// unknown system calls and connections on its one program, so its unknown
+    /// system calls and connections equal the run's, and its observations combine
+    /// to the run's accesses, each with `ok`; a run without them gives the tree of
+    /// `of_request`.
+    #[test]
+    fn the_helper_tree_of_a_run_holds_what_the_run_reports() {
+        let request = tool_request();
+        let mut accesses = Accesses::new();
+        accesses.record(path("/bin/tool"), AccessKind::Exec);
+        accesses.record(path("/work/in"), AccessKind::Read);
+        accesses.record(path("/work/out"), AccessKind::Write);
+        let reason = IncompleteReason::Other {
+            detail: "the tracer lost a process".to_owned(),
+        };
+        let connections = BTreeSet::from([
+            Connection::Ip("127.0.0.1:80".parse().unwrap()),
+            Connection::UnixAbstract(b"kizz".to_vec()),
+        ]);
+        let result = RunResult {
+            termination: Termination::Exited(4),
+            output: CapturedOutput::empty(CaptureMode::Split),
+            accesses: accesses.clone(),
+            incomplete: Some(reason.clone()),
+            first_reads: FirstReads::new(),
+            unknown_system_calls: BTreeSet::from([400, 1_000_000]),
+            connections: connections.clone(),
+            tree: None,
+        };
+        let tree = ProcessTree::of_run(&request, &result);
+        assert_eq!(tree.accesses(), accesses);
+        assert_eq!(tree.unknown_system_calls(), result.unknown_system_calls);
+        assert_eq!(tree.connections(), connections);
+        let [process] = tree.processes.as_slice() else {
+            panic!("expected one process, got {tree:?}");
+        };
+        assert_eq!(
+            (process.number, process.pid, process.parent, process.status),
+            (1, None, None, Some(Termination::Exited(4)))
+        );
+        let [program] = process.programs.as_slice() else {
+            panic!("expected one program, got {process:?}");
+        };
+        assert_eq!(program.incomplete, vec![reason]);
+        for (_, kinds) in &program.observations {
+            for outcomes in kinds.values() {
+                assert_eq!(outcomes, &BTreeSet::from([Outcome::Ok]));
+            }
+        }
+        let plain = RunResult {
+            incomplete: None,
+            unknown_system_calls: BTreeSet::new(),
+            connections: BTreeSet::new(),
+            ..result
+        };
+        assert_eq!(
+            ProcessTree::of_run(&request, &plain),
+            ProcessTree::of_request(&request, &accesses, Some(Termination::Exited(4)))
+        );
     }
 
     /// A tracer that runs nothing and implements only the required methods, so the

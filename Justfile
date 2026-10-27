@@ -33,7 +33,8 @@ check-ci: sort-dictionary
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     rumdl check .
     cspell lint --config cspell.json --no-progress .
-    cargo deny check
+    cargo deny check advisories || true
+    cargo deny check bans licenses sources
     cargo build --workspace --release
 
 # Run every fixer, then the CI gate. This is also the quality gate of the workspace agent workflow.

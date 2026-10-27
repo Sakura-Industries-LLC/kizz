@@ -125,6 +125,7 @@ Nobody declares dependencies; kizz observes them.
 The first version is the builder engine: it discovers tasks, runs their programs, runs and traces their commands,
 caches the results, and explains every decision.
 It ships as one command, `kizz`, with subcommands; commands planned for later are present as stubs.
+`kizz execute` runs any command and reports what it touched, without a `kizz.md` and without the cache.
 
 ### Later extensions
 
@@ -174,16 +175,21 @@ Version 1 implements these commands:
 * `kizz list [targets]` lists discovered tasks with their file, line, name and targets, plus any discovery warnings.
 * `kizz cache clean` removes stale entries from the shared cache, and `kizz cache reset` wipes the entries under a path,
   or the whole cache with `--all`, after confirmation (see [Cleaning up the cache](#cleaning-up-the-cache)).
+* `kizz execute --output=<file> -- <program> [arguments...]` runs any program and reports what it touched in `<file>`.
+  `--compact` combines the observations of every process, and `--json` writes JSON instead of text.
+  It needs no `kizz.md` and no cache; see [Observing any command](#observing-any-command-with-kizz-execute).
 
 Parsed but stubbed, in the same style as the cbork CLI stubs: `kizz graph`, `kizz run` (the command runner) and `kizz image`
 (container images).
 
 Output follows cbork: a banner suppressed by `--quiet` or `--no-banner`, with styling from `console`.
+`kizz execute` never prints the banner, writes nothing to standard output, and writes only its fatal errors to standard error.
 Warnings are loud: bold, colored, and repeated in the final summary.
 `kizz build` prints one line for each command it runs, with a one-line reason.
 Cached commands are counted in the summary and listed with `--verbose`.
 
 Exit status: 0 on success, 1 when a task fails, 2 for usage or configuration errors, and 130 when interrupted.
+`kizz execute` exits with its program's status instead, as [Observing any command](#observing-any-command-with-kizz-execute) says.
 
 ## Discovery
 
@@ -932,6 +938,38 @@ The workspace lints forbid code that panics, and `clippy.toml` bans the library 
 * Every other call that can panic, such as a `RefCell` borrow or `split_at`, uses a form that cannot.
 * The workspace lints and `clippy.toml` ban each kind of call that can panic, so that new code cannot bring one back.
 
+## Observing any command with `kizz execute`
+
+`kizz execute` runs one program, traces its whole process tree, and writes an [observation report](#observation-reports).
+It needs no `kizz.md`, no repository and no cache.
+It shows what an existing build or tool touches, which helps to diagnose it before anything moves to kizz.
+It is a diagnostic tool: it never restricts the program, and it never caches anything, so every run executes the program.
+
+* Everything after the required `--` is the program and its arguments, and the program runs without a shell.
+* A program name without `/` is looked up in the caller's `PATH`, as `run()` looks one up in the task's.
+  Each location that the lookup checks is an observation of the command's first program, as it is a dependency in a build.
+  Without `PATH` in the caller's environment, a name without `/` is not found.
+* The program gets the caller's whole environment, unchanged, and the caller's working directory.
+* It keeps kizz's standard input, output and error, process group and session, and kizz mixes nothing into them.
+* Kizz ignores `SIGINT` and `SIGQUIT` while the program runs, as `time` does, and the program gets their default action.
+* Kizz forwards a `SIGTERM` or `SIGHUP` that it receives to the program, so one sent to the process group arrives twice.
+* A signal that kizz was started with ignored stays ignored, for kizz and for the program.
+* Ctrl-Z stops kizz with the program, and `fg` continues both.
+  A traced process may still run after Ctrl-Z until its next traced system call or signal, where it waits for kizz.
+  A stop signal sent to a traced process alone, such as `kill -STOP`, does not keep it stopped.
+* Kizz waits for the whole process tree to end, then replaces `<file>` with the report atomically.
+  The program never sees the report, and the directory that holds `<file>` must exist before the program starts.
+* The report is written whatever happened: the program exited, failed, was killed or could not start, or tracing failed.
+* If kizz itself is killed, the traced processes die with it, and no report is written.
+* Kizz never opens the cache, never takes its lock, and never creates a cache directory.
+
+Exit status:
+
+* the program's exit code, or 128 plus the number of the signal that killed it
+* 127 when the program is not found, and 126 when it is found but cannot be run or started
+* 125 when kizz itself fails after it accepted the command line: the tracer failed, or the report could not be written
+* 2 for a command-line error, as for every kizz command, such as a missing `--output` or a missing directory for it
+
 ## Observation reports
 
 An observation report says what its commands touched, organized by process, for people and for programs.
@@ -970,6 +1008,13 @@ A report is text unless `--json` is given.
   A new field may appear without a new version, but a field that changes its meaning or disappears raises the version.
   JSON is indented by two spaces and ends with a newline.
 * Paths and arguments that are not valid UTF-8 appear with each invalid sequence replaced by U+FFFD, in both forms.
+* Text escapes each backslash and control character of the strings that it shows, such as paths, arguments and messages.
+  Here the control characters are U+0000 through U+001F, U+007F through U+009F, and the separators U+2028 and U+2029.
+  A backslash is written as `\\`, a newline as `\n`, a tab as `\t`, and a carriage return as `\r`.
+  Any other control character is written as `\u{`, its code in lowercase hexadecimal without leading zeros, and `}`.
+  For example, the escape character U+001B is written as `\u{1b}`, and U+0000 as `\u{0}`.
+  So no string can break its line, and the escapes never make two different strings read alike.
+  JSON keeps its standard escaping, and the escapes of text do not apply to it.
 
 ### Observation report fields
 
@@ -1023,7 +1068,7 @@ A connection has a `kind`, `ip`, `unix` or `abstract`, and an `address`, a `path
 crates/
   kizz/              the binary: command line (bpaf), terminal output (console), banner (build-info)
   kizz-core/         the engine, with no Linux code: discovery, Markdown, Starlark runtime, step keys,
-                     cache checks, explanations, ordering and observation reports
+                     cache checks, explanations, ordering, observation reports and running kizz execute
   kizz-store/        the cache location, the lock file, and the SurrealKV store of typed records
   kizz-threads/      the one place that starts threads, waiting and retrying while the system cannot start one
   kizz-trace/        the tracer interface: the run request, the result, the process tree, access kinds,
@@ -1126,7 +1171,8 @@ check-ci: sort-dictionary
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     rumdl check .
     cspell lint --config cspell.json --no-progress .
-    cargo deny check
+    cargo deny check advisories || true
+    cargo deny check bans licenses sources
     cargo build --workspace --release
 
 # Run every fixer, then the CI gate. This is also the quality gate of the workspace agent workflow.
@@ -1138,6 +1184,9 @@ fix-ci: fix check-ci
 * `check-ci` checks and builds: it sorts the dictionary, as decided, runs the checks, checks licenses,
   and builds the release binaries.
   No recipe passes `--locked`, so Cargo creates and refreshes `Cargo.lock` as needed.
+  `cargo deny check advisories` reports the advisories that apply to the dependencies, for information only.
+  No finding of that check, of any kind, ever fails `check-ci` or `fix-ci`, and `deny.toml` ignores no advisory.
+  `cargo deny check bans licenses sources` comes next, and any finding of those three checks fails the recipe.
 * `fix-ci` runs `fix` and then `check-ci`.
   It is also the quality gate the workspace agent workflow runs.
 
@@ -1335,6 +1384,7 @@ Depends on phases 7 and 8.
   and once for each of two numbers that the tracer does not know, 400 and 1,000,000.
 * `coverage.c` also binds, connects and sends to Unix sockets, and connects and sends to loopback addresses.
 * Another test runs the program through the Linux tracer with the process tree, without a cache.
+* A test runs the program with `kizz execute` too, and compares both of its reports with the expectation file.
 
 Acceptance, end to end with the real tracer and a temporary cache:
 
@@ -1352,12 +1402,16 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * The process tree combines to exactly the run's accesses, holds each child under its parent, and no process for a thread.
 * For each expected path, the tree records exactly the outcomes that the entry's sources give each of its kinds.
 * Each `coverage-incomplete` call and unknown number appears in the tree as a reason of the program that made it.
+* `kizz execute --compact --json` of the program records exactly the expected paths, kinds and outcomes under the task directory.
+* Its hierarchical report combines to exactly its compact report.
+* For each `coverage-incomplete` call and number, the report of `kizz execute` says that the trace is incomplete and names it.
 
 ## Testing
 
 * Each crate has unit tests.
 * `kizz-trace-linux` tests trace real processes, so they need `ptrace` and seccomp to be allowed where the tests run.
 * `kizz-core` tests use a fake tracer that performs scripted file operations and reports them.
+* A fake run that a test builds a report from has every reason, unknown system call and connection of the run in its tree.
 * The tracer's bookkeeping of processes has unit tests that replay forks, threads, `exec` calls, exits and reused IDs.
 * `kizz-trace-linux` tests run commands in both ways and check their process group, streams and forwarded signals.
 * Tests repeat an `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` at once while it fails with `EAGAIN`, up to 100 attempts.

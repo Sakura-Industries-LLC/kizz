@@ -192,11 +192,13 @@ pub(crate) fn run(
 }
 
 /// The largest signal number, plus one, that `signal_hook`'s delivery accepts: its
-/// `Handle::add_signal` panics at or above it.
-const SIGNAL_LIMIT: c_int = 128;
+/// `Handle::add_signal` panics at or above it. `kizz execute` checks its signals
+/// against it too.
+pub(crate) const SIGNAL_LIMIT: c_int = 128;
 
-/// How long the thread that handles Ctrl-C sleeps between its looks for signals.
-const SIGNAL_POLL: Duration = Duration::from_millis(20);
+/// How long the thread that handles Ctrl-C, or the one of `kizz execute` that
+/// forwards signals, sleeps between its looks for signals.
+pub(crate) const SIGNAL_POLL: Duration = Duration::from_millis(20);
 
 /// A delivery of `signal`, or the error of a signal that cannot be handled.
 ///
@@ -259,8 +261,9 @@ fn with_interrupts<T>(
 
 /// Closes a signal delivery when dropped, which ends the thread that looks for its
 /// signals; dropped at the end of [`with_interrupts`]'s scope, and while a panic
-/// unwinds out of it, before the scope waits for that thread.
-struct CloseOnDrop(Handle);
+/// unwinds out of it, before the scope waits for that thread. `kizz execute` uses
+/// it the same way.
+pub(crate) struct CloseOnDrop(pub(crate) Handle);
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {

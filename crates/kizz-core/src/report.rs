@@ -30,7 +30,10 @@
 //! hierarchical or compact ([`ReportMode`]), from the same model. [`JSON_FIELDS`]
 //! lists every field of the JSON format by its path, with the modes that hold it.
 //! Paths and arguments that are not valid UTF-8 appear with each invalid sequence
-//! replaced by U+FFFD, in both formats.
+//! replaced by U+FFFD, in both formats. Text then escapes each backslash and
+//! control character of every string that it shows ([`escape_text`]), so no string
+//! breaks its line and two different strings never read alike; JSON keeps its
+//! standard escaping.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -298,16 +301,17 @@ impl CommandOutcome {
     }
 
     /// The outcome as text shows it, such as `exited with 0` or
-    /// `not found: MESSAGE`.
+    /// `not found: MESSAGE`, with the message escaped as [`escape_text`] escapes
+    /// it.
     #[must_use]
     pub fn text(&self) -> String {
         match self {
             Self::Exited(code) => format!("exited with {code}"),
             Self::Signaled(signal) => format!("signaled with {signal}"),
-            Self::NotFound(error) => format!("not found: {error}"),
-            Self::NotExecutable(error) => format!("not executable: {error}"),
-            Self::StartFailed(error) => format!("start failed: {error}"),
-            Self::Failed(error) => format!("failed: {error}"),
+            Self::NotFound(error) => format!("not found: {}", escape_text(error)),
+            Self::NotExecutable(error) => format!("not executable: {}", escape_text(error)),
+            Self::StartFailed(error) => format!("start failed: {}", escape_text(error)),
+            Self::Failed(error) => format!("failed: {}", escape_text(error)),
         }
     }
 }
@@ -856,7 +860,7 @@ impl Report {
             blocks.push(text_command(index.saturating_add(1), command, mode));
         }
         if let Some(task_program) = &self.task_program {
-            let mut block = format!("task program: {}\n", task_program.task);
+            let mut block = format!("task program: {}\n", escape_text(&task_program.task));
             if mode == ReportMode::Hierarchical {
                 text_groups(&mut block, &task_program.observations, None, 1);
             }
@@ -977,6 +981,38 @@ fn lossy_path(path: &Path) -> String {
     lossy(path.as_os_str())
 }
 
+/// `text` as a text report shows it: a backslash as `\\`, a newline as `\n`, a tab
+/// as `\t`, a carriage return as `\r`, every other control character, U+0000
+/// through U+001F and U+007F through U+009F, and the separators U+2028 and U+2029
+/// as `\u{`, the code in lowercase hexadecimal without leading zeros, and `}`, as
+/// [`char::escape_unicode`] writes it, and every other character as it is.
+///
+/// So no string breaks its line, and since the backslash is escaped too, each
+/// escape reads one way and two different strings never give the same text.
+#[must_use]
+pub fn escape_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\t' => escaped.push_str("\\t"),
+            '\r' => escaped.push_str("\\r"),
+            other if other.is_control() || matches!(other, '\u{2028}' | '\u{2029}') => {
+                escaped.extend(other.escape_unicode());
+            },
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// `path` as a text report shows it: as [`lossy`] makes it, then escaped as
+/// [`escape_text`] escapes it.
+fn text_path(path: &Path) -> String {
+    escape_text(&lossy_path(path))
+}
+
 /// Whether `word` reads the same to a POSIX shell without quotes: it is not empty
 /// and holds only letters, digits and `-_./=:,+@%^`.
 fn is_plain_word(word: &str) -> bool {
@@ -986,13 +1022,15 @@ fn is_plain_word(word: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "-_./=:,+@%^".contains(character))
 }
 
-/// `args` as text shows them: separated by spaces, each quoted for a POSIX shell
-/// when it is empty or holds another character than [`is_plain_word`] allows.
+/// `args` as text shows them: separated by spaces, each escaped as
+/// [`escape_text`] escapes it, then quoted for a POSIX shell when it is empty or
+/// holds another character than [`is_plain_word`] allows, so an argument with an
+/// escape is always quoted.
 fn shell_words(args: &[OsString]) -> String {
     let words: Vec<String> = args
         .iter()
         .map(|arg| {
-            let word = lossy(arg);
+            let word = escape_text(&lossy(arg));
             if is_plain_word(&word) {
                 word
             } else {
@@ -1036,19 +1074,25 @@ fn line(
     text.push('\n');
 }
 
-/// `outcomes`, separated by `, `, in their order.
+/// `outcomes`, separated by `, `, in their order, each escaped as [`escape_text`]
+/// escapes it.
 fn outcome_list<'a>(outcomes: impl Iterator<Item = &'a Outcome>) -> String {
-    let outcomes: Vec<String> = outcomes.map(ToString::to_string).collect();
+    let outcomes: Vec<String> = outcomes
+        .map(|outcome| escape_text(&outcome.to_string()))
+        .collect();
     outcomes.join(", ")
 }
 
 /// A connection as text shows it: `ip ADDRESS`, `unix PATH` or `abstract NAME`,
-/// with the name as [`lossy`] makes it.
+/// with the path and the name as [`lossy`] makes them, escaped as [`escape_text`]
+/// escapes them.
 fn connection_text(connection: &Connection) -> String {
     match connection {
         Connection::Ip(address) => format!("ip {address}"),
-        Connection::UnixPath(path) => format!("unix {}", lossy_path(path.as_path())),
-        Connection::UnixAbstract(name) => format!("abstract {}", String::from_utf8_lossy(name)),
+        Connection::UnixPath(path) => format!("unix {}", text_path(path.as_path())),
+        Connection::UnixAbstract(name) => {
+            format!("abstract {}", escape_text(&String::from_utf8_lossy(name)))
+        },
     }
 }
 
@@ -1077,7 +1121,7 @@ fn text_groups(
                 inner,
                 &format!(
                     "{}: {}",
-                    lossy_path(path.as_path()),
+                    text_path(path.as_path()),
                     outcome_list(outcomes.iter())
                 ),
             );
@@ -1133,10 +1177,10 @@ fn reason_line(
             format!(
                 "{}, process {process}: {}",
                 reason.kind.text(),
-                reason.detail
+                escape_text(&reason.detail)
             )
         },
-        _ => format!("{}: {}", reason.kind.text(), reason.detail),
+        _ => format!("{}: {}", reason.kind.text(), escape_text(&reason.detail)),
     }
 }
 
@@ -1154,13 +1198,13 @@ fn text_command(
     );
     let program = command.program.as_ref().map_or_else(
         || "not found".to_owned(),
-        |program| lossy_path(program.as_path()),
+        |program| text_path(program.as_path()),
     );
     line(&mut text, 1, &format!("program: {program}"));
     line(
         &mut text,
         1,
-        &format!("directory: {}", lossy_path(command.cwd.as_path())),
+        &format!("directory: {}", text_path(command.cwd.as_path())),
     );
     line(
         &mut text,
@@ -1219,9 +1263,9 @@ fn text_processes(
         let inner = depth.saturating_add(1);
         for program in &process.programs {
             let head = if program.inherited {
-                format!("program {}, inherited", lossy_path(&program.path))
+                format!("program {}, inherited", text_path(&program.path))
             } else {
-                format!("program {}", lossy_path(&program.path))
+                format!("program {}", text_path(&program.path))
             };
             line(text, inner, &with_args(head, &program.args));
             text_groups(
@@ -1534,7 +1578,7 @@ fn json_command(
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Json, is_plain_word, shell_words, write_json_string};
+    use super::{Json, escape_text, is_plain_word, shell_words, write_json_string};
 
     /// Strings are escaped as `serde_json` escapes them, so it reads them back.
     #[test]
@@ -1581,5 +1625,84 @@ mod tests {
             .map(OsString::from)
             .collect();
         assert_eq!(shell_words(&args), "cc '' 'it'\\''s' '$HOME' 'a*b'");
+    }
+
+    /// Each escape of text: a backslash, a newline, a tab and a carriage return
+    /// with their short escapes, every other control character and the two
+    /// separators as `\u{...}` in lowercase hexadecimal without leading zeros.
+    #[test]
+    fn text_escapes_backslashes_and_control_characters() {
+        let cases = [
+            ("\\", "\\\\"),
+            ("\n", "\\n"),
+            ("\t", "\\t"),
+            ("\r", "\\r"),
+            ("\u{0}", "\\u{0}"),
+            ("\u{1}", "\\u{1}"),
+            ("\u{1b}", "\\u{1b}"),
+            ("\u{1f}", "\\u{1f}"),
+            ("\u{7f}", "\\u{7f}"),
+            ("\u{85}", "\\u{85}"),
+            ("\u{9f}", "\\u{9f}"),
+            ("\u{2028}", "\\u{2028}"),
+            ("\u{2029}", "\\u{2029}"),
+            ("a\nb\\c", "a\\nb\\\\c"),
+        ];
+        for (text, escaped) in cases {
+            assert_eq!(escape_text(text), escaped, "{text:?}");
+        }
+    }
+
+    /// Every other character stays as it is, such as letters, quotes, `é`, U+FFFD,
+    /// U+00A0 and U+200B, so a string without a backslash or a control character
+    /// reads as before.
+    #[test]
+    fn text_keeps_every_other_character() {
+        for text in [
+            "plain /work/main.c",
+            "it's \"quoted\" $HOME",
+            "caf\u{e9}",
+            "�",
+            "\u{a0}",
+            "\u{200b}",
+            "\u{1f600}",
+            "",
+        ] {
+            assert_eq!(escape_text(text), text, "{text:?}");
+        }
+    }
+
+    /// Two strings that would read alike without the backslash's escape read
+    /// differently, such as a newline and a backslash followed by `n`.
+    #[test]
+    fn escapes_keep_different_strings_apart() {
+        let pairs = [
+            ("\n", "\\n"),
+            ("\t", "\\t"),
+            ("\r", "\\r"),
+            ("\u{1b}", "\\u{1b}"),
+            ("\u{0}", "\\u{0}"),
+            ("\u{2028}", "\\u{2028}"),
+            ("a\\", "a\\\\"),
+        ];
+        for (first, second) in pairs {
+            assert_ne!(first, second);
+            assert_ne!(
+                escape_text(first),
+                escape_text(second),
+                "{first:?} {second:?}"
+            );
+        }
+    }
+
+    /// An argument is escaped before it is quoted, so an argument with an escape is
+    /// always quoted, and the escape of a single quote stays as it is.
+    #[test]
+    fn arguments_are_escaped_before_they_are_quoted() {
+        let args: Vec<OsString> = ["a\nb", "back\\slash", "it's\t"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(shell_words(&args), "'a\\nb' 'back\\\\slash' 'it'\\''s\\t'");
     }
 }

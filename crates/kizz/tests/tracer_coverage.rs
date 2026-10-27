@@ -102,6 +102,21 @@
 //! that made it, under the same gate for `open_tree_attr` and `fchroot` and the
 //! same variable for calls and numbers that the tracer never saw, with their
 //! notices.
+//!
+//! Two more tests run the program with `kizz execute` in copies of their own, after
+//! `kizz build coverage-build`, with `kizz`'s environment of `KIZZ_CACHE_DIR` and
+//! `PATH` (E9). The first runs `kizz execute --compact --json -- ./coverage` in the
+//! copy and requires that under the task directory the report's paths, kinds and
+//! outcomes are exactly those of the expectation file, under the same availability
+//! gate and notice, and that the report is complete; it then runs
+//! `kizz execute --json` in a second copy of the built copy and requires that the
+//! hierarchical report's observations and connections, combined over every
+//! program, are exactly the compact report's, with the paths under each copy taken
+//! relative to it. The second runs each mode of `coverage-incomplete` with
+//! `kizz execute --json` and requires that each report says that the trace is
+//! incomplete and names the call or the number, under the same gate for
+//! `open_tree_attr` and `fchroot` and the same variable for calls and numbers that
+//! the tracer never saw, with their notices.
 
 #![allow(
     clippy::disallowed_macros,
@@ -136,6 +151,7 @@ use kizz_trace::{
 };
 use kizz_trace_linux::{LinuxTracer, TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
 use libc::c_long;
+use serde_json::Value;
 
 /// The result of a test or a test helper.
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -3241,6 +3257,427 @@ fn the_process_tree_lists_each_incomplete_reason_on_its_program() -> TestResult 
             true,
             &mut skips,
         )?);
+    }
+    skips.write_notice(test)?;
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// Run `kizz execute` with `flags` in `copy`, with the cache `cache`, for
+/// `./coverage` with `mode` after it when it is given, writing the report to
+/// `report`; return the run and the report, parsed.
+fn execute_coverage(
+    copy: &Path,
+    cache: &Path,
+    flags: &[&str],
+    report: &Path,
+    mode: Option<&str>,
+) -> TestResult<(Run, Value)> {
+    let output = format!(
+        "--output={}",
+        report.to_str().ok_or("the report's path is not UTF-8")?
+    );
+    let mut args = vec!["execute"];
+    args.extend(flags);
+    args.extend([output.as_str(), "--", "./coverage"]);
+    args.extend(mode);
+    let run = run_kizz(copy, cache, &args)?;
+    let text = fs::read_to_string(report)
+        .map_err(|error| format!("no report at {}: {error}\n{run}", report.display()))?;
+    let value = serde_json::from_str(&text)?;
+    Ok((run, value))
+}
+
+/// The text of a path of a report of `kizz execute` in `copy`: relative to `copy`
+/// after `./` when it is under it, and as it is otherwise, so the reports of two
+/// copies compare.
+fn copy_relative(
+    path: &str,
+    copy: &Path,
+) -> String {
+    Path::new(path).strip_prefix(copy).map_or_else(
+        |_| path.to_owned(),
+        |relative| format!("./{}", relative.display()),
+    )
+}
+
+/// Each observation of a JSON report of `kizz execute` in `copy`, by its path as
+/// [`copy_relative`] gives it, with each kind's outcomes, and its connections, each
+/// as its kind and its address, path or name: the compact report's lists, or every
+/// program's of a hierarchical report, combined.
+type ReportObservations = (
+    BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    BTreeSet<String>,
+);
+
+/// The value at the JSON pointer `pointer` in `value`, or `null` when there is
+/// none.
+fn json_at<'a>(
+    value: &'a Value,
+    pointer: &str,
+) -> &'a Value {
+    value.pointer(pointer).unwrap_or(&Value::Null)
+}
+
+/// The [`ReportObservations`] of `report`, a JSON report of `kizz execute` in
+/// `copy`.
+fn report_observations(
+    report: &Value,
+    copy: &Path,
+) -> ReportObservations {
+    let mut observation_lists = Vec::new();
+    let mut connection_lists = Vec::new();
+    if json_at(report, "/mode") == "compact" {
+        observation_lists.push(json_at(report, "/observations"));
+        connection_lists.push(json_at(report, "/connections"));
+    } else {
+        for command in json_at(report, "/commands")
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for process in json_at(command, "/processes")
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for program in json_at(process, "/programs")
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    observation_lists.push(json_at(program, "/observations"));
+                    connection_lists.push(json_at(program, "/connections"));
+                }
+            }
+        }
+    }
+    let mut observations: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    for observation in observation_lists
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+    {
+        let path = copy_relative(
+            json_at(observation, "/path").as_str().unwrap_or_default(),
+            copy,
+        );
+        let kinds = observations.entry(path).or_default();
+        for (kind, outcomes) in json_at(observation, "/access")
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            kinds.entry(kind.clone()).or_default().extend(
+                outcomes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|outcome| outcome.as_str().map(str::to_owned)),
+            );
+        }
+    }
+    let connections = connection_lists
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .map(|connection| {
+            let kind = json_at(connection, "/kind").as_str().unwrap_or_default();
+            let target = ["/address", "/path", "/name"]
+                .into_iter()
+                .find_map(|key| json_at(connection, key).as_str())
+                .unwrap_or_default();
+            format!("{kind} {}", copy_relative(target, copy))
+        })
+        .collect();
+    (observations, connections)
+}
+
+/// The outcomes that the JSON report `report` of `kizz execute` records under
+/// `dir`, combined over every observation, by the path relative to `dir`; `dir`
+/// itself is `.`.
+fn report_outcomes(
+    report: &Value,
+    dir: &Path,
+) -> PathOutcomes {
+    let mut outcomes = PathOutcomes::new();
+    for (path, kinds) in report_observations(report, dir).0 {
+        let Some(relative) = path
+            .strip_prefix("./")
+            .or_else(|| (path == ".").then_some(""))
+        else {
+            continue;
+        };
+        let name = if relative.is_empty() {
+            ".".to_owned()
+        } else {
+            relative.to_owned()
+        };
+        let entry = outcomes.entry(name).or_default();
+        for (kind, names) in kinds {
+            if let Some((kind, ..)) = KINDS.iter().find(|(_, name, _)| *name == kind) {
+                entry.entry(*kind).or_default().extend(names);
+            }
+        }
+    }
+    outcomes
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, with `kizz execute --compact --json` in the copy (E9): under the task
+/// directory, its report's paths, kinds and outcomes must be exactly those of the
+/// expectation file, each kind with the outcomes of the entry's sources that add
+/// it, leaving out the entries that name an unavailable gated call, as the test's
+/// own check and the program's report, which must agree, find; the report must be
+/// complete, and kizz must exit with the program's 0. The same program, run with
+/// `kizz execute --json` in a second copy of the built copy, gives a hierarchical
+/// report whose observations and connections, combined over every program, are
+/// exactly the compact report's, with the paths under each copy taken relative to
+/// it. A notice names each unavailable gated call.
+#[test]
+fn kizz_execute_reports_every_outcome_of_the_coverage_program() -> TestResult {
+    let test = "kizz_execute_reports_every_outcome_of_the_coverage_program";
+    let (available, mut problems) = own_availability()?;
+    write_notice(test, &available)?;
+    let entries = fixture_entries()?;
+    let (dir, copy, build) = built_copy()?;
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    let second = dir.path().canonicalize()?.join("second");
+    copy_tree(&copy, &second)?;
+    let cache = tempfile::tempdir()?;
+    let reports = tempfile::tempdir()?;
+    let compact_report = reports.path().join("compact.json");
+    let (compact_run, compact) = execute_coverage(
+        &copy,
+        cache.path(),
+        &["--compact", "--json"],
+        &compact_report,
+        None,
+    )?;
+    let output = format!("{}{}", compact_run.stdout, compact_run.stderr);
+    if compact_run.status != Some(0) {
+        problems.push(format!("kizz execute ended with {:?}", compact_run.status));
+    }
+    if !output.lines().any(|line| line.starts_with(SUCCESS_LINE)) {
+        problems.push("the program did not print its summary line".to_owned());
+    }
+    let (complete, mode) = (json_at(&compact, "/complete"), json_at(&compact, "/mode"));
+    if *complete != true || *mode != "compact" {
+        problems.push(format!(
+            "the compact report is not complete, or not compact: complete {complete}, mode {mode}"
+        ));
+    }
+    let (reported, report_problems) = reported_availability(&output);
+    problems.extend(report_problems);
+    problems.extend(disagreements(&reported, &available));
+    problems.extend(outcome_differences(
+        &expected_outcomes(&entries, &available),
+        &report_outcomes(&compact, &copy),
+    ));
+
+    let hierarchical_report = reports.path().join("hierarchical.json");
+    let (hierarchical_run, hierarchical) = execute_coverage(
+        &second,
+        cache.path(),
+        &["--json"],
+        &hierarchical_report,
+        None,
+    )?;
+    if hierarchical_run.status != Some(0) {
+        problems.push(format!(
+            "kizz execute --json ended with {:?}",
+            hierarchical_run.status
+        ));
+    }
+    let combined = report_observations(&hierarchical, &second);
+    let listed = report_observations(&compact, &copy);
+    if combined.0.is_empty() {
+        problems.push("the hierarchical report holds no observation".to_owned());
+    }
+    let paths: BTreeSet<&String> = combined.0.keys().chain(listed.0.keys()).collect();
+    for path in paths {
+        let (from_hierarchical, from_compact) = (combined.0.get(path), listed.0.get(path));
+        if from_hierarchical != from_compact {
+            problems.push(format!(
+                "{path}: the hierarchical report combines to {from_hierarchical:?}, and the \
+                 compact one lists {from_compact:?}"
+            ));
+        }
+    }
+    if combined.1 != listed.1 {
+        problems.push(format!(
+            "the hierarchical report's connections {:?} are not the compact one's {:?}",
+            combined.1, listed.1
+        ));
+    }
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{compact_run}\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// The problems of the report `report` of `kizz execute` for the mode of
+/// `coverage-incomplete` that makes `made`, whose run is `run`, which `available`
+/// gives as available or not. For a gated call, the program's report must agree
+/// with `available`. A report that names no reason, so that the tracer never saw
+/// the call or number, is judged by [`Skips::never_saw`] where it is available, and
+/// needs nothing more where it is not. Otherwise kizz must have exited with the
+/// program's 0, and the report must be incomplete, at the top and for the command,
+/// and name the call in an `untraceable_system_call` reason, or the number in an
+/// `unknown_system_call` reason.
+fn execute_made_problems(
+    report: &Value,
+    run: &Run,
+    made: Made,
+    available: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let output = format!("{}{}", run.stdout, run.stderr);
+    let mut problems = Vec::new();
+    if let Made::Call(name) = made
+        && GATED_UNTRACEABLE.contains(&name)
+    {
+        let reported: Vec<bool> = output
+            .lines()
+            .filter_map(|line| {
+                if line == format!("{AVAILABLE_LINE}{name}") {
+                    Some(true)
+                } else if line == format!("{UNAVAILABLE_LINE}{name}") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if reported != [available] {
+            problems.push(format!(
+                "the run of {name} reported {reported:?}, but the test's own check found it {}",
+                availability_word(available)
+            ));
+        }
+    }
+    let command = json_at(report, "/commands/0");
+    let reasons = json_at(command, "/incomplete")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let (complete, command_complete) =
+        (json_at(report, "/complete"), json_at(command, "/complete"));
+    if reasons.is_empty() && *complete == true {
+        if available {
+            let mut ran = Vec::new();
+            if run.status != Some(0) {
+                ran.push(format!(
+                    "kizz execute of {made} ended with {:?}",
+                    run.status
+                ));
+            }
+            let answers: Vec<&str> = output
+                .lines()
+                .filter_map(|line| line.strip_prefix(made.report().as_str()))
+                .collect();
+            if !matches!(answers.as_slice(), [answer] if *answer != "success") {
+                ran.push(format!(
+                    "the tracer never saw {}, but its run did not report it once with an \
+                     error: {output}",
+                    made.quoted()
+                ));
+            }
+            problems.extend(skips.never_saw(made, ran));
+        } else if run.status != Some(0) {
+            problems.push(format!(
+                "kizz execute of {made} ended with {:?}",
+                run.status
+            ));
+        }
+        return problems;
+    }
+    if run.status != Some(0) {
+        problems.push(format!(
+            "kizz execute of {made} ended with {:?}",
+            run.status
+        ));
+    }
+    if *complete != false || *command_complete != false {
+        problems.push(format!(
+            "the report of {made} is not incomplete: complete {complete}, the command's \
+             {command_complete}"
+        ));
+    }
+    let names = |reason: &Value| {
+        match made {
+            Made::Call(name) => {
+                json_at(reason, "/kind") == "untraceable_system_call"
+                    && json_at(reason, "/detail")
+                        .as_str()
+                        .is_some_and(|detail| detail.contains(&format!("`{name}`")))
+            },
+            Made::Number(number) => {
+                json_at(reason, "/kind") == "unknown_system_call"
+                    && *json_at(reason, "/number") == number
+            },
+        }
+    };
+    if !reasons.iter().any(names) {
+        problems.push(format!(
+            "the report of {made} does not name {}: {reasons:?}",
+            made.quoted()
+        ));
+    }
+    problems
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, in each mode of `coverage-incomplete` with `kizz execute --json` in the
+/// copy: each report says that the trace is incomplete, at the top and for the
+/// command, and names the call or the unknown number, while kizz exits with the
+/// program's 0. Where `open_tree_attr` or `fchroot` is unavailable, as the test's
+/// own check and the program's report find, its report need not be incomplete, and
+/// a notice names it. A call or number that the tracer never saw fails the test,
+/// unless [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn kizz_execute_reports_each_incomplete_reason() -> TestResult {
+    let test = "kizz_execute_reports_each_incomplete_reason";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let (_dir, copy, build) = built_copy()?;
+    let mut problems = Vec::new();
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    let cache = tempfile::tempdir()?;
+    let reports = tempfile::tempdir()?;
+    let made: Vec<(Made, bool)> = UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .map(|call| {
+            (
+                Made::Call(call.name),
+                available.get(call.name).copied().unwrap_or(true),
+            )
+        })
+        .chain(UNKNOWN_NUMBERS.map(|number| (Made::Number(number), true)))
+        .collect();
+    for (made, has) in made {
+        let report = reports.path().join(format!("{}.json", made.mode()));
+        let (run, value) = execute_coverage(
+            &copy,
+            cache.path(),
+            &["--json"],
+            &report,
+            Some(&made.mode()),
+        )?;
+        problems.extend(execute_made_problems(&value, &run, made, has, &mut skips));
     }
     skips.write_notice(test)?;
     assert!(

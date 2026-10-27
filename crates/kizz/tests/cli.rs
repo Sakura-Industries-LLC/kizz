@@ -66,12 +66,14 @@ const STUBS: [(&[&str], &str); 3] = [
 
 /// `kizz --help` lists every command and exits with status 0, and the help of the
 /// commands with options lists and describes them, `kizz build --fail-unchecked`
-/// included.
+/// and every option of `kizz execute` included.
 #[test]
 fn help_lists_every_subcommand() {
     let run = kizz(&["--help"]).unwrap();
     assert_eq!(run.status, Some(0), "{run:?}");
-    for command in ["build", "why", "list", "cache", "graph", "run", "image"] {
+    for command in [
+        "build", "why", "list", "cache", "execute", "graph", "run", "image",
+    ] {
         assert!(
             run.stdout
                 .lines()
@@ -129,6 +131,20 @@ fn help_lists_every_subcommand() {
         assert!(
             reset.stdout.contains(option),
             "cache reset --help lacks {option}: {reset:?}"
+        );
+    }
+
+    let execute = kizz(&["execute", "--help"]).unwrap();
+    assert_eq!(execute.status, Some(0), "{execute:?}");
+    for (option, description) in [
+        ("--output", "Write the observation report to this file"),
+        ("--compact", "Combine the observations of every process"),
+        ("--json", "Write JSON instead of readable text"),
+        ("PROGRAM", "The program to run, after `--`"),
+    ] {
+        assert!(
+            execute.stdout.contains(option) && execute.stdout.contains(description),
+            "execute --help does not describe {option}: {execute:?}"
         );
     }
 }

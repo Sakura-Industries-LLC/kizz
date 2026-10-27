@@ -12,6 +12,7 @@
 mod build;
 mod cache;
 pub mod cli;
+mod execute;
 mod list;
 mod ui;
 mod why;

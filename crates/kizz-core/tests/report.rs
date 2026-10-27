@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Tests of observation reports, built from fake process trees: the golden output
-//! of each of the four renderings of a full fixture and of a report of one
-//! command as `kizz execute` writes it; the compact observations against the
-//! combined hierarchical ones; the JSON fields against [`JSON_FIELDS`]; text
-//! against JSON; inputs in another order; the totals; completeness; outcomes; and
-//! the numbering of processes across commands.
+//! of each of the four renderings of a full fixture, of a report of one command as
+//! `kizz execute` writes it, and of a fixture of the escapes of text; the compact
+//! observations against the combined hierarchical ones; the JSON fields against
+//! [`JSON_FIELDS`]; text against JSON, with the JSON's strings escaped by the rule
+//! of text; the JSON's strings read back; inputs in another order; the totals;
+//! completeness; outcomes; and the numbering of processes across commands.
 //!
 //! The full fixture holds four commands and a task program:
 //!
@@ -21,6 +22,10 @@
 //! * `/bin/true`, whose tracer failed before it started;
 //! * the task program, which read, checked, listed and wrote paths, one of them read by a
 //!   command too and one listed by a command too.
+//!
+//! The escapes fixture holds a newline, a tab, a carriage return, a backslash,
+//! U+0000, U+001B, U+007F, U+0085 and U+2028 in every place where text shows a
+//! string, and a path with a newline beside the same path with a backslash and `n`.
 
 #![allow(
     clippy::disallowed_macros,
@@ -400,12 +405,118 @@ fn execute_report(reversed: bool) -> TestResult<Report> {
     Ok(Report::new(execute_fixture(reversed)?, None))
 }
 
-/// Both fixtures' reports, by name.
+/// The arguments of the escapes fixture's first command: a tab, a backslash and a
+/// newline.
+const ESCAPED_ARGS: &[&[u8]] = &[b"tool\tx", b"a\\b", b"line\nbreak"];
+
+/// The fixture of the escapes of text: a newline, a tab, a carriage return, a
+/// backslash, U+0000, U+001B, U+007F, U+0085 and U+2028, in every place where text
+/// shows a string: an observed path, a program's path and argument, `argv`, the
+/// working directory, a Unix socket's path, an abstract socket's name, a reason's
+/// detail, a not-found command's message and the task program's name. It also
+/// observes a path with a newline and the same path with a backslash and `n` in its
+/// place.
+fn escapes_fixture() -> TestResult<(Vec<CommandInput>, Option<TaskProgramInput>)> {
+    let mut tool = program(
+        b"/bin/tool\x1b",
+        ESCAPED_ARGS,
+        false,
+        &[
+            (b"/work\r/new\nline", AccessKind::Write, "ok"),
+            (b"/work\r/new\\nline", AccessKind::Write, "ok"),
+            (b"/work\r/nul\x00", AccessKind::Read, "ok"),
+            (b"/work\r/del\x7f", AccessKind::Probe, "ENOENT"),
+            (b"/work\r/nel\xc2\x85", AccessKind::List, "ok"),
+            (b"/work\r/sep\xe2\x80\xa8", AccessKind::Exec, "ok"),
+        ],
+        false,
+    )?;
+    tool.connections = BTreeSet::from([
+        Connection::UnixPath(absolute(b"/run/s\nock")?),
+        Connection::UnixAbstract(b"ab\x1b-name".to_vec()),
+    ]);
+    tool.incomplete = vec![IncompleteReason::Other {
+        detail: "lost\nprocess\\".to_owned(),
+    }];
+    let commands = vec![
+        CommandInput {
+            argv: args(ESCAPED_ARGS),
+            program: Some(absolute(b"/bin/tool\x1b")?),
+            cwd: absolute(b"/work\r")?,
+            execution: Execution::Ran {
+                outcome: CommandOutcome::Exited(0),
+                tree: Some(ProcessTree {
+                    processes: vec![process(1, 10, None, vec![tool], Termination::Exited(0))],
+                }),
+                lookup: Observations::new(),
+            },
+        },
+        CommandInput {
+            argv: args(&[b"miss\xe2\x80\xa8ing"]),
+            program: None,
+            cwd: absolute(b"/work\r")?,
+            execution: Execution::Ran {
+                outcome: CommandOutcome::NotFound("miss\u{2028}ing: not found\nin PATH".to_owned()),
+                tree: None,
+                lookup: observations(
+                    &[(b"/bin/miss\xe2\x80\xa8ing", AccessKind::Probe, "ENOENT")],
+                    false,
+                )?,
+            },
+        },
+    ];
+    let task_program = TaskProgramInput {
+        task: "kizz.md:3 (Build\ttab)".to_owned(),
+        observations: observations(&[(b"/work\r/kizz.md", AccessKind::Read, "ok")], false)?,
+    };
+    Ok((commands, Some(task_program)))
+}
+
+/// The report of the escapes fixture.
+fn escapes_report() -> TestResult<Report> {
+    let (commands, task_program) = escapes_fixture()?;
+    Ok(Report::new(commands, task_program))
+}
+
+/// Every fixture's report, by name.
 fn every_report() -> TestResult<Vec<(&'static str, Report)>> {
     Ok(vec![
         ("full", full_report(false)?),
         ("execute", execute_report(false)?),
+        ("escapes", escapes_report()?),
     ])
+}
+
+/// `text` as a text report shows it, escaped by the rule of "Observation reports",
+/// written here on its own so that the tests check the report's escapes: a
+/// backslash as `\\`, a newline as `\n`, a tab as `\t`, a carriage return as `\r`,
+/// and every other control character and U+2028 and U+2029 as `\u{` and the code
+/// in lowercase hexadecimal without leading zeros and `}`.
+fn escaped(text: &str) -> String {
+    let mut escaped = String::new();
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\t' => escaped.push_str("\\t"),
+            '\r' => escaped.push_str("\\r"),
+            other if other.is_control() || other == '\u{2028}' || other == '\u{2029}' => {
+                escaped.extend(format!("\\u{{{:x}}}", u32::from(other)).chars());
+            },
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// `golden` with each placeholder of a character that a golden does not show as it
+/// is, because the character is invisible, replaced by the character: `<DEL>` by
+/// U+007F, `<NEL>` by U+0085, and `<LS>` by U+2028.
+fn with_characters(golden: &str) -> String {
+    golden
+        .replace("<DEL>", "\u{7f}")
+        .replace("<NEL>", "\u{85}")
+        .replace("<LS>", "\u{2028}")
 }
 
 /// Compare `actual` with its golden `expected`; on a difference, print `actual`
@@ -1657,6 +1768,420 @@ const EXECUTE_COMPACT_JSON: &str = r#"{
 }
 "#;
 
+/// The golden hierarchical text of the escapes fixture.
+const ESCAPES_HIERARCHICAL_TEXT: &str = r"kizz observation report, version 1, hierarchical
+trace: incomplete
+totals: commands 2, cached 0, processes 2, programs 2, paths 8, connections 2
+paths by access: read 2, probe 2, list 1, write 2, exec 1, xattr 0
+
+command 1: 'tool\tx' 'a\\b' 'line\nbreak'
+  program: /bin/tool\u{1b}
+  directory: /work\r
+  outcome: exited with 0
+  trace: incomplete
+    other, process 1: lost\nprocess\\
+  process 1, pid 10, exited with 0
+    program /bin/tool\u{1b}: 'tool\tx' 'a\\b' 'line\nbreak'
+      read:
+        /work\r/nul\u{0}: ok
+      probe:
+        /work\r/del\u{7f}: ENOENT
+      list:
+        /work\r/nel\u{85}: ok
+      write:
+        /work\r/new\nline: ok
+        /work\r/new\\nline: ok
+      exec:
+        /work\r/sep\u{2028}: ok
+      connections:
+        unix /run/s\nock
+        abstract ab\u{1b}-name
+
+command 2: 'miss\u{2028}ing'
+  program: not found
+  directory: /work\r
+  outcome: not found: miss\u{2028}ing: not found\nin PATH
+  trace: complete
+  process 2, not started
+    program miss\u{2028}ing: 'miss\u{2028}ing'
+      probe:
+        /bin/miss\u{2028}ing: ENOENT
+
+task program: kizz.md:3 (Build\ttab)
+  read:
+    /work\r/kizz.md: ok
+";
+
+/// The golden compact text of the escapes fixture.
+const ESCAPES_COMPACT_TEXT: &str = r"kizz observation report, version 1, compact
+trace: incomplete
+totals: commands 2, cached 0, processes 2, programs 2, paths 8, connections 2
+paths by access: read 2, probe 2, list 1, write 2, exec 1, xattr 0
+
+command 1: 'tool\tx' 'a\\b' 'line\nbreak'
+  program: /bin/tool\u{1b}
+  directory: /work\r
+  outcome: exited with 0
+  trace: incomplete
+    other: lost\nprocess\\
+
+command 2: 'miss\u{2028}ing'
+  program: not found
+  directory: /work\r
+  outcome: not found: miss\u{2028}ing: not found\nin PATH
+  trace: complete
+
+task program: kizz.md:3 (Build\ttab)
+
+read:
+  /work\r/kizz.md: ok
+  /work\r/nul\u{0}: ok
+probe:
+  /bin/miss\u{2028}ing: ENOENT
+  /work\r/del\u{7f}: ENOENT
+list:
+  /work\r/nel\u{85}: ok
+write:
+  /work\r/new\nline: ok
+  /work\r/new\\nline: ok
+exec:
+  /work\r/sep\u{2028}: ok
+connections:
+  unix /run/s\nock
+  abstract ab\u{1b}-name
+";
+
+/// The golden hierarchical JSON of the escapes fixture, with the placeholders of
+/// [`with_characters`] for U+007F, U+0085 and U+2028, which JSON writes as they are.
+const ESCAPES_HIERARCHICAL_JSON: &str = r#"{
+  "format": "kizz-execute",
+  "version": 1,
+  "mode": "hierarchical",
+  "complete": false,
+  "totals": {
+    "commands": 2,
+    "cached": 0,
+    "processes": 2,
+    "programs": 2,
+    "paths": 8,
+    "connections": 2,
+    "kinds": {
+      "read": 2,
+      "probe": 2,
+      "list": 1,
+      "write": 2,
+      "exec": 1,
+      "xattr": 0
+    }
+  },
+  "commands": [
+    {
+      "argv": [
+        "tool\tx",
+        "a\\b",
+        "line\nbreak"
+      ],
+      "program": "/bin/tool\u001b",
+      "cwd": "/work\r",
+      "cached": false,
+      "outcome": {
+        "kind": "exited",
+        "code": 0
+      },
+      "complete": false,
+      "incomplete": [
+        {
+          "kind": "other",
+          "detail": "lost\nprocess\\",
+          "number": null,
+          "process": 1
+        }
+      ],
+      "processes": [
+        {
+          "id": 1,
+          "pid": 10,
+          "parent": null,
+          "exit": {
+            "kind": "exited",
+            "code": 0
+          },
+          "programs": [
+            {
+              "path": "/bin/tool\u001b",
+              "args": [
+                "tool\tx",
+                "a\\b",
+                "line\nbreak"
+              ],
+              "inherited": false,
+              "observations": [
+                {
+                  "path": "/work\r/del<DEL>",
+                  "access": {
+                    "probe": [
+                      "ENOENT"
+                    ]
+                  }
+                },
+                {
+                  "path": "/work\r/nel<NEL>",
+                  "access": {
+                    "list": [
+                      "ok"
+                    ]
+                  }
+                },
+                {
+                  "path": "/work\r/new\nline",
+                  "access": {
+                    "write": [
+                      "ok"
+                    ]
+                  }
+                },
+                {
+                  "path": "/work\r/new\\nline",
+                  "access": {
+                    "write": [
+                      "ok"
+                    ]
+                  }
+                },
+                {
+                  "path": "/work\r/nul\u0000",
+                  "access": {
+                    "read": [
+                      "ok"
+                    ]
+                  }
+                },
+                {
+                  "path": "/work\r/sep<LS>",
+                  "access": {
+                    "exec": [
+                      "ok"
+                    ]
+                  }
+                }
+              ],
+              "connections": [
+                {
+                  "kind": "unix",
+                  "path": "/run/s\nock"
+                },
+                {
+                  "kind": "abstract",
+                  "name": "ab\u001b-name"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "argv": [
+        "miss<LS>ing"
+      ],
+      "program": null,
+      "cwd": "/work\r",
+      "cached": false,
+      "outcome": {
+        "kind": "not_found",
+        "error": "miss<LS>ing: not found\nin PATH"
+      },
+      "complete": true,
+      "incomplete": [],
+      "processes": [
+        {
+          "id": 2,
+          "pid": null,
+          "parent": null,
+          "exit": null,
+          "programs": [
+            {
+              "path": "miss<LS>ing",
+              "args": [
+                "miss<LS>ing"
+              ],
+              "inherited": false,
+              "observations": [
+                {
+                  "path": "/bin/miss<LS>ing",
+                  "access": {
+                    "probe": [
+                      "ENOENT"
+                    ]
+                  }
+                }
+              ],
+              "connections": []
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "task_program": {
+    "task": "kizz.md:3 (Build\ttab)",
+    "observations": [
+      {
+        "path": "/work\r/kizz.md",
+        "access": {
+          "read": [
+            "ok"
+          ]
+        }
+      }
+    ]
+  }
+}
+"#;
+
+/// The golden compact JSON of the escapes fixture, with the placeholders of
+/// [`with_characters`].
+const ESCAPES_COMPACT_JSON: &str = r#"{
+  "format": "kizz-execute",
+  "version": 1,
+  "mode": "compact",
+  "complete": false,
+  "totals": {
+    "commands": 2,
+    "cached": 0,
+    "processes": 2,
+    "programs": 2,
+    "paths": 8,
+    "connections": 2,
+    "kinds": {
+      "read": 2,
+      "probe": 2,
+      "list": 1,
+      "write": 2,
+      "exec": 1,
+      "xattr": 0
+    }
+  },
+  "commands": [
+    {
+      "argv": [
+        "tool\tx",
+        "a\\b",
+        "line\nbreak"
+      ],
+      "program": "/bin/tool\u001b",
+      "cwd": "/work\r",
+      "cached": false,
+      "outcome": {
+        "kind": "exited",
+        "code": 0
+      },
+      "complete": false,
+      "incomplete": [
+        {
+          "kind": "other",
+          "detail": "lost\nprocess\\",
+          "number": null
+        }
+      ]
+    },
+    {
+      "argv": [
+        "miss<LS>ing"
+      ],
+      "program": null,
+      "cwd": "/work\r",
+      "cached": false,
+      "outcome": {
+        "kind": "not_found",
+        "error": "miss<LS>ing: not found\nin PATH"
+      },
+      "complete": true,
+      "incomplete": []
+    }
+  ],
+  "task_program": {
+    "task": "kizz.md:3 (Build\ttab)"
+  },
+  "observations": [
+    {
+      "path": "/bin/miss<LS>ing",
+      "access": {
+        "probe": [
+          "ENOENT"
+        ]
+      }
+    },
+    {
+      "path": "/work\r/del<DEL>",
+      "access": {
+        "probe": [
+          "ENOENT"
+        ]
+      }
+    },
+    {
+      "path": "/work\r/kizz.md",
+      "access": {
+        "read": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "path": "/work\r/nel<NEL>",
+      "access": {
+        "list": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "path": "/work\r/new\nline",
+      "access": {
+        "write": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "path": "/work\r/new\\nline",
+      "access": {
+        "write": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "path": "/work\r/nul\u0000",
+      "access": {
+        "read": [
+          "ok"
+        ]
+      }
+    },
+    {
+      "path": "/work\r/sep<LS>",
+      "access": {
+        "exec": [
+          "ok"
+        ]
+      }
+    }
+  ],
+  "connections": [
+    {
+      "kind": "unix",
+      "path": "/run/s\nock"
+    },
+    {
+      "kind": "abstract",
+      "name": "ab\u001b-name"
+    }
+  ]
+}
+"#;
+
 /// Each of the four renderings of the full fixture is its golden.
 #[test]
 fn full_fixture_renders_as_its_golden_output() -> TestResult {
@@ -1695,6 +2220,228 @@ fn one_command_renders_as_kizz_execute_writes_it() -> TestResult {
             expected,
         )?;
     }
+    Ok(())
+}
+
+/// Each of the four renderings of the escapes fixture is its golden: text escapes
+/// each backslash and control character of every string that it shows, so each
+/// entry stays on one line, and JSON keeps its standard escaping.
+#[test]
+fn the_escapes_fixture_renders_as_its_golden_output() -> TestResult {
+    let report = escapes_report()?;
+    let expected_outputs = [
+        ESCAPES_HIERARCHICAL_TEXT.to_owned(),
+        ESCAPES_COMPACT_TEXT.to_owned(),
+        with_characters(ESCAPES_HIERARCHICAL_JSON),
+        with_characters(ESCAPES_COMPACT_JSON),
+    ];
+    for ((format, mode), expected) in RENDERINGS.into_iter().zip(expected_outputs) {
+        golden(
+            &format!("escapes {format:?} {mode:?}"),
+            &report.render(format, mode),
+            &expected,
+        )?;
+    }
+    Ok(())
+}
+
+/// A path with a newline and the same path with a backslash and `n` in its place
+/// read differently in text, each on one line of its own, in both modes.
+#[test]
+fn a_newline_and_a_backslash_and_n_read_differently() -> TestResult {
+    let report = escapes_report()?;
+    for mode in [ReportMode::Hierarchical, ReportMode::Compact] {
+        let text = report.text(mode);
+        let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+        let newline = r"/work\r/new\nline: ok";
+        let backslash = r"/work\r/new\\nline: ok";
+        assert_ne!(newline, backslash);
+        assert_eq!(
+            lines.iter().filter(|line| **line == newline).count(),
+            1,
+            "{mode:?}: {text}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| **line == backslash).count(),
+            1,
+            "{mode:?}: {text}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("line")),
+            "{mode:?}: a path broke its line: {text}"
+        );
+    }
+    Ok(())
+}
+
+/// The strings of a JSON report, by the path of each in the document, such as
+/// `commands[0].argv[1]`, in document order.
+fn json_strings(
+    value: &Value,
+    path: &str,
+    strings: &mut Vec<(String, String)>,
+) {
+    match value {
+        Value::String(text) => strings.push((path.to_owned(), text.clone())),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                json_strings(item, &format!("{path}[{index}]"), strings);
+            }
+        },
+        Value::Object(members) => {
+            for (key, member) in members {
+                let inner = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                json_strings(member, &inner, strings);
+            }
+        },
+        Value::Null | Value::Bool(_) | Value::Number(_) => {},
+    }
+}
+
+/// `pairs` as owned strings.
+fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(path, text)| ((*path).to_owned(), (*text).to_owned()))
+        .collect()
+}
+
+/// Every string that the hierarchical JSON of the escapes fixture holds, by its
+/// path in the document, as the fixture gives it.
+fn hierarchical_strings() -> Vec<(String, String)> {
+    let argv = ["tool\tx", "a\\b", "line\nbreak"];
+    let program = "commands[0].processes[0].programs[0]";
+    let mut strings = owned(&[
+        ("format", "kizz-execute"),
+        ("mode", "hierarchical"),
+        ("commands[0].program", "/bin/tool\u{1b}"),
+        ("commands[0].cwd", "/work\r"),
+        ("commands[0].outcome.kind", "exited"),
+        ("commands[0].incomplete[0].kind", "other"),
+        ("commands[0].incomplete[0].detail", "lost\nprocess\\"),
+        ("commands[0].processes[0].exit.kind", "exited"),
+        ("commands[1].argv[0]", "miss\u{2028}ing"),
+        ("commands[1].cwd", "/work\r"),
+        ("commands[1].outcome.kind", "not_found"),
+        (
+            "commands[1].outcome.error",
+            "miss\u{2028}ing: not found\nin PATH",
+        ),
+        (
+            "commands[1].processes[0].programs[0].path",
+            "miss\u{2028}ing",
+        ),
+        (
+            "commands[1].processes[0].programs[0].args[0]",
+            "miss\u{2028}ing",
+        ),
+        (
+            "commands[1].processes[0].programs[0].observations[0].path",
+            "/bin/miss\u{2028}ing",
+        ),
+        (
+            "commands[1].processes[0].programs[0].observations[0].access.probe[0]",
+            "ENOENT",
+        ),
+        ("task_program.task", "kizz.md:3 (Build\ttab)"),
+        ("task_program.observations[0].path", "/work\r/kizz.md"),
+        ("task_program.observations[0].access.read[0]", "ok"),
+    ]);
+    strings.push((format!("{program}.path"), "/bin/tool\u{1b}".to_owned()));
+    for (index, word) in argv.iter().enumerate() {
+        strings.push((format!("commands[0].argv[{index}]"), (*word).to_owned()));
+        strings.push((format!("{program}.args[{index}]"), (*word).to_owned()));
+    }
+    let observed = [
+        ("/work\r/del\u{7f}", "probe", "ENOENT"),
+        ("/work\r/nel\u{85}", "list", "ok"),
+        ("/work\r/new\nline", "write", "ok"),
+        ("/work\r/new\\nline", "write", "ok"),
+        ("/work\r/nul\u{0}", "read", "ok"),
+        ("/work\r/sep\u{2028}", "exec", "ok"),
+    ];
+    for (index, (path, kind, outcome)) in observed.iter().enumerate() {
+        let observation = format!("{program}.observations[{index}]");
+        strings.push((format!("{observation}.path"), (*path).to_owned()));
+        strings.push((
+            format!("{observation}.access.{kind}[0]"),
+            (*outcome).to_owned(),
+        ));
+    }
+    for (key, text) in [
+        ("connections[0].kind", "unix"),
+        ("connections[0].path", "/run/s\nock"),
+        ("connections[1].kind", "abstract"),
+        ("connections[1].name", "ab\u{1b}-name"),
+    ] {
+        strings.push((format!("{program}.{key}"), text.to_owned()));
+    }
+    strings.sort();
+    strings
+}
+
+/// Every string that the compact JSON of the escapes fixture holds, by its path in
+/// the document, as the fixture gives it: the strings of the commands of
+/// `hierarchical` outside their processes, the task, and the combined observations
+/// and connections.
+fn compact_strings(hierarchical: &[(String, String)]) -> Vec<(String, String)> {
+    let mut strings = owned(&[
+        ("format", "kizz-execute"),
+        ("mode", "compact"),
+        ("task_program.task", "kizz.md:3 (Build\ttab)"),
+        ("connections[0].kind", "unix"),
+        ("connections[0].path", "/run/s\nock"),
+        ("connections[1].kind", "abstract"),
+        ("connections[1].name", "ab\u{1b}-name"),
+    ]);
+    strings.extend(
+        hierarchical
+            .iter()
+            .filter(|(path, _)| path.starts_with("commands") && !path.contains("processes"))
+            .cloned(),
+    );
+    let observed = [
+        ("/bin/miss\u{2028}ing", "probe", "ENOENT"),
+        ("/work\r/del\u{7f}", "probe", "ENOENT"),
+        ("/work\r/kizz.md", "read", "ok"),
+        ("/work\r/nel\u{85}", "list", "ok"),
+        ("/work\r/new\nline", "write", "ok"),
+        ("/work\r/new\\nline", "write", "ok"),
+        ("/work\r/nul\u{0}", "read", "ok"),
+        ("/work\r/sep\u{2028}", "exec", "ok"),
+    ];
+    for (index, (path, kind, outcome)) in observed.iter().enumerate() {
+        strings.push((format!("observations[{index}].path"), (*path).to_owned()));
+        strings.push((
+            format!("observations[{index}].access.{kind}[0]"),
+            (*outcome).to_owned(),
+        ));
+    }
+    strings.sort();
+    strings
+}
+
+/// Both JSON renderings of the escapes fixture parse, and each string that they
+/// hold reads back as exactly the fixture's string.
+#[test]
+fn json_strings_read_back_as_the_fixture_s_strings() -> TestResult {
+    let report = escapes_report()?;
+    let expected = hierarchical_strings();
+    let hierarchical: Value = serde_json::from_str(&report.json(ReportMode::Hierarchical))?;
+    let mut strings = Vec::new();
+    json_strings(&hierarchical, "", &mut strings);
+    strings.sort();
+    assert_eq!(strings, expected);
+
+    let compact: Value = serde_json::from_str(&report.json(ReportMode::Compact))?;
+    let mut strings = Vec::new();
+    json_strings(&compact, "", &mut strings);
+    strings.sort();
+    assert_eq!(strings, compact_strings(&expected));
     Ok(())
 }
 
@@ -1758,14 +2505,15 @@ fn add_observations(
     Ok(())
 }
 
-/// A JSON connection as text shows it: its kind, then its address, path or name.
+/// A JSON connection as text shows it: its kind, then its address, path or name,
+/// escaped as [`escaped`] escapes it.
 fn connection_line(connection: &Value) -> TestResult<String> {
     let kind = string(member(connection, "kind")?)?;
     let target = ["address", "path", "name"]
         .into_iter()
         .find_map(|key| connection.get(key))
         .ok_or("a connection has no address, path or name")?;
-    Ok(format!("{kind} {}", string(target)?))
+    Ok(format!("{kind} {}", escaped(string(target)?)))
 }
 
 /// Every program of every process of every command of the hierarchical JSON
@@ -2114,8 +2862,8 @@ fn text_groups(text: &str) -> BTreeMap<String, Vec<String>> {
     groups
 }
 
-/// The group entries of `observations` and `connections`, as text shows them,
-/// added to `groups`.
+/// The group entries of `observations` and `connections`, as text shows them, with
+/// each string escaped as [`escaped`] escapes it, added to `groups`.
 fn json_group_entries(
     groups: &mut BTreeMap<String, Vec<String>>,
     observations: &[Value],
@@ -2127,16 +2875,17 @@ fn json_group_entries(
             .as_object()
             .ok_or("access is not an object")?
         {
-            let outcomes: Vec<&str> = outcomes
+            let outcomes: Vec<String> = outcomes
                 .as_array()
                 .ok_or("outcomes are not an array")?
                 .iter()
-                .map(string)
+                .map(|outcome| string(outcome).map(escaped))
                 .collect::<TestResult<_>>()?;
-            groups
-                .entry(kind.clone())
-                .or_default()
-                .push(format!("{path}: {}", outcomes.join(", ")));
+            groups.entry(kind.clone()).or_default().push(format!(
+                "{}: {}",
+                escaped(path),
+                outcomes.join(", ")
+            ));
         }
     }
     for connection in connections {
@@ -2182,7 +2931,8 @@ fn json_groups(
     Ok(groups)
 }
 
-/// A JSON outcome as text shows it.
+/// A JSON outcome as text shows it, with its error escaped as [`escaped`] escapes
+/// it.
 fn outcome_line(outcome: &Value) -> TestResult<String> {
     let kind = string(member(outcome, "kind")?)?;
     Ok(match kind {
@@ -2192,7 +2942,7 @@ fn outcome_line(outcome: &Value) -> TestResult<String> {
             format!(
                 "outcome: {}: {}",
                 other.replace('_', " "),
-                string(member(outcome, "error")?)?
+                escaped(string(member(outcome, "error")?)?)
             )
         },
     })
