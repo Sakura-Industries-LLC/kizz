@@ -5,10 +5,11 @@
 //! Command-line interface for the `kizz` tool.
 //!
 //! This module owns parsing and dispatch only. Every command is parsed with all of
-//! its options; `kizz build` runs in the `build` module, `kizz list` in the `list`
-//! module, `kizz why` in the `why` module, `kizz cache` in the `cache` module, and
-//! `kizz execute` in the `execute` module, and the other commands are scaffolds
-//! until later phases implement them. `kizz execute` never prints the banner.
+//! its options; `kizz build` runs in the `build` module, `kizz run` in the `run`
+//! module, `kizz list` in the `list` module, `kizz why` in the `why` module, `kizz
+//! cache` in the `cache` module, and `kizz execute` in the `execute` module, and the
+//! other commands are scaffolds until later phases implement them. `kizz execute`
+//! never prints the banner.
 
 use std::{ffi::OsString, fmt, path::PathBuf, process::ExitCode, str::FromStr};
 
@@ -110,12 +111,27 @@ impl Cli {
                 })
             },
             Command::Graph => stub("graph", "Show the learned task graph.", None),
-            Command::Run => {
-                stub(
-                    "run",
-                    "Run interactive or long-running commands without tracing or caching.",
-                    None,
-                )
+            Command::Run {
+                no_cache,
+                explain,
+                fail_unchecked,
+                cache_unknown_syscalls,
+                name,
+                args,
+            } => {
+                crate::run::run(&crate::run::Options {
+                    name,
+                    args,
+                    no_cache,
+                    build: crate::build::Options {
+                        explain,
+                        verbose: self.verbose,
+                        engine: crate::build::EngineOptions {
+                            cache_unknown_syscalls,
+                            fail_unchecked,
+                        },
+                    },
+                })
             },
             Command::Image => stub("image", "Build container images.", None),
         }
@@ -241,9 +257,41 @@ pub enum Command {
     #[bpaf(command)]
     Graph,
 
-    /// Run commands without tracing or caching (not implemented yet).
+    /// Run one task by its name, once, showing each command and its output live.
+    ///
+    /// The task named NAME whose kizz.md is the fewest directory levels below the
+    /// current directory runs once, with the cache, as a build runs it: no other
+    /// task, and no further pass. The words after `--` are its arguments, which its
+    /// program reads as `task.args`. Exit status: 0 when the task succeeds, 1 when
+    /// it fails, 2 for usage and configuration errors, and 130 when interrupted.
     #[bpaf(command)]
-    Run,
+    Run {
+        /// Run every command of the task, as if each had `always = True`, and still
+        /// record each result.
+        #[bpaf(long)]
+        no_cache: bool,
+
+        /// Print the full reason for every command, cached ones included.
+        #[bpaf(long)]
+        explain: bool,
+
+        /// Fail the task when it leaves a non-zero exit unchecked: no `expect`, and
+        /// no read of `rc` or `signal`.
+        #[bpaf(long)]
+        fail_unchecked: bool,
+
+        /// Cache commands that made system calls the tracer does not know.
+        #[bpaf(long)]
+        cache_unknown_syscalls: bool,
+
+        /// The name of the task, which its `name=` option gives.
+        #[bpaf(positional("NAME"))]
+        name: String,
+
+        /// The task's arguments, after `--`.
+        #[bpaf(external(task_arguments))]
+        args: Vec<String>,
+    },
 
     /// Build container images (not implemented yet).
     #[bpaf(command)]
@@ -260,6 +308,29 @@ fn program_and_arguments() -> impl Parser<Vec<OsString>> {
         )
         .strict()
         .some("kizz execute needs `--` and then the program to run")
+}
+
+/// The arguments of `kizz run`: strict positional arguments, which come only after
+/// `--`, so a word after the name without `--` is a usage error that says to put it
+/// after `--`; each must be valid UTF-8, because `task.args` holds strings.
+fn task_arguments() -> impl Parser<Vec<String>> {
+    bpaf::positional::<OsString>("ARGUMENTS")
+        .help("The task's arguments, after `--`, which its program reads as `task.args`")
+        .strict()
+        .many()
+        .parse(|words: Vec<OsString>| {
+            words
+                .into_iter()
+                .map(|word| {
+                    word.into_string().map_err(|word| {
+                        format!(
+                            "the argument {} is not valid UTF-8, and `task.args` holds strings",
+                            word.to_string_lossy()
+                        )
+                    })
+                })
+                .collect::<Result<Vec<String>, String>>()
+        })
 }
 
 /// How `kizz build` schedules tasks.
@@ -359,7 +430,7 @@ impl FromStr for ColorMode {
     reason = "test code: the tests assert and lock"
 )]
 mod tests {
-    use std::{ffi::OsString, path::PathBuf};
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _, path::PathBuf};
 
     use super::{CacheCommand, Cli, ColorMode, Command, Execution, USAGE_ERROR, cli};
 
@@ -384,7 +455,7 @@ mod tests {
         let set = parse(&["--color", "never", "--quiet", "--no-banner", "-v", "graph"]);
         assert_eq!(set.color, ColorMode::Never);
         assert!(set.quiet && set.no_banner && set.verbose);
-        assert!(parse(&["--verbose", "run"]).verbose);
+        assert!(parse(&["--verbose", "run", "lint"]).verbose);
         assert_eq!(
             parse(&["--color", "always", "image"]).color,
             ColorMode::Always
@@ -481,8 +552,80 @@ mod tests {
             other => panic!("expected list, got {other:?}"),
         }
         assert!(matches!(parse(&["graph"]).command, Command::Graph));
-        assert!(matches!(parse(&["run"]).command, Command::Run));
         assert!(matches!(parse(&["image"]).command, Command::Image));
+    }
+
+    /// `kizz run` parses its name, its options and the arguments after `--`, where
+    /// words that look like options are arguments of the task; without `--` it has
+    /// no arguments, and every option is off unless given.
+    #[test]
+    fn parses_run() {
+        match parse(&["run", "lint"]).command {
+            Command::Run {
+                no_cache,
+                explain,
+                fail_unchecked,
+                cache_unknown_syscalls,
+                name,
+                args,
+            } => {
+                assert!(!no_cache && !explain && !fail_unchecked && !cache_unknown_syscalls);
+                assert_eq!(name, "lint");
+                assert_eq!(args, Vec::<String>::new());
+            },
+            other => panic!("expected run, got {other:?}"),
+        }
+        match parse(&[
+            "run",
+            "--no-cache",
+            "--explain",
+            "--fail-unchecked",
+            "--cache-unknown-syscalls",
+            "lint",
+            "--",
+            "a",
+            "--fix",
+            "",
+        ])
+        .command
+        {
+            Command::Run {
+                no_cache,
+                explain,
+                fail_unchecked,
+                cache_unknown_syscalls,
+                name,
+                args,
+            } => {
+                assert!(no_cache && explain && fail_unchecked && cache_unknown_syscalls);
+                assert_eq!(name, "lint");
+                assert_eq!(args, ["a", "--fix", ""]);
+            },
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    /// A word after the name of `kizz run` without `--` is a usage error that says
+    /// to put it after `--`, and an argument that is not valid UTF-8 is a usage
+    /// error that says so.
+    #[test]
+    fn run_arguments_come_after_the_separator_and_are_utf_8() {
+        let failure = cli().run_inner(&["run", "lint", "extra"]).unwrap_err();
+        assert_eq!(super::parse_failure_status(&failure), USAGE_ERROR);
+        let message = failure.unwrap_stderr();
+        assert!(message.contains("right side of"), "{message}");
+        assert!(message.contains("--"), "{message}");
+        let invalid = OsString::from_vec(b"\xff".to_vec());
+        let args = [
+            OsString::from("run"),
+            OsString::from("lint"),
+            OsString::from("--"),
+            invalid,
+        ];
+        let failure = cli().run_inner(&args[..]).unwrap_err();
+        assert_eq!(super::parse_failure_status(&failure), USAGE_ERROR);
+        let message = failure.unwrap_stderr();
+        assert!(message.contains("is not valid UTF-8"), "{message}");
     }
 
     /// `kizz cache clean` and `kizz cache reset` parse with their options.
@@ -573,6 +716,8 @@ mod tests {
             &["execute", "--output=out.txt"][..],
             &["execute", "--output=out.txt", "make"][..],
             &["execute", "--output=out.txt", "--"][..],
+            &["run"][..],
+            &["run", "lint", "extra"][..],
         ] {
             let failure = cli().run_inner(args).unwrap_err();
             assert_eq!(
@@ -586,6 +731,7 @@ mod tests {
             &["--version"][..],
             &["build", "--help"][..],
             &["execute", "--help"][..],
+            &["run", "--help"][..],
         ] {
             let failure = cli().run_inner(args).unwrap_err();
             assert_eq!(super::parse_failure_status(&failure), 0, "{args:?}");

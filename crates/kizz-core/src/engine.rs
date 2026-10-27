@@ -44,7 +44,18 @@
 //! changed, its first result is returned again without running ("Commands that
 //! always run"). A key first reached in a later pass runs once then. Every step of a
 //! task marked `cache=never` runs the same way, as if it were marked `always`, and
-//! its reason names the task option.
+//! its reason names the task option. With [`Engine::with_no_cache`] (`kizz run
+//! --no-cache`), every step runs the same way too, without a cache check, and is
+//! still recorded; its reason names the option, unless the step is marked `always`,
+//! its task is marked `cache=never`, or it never ran, whose reasons come first. The
+//! option never makes a step cached.
+//!
+//! Step events ("Running one task with `kizz run`"): a run made with
+//! [`TaskSteps::with_events`] tells its [`StepEvents`] when a step starts to run,
+//! before its command starts and so before any of its output, and when a step comes
+//! from the cache, with the result that the step returns. With
+//! [`Engine::with_echo_every_step`], every command's output is echoed live, as if
+//! every `run()` had `stream = True`; the option is in no step key or record.
 //!
 //! Results that are not cached ("Results that are not cached"): a command killed by
 //! a signal, every run that returns once cancellation has been requested, whether a
@@ -162,6 +173,54 @@ use crate::{
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
 };
 
+/// Follows the steps of a task run as they start or come from the cache, for the
+/// live output of `kizz run`.
+pub trait StepEvents {
+    /// The step `decision` starts to run: its command has not started yet, so this
+    /// comes before any of its output.
+    fn step_started(
+        &self,
+        _decision: &StepDecision,
+    ) {
+    }
+
+    /// The step `decision` came from the cache, or was returned again within the
+    /// build, and returns `result`: its stored exit status and output, or its stored
+    /// failure.
+    fn step_cached(
+        &self,
+        _decision: &StepDecision,
+        _result: &Result<StepOutcome, StepError>,
+    ) {
+    }
+}
+
+/// Follows no step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoStepEvents;
+
+impl StepEvents for NoStepEvents {}
+
+/// Which commands' output the engine echoes live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveOutput {
+    /// Only the output of a `run()` with `stream = True`, as in a build.
+    Streamed,
+    /// Every command's output, as if every `run()` had `stream = True`, as `kizz
+    /// run` asks.
+    Every,
+}
+
+impl LiveOutput {
+    /// Whether the output of `step` is echoed live.
+    const fn echoes(
+        self,
+        step: &StepSpec,
+    ) -> bool {
+        step.stream || matches!(self, Self::Every)
+    }
+}
+
 /// The identity of the most recent build this process started, so every build
 /// gets a larger one than the last.
 static LAST_BUILD: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +314,10 @@ pub struct Engine<'a> {
     /// Whether a task run that leaves a step unchecked fails when its program
     /// ends, as `kizz build --fail-unchecked` asks.
     fail_unchecked: bool,
+    /// The command that runs the engine, as messages name it with one of its
+    /// options: `kizz build` unless [`Engine::with_command_name`] sets another, such
+    /// as `kizz run`.
+    command_name: &'static str,
     /// The step keys whose recorded machine state the build already compared, or
     /// whose step ran in the build. The machine state is compared at most once per
     /// step key and build, so a step that names a part that changes all the time,
@@ -264,6 +327,13 @@ pub struct Engine<'a> {
     /// before the step or the reader that waits for it fails: [`LOCK_PATIENCE`]
     /// unless [`Engine::with_lock_patience`] sets another.
     lock_patience: Duration,
+    /// Whether every step runs, as if it were marked `always`, and is still
+    /// recorded, as `kizz run --no-cache` asks.
+    no_cache: bool,
+    /// Which commands' output is echoed live: every command's, as if every `run()`
+    /// had `stream = True`, as `kizz run` asks, or only that of a `run()` with
+    /// `stream = True`.
+    live_output: LiveOutput,
 }
 
 impl fmt::Debug for Engine<'_> {
@@ -286,8 +356,11 @@ impl fmt::Debug for Engine<'_> {
             .field("unknown_calls", &self.unknown_calls)
             .field("connections", &self.connections)
             .field("fail_unchecked", &self.fail_unchecked)
+            .field("command_name", &self.command_name)
             .field("machine_compared", &self.machine_compared)
             .field("lock_patience", &self.lock_patience)
+            .field("no_cache", &self.no_cache)
+            .field("live_output", &self.live_output)
             .finish_non_exhaustive()
     }
 }
@@ -359,8 +432,11 @@ impl<'a> Engine<'a> {
             unknown_calls: Mutex::new(Vec::new()),
             connections: Mutex::new(Vec::new()),
             fail_unchecked: false,
+            command_name: "kizz build",
             machine_compared: Mutex::new(HashSet::new()),
             lock_patience: LOCK_PATIENCE,
+            no_cache: false,
+            live_output: LiveOutput::Streamed,
         }
     }
 
@@ -411,6 +487,38 @@ impl<'a> Engine<'a> {
         self.cache_unknown_system_calls
     }
 
+    /// The engine, which runs every step as if it were marked `always` when
+    /// `no_cache` is set, as `kizz run --no-cache` asks: no cache check decides
+    /// whether a step runs, every result is still recorded as usual, and the reason
+    /// of a step that has a record names the option, unless the step is marked
+    /// `always` or its task `cache=never`. Nothing makes a step cached that would
+    /// run without it. The option is in no step key or record.
+    #[must_use]
+    pub const fn with_no_cache(
+        mut self,
+        no_cache: bool,
+    ) -> Self {
+        self.no_cache = no_cache;
+        self
+    }
+
+    /// The engine, which echoes every command's output live when `echo` is set, as
+    /// if every `run()` had `stream = True`, as `kizz run` asks. Without it, only
+    /// the output of a `run()` with `stream = True` is echoed. The option is in no
+    /// step key or record.
+    #[must_use]
+    pub const fn with_echo_every_step(
+        mut self,
+        echo: bool,
+    ) -> Self {
+        self.live_output = if echo {
+            LiveOutput::Every
+        } else {
+            LiveOutput::Streamed
+        };
+        self
+    }
+
     /// The runs of the build that made system calls that the tracer does not know,
     /// in the order they ended, each with whether its result was cached.
     ///
@@ -449,6 +557,26 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub const fn fails_unchecked(&self) -> bool {
         self.fail_unchecked
+    }
+
+    /// The engine, whose messages name the command that runs it as `name`, such as
+    /// `kizz run`, with the option they mention, as in the failure of a task that
+    /// `--fail-unchecked` fails. Without it, they name `kizz build`. The name is in
+    /// no step key or record.
+    #[must_use]
+    pub const fn with_command_name(
+        mut self,
+        name: &'static str,
+    ) -> Self {
+        self.command_name = name;
+        self
+    }
+
+    /// The command that runs the engine, as messages name it: `kizz build` unless
+    /// [`Engine::with_command_name`] set another.
+    #[must_use]
+    pub const fn command_name(&self) -> &'static str {
+        self.command_name
     }
 
     /// The identity of the build.
@@ -587,6 +715,7 @@ impl<'a> Engine<'a> {
             decisions: Cell::new(Vec::new()),
             cached_positions: Cell::new(Vec::new()),
             cache_never: false,
+            events: &NoStepEvents,
         }
     }
 
@@ -609,6 +738,7 @@ impl<'a> Engine<'a> {
             decisions: Cell::new(Vec::new()),
             cached_positions: Cell::new(Vec::new()),
             cache_never: false,
+            events: &NoStepEvents,
         }
     }
 
@@ -674,6 +804,8 @@ pub struct TaskSteps<'a> {
     /// Whether the task is marked `cache=never`, so every step runs as if it were
     /// marked `always`.
     cache_never: bool,
+    /// Follows the steps as they start or come from the cache.
+    events: &'a dyn StepEvents,
 }
 
 impl fmt::Debug for TaskSteps<'_> {
@@ -931,10 +1063,12 @@ const fn step_exit(termination: Termination) -> StepExit {
 
 /// The request that runs `step` with the found program `program`: its exact
 /// arguments, environment, working directory, `stdin`, capture mode and echo,
-/// without the process tree, which a build never asks for.
+/// which `live_output` decides, without the process tree, which a build never asks
+/// for.
 fn run_request(
     step: &StepSpec,
     program: AbsolutePath,
+    live_output: LiveOutput,
 ) -> RunRequest {
     RunRequest {
         program,
@@ -947,7 +1081,7 @@ fn run_request(
         cwd: step.cwd.clone(),
         stdin: step.stdin.as_ref().map(|text| text.as_bytes().to_vec()),
         capture: step.capture,
-        echo: step.stream,
+        echo: live_output.echoes(step),
         tree: false,
         terminal: false,
     }
@@ -974,6 +1108,19 @@ fn replay(record: StepRecord) -> Result<StepOutcome, StepError> {
     })
 }
 
+impl<'a> TaskSteps<'a> {
+    /// The step executor, which tells `events` when each step starts to run and
+    /// when each comes from the cache, as `kizz run` asks for its live output.
+    #[must_use]
+    pub const fn with_events(
+        mut self,
+        events: &'a dyn StepEvents,
+    ) -> Self {
+        self.events = events;
+        self
+    }
+}
+
 impl TaskSteps<'_> {
     /// The step executor, which runs every step as if it were marked `always`, with
     /// the reason that names the task option, when `never` says that the task is
@@ -985,13 +1132,6 @@ impl TaskSteps<'_> {
     ) -> Self {
         self.cache_never = never;
         self
-    }
-
-    /// Whether every step runs as if it were marked `always`, because the task is
-    /// marked `cache=never`.
-    #[must_use]
-    pub const fn caches_never(&self) -> bool {
-        self.cache_never
     }
 
     /// The key of each step so far, in order.
@@ -1160,6 +1300,16 @@ impl TaskSteps<'_> {
         Ok(())
     }
 
+    /// Whether the step `step` runs as if it were marked `always`: it is, its task
+    /// is marked `cache=never`, or the engine runs every step (`kizz run
+    /// --no-cache`).
+    const fn runs_always(
+        &self,
+        step: &StepSpec,
+    ) -> bool {
+        step.always || self.cache_never || self.engine.no_cache
+    }
+
     /// Decide whether the step `step`, whose key is `key`, runs.
     fn decide(
         &self,
@@ -1173,7 +1323,7 @@ impl TaskSteps<'_> {
         )?
         .get(&key)
         .cloned();
-        if step.always || self.cache_never {
+        if self.runs_always(step) {
             let known = remembered.is_some() || self.record(&key)?.is_some();
             if let Some(first) = self.engine.first_always_result(key)? {
                 return Ok(Decision::Replay(first));
@@ -1182,8 +1332,10 @@ impl TaskSteps<'_> {
                 RunReason::NeverRun
             } else if self.cache_never {
                 RunReason::TaskCacheNever
-            } else {
+            } else if step.always {
                 RunReason::Always
+            } else {
+                RunReason::RunNoCache
             };
             return Ok(Decision::Run(reason, None));
         }
@@ -1322,6 +1474,7 @@ impl TaskSteps<'_> {
             RunReason::NeverRun => self.never_run(&txn, previous.as_ref(), key, spec)?,
             RunReason::Always => vec![Reason::Always],
             RunReason::TaskCacheNever => vec![Reason::TaskCacheNever],
+            RunReason::RunNoCache => vec![Reason::RunNoCache],
             RunReason::InputsChanged {
                 differences,
                 machine,
@@ -1392,21 +1545,24 @@ impl TaskSteps<'_> {
         })
     }
 
-    /// Note that the step `step` at `position`, whose key is `key`, was cached; its
-    /// position is stored, and its task becomes an owner of the record under `key`,
-    /// when the run finishes, unless it already ran in this build with the same key,
-    /// whose reasons it keeps and whose record its run made it an owner of.
+    /// Note that the step `step` at `position`, whose key is `key`, was cached and
+    /// returns `result`, and tell the run's step events; its position is stored,
+    /// and its task becomes an owner of the record under `key`, when the run
+    /// finishes, unless it already ran in this build with the same key, whose
+    /// reasons it keeps and whose record its run made it an owner of.
     fn note_cached(
         &self,
         position: u32,
         key: StepKey,
         step: &StepSpec,
+        result: &Result<StepOutcome, StepError>,
     ) -> Result<(), StepError> {
         let decision = StepDecision {
             position,
             command: step.command(),
             verdict: Verdict::Cached,
         };
+        self.events.step_cached(&decision, result);
         cells::update(&self.decisions, |decisions| decisions.push(decision));
         let Some(identity) = &self.identity else {
             return Ok(());
@@ -1441,8 +1597,9 @@ impl TaskSteps<'_> {
         Ok(())
     }
 
-    /// Note that the step `step` of `pending` ran, and warn when it re-ran in
-    /// consecutive builds for the same self-inflicted reason.
+    /// Note that the step `step` of `pending` ran, warn when it re-ran in
+    /// consecutive builds for the same self-inflicted reason, and tell the run's
+    /// step events that it starts, before its command starts.
     fn note_ran(
         &self,
         step: &StepSpec,
@@ -1462,6 +1619,7 @@ impl TaskSteps<'_> {
             command,
             verdict: Verdict::Ran(pending.explanation.clone()),
         };
+        self.events.step_started(&decision);
         cells::update(&self.decisions, |decisions| decisions.push(decision));
         Ok(())
     }
@@ -1495,7 +1653,7 @@ impl TaskSteps<'_> {
         checked: Accesses,
         machine: MachineStateRecord,
     ) -> Result<StepOutcome, StepError> {
-        let request = run_request(step, program.clone());
+        let request = run_request(step, program.clone(), self.engine.live_output);
         let ran_at = SystemTime::now();
         let started = Instant::now();
         let result = self
@@ -1846,11 +2004,11 @@ impl StepExecutor for TaskSteps<'_> {
                 checked_at_nanos,
             } => {
                 let result = self.hit(&key, *record, checked, checked_at_nanos);
-                self.note_cached(position, key, step)?;
+                self.note_cached(position, key, step, &result)?;
                 return result;
             },
             Decision::Replay(result) => {
-                self.note_cached(position, key, step)?;
+                self.note_cached(position, key, step, &result)?;
                 return result;
             },
         };
@@ -1870,7 +2028,7 @@ impl StepExecutor for TaskSteps<'_> {
         };
         self.note_ran(step, &pending)?;
         let result = self.look_up_and_run(step, name, &pending);
-        if step.always || self.cache_never {
+        if self.runs_always(step) {
             self.engine.finish_always(key, &result)?;
         }
         result

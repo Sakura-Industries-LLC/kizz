@@ -1154,6 +1154,10 @@ pub enum RunReason {
     /// if it were marked `always`, and this was its one run in the build.
     #[n(4)]
     TaskCacheNever,
+    /// `kizz run --no-cache` was given, so the step ran although its record may
+    /// have been a cache hit, and this was its one run in the run of the task.
+    #[n(5)]
+    RunNoCache,
 }
 
 /// What is recorded about one run of a step, by step key, and the tasks that own
@@ -1615,6 +1619,25 @@ mod tests {
         assert_eq!(matching, [&RunReason::TaskCacheNever]);
         let mut record = record();
         record.reason = RunReason::TaskCacheNever;
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+    }
+
+    /// The reason of a step that ran because `kizz run --no-cache` was given encodes
+    /// differently from every other run reason, and a record that holds it
+    /// round-trips.
+    #[test]
+    fn the_run_no_cache_reason_encodes_and_round_trips() {
+        let no_cache = minicbor::to_vec(&RunReason::RunNoCache).unwrap();
+        assert_eq!(
+            minicbor::decode::<RunReason>(&no_cache).unwrap(),
+            RunReason::RunNoCache
+        );
+        for reason in reasons() {
+            assert_ne!(minicbor::to_vec(&reason).unwrap(), no_cache, "{reason:?}");
+        }
+        let mut record = record();
+        record.reason = RunReason::RunNoCache;
         let bytes = minicbor::to_vec(&record).unwrap();
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
     }

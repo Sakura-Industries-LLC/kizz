@@ -1009,7 +1009,9 @@ fn cached_results_and_failed_programs_report_unchecked_steps() -> TestResult {
 }
 
 /// An unchecked step and the failure of `kizz build --fail-unchecked` show each
-/// command, its exit status, and its captured output, as an unexpected exit does.
+/// command, its exit status, and its captured output, as an unexpected exit does;
+/// the failure's first line names the command that was given `--fail-unchecked`,
+/// `kizz build` or `kizz run`, and only its first line depends on it.
 #[test]
 fn unchecked_failures_show_each_command_status_and_output() {
     let exits = vec![
@@ -1033,15 +1035,35 @@ fn unchecked_failures_show_each_command_status_and_output() {
             cached: true,
         },
     ];
-    let shown = TaskFailure::Unchecked { exits }.to_string();
+    let steps = "command `false`: exit code 1, which the task program never checked: its `run()` \
+                 has no `expect`, and the program never read the result's `rc` or \
+                 `signal`\n--- stdout ---\nout\n--- stderr ---\ncommand `sleep 9`: killed by \
+                 signal 9, which the task program never checked: its `run()` has no `expect`, \
+                 and the program never read the result's `rc` or `signal`\n--- output \
+                 ---\npartial\n";
+    let shown = TaskFailure::Unchecked {
+        exits: exits.clone(),
+        invoked: "kizz build",
+    }
+    .to_string();
     assert_eq!(
         shown,
-        "the task program left 2 non-zero exits unchecked, and `kizz build --fail-unchecked` \
-         makes that fail the task\ncommand `false`: exit code 1, which the task program never \
-         checked: its `run()` has no `expect`, and the program never read the result's `rc` or \
-         `signal`\n--- stdout ---\nout\n--- stderr ---\ncommand `sleep 9`: killed by signal 9, \
-         which the task program never checked: its `run()` has no `expect`, and the program \
-         never read the result's `rc` or `signal`\n--- output ---\npartial\n"
+        format!(
+            "the task program left 2 non-zero exits unchecked, and `kizz build --fail-unchecked` \
+             makes that fail the task\n{steps}"
+        )
+    );
+    let shown = TaskFailure::Unchecked {
+        exits,
+        invoked: "kizz run",
+    }
+    .to_string();
+    assert_eq!(
+        shown,
+        format!(
+            "the task program left 2 non-zero exits unchecked, and `kizz run --fail-unchecked` \
+             makes that fail the task\n{steps}"
+        )
     );
 }
 

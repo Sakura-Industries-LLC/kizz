@@ -56,17 +56,13 @@ fn kizz(args: &[&str]) -> io::Result<Run> {
 }
 
 /// Every scaffolded command, with the name its scaffold message shows. `kizz build`,
-/// `kizz list`, `kizz why`, and `kizz cache` are implemented, and `tests/build.rs`,
-/// `tests/list.rs`, `tests/why.rs`, and `tests/cache.rs` cover them.
-const STUBS: [(&[&str], &str); 3] = [
-    (&["graph"], "graph"),
-    (&["run"], "run"),
-    (&["image"], "image"),
-];
+/// `kizz list`, `kizz why`, `kizz cache`, `kizz execute` and `kizz run` are
+/// implemented, and their own test files cover them.
+const STUBS: [(&[&str], &str); 2] = [(&["graph"], "graph"), (&["image"], "image")];
 
 /// `kizz --help` lists every command and exits with status 0, and the help of the
-/// commands with options lists and describes them, `kizz build --fail-unchecked`
-/// and every option of `kizz execute` included.
+/// commands with options lists and describes them, `kizz build --fail-unchecked`,
+/// every option of `kizz execute` and every option of `kizz run` included.
 #[test]
 fn help_lists_every_subcommand() {
     let run = kizz(&["--help"]).unwrap();
@@ -147,6 +143,30 @@ fn help_lists_every_subcommand() {
             "execute --help does not describe {option}: {execute:?}"
         );
     }
+
+    let run_help = kizz(&["run", "--help"]).unwrap();
+    assert_eq!(run_help.status, Some(0), "{run_help:?}");
+    for (option, description) in [
+        ("--no-cache", "Run every command of the task"),
+        ("--explain", "Print the full reason for every command"),
+        ("--fail-unchecked", "leaves a non-zero exit unchecked"),
+        ("--cache-unknown-syscalls", "does not know"),
+        ("NAME", "The name of the task"),
+        ("ARGUMENTS", "The task's arguments, after `--`"),
+    ] {
+        assert!(
+            run_help.stdout.contains(option) && run_help.stdout.contains(description),
+            "run --help does not describe {option}: {run_help:?}"
+        );
+    }
+    assert!(
+        run_help.stdout.contains("Run one task by its name"),
+        "run --help does not describe the command: {run_help:?}"
+    );
+    assert!(
+        run.stdout.contains("Run one task by its name"),
+        "--help does not describe run: {run:?}"
+    );
 }
 
 /// `kizz --version` prints the version and exits with status 0.

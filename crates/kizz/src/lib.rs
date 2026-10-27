@@ -14,5 +14,6 @@ mod cache;
 pub mod cli;
 mod execute;
 mod list;
+mod run;
 mod ui;
 mod why;

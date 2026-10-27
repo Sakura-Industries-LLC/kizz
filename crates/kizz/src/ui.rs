@@ -234,6 +234,35 @@ pub(crate) fn print_cached(text: &str) {
     ));
 }
 
+/// Print a command that starts to run under `kizz run`: `text` names it and gives
+/// its one-line reason.
+pub(crate) fn print_run(text: &str) {
+    out(format_args!("{} {text}\n", style("run").green().bold()));
+}
+
+/// Write `bytes` to `stream` as they are and flush it, dropping a failure, as
+/// [`write_to`] does.
+fn write_bytes_to(
+    mut stream: impl Write,
+    bytes: &[u8],
+) {
+    let written = stream.write_all(bytes).and_then(|()| stream.flush());
+    // Output that cannot be written is dropped, and kizz goes on.
+    drop(written);
+}
+
+/// Write `bytes`, output that a command wrote to standard output, to standard
+/// output as they are, such as the stored output of a cache hit.
+pub(crate) fn print_output(bytes: &[u8]) {
+    write_bytes_to(io::stdout().lock(), bytes);
+}
+
+/// Write `bytes`, output that a command wrote to standard error, to standard
+/// error as they are, such as the stored output of a cache hit.
+pub(crate) fn print_error_output(bytes: &[u8]) {
+    write_bytes_to(io::stderr().lock(), bytes);
+}
+
 /// Print one line of detail under a command, indented.
 pub(crate) fn print_detail(line: &str) {
     out(format_args!("  {line}\n"));

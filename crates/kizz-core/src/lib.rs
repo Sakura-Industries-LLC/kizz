@@ -47,6 +47,8 @@
 //!   exit status and observation report, without the cache.
 //! * [`build`](mod@build): building the selected tasks in passes, in the default or
 //!   learned order, until a pass does no work, with failure handling and the pass limit.
+//! * [`run`](mod@run): running one task by its name for `kizz run`, once, with its
+//!   arguments, the nearest task of the name winning.
 //! * [`cleanup`]: the entries `kizz cache clean` removes because their files are gone,
 //!   and the entries `kizz cache reset` wipes for the tasks under a path.
 //! * [`pool`]: the worker pool that runs a command's parallel work, whose threads start
@@ -75,6 +77,7 @@ pub mod pool;
 pub mod project;
 pub mod render;
 pub mod report;
+pub mod run;
 pub mod runtime;
 pub mod states;
 pub mod step;
@@ -91,7 +94,7 @@ pub use check::{Checked, RACY_WINDOW_NANOS, check};
 pub use cleanup::{Cleaned, ResetPlan, clean, plan_reset};
 pub use discovery::{Discovery, KIZZ_FILE_NAME, KizzFile, default_order, discover};
 pub use dotenv::DotenvError;
-pub use engine::{Engine, StepConnections, TaskSteps, UnknownCalls};
+pub use engine::{Engine, NoStepEvents, StepConnections, StepEvents, TaskSteps, UnknownCalls};
 pub use execute::{
     ExecuteRequest, Executed, STATUS_FAILED, STATUS_NOT_EXECUTABLE, STATUS_NOT_FOUND, execute,
     exit_status, not_executed,
@@ -117,6 +120,7 @@ pub use report::{
     CommandInput, CommandOutcome, Execution, JSON_FIELDS, JsonField, Report, ReportFormat,
     ReportMode, TaskProgramInput,
 };
+pub use run::{NameError, RunReport, run, select_by_name, task_level};
 pub use runtime::{
     PrintSink, ProgramHash, ProgramLoad, ProgramParts, TaskFailure, TaskInfo, TaskProgram, TaskRun,
     UncheckedExit, UnexpectedExit,

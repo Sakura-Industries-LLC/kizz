@@ -212,7 +212,7 @@ pub(crate) const SIGNAL_POLL: Duration = Duration::from_millis(20);
 ///
 /// A message for a signal that `signal_hook` would panic on, or the error of
 /// `Signals::new`.
-fn interrupt_signals(signal: c_int) -> Result<Signals, String> {
+pub(crate) fn interrupt_signals(signal: c_int) -> Result<Signals, String> {
     if signal <= 0 || signal >= SIGNAL_LIMIT || FORBIDDEN.contains(&signal) {
         return Err(format!("signal {signal} cannot be handled"));
     }
@@ -232,7 +232,7 @@ fn interrupt_signals(signal: c_int) -> Result<Signals, String> {
 /// error" when reading the delivery fails. The scope that runs it waits for it
 /// before it returns, also when `work` panics. A [`CloseOnDrop`] therefore closes
 /// the delivery whichever way `work` ends, and the thread ends at its next look.
-fn with_interrupts<T>(
+pub(crate) fn with_interrupts<T>(
     signals: Signals,
     cancel: &Cancellation,
     work: impl FnOnce() -> T,
@@ -273,7 +273,7 @@ impl Drop for CloseOnDrop {
 
 /// `status`, or [`USAGE_ERROR`] in place of success, after an error in using the
 /// cache.
-const fn worse(status: u8) -> u8 {
+pub(crate) const fn worse(status: u8) -> u8 {
     if status == 0 { USAGE_ERROR } else { status }
 }
 
@@ -354,26 +354,18 @@ fn build_selected(
     )
     .with_cache_unknown_system_calls(options.engine.cache_unknown_syscalls)
     .with_fail_unchecked(options.engine.fail_unchecked);
-    let output = Output {
-        render: Render {
+    let output = Output::new(
+        Render {
             base: cwd.to_path_buf(),
             home,
             verbose: options.verbose,
         },
         options,
-        engine: &engine,
+        &engine,
         store,
-        seen: Cell::new(BTreeSet::new()),
-        pass_ran: Cell::new(false),
-        pass_changed: Cell::new(false),
-        repeated_shown: Cell::new(0),
-        incomplete_shown: Cell::new(BTreeSet::new()),
-        changed_shown: Cell::new(BTreeSet::new()),
-        unknown_shown: Cell::new(BTreeSet::new()),
-        connections_shown: Cell::new(BTreeSet::new()),
-        warnings: Cell::new(warnings),
-        unreadable: Cell::new(None),
-    };
+        warnings,
+        "kizz build",
+    );
     let status = match build(&engine, &tasks, &caller, &output, &output) {
         Ok(report) => output.finish(&report),
         Err(error) => {
@@ -381,7 +373,7 @@ fn build_selected(
             USAGE_ERROR
         },
     };
-    ui::print_warning_summary(&output.warnings.take());
+    ui::print_warning_summary(&output.take_warnings());
     status
 }
 
@@ -399,7 +391,7 @@ pub(crate) fn worker_pool() -> Option<WorkerPool> {
 
 /// Load the project under `cwd`, walking on `pool`, printing its configuration
 /// errors and warnings when it has errors.
-fn load_project(
+pub(crate) fn load_project(
     cwd: &Path,
     pool: &WorkerPool,
 ) -> Option<Project> {
@@ -453,7 +445,7 @@ fn available_targets(project: &Project) -> String {
 }
 
 /// Print each warning loudly and return their messages for the final summary.
-fn print_warnings(warnings: &[Warning]) -> Vec<String> {
+pub(crate) fn print_warnings(warnings: &[Warning]) -> Vec<String> {
     let messages: Vec<String> = warnings.iter().map(ToString::to_string).collect();
     for message in &messages {
         ui::print_warning(message);
@@ -462,7 +454,7 @@ fn print_warnings(warnings: &[Warning]) -> Vec<String> {
 }
 
 /// Print `message` as an error and return the usage-error status.
-fn failure(message: &str) -> ExitCode {
+pub(crate) fn failure(message: &str) -> ExitCode {
     ui::print_error(message);
     ExitCode::from(USAGE_ERROR)
 }
@@ -530,12 +522,16 @@ fn first_time<K: Ord>(
     update(cell, |keys| keys.insert(key))
 }
 
-/// What the build printed so far, and how it prints.
+/// What the build printed so far, and how it prints; `kizz run` uses it for its
+/// warnings.
 ///
 /// The state that the build's callbacks change through `&self` lives in `Cell`s,
 /// changed with [`update`], never in `RefCell`s, whose borrows panic while the cell
 /// is borrowed ("Kizz never panics").
-struct Output<'a> {
+pub(crate) struct Output<'a> {
+    /// The command as warnings name it with its options: `kizz build` or `kizz
+    /// run`.
+    invoked: &'static str,
     /// How paths, tasks, and reasons read.
     render: Render,
     /// What to print beyond the commands that run.
@@ -569,6 +565,43 @@ struct Output<'a> {
     /// The first error of engine state that stayed locked when the warnings were
     /// read, if any.
     unreadable: Cell<Option<LockError>>,
+}
+
+impl<'a> Output<'a> {
+    /// The output of a run of `engine`, whose records are in `store`, invoked as
+    /// `invoked`, such as `kizz build`, which renders with `render`, prints what
+    /// `options` ask for, and starts with the warnings `warnings` already printed.
+    pub(crate) fn new(
+        render: Render,
+        options: Options,
+        engine: &'a Engine<'a>,
+        store: &'a Store,
+        warnings: Vec<String>,
+        invoked: &'static str,
+    ) -> Self {
+        Self {
+            invoked,
+            render,
+            options,
+            engine,
+            store,
+            seen: Cell::new(BTreeSet::new()),
+            pass_ran: Cell::new(false),
+            pass_changed: Cell::new(false),
+            repeated_shown: Cell::new(0),
+            incomplete_shown: Cell::new(BTreeSet::new()),
+            changed_shown: Cell::new(BTreeSet::new()),
+            unknown_shown: Cell::new(BTreeSet::new()),
+            connections_shown: Cell::new(BTreeSet::new()),
+            warnings: Cell::new(warnings),
+            unreadable: Cell::new(None),
+        }
+    }
+
+    /// Every warning printed so far, for the final summary, which this takes.
+    pub(crate) fn take_warnings(&self) -> Vec<String> {
+        self.warnings.take()
+    }
 }
 
 impl PrintSink for Output<'_> {
@@ -673,7 +706,7 @@ impl Output<'_> {
     ///
     /// The [`LockError`] of engine state that stayed locked, after the warnings that
     /// could be read.
-    fn check_warnings(&self) -> Result<(), LockError> {
+    pub(crate) fn check_warnings(&self) -> Result<(), LockError> {
         let repeated = self.engine.warnings()?;
         for warning in repeated.iter().skip(self.repeated_shown.get()) {
             self.warn(self.render.repeated(warning));
@@ -783,13 +816,19 @@ impl Output<'_> {
         &self,
         calls: &UnknownCalls,
     ) -> String {
+        let invoked = self.invoked;
         let outcome = if calls.cached {
-            "; its result was cached because `kizz build --cache-unknown-syscalls` was given"
+            format!(
+                "; its result was cached because `{invoked} --cache-unknown-syscalls` was given"
+            )
         } else if self.engine.caches_unknown_system_calls() {
             "; its result was not cached for another reason, and it runs again on the next build"
+                .to_owned()
         } else {
-            ", so its result was not cached and it runs again on the next build; `kizz build \
-             --cache-unknown-syscalls` caches the results of such commands"
+            format!(
+                ", so its result was not cached and it runs again on the next build; `{invoked} \
+                 --cache-unknown-syscalls` caches the results of such commands"
+            )
         };
         format!(
             "{} made {}, which the tracer does not know{outcome}",
@@ -827,7 +866,7 @@ impl Output<'_> {
     /// never read `rc` or `signal`, and, when the build ran no command under the
     /// step's key, that the result came from the cache; then either that the task
     /// fails, with `--fail-unchecked`, or that the option would fail it.
-    fn unchecked(
+    pub(crate) fn unchecked(
         &self,
         step: &UncheckedStep,
     ) -> String {
@@ -836,10 +875,11 @@ impl Output<'_> {
         } else {
             "; the result came from the cache"
         };
+        let invoked = self.invoked;
         let outcome = if self.engine.fails_unchecked() {
-            "the task fails because `kizz build --fail-unchecked` was given"
+            format!("the task fails because `{invoked} --fail-unchecked` was given")
         } else {
-            "`kizz build --fail-unchecked` makes this fail the task"
+            format!("`{invoked} --fail-unchecked` makes this fail the task")
         };
         format!(
             "{} left {} unchecked: {}, but its `run()` has no `expect` and the task program never \
@@ -851,7 +891,7 @@ impl Output<'_> {
     }
 
     /// Print `message` as a loud warning and keep it for the final summary.
-    fn warn(
+    pub(crate) fn warn(
         &self,
         message: String,
     ) {
@@ -863,7 +903,7 @@ impl Output<'_> {
     /// warnings cannot be read, and keep it, so the build exits with
     /// [`USAGE_ERROR`] at the end instead of success; return whether this call
     /// printed it, which only the first error of a build does.
-    fn unreadable(
+    pub(crate) fn unreadable(
         &self,
         error: &LockError,
     ) -> bool {
@@ -878,7 +918,7 @@ impl Output<'_> {
     }
 
     /// Whether engine state stayed locked at some check, so warnings may be missing.
-    fn had_unreadable(&self) -> bool {
+    pub(crate) fn had_unreadable(&self) -> bool {
         update(&self.unreadable, |unreadable| unreadable.is_some())
     }
 
@@ -1263,13 +1303,13 @@ mod tests {
         engine: &'a Engine<'a>,
         store: &'a Store,
     ) -> Output<'a> {
-        Output {
-            render: Render {
+        Output::new(
+            Render {
                 base: PathBuf::from("/w"),
                 home: None,
                 verbose: false,
             },
-            options: Options {
+            Options {
                 explain: false,
                 verbose: false,
                 engine: EngineOptions {
@@ -1279,17 +1319,9 @@ mod tests {
             },
             engine,
             store,
-            seen: Cell::new(BTreeSet::new()),
-            pass_ran: Cell::new(false),
-            pass_changed: Cell::new(false),
-            repeated_shown: Cell::new(0),
-            incomplete_shown: Cell::new(BTreeSet::new()),
-            changed_shown: Cell::new(BTreeSet::new()),
-            unknown_shown: Cell::new(BTreeSet::new()),
-            connections_shown: Cell::new(BTreeSet::new()),
-            warnings: Cell::new(Vec::new()),
-            unreadable: Cell::new(None),
-        }
+            Vec::new(),
+            "kizz build",
+        )
     }
 
     /// When the engine's state stays locked as a finished task's warnings are

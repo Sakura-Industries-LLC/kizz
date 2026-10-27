@@ -29,7 +29,7 @@ These decisions came out of the review of the original outline.
 | Topic | Decision |
 | --- | --- |
 | Name | `kizz` everywhere: the binary, `kizz.md` files, the cache directory, and `KIZZ_CACHE_DIR`. |
-| First version | The core builder only. Container image building and a command-runner mode come later, as extensions of the core. |
+| First version | The core builder, with `kizz execute` to observe any command and `kizz run` to run one task. Container image building comes later, as an extension of the core. |
 | Platforms | Linux only. The one concession is a clean module boundary, so the core logic does not depend on how commands are run or traced. |
 | Build daemons | Not supported. Their work cannot be traced; builds that need them should use another tool. |
 | Unknown inputs | A step with no record has never run, so it runs. |
@@ -127,13 +127,14 @@ The first version is the builder engine: it discovers tasks, runs their programs
 caches the results, and explains every decision.
 It ships as one command, `kizz`, with subcommands; commands planned for later are present as stubs.
 `kizz execute` runs any command and reports what it touched, without a `kizz.md` and without the cache.
+`kizz run` runs one task by its name, as a command runner, with the same cache.
 
 ### Later extensions
 
 These build on the core and come after it:
 
 * Container image building, including the layer reuse from the original outline, keyed on what each layer step read.
-* A command-runner mode for interactive and long-running commands that should not be traced or cached.
+* Interactive commands in `kizz run`, which would give a command the terminal instead of `/dev/null` or its `stdin` text.
 * Parallel execution of independent tasks behind `kizz build --parallel`, scheduled from the learned dependency graph.
 * Restoring outputs from the cache instead of re-running commands, which would also let a moved project reuse its cache entries.
 * An aarch64 tracer.
@@ -179,9 +180,11 @@ Version 1 implements these commands:
 * `kizz execute --output=<file> -- <program> [arguments...]` runs any program and reports what it touched in `<file>`.
   `--compact` combines the observations of every process, and `--json` writes JSON instead of text.
   It needs no `kizz.md` and no cache; see [Observing any command](#observing-any-command-with-kizz-execute).
+* `kizz run <name> [-- <arguments>...]` runs the task named `<name>` once, showing each command and its output live.
+  `--no-cache` runs every command, and `--explain`, `--fail-unchecked` and `--cache-unknown-syscalls` work as for `kizz build`.
+  See [Running one task with kizz run](#running-one-task-with-kizz-run).
 
-Parsed but stubbed, in the same style as the cbork CLI stubs: `kizz graph`, `kizz run` (the command runner) and `kizz image`
-(container images).
+Parsed but stubbed, in the same style as the cbork CLI stubs: `kizz graph` and `kizz image` (container images).
 
 Output follows cbork: a banner suppressed by `--quiet` or `--no-banner`, with styling from `console`.
 `kizz execute` never prints the banner, writes nothing to standard output, and writes only its fatal errors to standard error.
@@ -728,6 +731,7 @@ To replay several log segments, SurrealKV starts a thread when it can, and other
 
 * The cache directory holds `kizz.lock`.
   A build holds an exclusive lock on it (`flock`) for its whole run, so only one build uses a cache at a time.
+* `kizz run` holds the lock for its whole run, as a build does.
 * The first build wins and any other build waits.
 * The holder writes its details into the file: process ID, user, host, working directory, command line and start time.
 * A waiting build prints those details at once, and prints them again if a different build takes the lock while it waits.
@@ -830,6 +834,7 @@ If it rewrites files with identical content, dependent steps see unchanged hashe
 If it changes content, dependent steps run again, as they should.
 Every command of a task marked `cache=never` runs as if it were marked `always`, and its reason names the task option.
 Nothing makes such a command cached.
+`kizz run --no-cache` runs every command of its task, also one that a cache hit would replay, and its reason says so.
 
 ### Cleaning up the cache
 
@@ -877,6 +882,7 @@ These are the reasons:
 * the machine state that the step names changed: each changed value, old and new
 * the command is marked `always`
 * its task is marked `cache=never`
+* `kizz run --no-cache` was given
 * the previous run could not be cached, and why
 
 When a step re-runs because of a file that it, or another step, writes on every build, the explanation says so directly,
@@ -992,6 +998,27 @@ Exit status:
 * 127 when the program is not found, and 126 when it is found but cannot be run or started
 * 125 when kizz itself fails after it accepted the command line: the tracer failed, or the report could not be written
 * 2 for a command-line error, as for every kizz command, such as a missing `--output` or a missing directory for it
+
+## Running one task with `kizz run`
+
+`kizz run <name>` makes kizz a command runner: it finds the task named `<name>` and runs its program once.
+
+* Discovery is the same as for `kizz build`: the current directory and every directory below it.
+* The task whose `kizz.md` is the fewest directory levels below the current directory wins.
+* Two tasks of that name at the same level are an error that lists each with its path.
+* A name that no task has is an error that lists the task names under the current directory.
+* The words after `--` are the task's arguments, which its program reads as `task.args`, and nothing else follows the name.
+* Under `kizz run`, `task.selected` is empty, because no target selected the task.
+* The task runs once: no other task runs, and no pass follows, even when its program changes a file.
+* It takes the cache lock, and it uses and updates the cache as a build does.
+* `--no-cache` runs every command of the task, as if each had `always = True`, and still records each result.
+* No option forces caching: a command marked `always`, or of a task marked `cache=never`, always runs.
+* `--explain`, `--fail-unchecked` and `--cache-unknown-syscalls` work as they do for `kizz build`.
+* A command's `stdin` is what its `run()` gives, or `/dev/null`, as in a build.
+* Kizz prints each command as it starts, then its output as it comes, as if every `run()` had `stream = True`.
+* A cache hit prints its command marked as cached, then replays its stored output.
+* Unchecked non-zero exits warn after the run, and `--fail-unchecked` fails the task, as in a build.
+* Exit status: 0 when the task succeeds, 1 when it fails, 2 for usage and configuration errors, and 130 when interrupted.
 
 ## Observation reports
 

@@ -20,6 +20,7 @@
 //! * the machine state that the step names changed: each changed value, old and new;
 //! * the command is marked `always`;
 //! * its task is marked `cache=never`;
+//! * `kizz run --no-cache` was given;
 //! * the previous run could not be cached, and why.
 //!
 //! Every type here is encoded by the rules of "Step keys": definite lengths, fields
@@ -322,6 +323,12 @@ pub enum Reason {
     /// marked `always`.
     #[n(15)]
     TaskCacheNever,
+    /// `kizz run --no-cache` was given, so the command ran although its record may
+    /// have been a cache hit. Unlike [`Reason::Always`] and
+    /// [`Reason::TaskCacheNever`], it does not make the step one that runs on every
+    /// build.
+    #[n(16)]
+    RunNoCache,
 }
 
 impl Reason {
@@ -505,6 +512,7 @@ mod tests {
             },
             Reason::Always,
             Reason::TaskCacheNever,
+            Reason::RunNoCache,
             Reason::NotCached {
                 why: NotCachedReason::Signaled { signal: 9 },
                 inputs: Vec::new(),
@@ -553,6 +561,12 @@ mod tests {
         };
         assert!(never.runs_every_build());
         assert_eq!(never.self_inflicted(), Vec::<PathBuf>::new());
+        let no_cache = Explanation {
+            reasons: vec![Reason::RunNoCache],
+            repeated: Vec::new(),
+        };
+        assert!(!no_cache.runs_every_build());
+        assert_eq!(no_cache.self_inflicted(), Vec::<PathBuf>::new());
     }
 
     /// The reason of a command whose task is marked `cache=never` encodes
@@ -567,6 +581,26 @@ mod tests {
         );
         let verdict = Verdict::Ran(Explanation {
             reasons: vec![Reason::TaskCacheNever],
+            repeated: Vec::new(),
+        });
+        let bytes = minicbor::to_vec(&verdict).unwrap();
+        assert_eq!(minicbor::decode::<Verdict>(&bytes).unwrap(), verdict);
+    }
+
+    /// The reason of a command that ran because `kizz run --no-cache` was given
+    /// encodes differently from `always` and from `cache=never`, and an explanation
+    /// that holds it round-trips.
+    #[test]
+    fn the_run_no_cache_reason_encodes_and_round_trips() {
+        let no_cache = minicbor::to_vec(&Reason::RunNoCache).unwrap();
+        assert_ne!(no_cache, minicbor::to_vec(&Reason::Always).unwrap());
+        assert_ne!(no_cache, minicbor::to_vec(&Reason::TaskCacheNever).unwrap());
+        assert_eq!(
+            minicbor::decode::<Reason>(&no_cache).unwrap(),
+            Reason::RunNoCache
+        );
+        let verdict = Verdict::Ran(Explanation {
+            reasons: vec![Reason::RunNoCache],
             repeated: Vec::new(),
         });
         let bytes = minicbor::to_vec(&verdict).unwrap();

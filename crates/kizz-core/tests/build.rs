@@ -1770,7 +1770,7 @@ fn fail_unchecked_fails_a_standing_unchecked_exit_and_the_build() -> TestResult 
             return Err(format!("unexpected failures {failures:?}").into());
         };
         assert_eq!(failed.task.heading.as_deref(), Some("Ignore"));
-        let TaskFailure::Unchecked { exits } = &failed.failure else {
+        let TaskFailure::Unchecked { exits, invoked } = &failed.failure else {
             return Err(format!("unexpected failure {:?}", failed.failure).into());
         };
         let commands: Vec<(String, Termination, bool)> = exits
@@ -1782,7 +1782,18 @@ fn fail_unchecked_fails_a_standing_unchecked_exit_and_the_build() -> TestResult 
             Termination::Exited(1),
             true
         )]);
+        assert_eq!(
+            *invoked, "kizz build",
+            "an engine without a command name is a build's"
+        );
         let message = failed.failure.to_string();
+        assert!(
+            message.starts_with(
+                "the task program left a non-zero exit unchecked, and `kizz build \
+                 --fail-unchecked` makes that fail the task\n"
+            ),
+            "{message}"
+        );
         assert!(
             message.contains("command `tool need:absent.txt`: exit code 1"),
             "{message}"

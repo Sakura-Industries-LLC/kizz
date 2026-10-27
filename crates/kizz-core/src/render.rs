@@ -451,6 +451,7 @@ impl Render {
             },
             Reason::Always => "marked `always`".to_owned(),
             Reason::TaskCacheNever => "its task is marked `cache=never`".to_owned(),
+            Reason::RunNoCache => "`kizz run --no-cache` was given".to_owned(),
             Reason::NotCached { why, inputs } => {
                 let why = self.not_cached(why);
                 if inputs.is_empty() {
@@ -525,7 +526,8 @@ impl Render {
             | Reason::TimestampsChanged { .. }
             | Reason::MachineNamesChanged { .. }
             | Reason::Always
-            | Reason::TaskCacheNever => vec![self.reason_line(reason)],
+            | Reason::TaskCacheNever
+            | Reason::RunNoCache => vec![self.reason_line(reason)],
         }
     }
 

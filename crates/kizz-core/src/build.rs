@@ -87,7 +87,7 @@ use kizz_store::{
 use kizz_trace::{AbsolutePath, AccessKind, Accesses};
 
 use crate::{
-    engine::{Engine, TaskSteps},
+    engine::{Engine, NoStepEvents, StepEvents, TaskSteps},
     explain::{StepDecision, TaskIdentity},
     runtime::{PrintSink, TaskFailure, TaskInfo, TaskProgram, UncheckedExit},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
@@ -402,6 +402,9 @@ struct Builder<'b> {
     caller: &'b BTreeMap<String, String>,
     /// Where the lines that task programs print go.
     print: &'b dyn PrintSink,
+    /// Follows each step as it starts or comes from the cache: nothing in a build,
+    /// the live output of `kizz run`.
+    step_events: &'b dyn StepEvents,
     /// The step keys under which the build ran a command so far, which only the
     /// builder's own `&mut self` methods change, so it needs no `RefCell`.
     ran: BTreeSet<StepKey>,
@@ -428,7 +431,8 @@ impl Builder<'_> {
                 let steps = self
                     .engine
                     .task_for(TaskIdentity::of(&program))
-                    .with_cache_never(task.cache_never);
+                    .with_cache_never(task.cache_never)
+                    .with_events(self.step_events);
                 let executor = CancelGuard {
                     steps: &steps,
                     engine: self.engine,
@@ -440,6 +444,7 @@ impl Builder<'_> {
                     Ok(()) if self.engine.fails_unchecked() && !run.unchecked.is_empty() => {
                         Err(TaskFailure::Unchecked {
                             exits: run.unchecked.clone(),
+                            invoked: self.engine.command_name(),
                         })
                     },
                     other => other,
@@ -544,6 +549,7 @@ pub fn build(
         engine,
         caller,
         print,
+        step_events: &NoStepEvents,
         ran: BTreeSet::new(),
     };
     let limit = pass_limit(ordered.len());
@@ -574,6 +580,40 @@ pub fn build(
         passes,
         outcome,
     })
+}
+
+/// Run `task` once with `engine`, as `kizz run` does: no other task and no further
+/// pass, even when its program changes a file; `caller` is the caller environment,
+/// the lines its program prints go to `print`, and `step_events` follows each step
+/// as it starts or comes from the cache.
+///
+/// The run stores what a build of that one task in one pass stores: the step
+/// records and positions, the task record, the task program as the last writer of
+/// each file it changed, and, unless the run was interrupted, the task's learned
+/// order.
+///
+/// # Errors
+///
+/// A [`StoreError`] when a record cannot be read or written.
+pub(crate) fn run_task_once(
+    engine: &Engine<'_>,
+    task: &TaskInfo,
+    caller: &BTreeMap<String, String>,
+    print: &dyn PrintSink,
+    step_events: &dyn StepEvents,
+) -> Result<TaskResult, StoreError> {
+    let mut builder = Builder {
+        engine,
+        caller,
+        print,
+        step_events,
+        ran: BTreeSet::new(),
+    };
+    let (result, trace) = builder.run_task(task)?;
+    if !engine.is_cancelled() {
+        learn(engine.store(), &BTreeMap::from([(task_id(task), trace)]))?;
+    }
+    Ok(result)
 }
 
 /// The outcome of a build whose pass `pass` did no work.

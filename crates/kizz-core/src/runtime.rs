@@ -156,6 +156,23 @@ impl TaskInfo {
         })
     }
 
+    /// The information of `task` as `kizz run` runs it: with the arguments `args`,
+    /// which its program reads as `task.args`, and an empty `task.selected`,
+    /// because no target selected the task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotAbsoluteError`] when the task's `kizz.md` path is not absolute.
+    pub fn for_run(
+        task: &Task,
+        args: Vec<String>,
+    ) -> Result<Self, NotAbsoluteError> {
+        Ok(Self {
+            args,
+            ..Self::new(task, &[])?
+        })
+    }
+
     /// The name that prefixes the task's `print` output: its name, else its heading,
     /// else `path/kizz.md:LINE`.
     #[must_use]
@@ -298,12 +315,16 @@ impl fmt::Display for UncheckedExit {
     }
 }
 
-/// The message of a task that `kizz build --fail-unchecked` fails because its
-/// program left the steps `exits` unchecked: a line that says so, then each
-/// command with its exit status and its captured output.
-fn unchecked_message(exits: &[UncheckedExit]) -> String {
+/// The message of a task that `--fail-unchecked` fails because its program left
+/// the steps `exits` unchecked, under the command `invoked`, such as `kizz build`
+/// or `kizz run`: a line that says so and names the command with the option, then
+/// each command with its exit status and its captured output.
+fn unchecked_message(
+    exits: &[UncheckedExit],
+    invoked: &str,
+) -> String {
     let mut message = format!(
-        "the task program left {} unchecked, and `kizz build --fail-unchecked` makes that fail \
+        "the task program left {} unchecked, and `{invoked} --fail-unchecked` makes that fail \
          the task\n",
         if exits.len() == 1 {
             "a non-zero exit".to_owned()
@@ -353,12 +374,18 @@ pub enum TaskFailure {
         message: String,
     },
     /// The program ended, and left steps unchecked, which fails the task with
-    /// `kizz build --fail-unchecked` ("Exit codes and failure").
-    #[error("{}", unchecked_message(.exits))]
+    /// `kizz build --fail-unchecked` or `kizz run --fail-unchecked` ("Exit codes and
+    /// failure").
+    #[error("{}", unchecked_message(.exits, .invoked))]
     Unchecked {
         /// Each unchecked step, in the order the program ran them, with its command,
         /// its exit status, and its captured output.
         exits: Vec<UncheckedExit>,
+        /// The command that was given `--fail-unchecked`, as the message names it:
+        /// `kizz build` or `kizz run` (see [`Engine::command_name`]).
+        ///
+        /// [`Engine::command_name`]: crate::Engine::command_name
+        invoked: &'static str,
     },
 }
 
