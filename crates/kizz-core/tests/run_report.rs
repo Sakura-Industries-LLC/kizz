@@ -13,7 +13,8 @@
 //! Each test writes a `kizz.md` into a temporary project directory and opens the
 //! store in a temporary cache directory. Every task inherits `PATH` from the caller
 //! environment, which holds the project's `bin` directory with an executable
-//! `tool`. The fake tracer, [`ReportTracer`], keeps whether each request asked for
+//! `tool`, apart from the tasks whose test says that they inherit nothing. The fake
+//! tracer, [`ReportTracer`], keeps whether each request asked for
 //! the process tree, builds the tree of each result with
 //! [`ProcessTree::of_run`] when it did (decision 1), names `ENOENT`, and reads the
 //! command's arguments:
@@ -41,8 +42,8 @@ use std::{
 };
 
 use kizz_core::{
-    CommandOutcome, Engine, NoStepEvents, PrintSink, Report, ReportMode, RunReport, TaskInfo,
-    WorkerPool, load, run, select_by_name,
+    CommandOutcome, Engine, NoPathError, NoStepEvents, PrintSink, Report, ReportMode, RunReport,
+    TaskInfo, WorkerPool, load, run, select_by_name,
 };
 use kizz_store::Store;
 use kizz_trace::{
@@ -609,6 +610,46 @@ fn a_step_whose_program_is_not_found_has_the_placeholder_process() -> TestResult
         &Value::from("not_found")
     );
     assert_eq!(at(&value, "/commands/0/processes/0/pid")?, &Value::Null);
+    Ok(())
+}
+
+/// A step whose bare program name has no `PATH` has no decision, so the run
+/// counts no command, but its report keeps it as a command that started no
+/// process: `not_found`, with the message of [`NoPathError`], no program, and the
+/// placeholder process without observations.
+#[test]
+fn a_step_without_path_is_reported_as_a_command_that_started_no_process() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.task("bare", "run(\"tool\", \"x\")", false)?;
+
+    let run = fixture.run("bare", REPORT)?;
+    assert!(!run.succeeded());
+    assert_eq!(run.command_counts(), (0, 0));
+    assert_eq!(fixture.tracer.take(), Vec::<bool>::new());
+    let report = report_of(&run)?;
+    let [command] = report.commands.as_slice() else {
+        return Err(format!("expected one command, got {report:?}").into());
+    };
+    let message = NoPathError {
+        program: "tool".to_owned(),
+    }
+    .to_string();
+    assert_eq!(command.outcome, CommandOutcome::NotFound(message));
+    assert_eq!(command.program, None);
+    let [process] = command.processes.as_slice() else {
+        return Err(format!("expected one process, got {command:?}").into());
+    };
+    assert_eq!((process.id, process.pid, process.exit), (1, None, None));
+    let [program] = process.programs.as_slice() else {
+        return Err(format!("expected one program, got {process:?}").into());
+    };
+    assert_eq!(program.path, Path::new("tool"));
+    assert_eq!(program.observations, Observations::new());
+    let value = json(&report, ReportMode::Hierarchical)?;
+    assert_eq!(
+        at(&value, "/commands/0/outcome/kind")?,
+        &Value::from("not_found")
+    );
     Ok(())
 }
 

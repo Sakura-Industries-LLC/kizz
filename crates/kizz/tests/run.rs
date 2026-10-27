@@ -8,7 +8,8 @@
 //! Each test writes a project into one temporary directory and gives every run of
 //! `kizz` a cache in another. Every run gets an explicit environment that holds only
 //! `KIZZ_CACHE_DIR`, set to that cache, and `PATH`, which the tasks inherit to find
-//! their programs, and runs with `--color never --no-banner`.
+//! their programs, apart from the task of a `run()` without `PATH`, and runs with
+//! `--color never --no-banner`.
 
 #![allow(
     clippy::disallowed_macros,
@@ -448,6 +449,44 @@ fn exit_statuses_follow_kizz_build() -> TestResult {
         "{broken:?}"
     );
     assert_eq!(broken.stdout, "", "{broken:?}");
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// `kizz run` of a task whose `run("true")` has no `PATH`, by its name, with or
+/// without `--no-cache`, exits with 1, prints the task's error with the message of
+/// `NoPathError` once and no line of the form "run `COMMAND` (step N): REASON", and
+/// its summary counts no command.
+#[test]
+fn a_run_without_path_counts_no_command() -> TestResult {
+    let project = Project::new()?;
+    project.write(
+        "kizz.md",
+        "# Bare\n\n```starlark name=bare\nrun(\"true\")\n```\n",
+    )?;
+    let message = "cannot run `true`: a program name without `/` is looked up in the task \
+                   environment's PATH, but the task environment has no PATH; set it with \
+                   env.set(\"PATH\", ...) or inherit it with env.inherit(\"PATH\")";
+
+    for args in [&["run", "bare"][..], &["run", "--no-cache", "bare"][..]] {
+        let run = project.run("", args)?;
+        assert_eq!(run.status, Some(1), "{args:?}: {run:?}");
+        assert_eq!(
+            run.stdout,
+            text(&["run failed: kizz.md:3 (Bare); 0 commands ran, 0 cached"]),
+            "{args:?}"
+        );
+        assert!(
+            !run.stdout.lines().any(|line| line.starts_with("run `")),
+            "{args:?}: {run:?}"
+        );
+        assert_eq!(run.stderr.matches(message).count(), 1, "{args:?}: {run:?}");
+        assert!(
+            run.stderr.contains("error: kizz.md:3 (Bare) failed:\n"),
+            "{args:?}: {run:?}"
+        );
+        assert!(!run.stderr.contains("run(): run():"), "{args:?}: {run:?}");
+    }
     assert!(!project.has_lock_file());
     Ok(())
 }

@@ -209,6 +209,12 @@ Prints the help of `kizz build` and exits with 0.
 * `cached`, the command, its task and its step, for each command that came from the cache, the first time the build
   reaches it, with `--verbose` or `--explain`.
 * With `--explain`, the full reasons under each of those lines, instead of the one-line reason.
+* No line for a `run()` that fails before kizz records its step or asks the tracer to run it: a bare program name
+  without `PATH`, an invalid `ignore` or `track` pattern, a `~/` pattern without `HOME`, a failure of kizz's own state,
+  such as a cache that it cannot read, or a step again after a tracer failure in an earlier pass, which counted it then;
+  the summary counts such a call neither as a command that ran nor as a cached one.
+* A program that is not found or not executable, a command that cannot start, such as one whose `cwd` does not exist,
+  and a tracer failure get their `ran` line and are counted as commands that ran.
 * `pass` and its number at the start of each pass after the first, with what the pass before did: a command ran,
   a task program changed a file, or both.
 * What each task program prints with `print`, after its task's name, else its heading, else its `kizz.md` and line.
@@ -814,6 +820,11 @@ Prints the help of `kizz run` and exits with 0.
 * `run`, the command in backticks, its step and its one-line reason, as each command starts, then its output as it comes,
   as if every `run()` had `stream = True`.
 * `cached`, the command and its step, for each cache hit, then its stored output.
+* No line for a `run()` that fails before kizz records its step or asks the tracer to run it: a bare program name
+  without `PATH`, an invalid `ignore` or `track` pattern, a `~/` pattern without `HOME`, or a failure of kizz's own state,
+  such as a cache that it cannot read; the summary counts such a call neither as a command that ran nor as a cached one.
+* A program that is not found or not executable, a command that cannot start, such as one whose `cwd` does not exist,
+  and a tracer failure get their `run` line and are counted as commands that ran.
 * With `split` capture, the default, a command's standard output goes to standard output and its standard error to
   standard error; with `merged` capture, its one stream goes to standard output.
 * What the task program prints, its failure and every warning, as in a build, and the warnings about unchecked exits after the run.

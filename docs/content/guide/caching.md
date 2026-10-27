@@ -9,7 +9,7 @@ This page explains how kizz decides that a command can be skipped, and the optio
 
 Kizz records what each command touched, and normally skips a command whose recorded inputs have not changed.
 A command runs anyway when kizz has no record for it, or when something it recorded has changed.
-It also runs on every build when its `run()` has `always = True`, when its task is marked `cache=never`,
+It also runs in every build that reaches it when its `run()` has `always = True`, when its task is marked `cache=never`,
 or under `kizz run --no-cache`.
 And a command whose previous result could not be cached, such as one that a signal killed, runs again.
 Every time a command runs, kizz says why.
@@ -100,7 +100,11 @@ Each of these runs a command, and its explanation says which one did:
 
 ## Results that are not cached
 
-Some results are never reused, and their commands run again on the next build, with that as the reason:
+Some results are never a cache hit in a later build: their commands run again in the next build that reaches them.
+The reason is that the previous run could not be cached, and why, except for a command marked `always`,
+a task marked `cache=never` and a step under `kizz run --no-cache`, whose reason is that marking or option,
+because kizz checks it first.
+Within one build, a later pass runs such a command again only if a path that it touched changed:
 
 * a command that a signal killed, including an interrupted one;
 * a run that the tracer reports as incompletely traced, such as one that changed the root directory or mounted a file system;
@@ -109,8 +113,13 @@ Some results are never reused, and their commands run again on the next build, w
   the explanation names each such file and says whether the command itself wrote it;
 * a command that could not start for a reason other than a missing or non-executable program.
 
+Until such a path changes, a later pass of the build returns the same result, with `cached` set,
+and a command that could not start fails its task again with the same error.
 A run in which something other than the command changed a file it read gets a loud warning.
 A command whose program is missing or not executable fails its task, and runs again once the program appears.
+A tracer failure fails its task and leaves no record, and no later pass of the same build runs that command again.
+The next build that reaches it decides as if that run had not happened: an older record of the step stays,
+and is used again if its inputs match.
 
 ## Specifying caching
 
@@ -119,8 +128,8 @@ The [Starlark reference](@/reference/starlark.md) lists every parameter.
 
 ### always
 
-`run(..., always = True)` runs the command on every build, for a command whose effect kizz cannot see, such as an upload,
-a download or a notification.
+`run(..., always = True)` runs the command in every build that reaches it, for a command whose effect kizz cannot see,
+such as an upload, a download or a notification.
 It runs at most once per build, when a pass first reaches it, and later passes of that build reuse its result.
 Its dependencies are still recorded, and if it rewrites files with the same content, the steps that read them stay cached.
 
@@ -166,13 +175,13 @@ Starlark variables make reusable sets, such as `GO_CACHE = ["~/.cache/go-build/*
 
 ### cache=never
 
-The task option `cache=never` makes every command of the task run on every build, as if each had `always = True`:
+The task option `cache=never` makes every command of the task run in every build that reaches it, as if each had `always = True`:
 
 ```text
 run `true` (step 1): its task is marked `cache=never`
 ```
 
-Nothing makes such a command cached.
+No option makes such a command a cache hit.
 
 ### kizz run --no-cache
 

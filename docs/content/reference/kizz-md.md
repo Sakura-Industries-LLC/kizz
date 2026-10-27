@@ -155,7 +155,8 @@ These are the problems of a task option, each a [configuration error](#configura
 
 ### `cache=never`
 
-`cache=never` makes every command of the task run on every build, as if each of its `run()` calls had `always = True`.
+`cache=never` makes every command of the task run in every build that reaches it,
+as if each of its `run()` calls had `always = True`.
 
 * Values: `never`, the only value that `cache` accepts.
   Without the option, the task's commands are cached as their `run()` calls say.

@@ -41,8 +41,8 @@ use std::{
 };
 
 use kizz_core::{
-    Engine, NameError, PrintSink, RunReport, StepDecision, StepError, StepEvents, StepOutcome,
-    TaskFailure, TaskInfo, WorkerPool, load, run, select_by_name,
+    Engine, NameError, NoPathError, PrintSink, RunReport, StepDecision, StepError, StepEvents,
+    StepOutcome, TaskFailure, TaskInfo, WorkerPool, load, run, select_by_name,
 };
 use kizz_store::{Explanation, Reason, RunReason, StepRecord, Store, Verdict};
 use kizz_trace::{
@@ -710,5 +710,40 @@ fn cache_unknown_syscalls_caches_a_run_with_an_unknown_call() -> TestResult {
     let hit = fixture.run("odd", caching)?;
     assert_eq!(verdicts(&hit), [Verdict::Cached]);
     assert_eq!(fixture.tracer.take(), ["tool unknown"]);
+    Ok(())
+}
+
+/// A run of a task whose `run("tool")` has no `PATH`, with or without
+/// `--no-cache`, tells its step events nothing, counts no command that ran or came
+/// from the cache, asks the tracer for nothing, and fails with exactly the message
+/// of [`NoPathError`], after the runtime's prefix, once.
+#[test]
+fn a_run_without_path_counts_no_command() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.kizz("kizz.md", &[(
+        "name=bare",
+        "env.unset(\"PATH\")\nrun(\"tool\")",
+    )])?;
+    let expected = format!("run(): {}", NoPathError {
+        program: "tool".to_owned(),
+    });
+    for no_cache in [false, true] {
+        let report = fixture.run("bare", Options {
+            no_cache,
+            ..Options::default()
+        })?;
+        assert!(!report.succeeded());
+        assert_eq!(report.command_counts(), (0, 0), "{no_cache}");
+        assert_eq!(report.result.decisions, Vec::new(), "{no_cache}");
+        assert_eq!(fixture.log.take(), Vec::<String>::new(), "{no_cache}");
+        let Err(failure) = &report.result.result else {
+            return Err(format!("unexpected result {report:?}").into());
+        };
+        let message = failure.to_string();
+        assert_eq!(message.matches(&expected).count(), 1, "{message}");
+        assert!(!message.contains("run(): run():"), "{message}");
+    }
+    assert_eq!(fixture.tracer.take(), Vec::<String>::new());
+    assert_eq!(fixture.records()?, Vec::new());
     Ok(())
 }

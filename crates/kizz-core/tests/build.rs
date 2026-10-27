@@ -13,8 +13,9 @@
 //! the store in a temporary cache directory. A build loads the project, selects the
 //! tasks of target `ci`, and runs them with one [`Engine`] through [`build`]. Every
 //! task inherits `PATH` from the caller environment, which holds the project's
-//! `bin` directory with an executable `tool`. The fake tracer performs the file
-//! operations that a command's arguments name on real files and reports them:
+//! `bin` directory with an executable `tool`, except the task of a `run()` without
+//! `PATH`, which inherits nothing. The fake tracer performs the file operations
+//! that a command's arguments name on real files and reports them:
 //!
 //! * `read:PATH` reads a file, which may be missing;
 //! * `need:PATH` reads a file and exits with status 1 when it is missing;
@@ -23,6 +24,7 @@
 //! * `exe:PATH` writes an executable program;
 //! * `list:PATH` lists a directory;
 //! * `interrupt` requests cancellation, as Ctrl-C does, and a signal kills the command;
+//! * `tracer-fail` makes the run fail with a tracer failure, `TRACER_FAILED`;
 //!
 //! and any other argument does nothing. Relative paths are relative to the
 //! command's working directory, the task directory. As the Linux tracer does, the
@@ -52,9 +54,9 @@ use std::{
 };
 
 use kizz_core::{
-    BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, INTERRUPTED, Pass, PrintSink,
-    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, UncheckedStep, WhyReport, WorkerPool,
-    build, load, task_id, why,
+    BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, INTERRUPTED, NoPathError, Pass,
+    PrintSink, Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, UncheckedStep, WhyReport,
+    WorkerPool, build, load, task_id, why,
 };
 use kizz_store::{
     BuildId, Change, Explanation, LearnedOrder, MachineChange, Reason, RunReason, StepRecord,
@@ -77,6 +79,9 @@ fn tracer_failure(error: &dyn Error) -> TraceError {
         source: None,
     }
 }
+
+/// The message of the tracer failure of a run with the argument `tracer-fail`.
+const TRACER_FAILED: &str = "the fake tracer failed";
 
 /// What a run of `request` does to real files and reports, as the module
 /// documentation describes; `cancel` is the build's cancellation flag.
@@ -140,6 +145,12 @@ fn script(
             "interrupt" => {
                 cancel.cancel();
                 termination = Termination::Signaled(2);
+            },
+            "tracer-fail" => {
+                return Err(TraceError::Tracer {
+                    message: TRACER_FAILED.to_owned(),
+                    source: None,
+                });
             },
             _ => {},
         }
@@ -2025,6 +2036,149 @@ fn adding_task_options_changes_no_step_key() -> TestResult {
     assert!(
         keys.windows(2).all(|pair| pair.first() == pair.last()),
         "{keys:?}"
+    );
+    Ok(())
+}
+
+/// The message of the task failure of the task with heading `heading` in the build
+/// that `report` reports, which must have failed with it.
+fn failure_of(
+    report: &BuildReport,
+    heading: &str,
+) -> TestResult<String> {
+    let BuildOutcome::Failed { failures } = &report.outcome else {
+        return Err(format!("the build did not fail: {:?}", report.outcome).into());
+    };
+    Ok(failures
+        .iter()
+        .find(|failed| failed.task.heading.as_deref() == Some(heading))
+        .ok_or("the task did not fail")?
+        .failure
+        .to_string())
+}
+
+/// The project's `kizz.md` with the task `Bare` of target `ci`, whose `run("tool")`
+/// has no `PATH`, because its program inherits nothing, then the blocks `others`.
+fn bare_project(others: &[String]) -> String {
+    let mut markdown = "# Tasks\n\n## Bare\n\n```starlark ci\nrun(\"tool\")\n```\n".to_owned();
+    for other in others {
+        markdown.push('\n');
+        markdown.push_str(other);
+    }
+    markdown
+}
+
+/// The error of the task `Bare` of [`bare_project`], as its task failure holds it
+/// once: the runtime's prefix, then exactly the message of [`NoPathError`].
+fn bare_error() -> String {
+    let error = NoPathError {
+        program: "tool".to_owned(),
+    };
+    format!("run(): {error}")
+}
+
+/// A task whose `run()` has a bare program name and no `PATH` fails before kizz
+/// starts anything: it has no decision, so its run did no work, and the build of
+/// that task alone ends after one pass, failed with that error, and not unsettled.
+#[test]
+fn a_run_without_path_fails_its_build_after_one_pass() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("kizz.md", &bare_project(&[]))?;
+    let tracer = FakeTracer::default();
+    let report = fixture.build(&tracer)?.report;
+    assert!(
+        matches!(&report.outcome, BuildOutcome::Failed { failures } if failures.len() == 1),
+        "{:?}",
+        report.outcome
+    );
+    assert_eq!(passes(&report), vec![lines(&["Bare cached failed"])]);
+    let bare = task_in(&report, 1, "Bare")?;
+    assert_eq!(bare.decisions, Vec::new());
+    assert!(!bare.ran() && !bare.did_work());
+    assert_eq!(report.settled_in(), 1);
+    let failure = failure_of(&report, "Bare")?;
+    assert_eq!(failure.matches(&bare_error()).count(), 1, "{failure}");
+    assert!(!failure.contains("run(): run():"), "{failure}");
+    assert_eq!(tracer.runs(), Vec::<String>::new());
+    Ok(())
+}
+
+/// With a second task whose command runs in the first pass, the build of a task
+/// whose `run()` has no `PATH` ends after a second pass that runs nothing, failed
+/// and not unsettled: the first task has no decision in either pass, and the tracer
+/// got only the other task's request.
+#[test]
+fn a_run_without_path_does_not_keep_a_build_from_settling() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write(
+        "kizz.md",
+        &bare_project(&[block("Make", "ci", &["write:out.txt=made"])]),
+    )?;
+    let tracer = FakeTracer::default();
+    let report = fixture.build(&tracer)?.report;
+    assert!(
+        matches!(&report.outcome, BuildOutcome::Failed { failures } if failures.len() == 1),
+        "{:?}",
+        report.outcome
+    );
+    assert_eq!(passes(&report), vec![
+        lines(&["Bare cached failed", "Make ran ok"]),
+        lines(&["Bare cached failed", "Make cached ok"]),
+    ]);
+    for pass in [1, 2] {
+        let bare = task_in(&report, pass, "Bare")?;
+        assert_eq!(bare.decisions, Vec::new(), "pass {pass}");
+        assert!(!bare.ran(), "pass {pass}");
+    }
+    assert_eq!(report.settled_in(), 1);
+    let failure = failure_of(&report, "Bare")?;
+    assert_eq!(failure.matches(&bare_error()).count(), 1, "{failure}");
+    assert_eq!(tracer.runs(), lines(&["tool write:out.txt=made"]));
+    Ok(())
+}
+
+/// A step whose request gets a tracer failure counts as a command that ran in the
+/// first pass, with one request; the build keeps the failure, so the second pass,
+/// which that run makes, returns it without a decision and without a new request,
+/// for a step marked `always` too, which gets no cached decision. The build ends
+/// failed with the tracer's error, not unsettled.
+#[test]
+fn a_tracer_failure_runs_once_per_build() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.kizz("", &[
+        ("Broken", "run(\"tool\", \"tracer-fail\")"),
+        (
+            "Again",
+            "run(\"tool\", \"tracer-fail\", \"again\", always = True)",
+        ),
+    ])?;
+    let tracer = FakeTracer::default();
+    let report = fixture.build(&tracer)?.report;
+    assert!(
+        matches!(&report.outcome, BuildOutcome::Failed { failures } if failures.len() == 2),
+        "{:?}",
+        report.outcome
+    );
+    assert_eq!(report.passes.len(), 2);
+    for heading in ["Broken", "Again"] {
+        let first = task_in(&report, 1, heading)?;
+        let verdicts: Vec<&Verdict> = first.decisions.iter().map(|d| &d.verdict).collect();
+        assert!(
+            matches!(verdicts.as_slice(), [Verdict::Ran(_)]),
+            "{heading}: {verdicts:?}"
+        );
+        let second = task_in(&report, 2, heading)?;
+        assert_eq!(second.decisions, Vec::new(), "{heading}");
+        let failure = failure_of(&report, heading)?;
+        assert!(
+            failure.contains(&format!("run(): tracer failure: {TRACER_FAILED}")),
+            "{heading}: {failure}"
+        );
+    }
+    assert_eq!(report.settled_in(), 1);
+    assert_eq!(
+        tracer.runs(),
+        lines(&["tool tracer-fail", "tool tracer-fail again"])
     );
     Ok(())
 }

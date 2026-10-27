@@ -90,7 +90,7 @@ Every module is part of the task program, so editing it runs the commands of eve
 ## Mark commands with effects outside files as always
 
 A cache hit does not repeat a command, so an upload, a database update, a notification or a download would be skipped.
-Mark such a command with `always = True`: it then runs in every build, and its dependencies are still recorded.
+Mark such a command with `always = True`: it then runs in every build that reaches it, and its dependencies are still recorded.
 
 ```starlark
 run("rsync", "-a", "dist/", "server:/srv/app/", always = True, expect = [0])

@@ -97,6 +97,11 @@ run succeeded: kizz.md:13 (Greet); 0 commands ran, 1 cached
 ```
 
 * Each line that starts a command gives the one-line reason it ran; `--explain` prints the full reasons under it instead.
+* A `run()` that fails before kizz records its step or asks the tracer to run it shows no line, and the summary counts it
+  neither as a command that ran nor as a cached one: a bare program name without `PATH`, an invalid `ignore` or `track`
+  pattern, a `~/` pattern without `HOME`, or a failure of kizz's own state, such as a cache that it cannot read.
+* A program that is not found or not executable, a command that cannot start, and a tracer failure show their line and
+  are counted as commands that ran.
 * The task's `print` output, its failure and every warning print as in a build, and a one-line summary closes the run.
 * The banner comes first, unless `--quiet` or `--no-banner` is given.
 
@@ -116,7 +121,8 @@ run succeeded: kizz.md:13 (Greet); 0 commands ran, 1 cached
 run `echo hello, world` (step 1): `kizz run --no-cache` was given
 ```
 
-A task marked `cache=never` runs every command on every run and build, and so does a command marked `always`.
+A task marked `cache=never` runs every command in every run and in every build that reaches it,
+and so does a command marked `always`.
 No option forces caching: `kizz run` can make a cached command run, but never make such a command cached.
 
 ## Reports

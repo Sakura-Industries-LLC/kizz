@@ -7,20 +7,25 @@
 //! An [`Engine`] holds what every task of one build shares: the tracer, the store,
 //! where live output goes, the cancellation flag, the caller's home directory, the
 //! in-memory cache of file states and hashes, the results of the `always` steps
-//! that already ran, and the results that were not cached. For each run of a task
-//! program, [`Engine::task`] makes a [`TaskSteps`], the [`StepExecutor`] that the
-//! runtime hands each `run()` call to. For each step it:
+//! that already ran, the results that were not cached, and the tracer failures of
+//! the build. For each run of a task program, [`Engine::task`] makes a
+//! [`TaskSteps`], the [`StepExecutor`] that the runtime hands each `run()` call to.
+//! For each step it:
 //!
 //! 1. derives the step key, counting identical commands earlier in the run;
-//! 2. decides whether the step runs, with the cache check;
-//! 3. on a cache hit, returns the recorded exit status and raw output, with `cached` set,
+//! 2. compiles the step's ignore and `track` patterns, and checks that a bare program
+//!    name has a `PATH` in the step's environment;
+//! 3. returns the tracer failure that the build keeps for the step key, if any;
+//! 4. decides whether the step runs, with the cache check;
+//! 5. on a cache hit, returns the recorded exit status and raw output, with `cached` set,
 //!    storing new metadata the check found;
-//! 4. otherwise looks the program up through the `PATH` of the step's environment,
+//! 6. otherwise looks the program up through the `PATH` of the step's environment,
 //!    recording every location checked, queries the machine state that the command starts
-//!    with, through the tracer's machine query, and runs the command through the tracer;
-//! 5. drops the cached hash of every path the step wrote, and records the state of every
+//!    with, through the tracer's machine query, notes that the step ran, and runs the
+//!    command through the tracer;
+//! 7. drops the cached hash of every path the step wrote, and records the state of every
 //!    touched path, concurrently, applying the step's ignore and `track` patterns; and
-//! 6. stores the step record, with the machine state, under the step key; a result that
+//! 8. stores the step record, with the machine state, under the step key; a result that
 //!    is not cached replaces any older record with a record marked as not cached.
 //!
 //! The cache check ("Cache check"): with no record for the key, the step runs, and
@@ -100,8 +105,27 @@
 //!
 //! A missing or non-executable program fails the task and is recorded like any
 //! other failure, with every path checked and the failure message, which a cache hit
-//! fails with again. A bare program name without `PATH` in the step's environment,
-//! a malformed pattern, and a tracer failure fail the task without a record.
+//! fails with again.
+//!
+//! Commands that ran ("Order of execution"): a step is noted as ran, with its
+//! decision, its warning for a repeated reason and its step event, only once kizz is
+//! about to record that its program is missing or not executable, or to ask the
+//! tracer to run its command: after the lookup and the query of the machine state.
+//! A `run()` that fails before that point has no decision, so it is neither a
+//! command that ran nor a cached one, and it does no work for its pass. A bare
+//! program name without `PATH` in the step's environment and a malformed pattern
+//! fail the task without a record; kizz checks both from the step's own values
+//! before the cache check, so every pass fails such a call the same way, and kizz
+//! never attempts it. The other failures before that point are failures of kizz's
+//! own state: the store's reads of the cache check and of the explanation, and the
+//! locks of the build's shared state. They leave nothing in the build's memories,
+//! neither an `always` result nor a compared machine state, so a later pass
+//! evaluates the call again, since that state can change. A tracer failure counts as
+//! a command that ran, because the engine cannot tell whether the tracer started
+//! anything, and it leaves no record; the engine keeps it by step key for the rest
+//! of the build, so a later pass returns the same failure before the cache check,
+//! without a decision and without asking the tracer again. A record that cannot be
+//! stored belongs to a command that ran, and the engine does not keep it.
 //!
 //! Explanations ("Explaining decisions"): before a step runs, the engine turns the
 //! cache check's reason into an [`Explanation`] (see [`explain`](crate::explain)), and
@@ -176,7 +200,7 @@ use crate::{
     },
     files::FileChanges,
     key::Occurrences,
-    lookup::{ProgramLookup, search_step_program},
+    lookup::{NoPathError, ProgramLookup, check_path, search_step_program},
     observe::{changed_after_read, observe},
     patterns::PathPatterns,
     pool::WorkerPool,
@@ -321,6 +345,11 @@ pub struct Engine<'a> {
     always_ran: Mutex<HashMap<StepKey, Option<Result<StepOutcome, StepError>>>>,
     /// The results of the build that were not cached, by step key.
     not_cached: Mutex<HashMap<StepKey, NotCachedRun>>,
+    /// The tracer failures of the build, by step key: a step whose request the
+    /// tracer failed returns the same failure every later time it comes up in the
+    /// build, before the cache check, without a decision and without asking the
+    /// tracer again.
+    tracer_failed: Mutex<HashMap<StepKey, StepError>>,
     /// The identity of the build.
     build: BuildId,
     /// The warnings for steps that re-ran in consecutive builds for the same
@@ -374,6 +403,7 @@ impl fmt::Debug for Engine<'_> {
             .field("states", &self.states)
             .field("always_ran", &self.always_ran)
             .field("not_cached", &self.not_cached)
+            .field("tracer_failed", &self.tracer_failed)
             .field("build", &self.build)
             .field("warnings", &self.warnings)
             .field(
@@ -398,6 +428,9 @@ const ALWAYS_RAN: &str = "the results of the build's `always` steps";
 
 /// What the engine's field `not_cached` holds, as a [`LockError`] names it.
 const NOT_CACHED: &str = "the build's results that were not cached";
+
+/// What the engine's field `tracer_failed` holds, as a [`LockError`] names it.
+const TRACER_FAILED: &str = "the build's tracer failures";
 
 /// What the engine's field `warnings` holds, as a [`LockError`] names it.
 const WARNINGS: &str = "the build's warnings for repeated reasons";
@@ -454,6 +487,7 @@ impl<'a> Engine<'a> {
             states: FileStates::new(pool.clone()),
             always_ran: Mutex::new(HashMap::new()),
             not_cached: Mutex::new(HashMap::new()),
+            tracer_failed: Mutex::new(HashMap::new()),
             build: next_build(),
             warnings: Mutex::new(Vec::new()),
             cache_unknown_system_calls: false,
@@ -840,6 +874,53 @@ impl<'a> Engine<'a> {
         step_lock(&self.always_ran, ALWAYS_RAN, self.lock_patience)?.insert(key, Some(result));
         Ok(())
     }
+
+    /// Take back what the step `key` marked in the build's memories, as `marks`
+    /// says, before it failed without being noted as ran: its `always` run, which
+    /// had not ended, and its compared machine state. So a later pass evaluates the
+    /// call again, with the cache check, instead of returning a result of a run that
+    /// never started.
+    fn forget_marks(
+        &self,
+        key: StepKey,
+        marks: Marks,
+    ) -> Result<(), StepError> {
+        if marks.always {
+            let mut ran = step_lock(&self.always_ran, ALWAYS_RAN, self.lock_patience)?;
+            if matches!(ran.get(&key), Some(None)) {
+                ran.remove(&key);
+            }
+        }
+        if marks.compared {
+            step_lock(&self.machine_compared, MACHINE_COMPARED, self.lock_patience)?.remove(&key);
+        }
+        Ok(())
+    }
+
+    /// The tracer failure that a run of the step `key` met earlier in this build,
+    /// if one did.
+    fn tracer_failure(
+        &self,
+        key: StepKey,
+    ) -> Result<Option<StepError>, StepError> {
+        Ok(
+            step_lock(&self.tracer_failed, TRACER_FAILED, self.lock_patience)?
+                .get(&key)
+                .cloned(),
+        )
+    }
+
+    /// Keep `failure`, the tracer failure of the run of the step `key`, to return
+    /// every later time the step comes up in the build.
+    fn remember_tracer_failure(
+        &self,
+        key: StepKey,
+        failure: &StepError,
+    ) -> Result<(), StepError> {
+        step_lock(&self.tracer_failed, TRACER_FAILED, self.lock_patience)?
+            .insert(key, failure.clone());
+        Ok(())
+    }
 }
 
 /// The step executor of one run of a task program.
@@ -865,9 +946,10 @@ pub struct TaskSteps<'a> {
     /// Whether the task is marked `cache=never`, so every step runs as if it were
     /// marked `always`.
     cache_never: bool,
-    /// The command of each step of the run that reached a decision, in order, with
-    /// its step key, kept for the observation report only when the engine writes
-    /// one ([`Engine::with_report`]).
+    /// The command of each step of the run that reached a decision, and of each
+    /// step whose bare program name has no `PATH`, in order, with its step key,
+    /// kept for the observation report only when the engine writes one
+    /// ([`Engine::with_report`]).
     commands: Cell<Vec<(StepKey, CommandInput)>>,
     /// Follows the steps as they start or come from the cache.
     events: &'a dyn StepEvents,
@@ -928,6 +1010,28 @@ enum Decision {
     /// A result of this build that was not cached is returned again, because
     /// nothing it touched changed.
     Replay(Result<StepOutcome, StepError>),
+}
+
+/// What a step marked in the build's memories before it was noted as ran, which
+/// [`Engine::forget_marks`] takes back when the step fails before that point.
+#[derive(Debug, Clone, Copy, Default)]
+struct Marks {
+    /// The step marked its `always` run in the build as started.
+    always: bool,
+    /// The step added its key to the build's compared machine states.
+    compared: bool,
+}
+
+/// How a step that the cache check let run ended: before it was noted as ran, or
+/// after.
+enum Attempt {
+    /// The step failed before it was noted as ran: kizz neither recorded it nor
+    /// asked the tracer to run it, and it has no decision.
+    NotStarted(StepError),
+    /// The step was noted as ran, because kizz was about to record that its
+    /// program is missing or not executable or to ask the tracer to run it, and
+    /// this is its result.
+    Ran(Result<StepOutcome, StepError>),
 }
 
 /// How a step ended, before its record is stored.
@@ -1289,7 +1393,9 @@ impl TaskSteps<'_> {
     /// The command of each step so far that reached a decision, in order, for the
     /// observation report: a step that ran, or whose program kizz did not find,
     /// with its outcome, its process tree and the lookup's observations, and a step
-    /// that came from the cache as cached. Empty unless the engine writes a report
+    /// that came from the cache as cached. A step whose bare program name has no
+    /// `PATH` is in it too, as a command that started no process, although it has
+    /// no decision. Empty unless the engine writes a report
     /// ([`Engine::with_report`]).
     #[must_use]
     pub fn commands(&self) -> Vec<CommandInput> {
@@ -1404,7 +1510,7 @@ impl TaskSteps<'_> {
         patterns: &[String],
     ) -> Result<PathPatterns, StepError> {
         PathPatterns::new(patterns, &self.task_dir, self.engine.home.as_ref())
-            .map_err(|error| StepError::new(format_args!("run(): {error}")))
+            .map_err(StepError::new)
     }
 
     /// The record stored under `key`, if there is one.
@@ -1517,11 +1623,14 @@ impl TaskSteps<'_> {
         step.always || self.cache_never || self.engine.no_cache
     }
 
-    /// Decide whether the step `step`, whose key is `key`, runs.
+    /// Decide whether the step `step`, whose key is `key`, runs; `marks` gains
+    /// what the decision marked in the build's memories: the start of an `always`
+    /// run, and the comparison of the record's machine state.
     fn decide(
         &self,
         key: StepKey,
         step: &StepSpec,
+        marks: &mut Marks,
     ) -> Result<Decision, StepError> {
         let remembered = step_lock(
             &self.engine.not_cached,
@@ -1535,6 +1644,7 @@ impl TaskSteps<'_> {
             if let Some(first) = self.engine.first_always_result(key)? {
                 return Ok(Decision::Replay(first));
             }
+            marks.always = true;
             let reason = if !known {
                 RunReason::NeverRun
             } else if self.cache_never {
@@ -1591,7 +1701,7 @@ impl TaskSteps<'_> {
                 )),
             ));
         }
-        let machine = self.changed_machine(key, &record)?;
+        let machine = self.changed_machine(key, &record, marks)?;
         Ok(if checked.is_hit() && machine.is_empty() {
             Decision::Hit {
                 record: Box::new(record),
@@ -1618,11 +1728,14 @@ impl TaskSteps<'_> {
     ///
     /// A record that names no part compares nothing and queries nothing. Nor does a
     /// record whose machine state the build already compared, or whose step already
-    /// ran in the build: each step key is compared at most once per build.
+    /// ran in the build: each step key is compared at most once per build. A
+    /// comparison adds the key to the build's compared machine states, which
+    /// `marks` notes.
     fn changed_machine(
         &self,
         key: StepKey,
         record: &StepRecord,
+        marks: &mut Marks,
     ) -> Result<Vec<MachineChange>, StepError> {
         let parts = MachinePart::parts(&record.spec.machine);
         if parts.is_empty()
@@ -1635,6 +1748,7 @@ impl TaskSteps<'_> {
         {
             return Ok(Vec::new());
         }
+        marks.compared = true;
         let current = machine_record(&self.engine.tracer.machine_state(&record.spec.cwd));
         Ok(machine_changes(&parts, &record.machine, &current))
     }
@@ -1806,7 +1920,10 @@ impl TaskSteps<'_> {
 
     /// Note that the step `step` of `pending` ran, warn when it re-ran in
     /// consecutive builds for the same self-inflicted reason, and tell the run's
-    /// step events that it starts, before its command starts.
+    /// step events that it starts, before its command starts. This comes only once
+    /// kizz is about to record that the program is missing or not executable, or to
+    /// ask the tracer to run the command; a step that fails before it has no
+    /// decision.
     fn note_ran(
         &self,
         step: &StepSpec,
@@ -1854,7 +1971,8 @@ impl TaskSteps<'_> {
     /// the lookup checked, `lookup` the same locations with their outcomes when the
     /// engine writes a report, and `machine` the machine state the command starts
     /// with. When the engine writes a report, the request asks for the process
-    /// tree, and the step's command is kept with its outcome, tree and lookup.
+    /// tree, and the step's command is kept with its outcome, tree and lookup. A
+    /// tracer failure is kept for the rest of the build under the step key.
     fn run(
         &self,
         step: &StepSpec,
@@ -1959,8 +2077,22 @@ impl TaskSteps<'_> {
                 self.finish_run(step, pending, finished, Some(why), Err(failure.clone()))?;
                 Err(failure)
             },
-            Err(error) => Err(StepError::new(&error)),
+            Err(error) => self.tracer_failed(pending.key, &error),
         }
+    }
+
+    /// The result of the run of the step `key` that the tracer failed with
+    /// `error`. A tracer failure leaves no record, and the engine cannot tell
+    /// whether anything started, so the build keeps it under `key`: the step returns
+    /// it again in a later pass, without a decision and without asking the tracer.
+    fn tracer_failed(
+        &self,
+        key: StepKey,
+        error: &TraceError,
+    ) -> Result<StepOutcome, StepError> {
+        let failure = StepError::new(error);
+        self.engine.remember_tracer_failure(key, &failure)?;
+        Err(failure)
     }
 
     /// Keep the command of `step`, which ran as `request` and gave `result`, for
@@ -2193,24 +2325,49 @@ impl TaskSteps<'_> {
         }
     }
 
+    /// Keep the command of `step`, whose key is `key` and whose bare program name
+    /// cannot be looked up without `PATH`, as `error` says, for the observation
+    /// report: a command that started no process, whose program was not found.
+    fn keep_no_path(
+        &self,
+        key: StepKey,
+        step: &StepSpec,
+        error: &NoPathError,
+    ) {
+        self.keep(key, || {
+            ran_command(
+                step,
+                None,
+                CommandOutcome::NotFound(error.to_string()),
+                None,
+                Observations::new(),
+            )
+        });
+    }
+
     /// Look the program of `step`, whose first argument is `name`, up and run it,
     /// or record that it is missing or not executable.
     ///
     /// Right before it runs the command, or records that the program is missing,
     /// it queries the machine state that the command starts with, which the record
     /// keeps whether or not the step names any part of it; the build compares the
-    /// state of this step key no more in this build.
+    /// state of this step key no more in this build, which `marks` notes. Only then
+    /// is the step noted as ran ([`TaskSteps::note_ran`]); a failure before that
+    /// point, of the lookup or of the lock of the compared machine states, is
+    /// [`Attempt::NotStarted`]. The lookup cannot fail for a missing `PATH`, which
+    /// [`TaskSteps::execute`] checked before the cache check.
     ///
     /// When the engine writes a report, each checked location's outcome is named
     /// through the tracer's error-name query, and a step whose program kizz does not
-    /// find, or cannot look up without `PATH`, is kept as a command that started no
-    /// process, with every checked location.
+    /// find is kept as a command that started no process, with every checked
+    /// location.
     fn look_up_and_run(
         &self,
         step: &StepSpec,
         name: &str,
         pending: &Pending,
-    ) -> Result<StepOutcome, StepError> {
+        marks: &mut Marks,
+    ) -> Attempt {
         let report = self.engine.reports();
         let tracer = self.engine.tracer;
         let searched = search_step_program(name, &step.env, &step.cwd, |errno| {
@@ -2223,16 +2380,8 @@ impl TaskSteps<'_> {
         let search = match searched {
             Ok(search) => search,
             Err(error) => {
-                self.keep(pending.key, || {
-                    ran_command(
-                        step,
-                        None,
-                        CommandOutcome::NotFound(error.to_string()),
-                        None,
-                        Observations::new(),
-                    )
-                });
-                return Err(StepError::new(error));
+                self.keep_no_path(pending.key, step, &error);
+                return Attempt::NotStarted(StepError::new(error));
             },
         };
         let observed = if report {
@@ -2241,16 +2390,25 @@ impl TaskSteps<'_> {
             Observations::new()
         };
         let lookup = search.into_lookup();
-        step_lock(
+        match step_lock(
             &self.engine.machine_compared,
             MACHINE_COMPARED,
             self.engine.lock_patience,
-        )?
-        .insert(pending.key);
+        ) {
+            Ok(mut compared) => {
+                if compared.insert(pending.key) {
+                    marks.compared = true;
+                }
+            },
+            Err(error) => return Attempt::NotStarted(error),
+        }
         let machine = machine_record(&self.engine.tracer.machine_state(step.cwd.as_path()));
+        if let Err(error) = self.note_ran(step, pending) {
+            return Attempt::NotStarted(error);
+        }
         let exit = match lookup {
             ProgramLookup::Found { program, checked } => {
-                return self.run(step, pending, program, checked, observed, machine);
+                return Attempt::Ran(self.run(step, pending, program, checked, observed, machine));
             },
             ProgramLookup::NotFound { .. } => StepExit::ProgramNotFound,
             ProgramLookup::NotExecutable { .. } => StepExit::ProgramNotExecutable,
@@ -2270,7 +2428,7 @@ impl TaskSteps<'_> {
             };
             ran_command(step, program, outcome, None, observed)
         });
-        self.store(step, pending, Finished {
+        let stored = self.store(step, pending, Finished {
             program: None,
             accesses: lookup.checked().clone(),
             exit,
@@ -2282,18 +2440,21 @@ impl TaskSteps<'_> {
             unknown_system_calls: Vec::new(),
             connections: Vec::new(),
             machine,
-        })?;
-        Err(StepError::new(message))
+        });
+        Attempt::Ran(stored.and(Err(StepError::new(message))))
     }
 }
 
 impl StepExecutor for TaskSteps<'_> {
+    /// Run `step`, as the module documentation lists: a step that fails before it
+    /// is noted as ran has no decision, and takes back what it marked in the
+    /// build's memories: the start of an `always` run and a compared machine state.
     fn execute(
         &self,
         step: &StepSpec,
     ) -> Result<StepOutcome, StepError> {
         let Some(name) = step.argv.first() else {
-            return Err(StepError::new("run() needs a program"));
+            return Err(StepError::new("the step has no program"));
         };
         let position =
             u32::try_from(cells::update(&self.keys, |keys| keys.len())).unwrap_or(u32::MAX);
@@ -2304,62 +2465,76 @@ impl StepExecutor for TaskSteps<'_> {
         cells::update(&self.keys, |keys| keys.push(key));
         let ignore = self.patterns(&step.ignore)?;
         let track = self.patterns(&step.track)?;
-        let (reason, baseline) = match self.decide(key, step)? {
-            Decision::Run(reason, baseline) => (reason, baseline),
-            Decision::Hit {
+        if let Err(error) = check_path(name, &step.env) {
+            self.keep_no_path(key, step, &error);
+            return Err(StepError::new(error));
+        }
+        if let Some(failure) = self.engine.tracer_failure(key)? {
+            return Err(failure);
+        }
+        let mut marks = Marks::default();
+        let decided = self.decide(key, step, &mut marks);
+        let (reason, baseline) = match decided {
+            Ok(Decision::Run(reason, baseline)) => (reason, baseline),
+            Ok(Decision::Hit {
                 record,
                 checked,
                 checked_at_nanos,
-            } => {
+            }) => {
                 self.keep(key, || cached_command(step, &record));
                 let result = self.hit(&key, *record, checked, checked_at_nanos);
                 self.note_cached(position, key, step, &result)?;
                 return result;
             },
-            Decision::Replay(result) => {
+            Ok(Decision::Replay(result)) => {
                 self.keep(key, || self.replayed_command(key, step, &result));
                 self.note_cached(position, key, step, &result)?;
                 return result;
             },
+            Err(error) => return Err(self.not_started(key, marks, error)),
         };
         let spec = self.spec_record(step, occurrence);
-        let (explanation, carried) = self
-            .explain(position, key, &spec, &reason, baseline.as_ref())
-            .map_err(|error| store_error(&error))?;
-        let pending = Pending {
-            key,
-            occurrence,
-            reason,
-            ignore,
-            track,
-            position,
-            explanation,
-            carried,
+        let attempt = match self.explain(position, key, &spec, &reason, baseline.as_ref()) {
+            Ok((explanation, carried)) => {
+                let pending = Pending {
+                    key,
+                    occurrence,
+                    reason,
+                    ignore,
+                    track,
+                    position,
+                    explanation,
+                    carried,
+                };
+                self.look_up_and_run(step, name, &pending, &mut marks)
+            },
+            Err(error) => Attempt::NotStarted(store_error(&error)),
         };
-        self.note_ran(step, &pending)?;
-        let kept = cells::update(&self.commands, |commands| commands.len());
-        let result = self.look_up_and_run(step, name, &pending);
-        if cells::update(&self.commands, |commands| commands.len()) == kept {
-            // Kizz failed itself before it knew how the command ended, such as when
-            // the cache could not be read, so the report says that it failed.
-            self.keep(key, || {
-                let message = result.as_ref().err().map_or_else(
-                    || "kizz kept nothing of this command".to_owned(),
-                    ToString::to_string,
-                );
-                ran_command(
-                    step,
-                    None,
-                    CommandOutcome::Failed(message),
-                    None,
-                    Observations::new(),
-                )
-            });
-        }
+        let result = match attempt {
+            Attempt::NotStarted(error) => return Err(self.not_started(key, marks, error)),
+            Attempt::Ran(result) => result,
+        };
         if self.runs_always(step) {
             self.engine.finish_always(key, &result)?;
         }
         result
+    }
+}
+
+impl TaskSteps<'_> {
+    /// The error of the step `key`, which failed with `error` before it was noted
+    /// as ran, after taking back what it marked in the build's memories, as `marks`
+    /// says; when that fails too, the error names both failures.
+    fn not_started(
+        &self,
+        key: StepKey,
+        marks: Marks,
+        error: StepError,
+    ) -> StepError {
+        match self.engine.forget_marks(key, marks) {
+            Ok(()) => error,
+            Err(forgotten) => StepError::new(format_args!("{error}; {forgotten}")),
+        }
     }
 }
 

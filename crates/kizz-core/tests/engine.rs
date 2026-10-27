@@ -34,13 +34,14 @@ use std::{
 };
 
 use kizz_core::{
-    Engine, PrintSink, ProgramHash, StepError, StepExecutor, StepOutcome, StepSpec, TaskInfo,
-    TaskProgram, WorkerPool, find_program, parse_tasks, step_key,
+    Engine, NoPathError, PathPatterns, PrintSink, ProgramHash, StepDecision, StepError, StepEvents,
+    StepExecutor, StepOutcome, StepSpec, TaskInfo, TaskProgram, WorkerPool, find_program,
+    parse_tasks, step_key,
 };
 use kizz_store::{
     AccessBits, Capture, ContentHash, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
     Owner, PathState, ProgramPath, RecordedOutput, RunReason, SpecialKind, StepExit, StepKey,
-    StepRecord, Store, Times,
+    StepRecord, Store, Times, Verdict,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
@@ -648,30 +649,141 @@ fn builds_never_ask_for_the_process_tree() -> TestResult {
     Ok(())
 }
 
-/// A bare program name without `PATH` in the task environment is an error that
-/// says to set or inherit `PATH`; nothing runs and nothing is recorded.
+/// Keeps every step event, as text: `started COMMAND` or `cached COMMAND`.
+#[derive(Default)]
+struct Events {
+    /// The events so far, in order.
+    seen: Mutex<Vec<String>>,
+}
+
+impl Events {
+    /// The events so far, in order.
+    fn seen(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl StepEvents for Events {
+    fn step_started(
+        &self,
+        decision: &StepDecision,
+    ) {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("started {}", decision.command));
+    }
+
+    fn step_cached(
+        &self,
+        decision: &StepDecision,
+        _result: &Result<StepOutcome, StepError>,
+    ) {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("cached {}", decision.command));
+    }
+}
+
+/// A bare program name without `PATH` in the task environment fails with exactly
+/// the message of [`NoPathError`], which says to set or inherit `PATH`, before kizz
+/// starts anything: no decision, no step event, no request and no record. So does
+/// the same step marked `always`, in a task marked `cache=never`, and under
+/// `--no-cache`; and each of them fails the same way when it comes up again in the
+/// same build, still with no decision, a cached one included.
 #[test]
 fn a_bare_program_name_without_path_is_an_error() -> TestResult {
     let fixture = Fixture::new()?;
     let store = fixture.store()?;
     let tracer = FakeTracer::quiet();
-    let engine = new_engine(&tracer, &store)?;
     let mut step = fixture.step(&["tool"]);
     step.env.clear();
-
-    let error = engine
-        .task(PROGRAM, fixture.dir())
-        .execute(&step)
-        .unwrap_err();
-    assert!(error.message.contains("`tool`"), "{error}");
-    assert!(error.message.contains("has no PATH"), "{error}");
-    assert!(
-        error.message.contains("env.set(\"PATH\", ...)")
-            && error.message.contains("env.inherit(\"PATH\")"),
-        "{error}"
+    let expected = NoPathError {
+        program: "tool".to_owned(),
+    }
+    .to_string();
+    assert_eq!(
+        expected,
+        "cannot run `tool`: a program name without `/` is looked up in the task environment's \
+         PATH, but the task environment has no PATH; set it with env.set(\"PATH\", ...) or \
+         inherit it with env.inherit(\"PATH\")"
     );
+    let mut always = step.clone();
+    always.always = true;
+
+    for case in ["plain", "always", "cache=never", "--no-cache"] {
+        let engine = new_engine(&tracer, &store)?.with_no_cache(case == "--no-cache");
+        let step = if case == "always" { &always } else { &step };
+        // The first pass of a build, then a later pass, which runs the task again
+        // with the same engine.
+        for pass in [1, 2] {
+            let events = Events::default();
+            let steps = engine
+                .task(PROGRAM, fixture.dir())
+                .with_cache_never(case == "cache=never")
+                .with_events(&events);
+            let error = steps.execute(step).unwrap_err();
+            assert_eq!(error.message, expected, "{case}, pass {pass}");
+            assert_eq!(steps.decisions(), Vec::new(), "{case}, pass {pass}");
+            assert_eq!(events.seen(), Vec::<String>::new(), "{case}, pass {pass}");
+        }
+    }
     assert_eq!(tracer.requests(), Vec::new());
     assert_eq!(records(&store)?, Vec::new());
+    Ok(())
+}
+
+/// A step whose request gets a tracer failure has a decision that it ran and one
+/// request; when it comes up again in the same build, it fails with the same
+/// error, without a decision and without a new request, whether or not it is
+/// marked `always`. Nothing is recorded, and a new build asks the tracer again.
+#[test]
+fn a_tracer_failure_is_kept_for_the_rest_of_the_build() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = fixture.store()?;
+    let tracer = FakeTracer::new(|_| {
+        Err(TraceError::Tracer {
+            message: "cannot trace".to_owned(),
+            source: None,
+        })
+    });
+    let step = fixture.step(&["tool"]);
+    let mut always = fixture.step(&["tool", "always"]);
+    always.always = true;
+    let engine = new_engine(&tracer, &store)?;
+    for (index, step) in [&step, &always].into_iter().enumerate() {
+        let first = engine.task(PROGRAM, fixture.dir());
+        let error = first.execute(step).unwrap_err();
+        assert_eq!(error.message, "tracer failure: cannot trace");
+        let verdicts: Vec<Verdict> = first
+            .decisions()
+            .into_iter()
+            .map(|decision| decision.verdict)
+            .collect();
+        assert!(
+            matches!(verdicts.as_slice(), [Verdict::Ran(_)]),
+            "{verdicts:?}"
+        );
+        assert_eq!(tracer.requests().len(), index + 1);
+
+        let events = Events::default();
+        let again = engine.task(PROGRAM, fixture.dir()).with_events(&events);
+        assert_eq!(again.execute(step).unwrap_err(), error);
+        assert_eq!(again.decisions(), Vec::new());
+        assert_eq!(events.seen(), Vec::<String>::new());
+        assert_eq!(tracer.requests().len(), index + 1);
+    }
+    assert_eq!(records(&store)?, Vec::new());
+
+    let next = new_engine(&tracer, &store)?;
+    next.task(PROGRAM, fixture.dir())
+        .execute(&step)
+        .unwrap_err();
+    assert_eq!(tracer.requests().len(), 3);
     Ok(())
 }
 
@@ -1368,7 +1480,8 @@ fn a_step_record_read_back_holds_every_field() -> TestResult {
 }
 
 /// A step the executor cannot run because its patterns are malformed fails without
-/// a record.
+/// a record and without a decision, with exactly the pattern's own error, which has
+/// no `run():` prefix: the runtime adds that prefix to every step error, once.
 #[test]
 fn malformed_patterns_fail_the_step_without_a_record() -> TestResult {
     let fixture = Fixture::new()?;
@@ -1377,16 +1490,17 @@ fn malformed_patterns_fail_the_step_without_a_record() -> TestResult {
     let engine = new_engine(&tracer, &store)?;
     let mut step = fixture.step(&["tool"]);
     step.track.push("re:(".to_owned());
-    let error: StepError = engine
-        .task(PROGRAM, fixture.dir())
-        .execute(&step)
-        .unwrap_err();
+    let steps = engine.task(PROGRAM, fixture.dir());
+    let error: StepError = steps.execute(&step).unwrap_err();
+    let expected = PathPatterns::new(&step.track, &fixture.dir(), None)
+        .unwrap_err()
+        .to_string();
     assert!(
-        error
-            .message
-            .starts_with("run(): invalid regular expression"),
-        "{error}"
+        expected.starts_with("invalid regular expression in pattern `re:(`: "),
+        "{expected}"
     );
+    assert_eq!(error.message, expected);
+    assert_eq!(steps.decisions(), Vec::new());
     assert_eq!(tracer.requests(), Vec::new());
     assert_eq!(records(&store)?, Vec::new());
     Ok(())

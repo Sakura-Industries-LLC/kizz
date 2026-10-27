@@ -820,6 +820,8 @@ Hashing and the other parallel work of a command run on kizz's worker pool, as [
 These run again on the next build, with that stated as the reason.
 A run in which something other than the command changed a file it read gets a loud warning.
 Within a build, kizz keeps the paths such a command touched in memory, so a later pass reruns it only if one of them changed.
+A tracer failure counts as a command that ran, and it leaves no record.
+Within a build, kizz keeps such a failure in memory too, so no later pass runs that command again.
 
 A command whose program is missing or not executable fails its task and is recorded like any other failure,
 with every path kizz checked while looking for the program.
@@ -913,6 +915,7 @@ It also lists the system calls that a step made and that the tracer does not kno
   or one that failed and whose looked-for dependencies have since appeared.
   A task whose inputs did not change is a cache hit, and a failed one fails again from the cache without running.
   A pass runs nothing when no command ran in it and no task program changed a file.
+  A `run()` that fails without a record before kizz asks the tracer to start its command is not a command that ran.
   The build ends when a pass runs nothing; it succeeds if no task failed in that pass, and fails otherwise.
   A build settles in the passes up to and including the last one that ran a command or changed a file, or in one pass if none did.
   After such a pass, the final pass, which runs nothing, only confirms the build and is not counted.
@@ -940,6 +943,8 @@ This is the first version of the rule, to be refined later.
 * A failed task whose missing paths are all still missing, and whose other inputs are unchanged, has nothing new to try:
   in later passes it fails again from the cache without running.
   As for any task, a change to anything else it depended on also runs it again.
+* A bare program name without `PATH` and an invalid `ignore` or `track` pattern fail their task before kizz starts anything.
+  Kizz checks both before the cache check, so every pass of a build fails such a call the same way.
 * When a pass runs nothing and failures remain, nothing those tasks looked for has appeared, so kizz stops.
   The build fails with exit status 1 and lists each failed task with the paths it looked for and did not find,
   since any of them may be the cause.

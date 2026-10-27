@@ -23,7 +23,9 @@
 //! [`find_program`] is the lookup of `run()`, for a task environment of strings,
 //! with the checked locations as accesses; [`search_step_program`] is the same
 //! lookup with each checked location's outcome, for the report of `kizz run
-//! --output`.
+//! --output`. [`check_path`] is the check that such a lookup can be made at all,
+//! from the program name and the environment alone, which the engine makes before
+//! the cache check.
 
 use std::{
     collections::BTreeMap,
@@ -152,6 +154,27 @@ pub struct NoPathError {
     pub program: String,
 }
 
+/// Check that the program `name` of a step whose environment is `env` can be
+/// looked up: a name with `/` needs no lookup, and any other name needs a `PATH`
+/// in `env`. The check reads only these two values, so it gives the same answer
+/// every time, as [`search_step_program`] does for a missing `PATH`.
+///
+/// # Errors
+///
+/// Returns [`NoPathError`] when `name` has no `/` and `env` has no `PATH`.
+pub fn check_path(
+    name: &str,
+    env: &BTreeMap<String, String>,
+) -> Result<(), NoPathError> {
+    if name.contains('/') || env.contains_key(PATH_VARIABLE) {
+        Ok(())
+    } else {
+        Err(NoPathError {
+            program: name.to_owned(),
+        })
+    }
+}
+
 /// Look up the program `name` for a step whose environment is `env` and whose
 /// working directory is `cwd`, with [`search_program`].
 ///
@@ -254,7 +277,10 @@ mod tests {
 
     use kizz_trace::{AbsolutePath, AccessKind, Observations, Outcome};
 
-    use super::{ProgramLookup, ProgramSearch, find_program, search_program};
+    use super::{
+        NoPathError, ProgramLookup, ProgramSearch, check_path, find_program, search_program,
+        search_step_program,
+    };
 
     /// The name that the tests give each error number.
     fn named(errno: i32) -> String {
@@ -356,6 +382,35 @@ mod tests {
             })
         );
         assert_eq!(search_program(OsStr::new("tool"), None, &root, named), None);
+        Ok(())
+    }
+
+    /// A bare name needs `PATH` in the environment, as the lookup itself does,
+    /// with the same error; a name with `/` and a name in an environment with
+    /// `PATH`, even an empty one, pass the check.
+    #[test]
+    fn the_check_for_path_agrees_with_the_lookup() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, root) = fixture()?;
+        let none = BTreeMap::new();
+        let missing = NoPathError {
+            program: "tool".to_owned(),
+        };
+        assert_eq!(check_path("tool", &none), Err(missing.clone()));
+        assert_eq!(
+            search_step_program("tool", &none, &root, named),
+            Err(missing)
+        );
+        assert_eq!(
+            check_path("", &none),
+            Err(NoPathError {
+                program: String::new(),
+            })
+        );
+        assert_eq!(check_path("./tool", &none), Ok(()));
+        assert_eq!(check_path("bin/tool", &none), Ok(()));
+        let empty = BTreeMap::from([("PATH".to_owned(), String::new())]);
+        assert_eq!(check_path("tool", &empty), Ok(()));
+        assert!(search_step_program("tool", &empty, &root, named).is_ok());
         Ok(())
     }
 }

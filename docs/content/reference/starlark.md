@@ -79,16 +79,21 @@ Each call goes through these stages:
 1. Kizz builds the step's specification from the arguments and the task environment.
 2. It derives the *step key*, a BLAKE3 hash of the task program's hash and of the values that each entry below marks as
    part of the step key, plus the *occurrence number*: how many identical commands came earlier in the same run of the task.
-3. It checks the cache.
+3. It checks the step's `ignore` and `track` patterns, and that a bare program name has a `PATH` in the step's environment.
+   Either failure fails the task before kizz starts anything, in every pass, and the call counts as no command that ran.
+   A step whose command met a tracer failure earlier in the same build fails again with that error, without a new run.
+4. It checks the cache.
    A step whose record holds a cached result, and whose recorded paths and named machine state are unchanged, is a cache hit:
    `run()` returns the recorded exit status and output, and nothing runs.
-4. Otherwise it looks the program up, runs it through the tracer, and records every path that the command's process tree touched,
+   An `always` step, every step of a `cache=never` task and every step under `kizz run --no-cache` get no cache check,
+   so each runs again in every build or `kizz run` that reaches it.
+5. Otherwise it looks the program up, runs it through the tracer, and records every path that the command's process tree touched,
    with the state of each path when the command finished.
-   In a later pass of the same build, kizz returns the earlier result instead, without running the command.
-   This holds for an `always` step, every step of a `cache=never` task and every step under `kizz run --no-cache`.
-   It also holds for a result that was not cached, while no path that its run touched has changed.
+   In a later pass of the same build, kizz returns the earlier result of an `always` step
+   or of a step of a `cache=never` task instead, without running the command; `kizz run` runs its task once, with no later pass.
+   It also returns a result that was not cached again, while no path that its run touched has changed.
    Such a result comes back with `cached` set, and a command that could not start fails the task again with the same error.
-5. It stores the step record under the step key, and returns the result.
+6. It stores the step record under the step key, and returns the result.
 
 The [caching guide](@/guide/caching.md) explains the cache check,
 and the [caching controls](@/reference/kizz-md.md#caching-controls) list every option that changes it.
@@ -194,7 +199,7 @@ Whether the command runs in every build that reaches it, even when its cache ent
 * Step key: not part of it.
 * Tracks: everything a run tracks: the command's paths are recorded as for any step,
   so steps that read the files it writes stay cached when it rewrites them with the same content.
-* Side effects: those of the command, once in each build.
+* Side effects: those of the command, once in each build that reaches it.
 
 A task marked [`cache=never`](@/reference/kizz-md.md#cache-never) runs every command as if it had `always = True`,
 and so does `kizz run --no-cache`.
@@ -344,7 +349,7 @@ error: kizz.md:33 (Expect) failed:
 
 * A program name without `/` is looked up in the `PATH` of the command's environment: the task environment with `env` applied.
   Kizz's own `PATH` is not used.
-* Without `PATH` in that environment, a bare name fails the task, and kizz stores no record for such a call.
+* Without `PATH` in that environment, a bare name fails the task before its cache check, and kizz stores no record for such a call.
   The message says that a program name without `/` is looked up in the task environment's `PATH`,
   and that the task environment has none: "set it with `env.set("PATH", ...)` or inherit it with `env.inherit("PATH")`".
 * The directories of `PATH` are tried in order, as `execvp` tries them.
@@ -362,6 +367,7 @@ These fail the task at the `run()` call, with a Starlark error and the stack:
 * a call without a program, an invalid `capture`, or an unknown `machine` part;
 * an invalid `ignore` or `track` pattern;
 * a bare program name without `PATH`;
+* a tracer failure;
 * a program that is not found, or not executable;
 * a command that cannot start for another reason;
 * an exit that `expect` does not accept.
@@ -370,6 +376,9 @@ A program that is not found or not executable is recorded like any other step, w
 so the step fails again from the cache until a checked location changes, and it runs again when the program appears.
 A command that cannot start for another reason, such as one whose `cwd` does not exist, has a result that is not cached.
 Within the build it runs again only when a path that it touched changes, and a later build runs it again.
+A bare program name without `PATH` and an invalid pattern fail the task before kizz starts anything, in every pass of a build.
+Kizz prints no `ran`, `run` or `cached` line for such a call, and counts it neither as a command that ran nor as a cached one.
+A tracer failure counts as a command that ran and leaves no record, and no later pass of the same build runs that command again.
 
 A program that is not found names every location checked:
 

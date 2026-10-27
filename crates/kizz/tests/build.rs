@@ -11,7 +11,8 @@
 //! their programs. The golden tests run with `--color never --no-banner`.
 //!
 //! Every task block in these projects starts with `env.inherit("PATH")`, so with a
-//! one-line body, the blocks of a `kizz.md` open on lines 3, 10, 17, and so on.
+//! one-line body, the blocks of a `kizz.md` open on lines 3, 10, 17, and so on;
+//! only the tests of a `run()` without `PATH` write a block that inherits nothing.
 
 #![allow(
     clippy::disallowed_macros,
@@ -898,6 +899,133 @@ fn a_script_that_loses_its_execute_bits_runs_again_and_fails() -> TestResult {
         assert!(third.stderr.contains(expected), "{expected:?}: {third:?}");
     }
     assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// The message of a `run("true")` whose task environment has no `PATH`, which
+/// `NoPathError` gives.
+const NO_PATH: &str = "cannot run `true`: a program name without `/` is looked up in the task \
+                       environment's PATH, but the task environment has no PATH; set it with \
+                       env.set(\"PATH\", ...) or inherit it with env.inherit(\"PATH\")";
+
+/// The task `Bare` of target `ci`, whose `run("true")` has no `PATH`, because its
+/// program inherits nothing; its block opens on line 3.
+const BARE: &str = "# Bare\n\n```starlark ci name=bare\nrun(\"true\")\n```\n";
+
+/// Whether `line` is a line that `kizz build` prints for a command that ran:
+/// "ran `COMMAND` in TASK step N: REASON".
+fn is_ran_line(line: &str) -> bool {
+    line.starts_with("ran `") && line.contains(" step ") && line.contains(": ")
+}
+
+/// `kizz build` of a task whose `run("true")` has no `PATH` fails before kizz
+/// starts anything: it exits with 1, prints the task's error with the message of
+/// `NoPathError` once, prints no `ran` line and no "did not settle", and its summary
+/// counts no command and one pass.
+#[test]
+fn a_build_whose_run_has_no_path_fails_after_one_pass() -> TestResult {
+    let project = Project::new()?;
+    project.write("kizz.md", BARE)?;
+
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    assert_eq!(
+        run.stdout,
+        text(&["build failed: 1 task, 1 failed, settled in 1 pass; 0 commands ran, 0 cached"])
+    );
+    assert!(!run.stdout.lines().any(is_ran_line), "{run:?}");
+    assert_eq!(run.stderr.matches(NO_PATH).count(), 1, "{run:?}");
+    assert_eq!(
+        run.stderr
+            .matches("error: kizz.md:3 (Bare) failed:\n")
+            .count(),
+        1,
+        "{run:?}"
+    );
+    assert!(
+        run.stderr
+            .lines()
+            .any(|line| line == format!("  error: run(): {NO_PATH}")),
+        "{run:?}"
+    );
+    for output in [&run.stdout, &run.stderr] {
+        assert!(!output.contains("did not settle"), "{run:?}");
+        assert!(!output.contains("run(): run():"), "{run:?}");
+    }
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// With a second task whose command writes a file, the build of a task whose
+/// `run("true")` has no `PATH` ends after a second pass that runs nothing: it exits
+/// with 1, prints the error once, the line of pass 2 and the `ran` line of the
+/// second task's command only, and no "did not settle".
+#[test]
+fn a_run_without_path_does_not_keep_the_build_from_settling() -> TestResult {
+    let project = Project::new()?;
+    let make = [
+        "# Make",
+        "",
+        "```starlark ci",
+        "env.inherit(\"PATH\")",
+        "run(\"sh\", \"-c\", \"echo made > out.txt\")",
+        "```",
+    ];
+    project.write("kizz.md", &format!("{BARE}\n{}", text(&make)))?;
+
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    assert_eq!(
+        run.stdout,
+        text(&[
+            &ran("sh -c echo made > out.txt", "kizz.md:9 (Make)", NEVER_RUN),
+            &pass(2),
+            "build failed: 2 tasks, 1 failed, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    assert_eq!(run.stderr.matches(NO_PATH).count(), 1, "{run:?}");
+    for output in [&run.stdout, &run.stderr] {
+        assert!(!output.contains("did not settle"), "{run:?}");
+        assert!(!output.contains("run(): run():"), "{run:?}");
+    }
+    assert_eq!(fs::read_to_string(project.root.join("out.txt"))?, "made\n");
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// A pattern that starts with `~/`, with no `HOME` in kizz's environment, fails its
+/// task with the Starlark error of `run()`, whose line holds the prefix `run(): `
+/// once, and no output holds `run(): run():`.
+#[test]
+fn a_pattern_error_has_one_run_prefix() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[("Home", "run(\"true\", ignore = [\"~/x\"])")])?;
+
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    let expected = "  error: run(): pattern `~/x` starts with `~/`, but the caller environment \
+                    has no HOME";
+    assert_eq!(
+        run.stderr.lines().filter(|line| *line == expected).count(),
+        1,
+        "{run:?}"
+    );
+    assert_eq!(
+        run.stderr
+            .matches(
+                "run(): pattern `~/x` starts with `~/`, but the caller environment has no HOME"
+            )
+            .count(),
+        1,
+        "{run:?}"
+    );
+    assert_eq!(
+        run.stdout,
+        text(&["build failed: 1 task, 1 failed, settled in 1 pass; 0 commands ran, 0 cached"])
+    );
+    for output in [&run.stdout, &run.stderr] {
+        assert!(!output.contains("run(): run():"), "{run:?}");
+    }
     Ok(())
 }
 

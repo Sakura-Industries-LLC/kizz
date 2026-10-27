@@ -66,7 +66,8 @@ After `starlark`, every word with `=` is a task option, in any order among the t
   A name uses the characters of a target name.
   Each name is unique within its `kizz.md`, and the same name in two tasks of one file is a configuration error.
   Tasks in different `kizz.md` files may share a name; [`kizz run`](@/guide/run.md) explains which one it picks.
-* `cache=never` makes every command of the task run on every build, as if each of its `run()` calls had `always = True`.
+* `cache=never` makes every command of the task run in every build that reaches it,
+  as if each of its `run()` calls had `always = True`.
   `never` is the only value it accepts.
   [Caching](@/guide/caching.md) explains when to use it.
 
@@ -297,6 +298,9 @@ A build has no fail-fast and no `--keep-going`: it tries every task, even after 
   When a path that a failed task looked for and did not find appears, the task runs again, as "Package" did above.
 * A failed task whose missing paths are all still missing, and whose other inputs are unchanged, fails again from the
   cache without running.
+* A bare program name without `PATH` and an invalid `ignore` or `track` pattern fail their task before kizz starts anything.
+  Kizz checks both before the cache check, so every pass fails such a call the same way, and it counts as no command that ran.
+* A tracer failure counts as a command that ran and leaves no record, and no later pass of the same build runs it again.
 * When a pass runs nothing and failures remain, the build stops with exit status 1.
   It lists each failed task with the paths it looked for and did not find, since any of them may be the cause.
 * Commands that finished before a failure keep their cache entries.

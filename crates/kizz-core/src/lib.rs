@@ -107,8 +107,8 @@ pub use explain::{
 pub use files::{AccessOutcomes, ChangedFile, FileChanges, FileError, Files, stable_json};
 pub use key::{KeyError, Occurrences, STEP_KEY_CONTEXT, step_key};
 pub use lookup::{
-    NoPathError, PATH_VARIABLE, ProgramLookup, ProgramSearch, find_program, search_program,
-    search_step_program,
+    NoPathError, PATH_VARIABLE, ProgramLookup, ProgramSearch, check_path, find_program,
+    search_program, search_step_program,
 };
 pub use observe::{
     HashCounter, Observed, access_bits, changed_after_read, is_kernel_path, kernel_links, observe,
