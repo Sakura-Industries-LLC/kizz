@@ -42,7 +42,9 @@
 //! the first time its key comes up in the build, normally in the first pass, and it
 //! is recorded like any other step. Every later time in the same build, whatever
 //! changed, its first result is returned again without running ("Commands that
-//! always run"). A key first reached in a later pass runs once then.
+//! always run"). A key first reached in a later pass runs once then. Every step of a
+//! task marked `cache=never` runs the same way, as if it were marked `always`, and
+//! its reason names the task option.
 //!
 //! Results that are not cached ("Results that are not cached"): a command killed by
 //! a signal, every run that returns once cancellation has been requested, whether a
@@ -584,6 +586,7 @@ impl<'a> Engine<'a> {
             keys: Cell::new(Vec::new()),
             decisions: Cell::new(Vec::new()),
             cached_positions: Cell::new(Vec::new()),
+            cache_never: false,
         }
     }
 
@@ -605,6 +608,7 @@ impl<'a> Engine<'a> {
             keys: Cell::new(Vec::new()),
             decisions: Cell::new(Vec::new()),
             cached_positions: Cell::new(Vec::new()),
+            cache_never: false,
         }
     }
 
@@ -667,6 +671,9 @@ pub struct TaskSteps<'a> {
     /// The step positions of the cached steps, stored by [`TaskSteps::finish`],
     /// which also makes the task an owner of the record each of them names.
     cached_positions: Cell<Vec<(PositionKey, StepPosition)>>,
+    /// Whether the task is marked `cache=never`, so every step runs as if it were
+    /// marked `always`.
+    cache_never: bool,
 }
 
 impl fmt::Debug for TaskSteps<'_> {
@@ -681,6 +688,7 @@ impl fmt::Debug for TaskSteps<'_> {
             .field("identity", &self.identity)
             .field("keys", &cells::cloned(&self.keys))
             .field("decisions", &cells::cloned(&self.decisions))
+            .field("cache_never", &self.cache_never)
             .finish_non_exhaustive()
     }
 }
@@ -967,6 +975,25 @@ fn replay(record: StepRecord) -> Result<StepOutcome, StepError> {
 }
 
 impl TaskSteps<'_> {
+    /// The step executor, which runs every step as if it were marked `always`, with
+    /// the reason that names the task option, when `never` says that the task is
+    /// marked `cache=never`. The option is in no step key.
+    #[must_use]
+    pub const fn with_cache_never(
+        mut self,
+        never: bool,
+    ) -> Self {
+        self.cache_never = never;
+        self
+    }
+
+    /// Whether every step runs as if it were marked `always`, because the task is
+    /// marked `cache=never`.
+    #[must_use]
+    pub const fn caches_never(&self) -> bool {
+        self.cache_never
+    }
+
     /// The key of each step so far, in order.
     #[must_use]
     pub fn keys(&self) -> Vec<StepKey> {
@@ -1146,15 +1173,17 @@ impl TaskSteps<'_> {
         )?
         .get(&key)
         .cloned();
-        if step.always {
+        if step.always || self.cache_never {
             let known = remembered.is_some() || self.record(&key)?.is_some();
             if let Some(first) = self.engine.first_always_result(key)? {
                 return Ok(Decision::Replay(first));
             }
-            let reason = if known {
-                RunReason::Always
-            } else {
+            let reason = if !known {
                 RunReason::NeverRun
+            } else if self.cache_never {
+                RunReason::TaskCacheNever
+            } else {
+                RunReason::Always
             };
             return Ok(Decision::Run(reason, None));
         }
@@ -1292,6 +1321,7 @@ impl TaskSteps<'_> {
         let reasons = match reason {
             RunReason::NeverRun => self.never_run(&txn, previous.as_ref(), key, spec)?,
             RunReason::Always => vec![Reason::Always],
+            RunReason::TaskCacheNever => vec![Reason::TaskCacheNever],
             RunReason::InputsChanged {
                 differences,
                 machine,
@@ -1840,7 +1870,7 @@ impl StepExecutor for TaskSteps<'_> {
         };
         self.note_ran(step, &pending)?;
         let result = self.look_up_and_run(step, name, &pending);
-        if step.always {
+        if step.always || self.cache_never {
             self.engine.finish_always(key, &result)?;
         }
         result

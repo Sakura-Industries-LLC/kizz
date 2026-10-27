@@ -1150,6 +1150,10 @@ pub enum RunReason {
         #[n(1)]
         differences: Vec<Difference>,
     },
+    /// The step's task is marked `cache=never`, so every command of the task runs as
+    /// if it were marked `always`, and this was its one run in the build.
+    #[n(4)]
+    TaskCacheNever,
 }
 
 /// What is recorded about one run of a step, by step key, and the tasks that own
@@ -1559,6 +1563,7 @@ mod tests {
         let mut reasons = vec![
             RunReason::NeverRun,
             RunReason::Always,
+            RunReason::TaskCacheNever,
             RunReason::InputsChanged {
                 differences: differences.clone(),
                 machine: vec![kernel_change()],
@@ -1585,6 +1590,33 @@ mod tests {
             let bytes = minicbor::to_vec(&record).unwrap();
             assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
         }
+    }
+
+    /// The reason of a step whose task is marked `cache=never` encodes differently
+    /// from every other run reason, and a record that holds it round-trips.
+    #[test]
+    fn the_task_cache_never_reason_encodes_and_round_trips() {
+        let reasons = reasons();
+        let encoded: Vec<Vec<u8>> = reasons
+            .iter()
+            .map(|reason| minicbor::to_vec(reason).unwrap())
+            .collect();
+        let never = minicbor::to_vec(&RunReason::TaskCacheNever).unwrap();
+        assert_eq!(
+            minicbor::decode::<RunReason>(&never).unwrap(),
+            RunReason::TaskCacheNever
+        );
+        let matching: Vec<&RunReason> = reasons
+            .iter()
+            .zip(&encoded)
+            .filter(|(_, bytes)| **bytes == never)
+            .map(|(reason, _)| reason)
+            .collect();
+        assert_eq!(matching, [&RunReason::TaskCacheNever]);
+        let mut record = record();
+        record.reason = RunReason::TaskCacheNever;
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
     }
 
     #[test]

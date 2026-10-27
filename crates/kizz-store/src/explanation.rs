@@ -19,6 +19,7 @@
 //! * inputs changed: every changed path, what changed about it, and who last wrote it;
 //! * the machine state that the step names changed: each changed value, old and new;
 //! * the command is marked `always`;
+//! * its task is marked `cache=never`;
 //! * the previous run could not be cached, and why.
 //!
 //! Every type here is encoded by the rules of "Step keys": definite lengths, fields
@@ -111,8 +112,9 @@ pub enum SelfInflicted {
     /// This command writes the file and also reads it.
     #[n(0)]
     WritesAndReads,
-    /// Another step that runs on every build, because it is marked `always` or
-    /// re-runs for a self-inflicted reason itself, wrote the file in this build.
+    /// Another step that runs on every build, because it is marked `always`, its
+    /// task is marked `cache=never`, or it re-runs for a self-inflicted reason
+    /// itself, wrote the file in this build.
     #[n(1)]
     WrittenEveryBuild {
         /// The task of the writing step.
@@ -316,6 +318,10 @@ pub enum Reason {
         #[n(1)]
         inputs: Vec<ChangedInput>,
     },
+    /// The command's task is marked `cache=never`, so the command runs as if it were
+    /// marked `always`.
+    #[n(15)]
+    TaskCacheNever,
 }
 
 impl Reason {
@@ -359,12 +365,12 @@ impl Explanation {
         paths
     }
 
-    /// Whether the step runs on every build: it is marked `always`, or one of its
-    /// changed inputs is self-inflicted.
+    /// Whether the step runs on every build: it is marked `always`, its task is
+    /// marked `cache=never`, or one of its changed inputs is self-inflicted.
     #[must_use]
     pub fn runs_every_build(&self) -> bool {
         self.reasons.iter().any(|reason| {
-            matches!(reason, Reason::Always)
+            matches!(reason, Reason::Always | Reason::TaskCacheNever)
                 || reason
                     .inputs()
                     .iter()
@@ -498,6 +504,7 @@ mod tests {
                 }],
             },
             Reason::Always,
+            Reason::TaskCacheNever,
             Reason::NotCached {
                 why: NotCachedReason::Signaled { signal: 9 },
                 inputs: Vec::new(),
@@ -540,5 +547,29 @@ mod tests {
             repeated: Vec::new(),
         };
         assert!(always.runs_every_build());
+        let never = Explanation {
+            reasons: vec![Reason::TaskCacheNever],
+            repeated: Vec::new(),
+        };
+        assert!(never.runs_every_build());
+        assert_eq!(never.self_inflicted(), Vec::<PathBuf>::new());
+    }
+
+    /// The reason of a command whose task is marked `cache=never` encodes
+    /// differently from `always`, and an explanation that holds it round-trips.
+    #[test]
+    fn the_task_cache_never_reason_encodes_and_round_trips() {
+        let never = minicbor::to_vec(&Reason::TaskCacheNever).unwrap();
+        assert_ne!(never, minicbor::to_vec(&Reason::Always).unwrap());
+        assert_eq!(
+            minicbor::decode::<Reason>(&never).unwrap(),
+            Reason::TaskCacheNever
+        );
+        let verdict = Verdict::Ran(Explanation {
+            reasons: vec![Reason::TaskCacheNever],
+            repeated: Vec::new(),
+        });
+        let bytes = minicbor::to_vec(&verdict).unwrap();
+        assert_eq!(minicbor::decode::<Verdict>(&bytes).unwrap(), verdict);
     }
 }

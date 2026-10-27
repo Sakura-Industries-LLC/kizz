@@ -4,9 +4,10 @@
 
 //! Tests of builds in passes: the default and learned order, failed tasks that run
 //! again once a path they looked for appears, failures from the cache, the pass
-//! limit, `always` commands, interruption, and task programs whose `fs.write`
-//! changes a file, which is work in its pass and makes the task the file's last
-//! writer.
+//! limit, `always` commands, tasks marked `cache=never`, named tasks without
+//! targets, task options that change no step key, interruption, and task programs
+//! whose `fs.write` changes a file, which is work in its pass and makes the task the
+//! file's last writer.
 //!
 //! Each test writes `kizz.md` files into a temporary project directory and opens
 //! the store in a temporary cache directory. A build loads the project, selects the
@@ -52,12 +53,12 @@ use std::{
 
 use kizz_core::{
     BuildEvents, BuildOutcome, BuildReport, ChangingInput, Engine, INTERRUPTED, Pass, PrintSink,
-    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, UncheckedStep, WorkerPool, build, load,
-    task_id,
+    Render, TargetExpr, TaskFailure, TaskInfo, TaskResult, UncheckedStep, WhyReport, WorkerPool,
+    build, load, task_id, why,
 };
 use kizz_store::{
-    BuildId, Change, LearnedOrder, MachineChange, Reason, Store, TaskId, TaskLabel, TaskRecord,
-    Verdict, Writer,
+    BuildId, Change, Explanation, LearnedOrder, MachineChange, Reason, RunReason, StepRecord,
+    Store, TaskId, TaskLabel, TaskRecord, Verdict, Writer,
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CapturedOutput, EchoSink, FirstReads,
@@ -299,7 +300,7 @@ impl BuildEvents for Events {
 fn describe(result: &TaskResult) -> String {
     format!(
         "{} {} {}",
-        result.task.name.as_deref().unwrap_or("?"),
+        result.task.heading.as_deref().unwrap_or("?"),
         if result.ran() { "ran" } else { "cached" },
         if result.failed() { "failed" } else { "ok" },
     )
@@ -557,7 +558,7 @@ fn order_headings(report: &BuildReport) -> TestResult<Vec<String>> {
             .iter()
             .find(|result| &task_id(&result.task) == id)
             .ok_or("a task in the order did not run")?;
-        headings.push(task.task.name.clone().unwrap_or_default());
+        headings.push(task.task.heading.clone().unwrap_or_default());
     }
     Ok(headings)
 }
@@ -577,7 +578,7 @@ fn task_in<'r>(
     Ok(pass
         .tasks
         .iter()
-        .find(|result| result.task.name.as_deref() == Some(heading))
+        .find(|result| result.task.heading.as_deref() == Some(heading))
         .ok_or("no such task in the pass")?)
 }
 
@@ -821,7 +822,7 @@ fn a_task_that_keeps_failing_runs_once_then_fails_from_the_cache() -> TestResult
     };
     let listed: Vec<(Option<&str>, &[PathBuf])> = failures
         .iter()
-        .map(|failure| (failure.task.name.as_deref(), failure.missing.as_slice()))
+        .map(|failure| (failure.task.heading.as_deref(), failure.missing.as_slice()))
         .collect();
     assert_eq!(listed, vec![
         (Some("Check"), &[fixture.path("never.txt")][..]),
@@ -906,7 +907,7 @@ fn tasks_that_keep_changing_each_others_inputs_stop_at_the_pass_limit() -> TestR
         (fixture.path("b.txt"), Some("Ping"), Some("Pong")),
     ]);
     assert!(written.is_empty(), "{written:?}");
-    let worked: Vec<Option<&str>> = worked.iter().map(|task| task.name.as_deref()).collect();
+    let worked: Vec<Option<&str>> = worked.iter().map(|task| task.heading.as_deref()).collect();
     assert_eq!(worked, vec![Some("Ping"), Some("Pong")]);
     Ok(())
 }
@@ -1283,7 +1284,7 @@ fn changed_in(
                         .to_string()
                 })
                 .collect();
-            (result.task.name.clone().unwrap_or_default(), paths)
+            (result.task.heading.clone().unwrap_or_default(), paths)
         })
         .collect())
 }
@@ -1520,7 +1521,7 @@ fn a_program_that_keeps_changing_a_file_stops_at_the_pass_limit() -> TestResult 
     assert_eq!(write.path, fixture.path("count.txt"));
     assert!(is_task(&write.writer, "Count"), "{write:?}");
     assert_eq!(write.writer.task, fixture.id("", 0));
-    let worked: Vec<Option<&str>> = worked.iter().map(|task| task.name.as_deref()).collect();
+    let worked: Vec<Option<&str>> = worked.iter().map(|task| task.heading.as_deref()).collect();
     assert_eq!(worked, vec![Some("Count")]);
     Ok(())
 }
@@ -1768,7 +1769,7 @@ fn fail_unchecked_fails_a_standing_unchecked_exit_and_the_build() -> TestResult 
         let [failed] = failures.as_slice() else {
             return Err(format!("unexpected failures {failures:?}").into());
         };
-        assert_eq!(failed.task.name.as_deref(), Some("Ignore"));
+        assert_eq!(failed.task.heading.as_deref(), Some("Ignore"));
         let TaskFailure::Unchecked { exits } = &failed.failure else {
             return Err(format!("unexpected failure {:?}", failed.failure).into());
         };
@@ -1799,5 +1800,220 @@ fn fail_unchecked_fails_a_standing_unchecked_exit_and_the_build() -> TestResult 
     assert_eq!(report.outcome, BuildOutcome::Succeeded);
     let standing = report.unchecked();
     assert_eq!(standing.len(), 1, "{standing:?}");
+    Ok(())
+}
+
+/// The task block of `info`, which follows `starlark`, under the heading `heading`;
+/// its program inherits `PATH` and runs `tool` once for each of `args`.
+fn block(
+    heading: &str,
+    info: &str,
+    args: &[&str],
+) -> String {
+    let fence = format!("```starlark {info}");
+    let mut block = [
+        format!("## {heading}\n"),
+        fence,
+        "env.inherit(\"PATH\")\n".to_owned(),
+    ]
+    .join("\n");
+    for arg in args {
+        block.push_str("run(\"tool\", \"");
+        block.push_str(arg);
+        block.push_str("\")\n");
+    }
+    block.push_str("```\n");
+    block
+}
+
+/// The report of `kizz why` for the whole project of `fixture`.
+fn why_report(fixture: &Fixture) -> TestResult<WhyReport> {
+    let store = fixture.store()?;
+    let report = why(&store, fixture.project.path())?;
+    store.close()?;
+    Ok(report)
+}
+
+/// The stored reason of the step record of each step of the task with heading
+/// `heading` in `report`, in order.
+fn record_reasons(
+    fixture: &Fixture,
+    report: &WhyReport,
+    heading: &str,
+) -> TestResult<Vec<RunReason>> {
+    let task = report
+        .tasks
+        .iter()
+        .find(|task| task.record.heading.as_deref() == Some(heading))
+        .ok_or("no such task in the report")?;
+    let store = fixture.store()?;
+    let mut reasons = Vec::new();
+    for step in &task.steps {
+        let record = store
+            .read()?
+            .get::<StepRecord>(&step.key)?
+            .ok_or("no step record")?;
+        reasons.push(record.reason);
+    }
+    store.close()?;
+    Ok(reasons)
+}
+
+/// Every command of a task marked `cache=never` runs in each build, once per build,
+/// with the reason that names the task option in its decision, its step record and
+/// `kizz why`, while an unmarked task with the same command stays cached.
+#[test]
+fn every_command_of_a_cache_never_task_runs_in_each_build() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("in.txt", "input")?;
+    fixture.write(
+        "kizz.md",
+        &format!(
+            "# Tasks\n\n{}\n{}",
+            block("Count", "ci cache=never", &[
+                "read:in.txt",
+                "read:other.txt"
+            ]),
+            block("Plain", "ci", &["read:in.txt"])
+        ),
+    )?;
+    let tracer = FakeTracer::default();
+    let first = fixture.build(&tracer)?.report;
+    assert_eq!(first.outcome, BuildOutcome::Succeeded);
+    assert_eq!(
+        tracer.runs(),
+        lines(&[
+            "tool read:in.txt",
+            "tool read:other.txt",
+            "tool read:in.txt"
+        ])
+    );
+    assert_eq!(
+        passes(&first).last(),
+        Some(&lines(&["Count cached ok", "Plain cached ok"]))
+    );
+
+    for (build, runs) in [(2, 5_usize), (3, 7)] {
+        let report = fixture.build(&tracer)?.report;
+        assert_eq!(report.outcome, BuildOutcome::Succeeded);
+        assert_eq!(tracer.runs().len(), runs, "{build}");
+        assert_eq!(
+            summary(report.passes.first().ok_or("no pass")?),
+            lines(&["Count ran ok", "Plain cached ok"])
+        );
+        let count = task_in(&report, 1, "Count")?;
+        let never = Verdict::Ran(Explanation {
+            reasons: vec![Reason::TaskCacheNever],
+            repeated: Vec::new(),
+        });
+        let verdicts: Vec<&Verdict> = count.decisions.iter().map(|d| &d.verdict).collect();
+        assert_eq!(verdicts, [&never, &never], "{build}");
+        let render = Render {
+            base: fixture.project.path().to_path_buf(),
+            home: None,
+            verbose: false,
+        };
+        assert_eq!(render.one_line(&never), "its task is marked `cache=never`");
+
+        let report = why_report(&fixture)?;
+        assert_eq!(record_reasons(&fixture, &report, "Count")?, [
+            RunReason::TaskCacheNever,
+            RunReason::TaskCacheNever
+        ]);
+        assert_eq!(record_reasons(&fixture, &report, "Plain")?, [
+            RunReason::NeverRun
+        ]);
+        let text = render.why(&report);
+        assert_eq!(
+            text.matches("    ran because:\n      its task is marked `cache=never`\n")
+                .count(),
+            2,
+            "{text}"
+        );
+    }
+    Ok(())
+}
+
+/// A named task without targets is a task that `kizz build` never selects or runs,
+/// and it draws no warning.
+#[test]
+fn a_named_task_without_targets_is_never_built() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write(
+        "kizz.md",
+        &format!(
+            "# Tasks\n\n{}\n{}",
+            block("Deploy", "name=deploy", &["write:deployed.txt=yes"]),
+            block("Check", "ci", &["read:in.txt"])
+        ),
+    )?;
+    let project = load(fixture.project.path(), &WorkerPool::new()?)?;
+    assert!(project.warnings.is_empty(), "{:?}", project.warnings);
+    let named: Vec<(Option<&str>, usize)> = project
+        .tasks
+        .iter()
+        .map(|task| (task.options.name.as_deref(), task.targets.len()))
+        .collect();
+    assert_eq!(named, [(Some("deploy"), 0), (None, 1)]);
+    let selected: Vec<Option<String>> = fixture
+        .tasks()?
+        .into_iter()
+        .map(|task| task.heading)
+        .collect();
+    assert_eq!(selected, [Some("Check".to_owned())]);
+
+    let tracer = FakeTracer::default();
+    for _ in 0..2 {
+        let report = fixture.build(&tracer)?.report;
+        assert_eq!(report.outcome, BuildOutcome::Succeeded);
+        assert!(
+            passes(&report)
+                .iter()
+                .flatten()
+                .all(|task| task.starts_with("Check ")),
+            "{:?}",
+            passes(&report)
+        );
+    }
+    assert_eq!(tracer.runs(), lines(&["tool read:in.txt"]));
+    assert!(!fixture.path("deployed.txt").exists());
+    Ok(())
+}
+
+/// Adding `name=` or `cache=never` to a block changes no step key: after `name=`,
+/// the step is a cache hit, and after `cache=never` it runs because of the task
+/// option, not because it never ran, under the same key.
+#[test]
+fn adding_task_options_changes_no_step_key() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("in.txt", "input")?;
+    let tracer = FakeTracer::default();
+    let mut keys = Vec::new();
+    for (info, runs) in [
+        ("ci", 1_usize),
+        ("ci name=count", 1),
+        ("name=count ci cache=never", 2),
+    ] {
+        fixture.write(
+            "kizz.md",
+            &format!("# Tasks\n\n{}", block("Count", info, &["read:in.txt"])),
+        )?;
+        let report = fixture.build(&tracer)?.report;
+        assert_eq!(report.outcome, BuildOutcome::Succeeded, "{info}");
+        assert_eq!(tracer.runs().len(), runs, "{info}");
+        let report = why_report(&fixture)?;
+        let task = report.tasks.first().ok_or("no task in the report")?;
+        keys.extend(task.steps.iter().map(|step| step.key));
+        if info.contains("cache=never") {
+            assert_eq!(record_reasons(&fixture, &report, "Count")?, [
+                RunReason::TaskCacheNever
+            ]);
+        }
+    }
+    assert_eq!(keys.len(), 3);
+    assert!(
+        keys.windows(2).all(|pair| pair.first() == pair.last()),
+        "{keys:?}"
+    );
     Ok(())
 }

@@ -1119,9 +1119,12 @@ mod tests {
                 relative_file: "kizz.md".into(),
                 line: 3,
                 index: 0,
-                name: Some("Build".to_owned()),
+                name: None,
+                heading: Some("Build".to_owned()),
                 targets: vec!["ci".to_owned()],
                 selected: vec!["ci".to_owned()],
+                args: Vec::new(),
+                cache_never: false,
                 source: String::new(),
             },
             decisions: verdicts

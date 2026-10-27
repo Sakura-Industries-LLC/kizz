@@ -27,10 +27,10 @@
 //!   program of the step's own task.
 //! * A changed input is self-inflicted when this command last wrote it on its previous
 //!   run and also reads it, or when the step that wrote it in this build runs on every
-//!   build, because it is marked `always` or re-runs for a self-inflicted reason itself.
-//!   A path the command read and wrote before is not self-inflicted when something
-//!   outside kizz, another task, or a task program changed it since; a change that a task
-//!   program made is never self-inflicted.
+//!   build, because it is marked `always`, its task is marked `cache=never`, or it
+//!   re-runs for a self-inflicted reason itself. A path the command read and wrote before
+//!   is not self-inflicted when something outside kizz, another task, or a task program
+//!   changed it since; a change that a task program made is never self-inflicted.
 //! * A step that re-runs for a self-inflicted input that also made it run in its task's
 //!   previous build gets the loud warning for consecutive builds: the step-position
 //!   record carries the self-inflicted inputs of the previous build's run.
@@ -81,7 +81,7 @@ impl TaskIdentity {
                 index: task.index,
             },
             line: u32::try_from(task.line).unwrap_or(u32::MAX),
-            heading: task.name.clone(),
+            heading: task.heading.clone(),
             targets: task.targets.clone(),
             program: program.hash(),
             parts: program.parts().clone(),
@@ -466,9 +466,9 @@ fn label_of(
 }
 
 /// Whether the step that `entry` names, which wrote its path in `build`, runs on
-/// every build: in this build it ran because it is marked `always` or for a
-/// self-inflicted reason. A task program is not a step, so this is never so for
-/// one.
+/// every build: in this build it ran because it is marked `always`, because its task
+/// is marked `cache=never`, or for a self-inflicted reason. A task program is not a
+/// step, so this is never so for one.
 fn writes_every_build(
     txn: &Txn<'_>,
     entry: &LastWriter,

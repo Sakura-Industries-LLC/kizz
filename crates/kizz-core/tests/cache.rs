@@ -519,7 +519,7 @@ fn differences(record: &StepRecord) -> Vec<Difference> {
         RunReason::InputsChanged { differences, .. } | RunReason::NotCached { differences, .. } => {
             differences.clone()
         },
-        RunReason::NeverRun | RunReason::Always => Vec::new(),
+        RunReason::NeverRun | RunReason::Always | RunReason::TaskCacheNever => Vec::new(),
     }
 }
 

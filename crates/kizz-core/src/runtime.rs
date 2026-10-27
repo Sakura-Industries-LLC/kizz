@@ -109,18 +109,27 @@ pub struct TaskInfo {
     pub line: usize,
     /// The index of the task block in its `kizz.md`, counting from zero.
     pub index: u32,
-    /// The nearest heading above the block, which names the task, if there is one.
+    /// The name that the block's `name=` option gives the task, if it has one.
     pub name: Option<String>,
+    /// The nearest heading above the block, the task's heading, if there is one.
+    pub heading: Option<String>,
     /// The targets on the block, in the order written.
     pub targets: Vec<String>,
     /// The requested targets that selected the task.
     pub selected: Vec<String>,
+    /// The task's arguments, which programs read as `task.args`: empty under
+    /// `kizz build`. They are not part of the task program hash.
+    pub args: Vec<String>,
+    /// Whether the block's `cache=never` option marks the task, so every command of
+    /// the task runs as if it were marked `always`.
+    pub cache_never: bool,
     /// The block's Starlark source.
     pub source: String,
 }
 
 impl TaskInfo {
-    /// The information of `task`, selected by the requested targets `selected`.
+    /// The information of `task`, selected by the requested targets `selected`, with
+    /// no arguments, as `kizz build` runs it.
     ///
     /// # Errors
     ///
@@ -137,26 +146,31 @@ impl TaskInfo {
             relative_file: task.relative_file.clone(),
             line: task.line,
             index: task.id.index,
-            name: task.heading.clone(),
+            name: task.options.name.clone(),
+            heading: task.heading.clone(),
             targets: task.targets.clone(),
             selected: selected.to_vec(),
+            args: Vec::new(),
+            cache_never: task.options.cache_never,
             source: task.source.clone(),
         })
     }
 
-    /// The name that prefixes the task's `print` output: its heading, or
-    /// `path/kizz.md:LINE` when the block has no heading above it.
+    /// The name that prefixes the task's `print` output: its name, else its heading,
+    /// else `path/kizz.md:LINE`.
     #[must_use]
     pub fn display_name(&self) -> String {
         self.name
             .clone()
+            .or_else(|| self.heading.clone())
             .unwrap_or_else(|| format!("{}:{}", self.relative_file.display(), self.line))
     }
 }
 
 /// Where the lines that task programs `print` go.
 pub trait PrintSink {
-    /// Show one line of `print` output, already prefixed with the task name.
+    /// Show one line of `print` output, already prefixed with the task's
+    /// [`TaskInfo::display_name`]: its name, else its heading, else its location.
     fn print_line(
         &self,
         line: &str,
@@ -637,9 +651,10 @@ impl FileLoader for ModuleMap {
     }
 }
 
-/// Prefixes each line a program prints with the task name.
+/// Prefixes each line a program prints with the task's
+/// [`TaskInfo::display_name`]: its name, else its heading, else its location.
 struct TaskPrinter<'a> {
-    /// The task name.
+    /// The prefix: the task's name, else its heading, else `path/kizz.md:LINE`.
     name: String,
     /// Where the lines go.
     sink: &'a dyn PrintSink,
@@ -1350,23 +1365,24 @@ fn globals() -> Globals {
         .build()
 }
 
-/// Set `task` in `module` to the values that describe `task`.
+/// Set `task` in `module` to the values that describe `task`: `task.name` is the
+/// name that its `name=` option gives, or `None`, `task.heading` its heading, or
+/// `None`, and `task.args` its arguments.
 fn set_task_value(
     module: &Module<'_>,
     task: &TaskInfo,
 ) {
     let heap = module.heap();
-    let name = task
-        .name
-        .as_deref()
-        .map_or_else(Value::new_none, |name| heap.alloc(name));
+    let optional = |text: Option<&str>| text.map_or_else(Value::new_none, |text| heap.alloc(text));
     let value = heap.alloc(AllocStruct([
         ("dir", heap.alloc(task.dir.to_string())),
         ("file", heap.alloc(task.file.to_string())),
         ("line", heap.alloc(task.line)),
-        ("name", name),
+        ("name", optional(task.name.as_deref())),
+        ("heading", optional(task.heading.as_deref())),
         ("targets", heap.alloc(task.targets.clone())),
         ("selected", heap.alloc(task.selected.clone())),
+        ("args", heap.alloc(task.args.clone())),
     ]));
     module.set("task", value);
 }
@@ -1856,8 +1872,11 @@ mod tests {
             line: 1,
             index: 0,
             name: None,
+            heading: None,
             targets: vec!["ci".to_owned()],
             selected: vec!["ci".to_owned()],
+            args: Vec::new(),
+            cache_never: false,
             source: source.to_owned(),
         }
     }

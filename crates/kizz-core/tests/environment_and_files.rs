@@ -93,7 +93,7 @@ struct Printed {
 }
 
 impl Printed {
-    /// The lines printed so far, without the task name prefix.
+    /// The lines printed so far, without the `print` prefix, the task's heading.
     fn lines(&self) -> Vec<String> {
         self.lines
             .borrow()
@@ -118,7 +118,7 @@ struct Ran {
     run: TaskRun,
     /// The steps the executor received.
     executor: FakeExecutor,
-    /// The lines the program printed, without the task name prefix.
+    /// The lines the program printed, without the `print` prefix, the task's heading.
     printed: Vec<String>,
 }
 
@@ -195,7 +195,7 @@ impl Fixture {
         Ok(fs::read_to_string(self.project().join(relative))?)
     }
 
-    /// The task named `Task` whose block is `source`.
+    /// The task with the heading `Task` and no name, whose block is `source`.
     fn task(
         &self,
         source: &str,

@@ -124,6 +124,9 @@ pub use runtime::{
 pub use states::FileStates;
 pub use step::{StepError, StepExecutor, StepOutcome, StepSpec};
 pub use targets::{Selected, TARGET_NAME_RULE, TargetExpr, TargetExprError, is_valid_target};
-pub use tasks::{ParsedFile, TASK_LANGUAGE, Task, parse_tasks};
+pub use tasks::{
+    OptionProblem, ParsedFile, TASK_LANGUAGE, TASK_NAME_RULE, TASK_OPTION_KEYS, Task, TaskOptions,
+    parse_tasks,
+};
 pub use warning::Warning;
 pub use why::{WhyReport, WhyStep, WhyTask, why};

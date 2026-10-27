@@ -336,6 +336,87 @@ fn explain_prints_the_full_reason_for_every_command() -> TestResult {
     Ok(())
 }
 
+/// The `kizz.md` of [`a_cache_never_task_runs_in_every_build`]: a task marked
+/// `cache=never` that reads `in.txt`, and a named task without targets that would
+/// write `deployed.txt`.
+const CACHE_NEVER_AND_NAMED: &str = "# Fresh
+
+```starlark ci cache=never
+env.inherit(\"PATH\")
+run(\"cat\", \"in.txt\")
+```
+
+# Deploy
+
+```starlark name=deploy
+env.inherit(\"PATH\")
+run(\"sh\", \"-c\", \"echo deployed > deployed.txt\")
+```
+";
+
+/// With the real tracer, a task marked `cache=never` runs its command in two
+/// consecutive builds, whose inputs are unchanged, and `--explain` and `kizz why`
+/// give the task option as the reason; `kizz build` never runs a named task without
+/// targets, which draws no warning.
+#[test]
+fn a_cache_never_task_runs_in_every_build() -> TestResult {
+    let project = Project::new()?;
+    project.write("in.txt", "input\n")?;
+    project.write("kizz.md", CACHE_NEVER_AND_NAMED)?;
+    let ran_line = "ran `cat in.txt` in kizz.md:3 (Fresh) step 1\n";
+
+    let first = project.run("", &["build", "--explain", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first
+            .stdout
+            .starts_with(&format!("{ran_line}  ran because:\n    {NEVER_RUN}\n")),
+        "{first:?}"
+    );
+    assert_eq!(first.stderr, "", "{first:?}");
+
+    for build in 2..=3 {
+        let again = project.run("", &["build", "--explain", "ci"])?;
+        assert_eq!(again.status, Some(0), "{build}: {again:?}");
+        assert!(
+            again.stdout.starts_with(&format!(
+                "{ran_line}  ran because:\n    its task is marked `cache=never`\n"
+            )),
+            "{build}: {again:?}"
+        );
+        assert_eq!(
+            again.stdout.matches(ran_line).count(),
+            1,
+            "{build}: {again:?}"
+        );
+        assert_eq!(again.stderr, "", "{build}: {again:?}");
+
+        let why = project.run("", &["why"])?;
+        assert_eq!(why.status, Some(0), "{why:?}");
+        assert!(
+            why.stdout.contains(
+                "  step 1: `cat in.txt`\n    ran because:\n      its task is marked `cache=never`\n"
+            ),
+            "{why:?}"
+        );
+    }
+    let records = project.step_records()?;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let commands: Vec<&[String]> = records
+        .iter()
+        .map(|record| record.spec.argv.as_slice())
+        .collect();
+    assert_eq!(commands, [
+        ["cat".to_owned(), "in.txt".to_owned()].as_slice()
+    ]);
+    assert_eq!(
+        records.first().map(|record| &record.reason),
+        Some(&kizz_store::RunReason::TaskCacheNever)
+    );
+    assert!(!project.root.join("deployed.txt").exists());
+    Ok(())
+}
+
 /// A later task's program that changes a cached command's input is work: pass 2
 /// starts with a line that says a task program changed a file in pass 1, runs
 /// `cat` again, and names the program as the input's last writer; the summary

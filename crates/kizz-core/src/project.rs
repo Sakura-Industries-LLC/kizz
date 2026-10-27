@@ -15,7 +15,7 @@ use crate::{
     discovery::{Discovery, KizzFile, discover},
     pool::WorkerPool,
     targets::TARGET_NAME_RULE,
-    tasks::{Task, parse_tasks},
+    tasks::{OptionProblem, Task, parse_tasks},
     warning::{Warning, location, shown},
 };
 
@@ -57,6 +57,20 @@ pub enum ConfigError {
         /// The invalid target.
         target: String,
     },
+    /// A task block has a task option that is unknown, repeated, or has a value that
+    /// the option does not accept, or a name that another task of its file has.
+    TaskOption {
+        /// The `kizz.md` that holds the block.
+        file: PathBuf,
+        /// The line of the block's opening fence, counting from 1.
+        line: usize,
+        /// The nearest heading above the block, if there is one.
+        heading: Option<String>,
+        /// The option, as the info string writes it.
+        option: String,
+        /// What is wrong with it.
+        problem: OptionProblem,
+    },
     /// A `kizz.md` has more task blocks than a task position can number.
     TooManyTasks {
         /// The file.
@@ -81,6 +95,20 @@ impl fmt::Display for ConfigError {
                     f,
                     "{}: invalid target name `{target}`: {TARGET_NAME_RULE}",
                     location(file, *line, heading.as_deref())
+                )
+            },
+            Self::TaskOption {
+                file,
+                line,
+                heading,
+                option,
+                problem,
+            } => {
+                write!(
+                    f,
+                    "{}: {}",
+                    location(file, *line, heading.as_deref()),
+                    problem.message(option)
                 )
             },
             Self::TooManyTasks { file } => {
@@ -138,8 +166,8 @@ impl fmt::Display for LoadError {
 ///
 /// [`LoadError::Root`] when `root` is not a readable directory, and
 /// [`LoadError::Config`] with every configuration error found when any `kizz.md`
-/// cannot be read or has an invalid target name, together with every discovery and
-/// parsing warning found.
+/// cannot be read or has an invalid target name or task option, together with every
+/// discovery and parsing warning found.
 pub fn load(
     root: &Path,
     pool: &WorkerPool,
@@ -348,7 +376,9 @@ mod tests {
         let warnings: Vec<String> = warnings.iter().map(ToString::to_string).collect();
         assert_eq!(warnings, [
             recursive_link_warning("a"),
-            "kizz.md:3 (Notes): this starlark block has no targets, so it is not a task".to_owned(),
+            "kizz.md:3 (Notes): this starlark block has neither targets nor a name, so it is not \
+             a task"
+                .to_owned(),
         ]);
     }
 
@@ -371,7 +401,8 @@ mod tests {
         let warnings: Vec<String> = warnings.iter().map(ToString::to_string).collect();
         assert_eq!(warnings, [
             recursive_link_warning("sub"),
-            "sub/kizz.md:3 (Sub): this starlark block has no targets, so it is not a task"
+            "sub/kizz.md:3 (Sub): this starlark block has neither targets nor a name, so it is \
+             not a task"
                 .to_owned(),
         ]);
     }

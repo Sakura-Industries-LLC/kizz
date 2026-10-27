@@ -158,11 +158,12 @@ fn fixture(root: &Path) -> io::Result<()> {
 const FIXTURE_STDERR: &str = "\
 warning: skipped the symbolic link a/up: it leads back to ., one of its own parent \
 directories, so following it would recurse
-warning: kizz.md:13 (Notes): this starlark block has no targets, so it is not a task
+warning: kizz.md:13 (Notes): this starlark block has neither targets nor a name, so it is not \
+a task
 2 warnings:
   skipped the symbolic link a/up: it leads back to ., one of its own parent directories, \
 so following it would recurse
-  kizz.md:13 (Notes): this starlark block has no targets, so it is not a task
+  kizz.md:13 (Notes): this starlark block has neither targets nor a name, so it is not a task
 ";
 
 /// `kizz list` shows every task in the default order, from hidden directories and
@@ -315,8 +316,10 @@ fn stderr_with_errors(
         "skipped the symbolic link {dir}/up: it leads back to ., one of its own parent \
          directories, so following it would recurse"
     );
-    let untagged =
-        format!("{file_and_heading}: this starlark block has no targets, so it is not a task");
+    let untagged = format!(
+        "{file_and_heading}: this starlark block has neither targets nor a name, so it is not a \
+         task"
+    );
     format!("warning: {link}\nwarning: {untagged}\n{errors}2 warnings:\n  {link}\n  {untagged}\n")
 }
 
@@ -468,4 +471,111 @@ fn warnings_are_loud() {
         .count();
     assert_eq!(styled_warnings, 2, "{run:?}");
     assert!(run.stderr.contains("1 warning:"), "{run:?}");
+}
+
+/// A `kizz.md` with task options: a task with targets and both options, a named
+/// task without targets, a task with only `cache=never` besides its target, and a
+/// block with only `cache=never`, which is untagged.
+const OPTIONS: &str = "# Options
+
+## Lint
+
+```starlark cache=never ci name=lint check
+run(\"lint\")
+```
+
+## Deploy
+
+```starlark name=deploy
+run(\"ship\")
+```
+
+## Fresh
+
+```starlark ci cache=never
+run(\"date\")
+```
+
+## Odd
+
+```starlark cache=never
+```
+";
+
+/// The warnings of [`OPTIONS`], as `kizz list` prints them on standard error.
+const OPTIONS_STDERR: &str = "\
+warning: kizz.md:23 (Odd): this starlark block has neither targets nor a name, so it is not a \
+task
+1 warning:
+  kizz.md:23 (Odd): this starlark block has neither targets nor a name, so it is not a task
+";
+
+/// `kizz list` shows each task's options in their info-string form after its
+/// targets, and a named task without targets with `[]`; a target expression never
+/// selects a task without targets.
+#[test]
+fn lists_task_options_and_named_tasks_without_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "kizz.md", OPTIONS).unwrap();
+
+    let all = list(dir.path(), &[]).unwrap();
+    assert_eq!(all.status, Some(0), "{all:?}");
+    assert_eq!(
+        all.stdout,
+        "\
+kizz.md:5 (Lint) [ci, check] name=lint cache=never
+kizz.md:11 (Deploy) [] name=deploy
+kizz.md:17 (Fresh) [ci] cache=never
+3 tasks in 1 kizz.md file.
+",
+        "{all:?}"
+    );
+    assert_eq!(all.stderr, OPTIONS_STDERR, "{all:?}");
+
+    let ci = list(dir.path(), &["ci"]).unwrap();
+    assert_eq!(ci.status, Some(0), "{ci:?}");
+    assert_eq!(
+        ci.stdout,
+        "\
+kizz.md:5 (Lint) [ci, check] name=lint cache=never
+kizz.md:17 (Fresh) [ci] cache=never
+2 of 3 tasks selected by `ci`.
+",
+        "{ci:?}"
+    );
+    assert_eq!(ci.stderr, OPTIONS_STDERR, "{ci:?}");
+
+    let named = list(dir.path(), &["deploy"]).unwrap();
+    assert_eq!(named.status, Some(0), "{named:?}");
+    assert_eq!(
+        named.stdout, "0 of 3 tasks selected by `deploy`.\n",
+        "{named:?}"
+    );
+}
+
+/// Mistakes in task options are configuration errors with status 2 that name the
+/// file, line, heading and option; a name given to two tasks of one file is one too.
+#[test]
+fn task_option_mistakes_are_configuration_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "kizz.md",
+        "# Opts\n\n```starlark ci color=red\n```\n\n```starlark name=x\n```\n\n\
+         ```starlark ci name=x\n```\n",
+    )
+    .unwrap();
+    let run = list(dir.path(), &[]).unwrap();
+    assert_eq!(run.status, Some(2), "{run:?}");
+    assert_eq!(run.stdout, "", "{run:?}");
+    assert_eq!(
+        run.stderr,
+        "\
+error: kizz.md:3 (Opts): unknown task option `color=red`: the task options are `name=<name>` \
+and `cache=never`
+error: kizz.md:9 (Opts): task option `name=x` gives a name that the task at line 6 of this \
+file already has, and a name is unique within its kizz.md
+",
+        "{run:?}"
+    );
 }

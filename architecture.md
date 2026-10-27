@@ -13,8 +13,9 @@ Anything marked *Proposed* has not been decided yet;
 * `kizz.md`: a Markdown file named exactly `kizz.md`.
   These are the only files kizz reads to find work.
 * Target: a name given on the command line, such as `ci` or `check`.
-* Task: a Starlark code block in a `kizz.md`, tagged with one or more targets.
+* Task: a Starlark code block in a `kizz.md`, tagged with one or more targets, a name, or both.
   Each task is a small program.
+* Task option: a `key=value` word in a task block's info string, such as `name=lint` or `cache=never`.
 * Step: one command that a task runs with `run()`.
   Steps are what kizz traces and caches.
 * Observation: one path a step touched, how it touched it, and the path's state when the step finished.
@@ -75,10 +76,10 @@ The open questions of earlier drafts were answered as follows:
 | Build without a target | `kizz build` with no target is an error that lists the available targets. |
 | Exit status | 0 on success, 1 when a task fails, 2 for usage or configuration errors, and 130 when interrupted. |
 | `Cargo.lock` | Committed, unlike in cbork, because kizz is a binary. |
-| Untagged blocks | A `starlark` block without targets in a `kizz.md` gets a warning, not an error. |
+| Untagged blocks | A `starlark` block with neither targets nor a name in a `kizz.md` gets a warning, not an error. |
 | Symbolic links | Discovery follows symbolic links to directories. A link that would make it recurse is skipped with a warning, and a `kizz.md` reached through several paths runs once, under the first path in sorted order. |
 | Git ignore rules | Not consulted for now. Discovery finds every `kizz.md` and uses it. |
-| Target names | Letters, digits, `_`, `.` and `-`. |
+| Target names | Letters, digits, `_`, `.` and `-`; task names use the same characters. |
 | Dotenv files | No `${VAR}` expansion. |
 | Writes from task programs | Only when the content differs. |
 | Output decoding | Task programs get output with invalid UTF-8 replaced; the cache keeps the raw bytes. |
@@ -172,7 +173,7 @@ Version 1 implements these commands:
   which are not cached by default; kizz warns about them either way (see [The Linux tracer](#the-linux-tracer)).
 * `kizz why [path]` prints why each command ran or was cached in the most recent build,
   for tasks under `path`, which defaults to the current directory.
-* `kizz list [targets]` lists discovered tasks with their file, line, name and targets, plus any discovery warnings.
+* `kizz list [targets]` lists discovered tasks with their file, line, heading, targets and options, plus any discovery warnings.
 * `kizz cache clean` removes stale entries from the shared cache, and `kizz cache reset` wipes the entries under a path,
   or the whole cache with `--all`, after confirmation (see [Cleaning up the cache](#cleaning-up-the-cache)).
 * `kizz execute --output=<file> -- <program> [arguments...]` runs any program and reports what it touched in `<file>`.
@@ -205,12 +206,12 @@ Exit status: 0 on success, 1 when a task fails, 2 for usage or configuration err
 
 ## Tasks
 
-A task is a fenced code block in a `kizz.md` whose info string is `starlark` followed by one or more target names:
+A task is a fenced code block in a `kizz.md` whose info string is `starlark` followed by targets, task options or both:
 
 ````markdown
 ## Build the library
 
-```starlark ci check
+```starlark ci check name=build
 env.inherit("PATH", "HOME")
 build = run("cargo", "build", "--locked", stream = True)
 if build.rc != 0:
@@ -219,9 +220,17 @@ if build.rc != 0:
 ````
 
 * Target names use letters, digits, `_`, `.` and `-`.
-* The nearest heading above the block names the task in output, which shows it as `path/kizz.md:LINE (Heading)`.
+* After `starlark`, a word with `=` is a task option, and any other word is a target.
+* `name=<name>` names the task, with the characters of a target name, so that `kizz run <name>` can run it.
+  Each name is unique within its `kizz.md`, and a name given to two tasks of one file is a configuration error.
+* `cache=never` makes every command of the task run on every build, as if each of its `run()` calls had `always = True`.
+* An unknown option, an option given twice, or a value that the option does not accept is a configuration error.
+* A task with a name and no targets is selected only by `kizz run`, never by `kizz build`.
+* Task options are not part of the task program, so they change no step key.
+* The nearest heading above the block is the task's heading, and output shows the task as `path/kizz.md:LINE (Heading)`.
 * A task is identified by the absolute path of its `kizz.md` and its position among the task blocks in that file.
-* A `starlark` block with no targets is not a task, and kizz warns about it because it is probably a mistake.
+* A `starlark` block with neither targets nor a name is not a task, and kizz warns about it because it is probably a mistake.
+  Its task options are still checked, so a mistake in them is still a configuration error.
 * Backtick and tilde fences are both recognized.
 * Each task is one Starlark program.
   The block's source plus every module it loads is the *task program*.
@@ -239,7 +248,7 @@ A task program runs commands, captures their output, inspects their exit codes, 
 
 * Starlark through starlark-rust, with its extended dialect so programs can use top-level `if` and `for`.
 * `fail(message)` fails the task.
-  Output from `print(...)` is shown, prefixed with the task name.
+  Output from `print(...)` is shown, prefixed with the task's name, or its heading when it has none, or its location.
 * Starlark's `json.encode` and `json.decode` are available for strings.
 * There is no sandbox: task programs read and write files, read the caller environment, and run any command.
 
@@ -364,8 +373,19 @@ and is tracked there.
 
 ### Task information
 
-`task.dir`, `task.file`, `task.line`, `task.name` (the heading), `task.targets` (the targets on the block) and `task.selected`
-(the requested targets that selected the task) describe the running task.
+These members of `task` describe the running task:
+
+* `task.dir`: the directory of its `kizz.md`, the task directory
+* `task.file`: the absolute path of its `kizz.md`
+* `task.line`: the line of the block's opening fence, counting from 1
+* `task.name`: the name that its `name=` option gives, or `None`
+* `task.heading`: the nearest heading above the block, or `None`
+* `task.targets`: the targets on the block
+* `task.selected`: the requested targets that selected the task
+* `task.args`: the task's arguments, as a list of strings, which is empty under `kizz build`
+
+`task.name` was the heading before tasks had names; the heading is now `task.heading`.
+The arguments are not part of the task program hash: they reach commands only through what the program does with them.
 
 ### Example
 
@@ -808,6 +828,8 @@ That is normally the first pass; later passes of the same build reuse its result
 A command first reached in a later pass, or with a new step key, therefore runs once in that pass.
 If it rewrites files with identical content, dependent steps see unchanged hashes and stay cached.
 If it changes content, dependent steps run again, as they should.
+Every command of a task marked `cache=never` runs as if it were marked `always`, and its reason names the task option.
+Nothing makes such a command cached.
 
 ### Cleaning up the cache
 
@@ -854,6 +876,7 @@ These are the reasons:
   a command or task program of an earlier build, or something outside kizz
 * the machine state that the step names changed: each changed value, old and new
 * the command is marked `always`
+* its task is marked `cache=never`
 * the previous run could not be cached, and why
 
 When a step re-runs because of a file that it, or another step, writes on every build, the explanation says so directly,

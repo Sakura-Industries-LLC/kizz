@@ -195,13 +195,21 @@ pub(crate) fn print_warning_summary(warnings: &[String]) {
     }
 }
 
-/// Print one task as `path/kizz.md:LINE (Heading) [targets]`.
+/// Print one task as `path/kizz.md:LINE (Heading) [targets]`, followed by its task
+/// options in their info-string form, such as `name=lint cache=never`, when it has
+/// any; a task without targets shows `[]`.
 pub(crate) fn print_task(
     location: &str,
     targets: &[String],
+    options: &[String],
 ) {
+    let options = if options.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", style(options.join(" ")).magenta())
+    };
     out(format_args!(
-        "{} {}\n",
+        "{} {}{options}\n",
         style(location).bold(),
         style(format!("[{}]", targets.join(", "))).cyan()
     ));

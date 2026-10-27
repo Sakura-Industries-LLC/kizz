@@ -145,7 +145,7 @@ mod tests {
     use kizz_store::TaskId;
 
     use super::{TargetExpr, TargetExprError, is_valid_target};
-    use crate::tasks::Task;
+    use crate::tasks::{Task, TaskOptions};
 
     /// A task in `kizz.md` at `index`, tagged with `targets`.
     fn task(
@@ -161,6 +161,7 @@ mod tests {
             line: 1,
             heading: None,
             targets: targets.iter().map(|&target| target.to_owned()).collect(),
+            options: TaskOptions::default(),
             source: String::new(),
         }
     }

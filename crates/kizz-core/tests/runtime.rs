@@ -187,7 +187,8 @@ impl Fixture {
         Ok(TaskInfo::new(task, &["ci".to_owned()])?)
     }
 
-    /// A task named `Build it`, tagged `ci check`, whose block is `source`.
+    /// A task with the heading `Build it` and no name, tagged `ci check`, whose block
+    /// is `source`.
     fn block(
         &self,
         source: &str,
@@ -520,7 +521,8 @@ fn result_attributes_follow_the_capture_mode() -> TestResult {
 }
 
 /// Top-level `if` and `for` work, `json.encode` and `json.decode` are available,
-/// and `print` output is prefixed with the task name, one line at a time.
+/// and `print` output is prefixed with the task's heading when it has no name, or
+/// with its location when it has neither, one line at a time.
 #[test]
 fn extended_dialect_json_and_prefixed_print() -> TestResult {
     let fixture = Fixture::new()?;
@@ -581,14 +583,16 @@ fn starlark_errors_fail_the_task_with_message_and_stack() -> TestResult {
     Ok(())
 }
 
-/// `task` describes the running task, in the block and in module functions.
+/// `task` describes the running task, in the block and in module functions: a task
+/// without `name=` has the name `None` and its heading as `task.heading`, and
+/// `task.args` is an empty list under a build.
 #[test]
 fn task_values_match_the_task() -> TestResult {
     let fixture = Fixture::new()?;
-    fixture.write("lib/info.star", "def heading():\n    return task.name\n")?;
+    fixture.write("lib/info.star", "def heading():\n    return task.heading\n")?;
     let task = fixture.block(
         "load(\"lib/info.star\", \"heading\")\nprint(task.dir)\nprint(task.file)\nprint(task.line, \
-         task.name, heading())\nprint(task.targets, task.selected)\n",
+         task.name, task.heading, heading())\nprint(task.targets, task.selected, task.args)\n",
     )?;
     let (result, printed) = run(task, &FakeExecutor::new())?;
     result?;
@@ -596,14 +600,82 @@ fn task_values_match_the_task() -> TestResult {
     assert_eq!(printed, [
         format!("Build it: {dir}"),
         format!("Build it: {dir}/kizz.md"),
-        "Build it: 3 Build it Build it".to_owned(),
-        "Build it: [\"ci\", \"check\"] [\"ci\"]".to_owned(),
+        "Build it: 3 None Build it Build it".to_owned(),
+        "Build it: [\"ci\", \"check\"] [\"ci\"] []".to_owned(),
     ]);
 
-    let task = fixture.task("```starlark ci\nprint(task.name)\n```\n")?;
+    let task = fixture.task("```starlark ci\nprint(task.name, task.heading)\n```\n")?;
     let (result, printed) = run(task, &FakeExecutor::new())?;
     result?;
-    assert_eq!(printed, ["kizz.md:1: None"]);
+    assert_eq!(printed, ["kizz.md:1: None None"]);
+    Ok(())
+}
+
+/// `task.name` is the name that `name=` gives, in the block and in module
+/// functions, and `print` output is prefixed with the name, not the heading; a
+/// named task without a heading has the heading `None`.
+#[test]
+fn task_names_come_from_the_name_option() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("lib/info.star", "def name():\n    return task.name\n")?;
+    let task = fixture.task(
+        "# Lint everything\n\n```starlark ci name=lint cache=never\nload(\"lib/info.star\", \
+         \"name\")\nprint(task.name, name(), task.heading)\nprint(task.targets, task.args)\n```\n",
+    )?;
+    assert_eq!(task.name.as_deref(), Some("lint"));
+    assert_eq!(task.heading.as_deref(), Some("Lint everything"));
+    assert!(task.cache_never);
+    assert_eq!(task.args, Vec::<String>::new());
+    let (result, printed) = run(task, &FakeExecutor::new())?;
+    result?;
+    assert_eq!(printed, [
+        "lint: lint lint Lint everything",
+        "lint: [\"ci\"] []",
+    ]);
+
+    let task = fixture.task("```starlark name=deploy\nprint(task.name, task.heading)\n```\n")?;
+    let (result, printed) = run(task, &FakeExecutor::new())?;
+    result?;
+    assert_eq!(printed, ["deploy: deploy None"]);
+    Ok(())
+}
+
+/// `task.args` is a list of strings that a program can read like any list, and
+/// is empty under a build, which runs a task with no arguments.
+#[test]
+fn task_args_are_an_empty_list_under_a_build() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task =
+        fixture.block("print(type(task.args), len(task.args))\nrun(\"tool\", *task.args)\n")?;
+    assert_eq!(task.args, Vec::<String>::new());
+    let executor = FakeExecutor::new();
+    let (result, printed) = run(task, &executor)?;
+    result?;
+    assert_eq!(printed, ["Build it: list 0"]);
+    let argv: Vec<Vec<String>> = executor.steps().into_iter().map(|step| step.argv).collect();
+    assert_eq!(argv, [vec!["tool".to_owned()]]);
+    Ok(())
+}
+
+/// Task options and arguments are not part of the task program, so adding `name=`
+/// or `cache=never` to a block, or giving it arguments, keeps its program hash.
+#[test]
+fn task_options_and_arguments_keep_the_program_hash() -> TestResult {
+    let fixture = Fixture::new()?;
+    let source = "run(\"tool\")\n";
+    let plain = hash(fixture.task(&format!("# T\n\n```starlark ci\n{source}```\n")))?;
+    for info in [
+        "ci name=tool",
+        "ci cache=never",
+        "name=tool cache=never",
+        "cache=never ci name=x",
+    ] {
+        let options = hash(fixture.task(&format!("# T\n\n```starlark {info}\n{source}```\n")))?;
+        assert_eq!(options, plain, "{info}");
+    }
+    let mut task = fixture.task(&format!("# T\n\n```starlark ci\n{source}```\n"))?;
+    task.args = vec!["a".to_owned(), "b".to_owned()];
+    assert_eq!(hash(Ok(task))?, plain);
     Ok(())
 }
 

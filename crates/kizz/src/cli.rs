@@ -195,7 +195,7 @@ pub enum Command {
         path: Option<PathBuf>,
     },
 
-    /// List the discovered tasks with their file, line, name and targets.
+    /// List the discovered tasks with their file, line, heading, targets and options.
     #[bpaf(command)]
     List {
         /// Show only the tasks of these targets, joined with `+`.

@@ -132,8 +132,10 @@ fn tree_options(path: PathBuf) -> Options {
 /// current values. Version 17 adds the machine state that a command started with to
 /// every step record, the `machine` names to the step specification, the machine
 /// state values that a cache check finds changed, and the reasons that name a change
-/// of the `machine` names or of the machine state.
-pub const SCHEMA_VERSION: u32 = 17;
+/// of the `machine` names or of the machine state. Version 18 adds the reason of a
+/// command that runs because its task is marked `cache=never`, to step records and
+/// to the explanations of step positions.
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -966,11 +968,11 @@ mod tests {
         }
     }
 
-    /// Version 17 adds the machine state of step records, one more than version 16,
-    /// which added the cache identity.
+    /// Version 18 adds the reason of a command whose task is marked `cache=never`,
+    /// one more than version 17, which added the machine state of step records.
     #[test]
-    fn schema_version_17_records_machine_state() {
-        assert_eq!(SCHEMA_VERSION, 17);
+    fn schema_version_18_records_the_task_cache_never_reason() {
+        assert_eq!(SCHEMA_VERSION, 18);
     }
 
     /// The store's thresholds keep write pacing from running: `SurrealKV` paces a

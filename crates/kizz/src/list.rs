@@ -51,7 +51,11 @@ pub(crate) fn run(targets: Option<&str>) -> ExitCode {
     if let Some(expression) = expression {
         let selected = expression.select(&project.tasks);
         for chosen in &selected {
-            ui::print_task(&chosen.task.location(), &chosen.task.targets);
+            ui::print_task(
+                &chosen.task.location(),
+                &chosen.task.targets,
+                &chosen.task.options.words(),
+            );
         }
         ui::print_summary(&format!(
             "{} of {all} selected by `{expression}`.",
@@ -59,7 +63,7 @@ pub(crate) fn run(targets: Option<&str>) -> ExitCode {
         ));
     } else {
         for task in &project.tasks {
-            ui::print_task(&task.location(), &task.targets);
+            ui::print_task(&task.location(), &task.targets, &task.options.words());
         }
         ui::print_summary(&format!(
             "{all} in {}.",

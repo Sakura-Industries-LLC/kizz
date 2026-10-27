@@ -33,7 +33,9 @@
 //! `always` runs at most once per build, when a pass first reaches it, normally the
 //! first one, because the engine runs each `always` step key once per build; later
 //! passes reuse its result, and one first reached in a later pass, or with a new step
-//! key, runs once in that pass.
+//! key, runs once in that pass. Every command of a task marked `cache=never` runs
+//! the same way, because the engine runs it as if it were marked `always`; a task
+//! with a name and no targets is never selected, because selection goes by targets.
 //!
 //! When a task program ends, whether it succeeded or failed, each step it left
 //! unchecked, which exited with a non-zero code or was killed by a signal, had no
@@ -115,7 +117,7 @@ pub fn task_label(task: &TaskInfo) -> TaskLabel {
     TaskLabel {
         task: task_id(task),
         line: u32::try_from(task.line).unwrap_or(u32::MAX),
-        heading: task.name.clone(),
+        heading: task.heading.clone(),
     }
 }
 
@@ -423,7 +425,10 @@ impl Builder<'_> {
         let (result, decisions, keys, exits) = match load.program {
             Err(failure) => (Err(failure), Vec::new(), Vec::new(), Vec::new()),
             Ok(program) => {
-                let steps = self.engine.task_for(TaskIdentity::of(&program));
+                let steps = self
+                    .engine
+                    .task_for(TaskIdentity::of(&program))
+                    .with_cache_never(task.cache_never);
                 let executor = CancelGuard {
                     steps: &steps,
                     engine: self.engine,
