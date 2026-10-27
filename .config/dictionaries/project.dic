@@ -9,6 +9,7 @@ cachyos
 CBOR
 cbork
 chdir
+CLICOLOR
 CLOEXEC
 cmark
 cowextsize

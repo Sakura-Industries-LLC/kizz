@@ -40,7 +40,7 @@ pub struct Cli {
     #[bpaf(long, argument("auto|always|never"), fallback(ColorMode::Auto))]
     pub color: ColorMode,
 
-    /// Suppress the banner and other non-essential output.
+    /// Suppress the banner.
     #[bpaf(long)]
     pub quiet: bool,
 
