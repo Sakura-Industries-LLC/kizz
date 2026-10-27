@@ -9,7 +9,7 @@ The guide explains what kizz is and how to use it, from a first `kizz.md` to obs
 ## Pages
 
 * [What kizz is](@/guide/what-is-kizz.md): what kizz does, its philosophy, and what it is not.
-* [Getting started](@/guide/getting-started.md): a first `kizz.md` and a first build.
+* [Getting started](@/guide/getting-started.md): what kizz needs, how to build it, and a first `kizz.md`, build and run.
 * [The kizz.md file](@/guide/kizz-md.md): how tasks are written and tagged with targets and options.
 * [Caching](@/guide/caching.md): how kizz decides that a command can be skipped, and how to change that.
 * [Recommended usage](@/guide/recommended-usage.md): how to lay out tasks and targets in a project.
