@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+{% set root = get_section(path="_index.md") %}
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="{{ config.description }}">
+    <title>{% block title %}{{ config.title }}{% endblock title %}</title>
+    <link rel="stylesheet" href="{{ root.permalink }}style.css">
+</head>
+<body>
+    <header class="site-header">
+        <a class="site-title" href="{{ root.permalink }}">{{ config.title }}</a>
+    </header>
+    <div class="layout">
+        <nav class="site-nav">
+            <ul>
+                {% for sub_path in root.subsections %}
+                {% set sub = get_section(path=sub_path) %}
+                <li>
+                    <a href="{{ sub.permalink }}">{{ sub.title }}</a>
+                    <ul>
+                        {% for item in sub.pages %}
+                        <li>
+                            <a href="{{ item.permalink }}">{% if item.title %}{{ item.title }}{% else %}{{ item.slug }}{% endif %}</a>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </li>
+                {% endfor %}
+            </ul>
+        </nav>
+        <main class="content">
+            {% block content %}{% endblock content %}
+        </main>
+    </div>
+</body>
+</html>

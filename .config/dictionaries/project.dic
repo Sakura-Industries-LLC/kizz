@@ -82,6 +82,9 @@ EMSGSIZE
 EMULTIHOP
 ENAMETOOLONG
 ENAVAIL
+endblock
+endfor
+endif
 ENETDOWN
 ENETRESET
 ENETUNREACH
@@ -250,6 +253,7 @@ mknodat
 mmap
 MMSG
 mmsghdr
+monospace
 msghdr
 msgqueue
 namelen
@@ -272,6 +276,7 @@ opendir
 openpt
 osrelease
 pagable
+permalink
 phentsize
 phnum
 phoff
@@ -360,6 +365,7 @@ startswith
 statfs
 statvfs
 statx
+stylesheet
 subshell
 SurrealKV
 swapoff
@@ -402,6 +408,7 @@ utsname
 vfork
 vforked
 vforks
+viewport
 waitid
 waitpid
 WEXITED
@@ -422,3 +429,4 @@ WUNTRACED
 xattr
 xattrat
 xxhash
+zola

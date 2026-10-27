@@ -16,7 +16,7 @@ fix: sort-dictionary
     cargo +nightly fmt --all
     rumdl check --fix .
 
-# Check formatting, lints, tests, docs, Markdown and spelling. Changes nothing.
+# Check formatting, lints, tests, docs, Markdown, spelling and the documentation site. Changes no tracked file.
 check:
     cargo +nightly fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -24,6 +24,7 @@ check:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     rumdl check .
     cspell lint --config cspell.json --no-progress .
+    zola --root docs build
 
 # CI: sort the dictionary, run the checks, check licenses, then build.
 check-ci: sort-dictionary
@@ -33,6 +34,7 @@ check-ci: sort-dictionary
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     rumdl check .
     cspell lint --config cspell.json --no-progress .
+    zola --root docs build
     cargo deny check advisories || true
     cargo deny check bans licenses sources
     cargo build --workspace --release

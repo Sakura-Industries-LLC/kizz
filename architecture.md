@@ -1186,6 +1186,10 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
   Case variants collapse into one entry, so add only the canonical form.
 * Tests never use the real cache: every test that runs the engine sets `KIZZ_CACHE_DIR` to a temporary directory.
 * `Cargo.lock` is committed, unlike in cbork, because kizz is a binary.
+* The documentation site is a Zola site in `docs/`, with its own templates and styles and no theme, framework or script.
+  `zola --root docs build` builds it into `docs/public/`, which Git ignores, and fails on a broken internal link.
+  Its pages link to each other with Zola's `@/` links, so the build checks every one, and external links are not checked.
+  The Markdown and spelling checks cover its pages, front matter included.
 * `vendor/surrealkv` holds SurrealKV 1.0.0 with kizz's patch, which `[patch.crates-io]` uses instead of the published crate.
   The workspace excludes it, and the format, Markdown and spelling checks skip it.
   Only the changes that `vendor/surrealkv/KIZZ-PATCHES.md` lists may differ from the published crate.
@@ -1210,7 +1214,7 @@ fix: sort-dictionary
     cargo +nightly fmt --all
     rumdl check --fix .
 
-# Check formatting, lints, tests, docs, Markdown and spelling. Changes nothing.
+# Check formatting, lints, tests, docs, Markdown, spelling and the documentation site. Changes no tracked file.
 check:
     cargo +nightly fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -1218,6 +1222,7 @@ check:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     rumdl check .
     cspell lint --config cspell.json --no-progress .
+    zola --root docs build
 
 # CI: sort the dictionary, run the checks, check licenses, then build.
 check-ci: sort-dictionary
@@ -1227,6 +1232,7 @@ check-ci: sort-dictionary
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
     rumdl check .
     cspell lint --config cspell.json --no-progress .
+    zola --root docs build
     cargo deny check advisories || true
     cargo deny check bans licenses sources
     cargo build --workspace --release
@@ -1236,7 +1242,7 @@ fix-ci: fix check-ci
 ```
 
 * `fix` fixes: it runs every automated fixer, the formatters and anything else that can be fixed automatically.
-* `check` checks and changes nothing.
+* `check` checks and changes no tracked file; it builds the documentation site into the ignored `docs/public/`.
 * `check-ci` checks and builds: it sorts the dictionary, as decided, runs the checks, checks licenses,
   and builds the release binaries.
   No recipe passes `--locked`, so Cargo creates and refreshes `Cargo.lock` as needed.

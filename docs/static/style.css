@@ -1,0 +1,136 @@
+/* The documentation site's only style sheet: system fonts, no imports, nothing from another host. */
+
+:root {
+    --text: #1d1f21;
+    --muted: #5c6166;
+    --background: #fff;
+    --surface: #f4f5f6;
+    --border: #d6d9dc;
+    --link: #1a5fb4;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --text: #e6e6e6;
+        --muted: #a0a4a8;
+        --background: #16181a;
+        --surface: #202326;
+        --border: #3a3e42;
+        --link: #8cb4ff;
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html {
+    color: var(--text);
+    background: var(--background);
+    font-family: system-ui, sans-serif;
+    font-size: 100%;
+    line-height: 1.6;
+}
+
+body {
+    margin: 0;
+}
+
+a {
+    color: var(--link);
+}
+
+.site-header {
+    padding: 0.75rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.site-title {
+    font-size: 1.25rem;
+    font-weight: bold;
+    text-decoration: none;
+}
+
+.layout {
+    display: flex;
+    gap: 2rem;
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: 1.5rem;
+}
+
+.site-nav {
+    flex: 0 0 14rem;
+    font-size: 0.95rem;
+}
+
+.site-nav ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.site-nav > ul > li {
+    margin-bottom: 1rem;
+}
+
+.site-nav > ul > li > a {
+    font-weight: bold;
+}
+
+.site-nav ul ul {
+    margin-top: 0.25rem;
+    padding-left: 0.75rem;
+    border-left: 1px solid var(--border);
+}
+
+.content {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+code,
+pre {
+    font-family: ui-monospace, monospace;
+    font-size: 0.9em;
+}
+
+code {
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+    background: var(--surface);
+}
+
+pre {
+    overflow-x: auto;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+}
+
+pre code {
+    padding: 0;
+    background: none;
+}
+
+table {
+    border-collapse: collapse;
+}
+
+th,
+td {
+    padding: 0.3rem 0.6rem;
+    border: 1px solid var(--border);
+    text-align: left;
+}
+
+@media (max-width: 48rem) {
+    .layout {
+        flex-direction: column;
+    }
+
+    .site-nav {
+        flex-basis: auto;
+    }
+}
