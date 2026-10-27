@@ -48,7 +48,8 @@
 //! * [`build`](mod@build): building the selected tasks in passes, in the default or
 //!   learned order, until a pass does no work, with failure handling and the pass limit.
 //! * [`run`](mod@run): running one task by its name for `kizz run`, once, with its
-//!   arguments, the nearest task of the name winning.
+//!   arguments, the nearest task of the name winning, and the observation report of `kizz
+//!   run --output`.
 //! * [`cleanup`]: the entries `kizz cache clean` removes because their files are gone,
 //!   and the entries `kizz cache reset` wipes for the tasks under a path.
 //! * [`pool`]: the worker pool that runs a command's parallel work, whose threads start
@@ -103,10 +104,11 @@ pub use explain::{
     Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
     changed_inputs, spec_reasons,
 };
-pub use files::{ChangedFile, FileChanges, FileError, Files, stable_json};
+pub use files::{AccessOutcomes, ChangedFile, FileChanges, FileError, Files, stable_json};
 pub use key::{KeyError, Occurrences, STEP_KEY_CONTEXT, step_key};
 pub use lookup::{
     NoPathError, PATH_VARIABLE, ProgramLookup, ProgramSearch, find_program, search_program,
+    search_step_program,
 };
 pub use observe::{
     HashCounter, Observed, access_bits, changed_after_read, is_kernel_path, kernel_links, observe,
@@ -120,7 +122,7 @@ pub use report::{
     CommandInput, CommandOutcome, Execution, JSON_FIELDS, JsonField, Report, ReportFormat,
     ReportMode, TaskProgramInput,
 };
-pub use run::{NameError, RunReport, run, select_by_name, task_level};
+pub use run::{NameError, RunObservations, RunReport, run, select_by_name, task_level};
 pub use runtime::{
     PrintSink, ProgramHash, ProgramLoad, ProgramParts, TaskFailure, TaskInfo, TaskProgram, TaskRun,
     UncheckedExit, UnexpectedExit,

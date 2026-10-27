@@ -57,6 +57,16 @@
 //! [`Engine::with_echo_every_step`], every command's output is echoed live, as if
 //! every `run()` had `stream = True`; the option is in no step key or record.
 //!
+//! Observation reports ("Running one task with `kizz run`"): with
+//! [`Engine::with_report`] (`kizz run --output`), every request asks the tracer for
+//! the process tree, and each run of a task program keeps, in the order its steps
+//! came, the [`CommandInput`] of each step ([`TaskSteps::commands`]): a step that
+//! ran, or whose program kizz did not find, with its outcome, its tree, and every
+//! location that the lookup checked with its outcome, named through the tracer's
+//! error-name query; and a cache hit as cached, with its recorded outcome and no
+//! observations. Without it, as in every build, no request asks for the tree and
+//! nothing more is kept. The option is in no step key or record.
+//!
 //! Results that are not cached ("Results that are not cached"): a command killed by
 //! a signal, every run that returns once cancellation has been requested, whether a
 //! signal ended it or it exited with a code after it handled the interrupt, a run
@@ -152,22 +162,25 @@ use kizz_store::{
 use kizz_threads::{LOCK_PATIENCE, LockError};
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    FirstReads, MachineState, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, MachineState, Observations, ProcessTree, RunRequest, RunResult, Termination,
+    TraceError, Tracer,
 };
 
 use crate::{
     cells,
     check::{Checked, check},
+    execute::run_tree,
     explain::{
         Baseline, InputContext, RepeatedWarning, StepDecision, TaskIdentity, carried_from,
         changed_inputs, spec_reasons,
     },
     files::FileChanges,
     key::Occurrences,
-    lookup::{ProgramLookup, find_program},
+    lookup::{ProgramLookup, search_step_program},
     observe::{changed_after_read, observe},
     patterns::PathPatterns,
     pool::WorkerPool,
+    report::{CommandInput, CommandOutcome, Execution},
     runtime::ProgramHash,
     states::FileStates,
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
@@ -219,6 +232,16 @@ impl LiveOutput {
     ) -> bool {
         step.stream || matches!(self, Self::Every)
     }
+}
+
+/// What the engine keeps of each command for an observation report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportKeeping {
+    /// Nothing, and no request asks for the process tree, as in a build.
+    Nothing,
+    /// The command of each step, with its outcome, its process tree and the
+    /// lookup's observations, as `kizz run --output` asks.
+    Commands,
 }
 
 /// The identity of the most recent build this process started, so every build
@@ -334,6 +357,10 @@ pub struct Engine<'a> {
     /// had `stream = True`, as `kizz run` asks, or only that of a `run()` with
     /// `stream = True`.
     live_output: LiveOutput,
+    /// Whether every request asks for the process tree and each task run keeps the
+    /// commands of its steps for the observation report, as `kizz run --output`
+    /// asks.
+    report: ReportKeeping,
 }
 
 impl fmt::Debug for Engine<'_> {
@@ -361,6 +388,7 @@ impl fmt::Debug for Engine<'_> {
             .field("lock_patience", &self.lock_patience)
             .field("no_cache", &self.no_cache)
             .field("live_output", &self.live_output)
+            .field("report", &self.report)
             .finish_non_exhaustive()
     }
 }
@@ -437,6 +465,7 @@ impl<'a> Engine<'a> {
             lock_patience: LOCK_PATIENCE,
             no_cache: false,
             live_output: LiveOutput::Streamed,
+            report: ReportKeeping::Nothing,
         }
     }
 
@@ -517,6 +546,36 @@ impl<'a> Engine<'a> {
             LiveOutput::Streamed
         };
         self
+    }
+
+    /// The engine, which asks the tracer for the process tree of every command and
+    /// keeps the commands of each task run for the observation report when `report`
+    /// is set, as `kizz run --output` asks (see [`TaskSteps::commands`]). Without
+    /// it, no request asks for the tree and nothing more is kept. The option is in
+    /// no step key or record.
+    #[must_use]
+    pub const fn with_report(
+        mut self,
+        report: bool,
+    ) -> Self {
+        self.report = if report {
+            ReportKeeping::Commands
+        } else {
+            ReportKeeping::Nothing
+        };
+        self
+    }
+
+    /// Whether the engine keeps what the observation report needs.
+    #[must_use]
+    pub const fn reports(&self) -> bool {
+        matches!(self.report, ReportKeeping::Commands)
+    }
+
+    /// The tracer that runs the commands, whose error-name query names the
+    /// outcomes of a report.
+    pub(crate) fn tracer(&self) -> &'a dyn Tracer {
+        self.tracer
     }
 
     /// The runs of the build that made system calls that the tracer does not know,
@@ -715,6 +774,7 @@ impl<'a> Engine<'a> {
             decisions: Cell::new(Vec::new()),
             cached_positions: Cell::new(Vec::new()),
             cache_never: false,
+            commands: Cell::new(Vec::new()),
             events: &NoStepEvents,
         }
     }
@@ -738,6 +798,7 @@ impl<'a> Engine<'a> {
             decisions: Cell::new(Vec::new()),
             cached_positions: Cell::new(Vec::new()),
             cache_never: false,
+            commands: Cell::new(Vec::new()),
             events: &NoStepEvents,
         }
     }
@@ -804,6 +865,10 @@ pub struct TaskSteps<'a> {
     /// Whether the task is marked `cache=never`, so every step runs as if it were
     /// marked `always`.
     cache_never: bool,
+    /// The command of each step of the run that reached a decision, in order, with
+    /// its step key, kept for the observation report only when the engine writes
+    /// one ([`Engine::with_report`]).
+    commands: Cell<Vec<(StepKey, CommandInput)>>,
     /// Follows the steps as they start or come from the cache.
     events: &'a dyn StepEvents,
 }
@@ -1011,6 +1076,19 @@ fn missing_program_message(
     }
 }
 
+/// The message of a step whose found program the tracer reports as missing or not
+/// executable, as `error` says, with the locations `checked` that the lookup
+/// checked, when it checked any.
+fn missing_message(
+    error: &TraceError,
+    checked: Option<&str>,
+) -> String {
+    match checked {
+        None => error.to_string(),
+        Some(list) => format!("{error}; checked {list}"),
+    }
+}
+
 /// The capture mode as the store records it.
 const fn capture(mode: CaptureMode) -> Capture {
     match mode {
@@ -1063,16 +1141,17 @@ const fn step_exit(termination: Termination) -> StepExit {
 
 /// The request that runs `step` with the found program `program`: its exact
 /// arguments, environment, working directory, `stdin`, capture mode and echo,
-/// which `live_output` decides, without the process tree, which a build never asks
-/// for.
+/// which `live_output` decides, with the process tree only when `tree` is set,
+/// which a build never asks for and `kizz run --output` does.
 fn run_request(
     step: &StepSpec,
     program: AbsolutePath,
     live_output: LiveOutput,
+    tree: bool,
 ) -> RunRequest {
     RunRequest {
         program,
-        args: step.argv.iter().map(OsString::from).collect(),
+        args: step_argv(step),
         env: step
             .env
             .iter()
@@ -1082,8 +1161,68 @@ fn run_request(
         stdin: step.stdin.as_ref().map(|text| text.as_bytes().to_vec()),
         capture: step.capture,
         echo: live_output.echoes(step),
-        tree: false,
+        tree,
         terminal: false,
+    }
+}
+
+/// The arguments of `step`, starting with its program as given.
+fn step_argv(step: &StepSpec) -> Vec<OsString> {
+    step.argv.iter().map(OsString::from).collect()
+}
+
+/// The command of `step`, which ran, or whose program kizz did not find, for the
+/// observation report: with the found program `program`, if any, how it ended,
+/// the tracer's `tree`, or `None` when kizz started no process, and the lookup's
+/// observations `lookup`.
+fn ran_command(
+    step: &StepSpec,
+    program: Option<AbsolutePath>,
+    outcome: CommandOutcome,
+    tree: Option<ProcessTree>,
+    lookup: Observations,
+) -> CommandInput {
+    CommandInput {
+        argv: step_argv(step),
+        program,
+        cwd: step.cwd.clone(),
+        execution: Execution::Ran {
+            outcome,
+            tree,
+            lookup,
+        },
+    }
+}
+
+/// The command of `step`, a cache hit on `record`, for the observation report:
+/// cached, with the recorded program and outcome, and no observations.
+fn cached_command(
+    step: &StepSpec,
+    record: &StepRecord,
+) -> CommandInput {
+    CommandInput {
+        argv: step_argv(step),
+        program: record
+            .program
+            .as_ref()
+            .and_then(|program| AbsolutePath::new(&program.0).ok()),
+        cwd: step.cwd.clone(),
+        execution: Execution::Cached {
+            outcome: recorded_outcome(record),
+        },
+    }
+}
+
+/// How the run that `record` recorded ended, as a report names it, with the
+/// recorded failure as the message of a command that did not start.
+fn recorded_outcome(record: &StepRecord) -> CommandOutcome {
+    let failure = || record.failure.clone().unwrap_or_default();
+    match record.exit {
+        StepExit::Exited { code } => CommandOutcome::Exited(code),
+        StepExit::Signaled { signal } => CommandOutcome::Signaled(signal),
+        StepExit::ProgramNotFound => CommandOutcome::NotFound(failure()),
+        StepExit::ProgramNotExecutable => CommandOutcome::NotExecutable(failure()),
+        StepExit::NotStarted => CommandOutcome::StartFailed(failure()),
     }
 }
 
@@ -1145,6 +1284,74 @@ impl TaskSteps<'_> {
     #[must_use]
     pub fn decisions(&self) -> Vec<StepDecision> {
         cells::cloned(&self.decisions)
+    }
+
+    /// The command of each step so far that reached a decision, in order, for the
+    /// observation report: a step that ran, or whose program kizz did not find,
+    /// with its outcome, its process tree and the lookup's observations, and a step
+    /// that came from the cache as cached. Empty unless the engine writes a report
+    /// ([`Engine::with_report`]).
+    #[must_use]
+    pub fn commands(&self) -> Vec<CommandInput> {
+        cells::update(&self.commands, |commands| {
+            commands
+                .iter()
+                .map(|(_, command)| command.clone())
+                .collect()
+        })
+    }
+
+    /// Keep the command that `command` makes, the command of the step `key`, for
+    /// the observation report, when the engine writes one; otherwise make nothing.
+    fn keep(
+        &self,
+        key: StepKey,
+        command: impl FnOnce() -> CommandInput,
+    ) {
+        if self.engine.reports() {
+            let command = command();
+            cells::update(&self.commands, |commands| commands.push((key, command)));
+        }
+    }
+
+    /// The command of `step`, whose key is `key`, which returns `result` again
+    /// without running, for the observation report: cached, with the program and
+    /// outcome of the latest command of the run under the same key, or else with
+    /// the outcome of `result` and no program; a failure then reads as a start
+    /// that failed, with its message.
+    fn replayed_command(
+        &self,
+        key: StepKey,
+        step: &StepSpec,
+        result: &Result<StepOutcome, StepError>,
+    ) -> CommandInput {
+        let earlier = cells::update(&self.commands, |commands| {
+            commands
+                .iter()
+                .rev()
+                .find(|(kept, _)| *kept == key)
+                .map(|(_, command)| command.clone())
+        });
+        let (program, outcome) = match earlier {
+            Some(CommandInput {
+                program,
+                execution: Execution::Cached { outcome } | Execution::Ran { outcome, .. },
+                ..
+            }) => (program, outcome),
+            None => {
+                let outcome = match result {
+                    Ok(outcome) => CommandOutcome::from_termination(outcome.termination),
+                    Err(error) => CommandOutcome::StartFailed(error.to_string()),
+                };
+                (None, outcome)
+            },
+        };
+        CommandInput {
+            argv: step_argv(step),
+            program,
+            cwd: step.cwd.clone(),
+            execution: Execution::Cached { outcome },
+        }
     }
 
     /// End the run of the task: store the step positions of its cached steps, add
@@ -1644,16 +1851,21 @@ impl TaskSteps<'_> {
     }
 
     /// Run `step` with the found program `program`; `checked` holds the locations
-    /// the lookup checked, and `machine` the machine state the command starts with.
+    /// the lookup checked, `lookup` the same locations with their outcomes when the
+    /// engine writes a report, and `machine` the machine state the command starts
+    /// with. When the engine writes a report, the request asks for the process
+    /// tree, and the step's command is kept with its outcome, tree and lookup.
     fn run(
         &self,
         step: &StepSpec,
         pending: &Pending,
         program: AbsolutePath,
         checked: Accesses,
+        lookup: Observations,
         machine: MachineStateRecord,
     ) -> Result<StepOutcome, StepError> {
-        let request = run_request(step, program.clone(), self.engine.live_output);
+        let tree = self.engine.reports();
+        let request = run_request(step, program.clone(), self.engine.live_output, tree);
         let ran_at = SystemTime::now();
         let started = Instant::now();
         let result = self
@@ -1662,6 +1874,14 @@ impl TaskSteps<'_> {
             .run(&request, self.engine.echo, &self.engine.cancel);
         let duration = started.elapsed();
         let lookup_checked = (!checked.is_empty()).then(|| checked_list(&checked));
+        self.keep_run(
+            step,
+            pending,
+            &request,
+            &result,
+            lookup_checked.as_deref(),
+            lookup,
+        );
         let mut accesses = checked;
         match result {
             Ok(result) => {
@@ -1699,10 +1919,7 @@ impl TaskSteps<'_> {
                 } else {
                     StepExit::ProgramNotExecutable
                 };
-                let message = match lookup_checked {
-                    None => error.to_string(),
-                    Some(list) => format!("{error}; checked {list}"),
-                };
+                let message = missing_message(&error, lookup_checked.as_deref());
                 self.store(step, pending, Finished {
                     program: Some(program),
                     accesses,
@@ -1744,6 +1961,49 @@ impl TaskSteps<'_> {
             },
             Err(error) => Err(StepError::new(&error)),
         }
+    }
+
+    /// Keep the command of `step`, which ran as `request` and gave `result`, for
+    /// the observation report, when the engine writes one: with how it ended, its
+    /// process tree, which [`run_tree`] completes with everything that the run
+    /// reports, or the tree of the tracer's error, and the lookup's observations
+    /// `lookup`. A missing or non-executable program's message names the
+    /// locations `checked`, as the step's failure does.
+    fn keep_run(
+        &self,
+        step: &StepSpec,
+        pending: &Pending,
+        request: &RunRequest,
+        result: &Result<RunResult, TraceError>,
+        checked: Option<&str>,
+        lookup: Observations,
+    ) {
+        self.keep(pending.key, || {
+            let (outcome, tree) = match result {
+                Ok(result) => {
+                    (
+                        CommandOutcome::from_termination(result.termination),
+                        Some(run_tree(request, result)),
+                    )
+                },
+                Err(error) => {
+                    let outcome = match error {
+                        TraceError::ProgramNotFound { .. } => {
+                            CommandOutcome::NotFound(missing_message(error, checked))
+                        },
+                        TraceError::ProgramNotExecutable { .. } => {
+                            CommandOutcome::NotExecutable(missing_message(error, checked))
+                        },
+                        TraceError::StartFailed { .. } => {
+                            CommandOutcome::StartFailed(error.to_string())
+                        },
+                        TraceError::Tracer { .. } => CommandOutcome::Failed(error.to_string()),
+                    };
+                    (outcome, error.tree().cloned())
+                },
+            };
+            ran_command(step, Some(request.program.clone()), outcome, tree, lookup)
+        });
     }
 
     /// Why the result `result` of a run is not cached, or `None` when it is.
@@ -1940,13 +2200,47 @@ impl TaskSteps<'_> {
     /// it queries the machine state that the command starts with, which the record
     /// keeps whether or not the step names any part of it; the build compares the
     /// state of this step key no more in this build.
+    ///
+    /// When the engine writes a report, each checked location's outcome is named
+    /// through the tracer's error-name query, and a step whose program kizz does not
+    /// find, or cannot look up without `PATH`, is kept as a command that started no
+    /// process, with every checked location.
     fn look_up_and_run(
         &self,
         step: &StepSpec,
         name: &str,
         pending: &Pending,
     ) -> Result<StepOutcome, StepError> {
-        let lookup = find_program(name, &step.env, &step.cwd).map_err(StepError::new)?;
+        let report = self.engine.reports();
+        let tracer = self.engine.tracer;
+        let searched = search_step_program(name, &step.env, &step.cwd, |errno| {
+            if report {
+                tracer.error_name(errno)
+            } else {
+                kizz_trace::unnamed_error(errno)
+            }
+        });
+        let search = match searched {
+            Ok(search) => search,
+            Err(error) => {
+                self.keep(pending.key, || {
+                    ran_command(
+                        step,
+                        None,
+                        CommandOutcome::NotFound(error.to_string()),
+                        None,
+                        Observations::new(),
+                    )
+                });
+                return Err(StepError::new(error));
+            },
+        };
+        let observed = if report {
+            search.checked().clone()
+        } else {
+            Observations::new()
+        };
+        let lookup = search.into_lookup();
         step_lock(
             &self.engine.machine_compared,
             MACHINE_COMPARED,
@@ -1956,12 +2250,26 @@ impl TaskSteps<'_> {
         let machine = machine_record(&self.engine.tracer.machine_state(step.cwd.as_path()));
         let exit = match lookup {
             ProgramLookup::Found { program, checked } => {
-                return self.run(step, pending, program, checked, machine);
+                return self.run(step, pending, program, checked, observed, machine);
             },
             ProgramLookup::NotFound { .. } => StepExit::ProgramNotFound,
             ProgramLookup::NotExecutable { .. } => StepExit::ProgramNotExecutable,
         };
         let message = missing_program_message(name, &lookup);
+        self.keep(pending.key, || {
+            let (program, outcome) = match &lookup {
+                ProgramLookup::NotExecutable { candidate, .. } => {
+                    (
+                        Some(candidate.clone()),
+                        CommandOutcome::NotExecutable(message.clone()),
+                    )
+                },
+                ProgramLookup::NotFound { .. } | ProgramLookup::Found { .. } => {
+                    (None, CommandOutcome::NotFound(message.clone()))
+                },
+            };
+            ran_command(step, program, outcome, None, observed)
+        });
         self.store(step, pending, Finished {
             program: None,
             accesses: lookup.checked().clone(),
@@ -2003,11 +2311,13 @@ impl StepExecutor for TaskSteps<'_> {
                 checked,
                 checked_at_nanos,
             } => {
+                self.keep(key, || cached_command(step, &record));
                 let result = self.hit(&key, *record, checked, checked_at_nanos);
                 self.note_cached(position, key, step, &result)?;
                 return result;
             },
             Decision::Replay(result) => {
+                self.keep(key, || self.replayed_command(key, step, &result));
                 self.note_cached(position, key, step, &result)?;
                 return result;
             },
@@ -2027,7 +2337,25 @@ impl StepExecutor for TaskSteps<'_> {
             carried,
         };
         self.note_ran(step, &pending)?;
+        let kept = cells::update(&self.commands, |commands| commands.len());
         let result = self.look_up_and_run(step, name, &pending);
+        if cells::update(&self.commands, |commands| commands.len()) == kept {
+            // Kizz failed itself before it knew how the command ended, such as when
+            // the cache could not be read, so the report says that it failed.
+            self.keep(key, || {
+                let message = result.as_ref().err().map_or_else(
+                    || "kizz kept nothing of this command".to_owned(),
+                    ToString::to_string,
+                );
+                ran_command(
+                    step,
+                    None,
+                    CommandOutcome::Failed(message),
+                    None,
+                    Observations::new(),
+                )
+            });
+        }
         if self.runs_always(step) {
             self.engine.finish_always(key, &result)?;
         }

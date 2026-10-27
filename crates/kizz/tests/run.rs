@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! End-to-end tests of `kizz run`, which run the built binary with the real Linux
-//! tracer on fixture projects.
+//! tracer on fixture projects, its observation report of `--output` included.
 //!
 //! Each test writes a project into one temporary directory and gives every run of
 //! `kizz` a cache in another. Every run gets an explicit environment that holds only
@@ -19,14 +19,20 @@
 )]
 
 use std::{
+    collections::BTreeSet,
     error::Error,
     fs,
     io::{self, BufRead as _, BufReader, Lines},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
-use kizz_store::{LOCK_FILE_NAME, NotCachedReason, RunReason, StepRecord, Store};
+use kizz_store::{
+    CacheLock, LOCK_FILE_NAME, LockDetails, NotCachedReason, RunReason, StepRecord, Store,
+};
+use serde_json::Value;
 use tempfile::TempDir;
 
 /// The result of a test or a test helper.
@@ -593,5 +599,373 @@ fn a_build_waits_for_a_run_and_says_what_it_waits_for() -> TestResult {
         text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"])
     );
     assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// How long a run of `kizz` that must fail at once may take before the test kills
+/// it and fails, so a usage error that waited for the cache lock cannot hang the
+/// test.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// A task named `report` whose program reads `in.txt` and checks whether
+/// `missing.txt` exists, then runs `echo cached`, which a first run caches, and
+/// `cat in.txt`, which runs on every run; its block opens on line 3.
+const REPORT: &str = "# Report
+
+```starlark name=report
+env.inherit(\"PATH\")
+fs.read(\"in.txt\")
+fs.exists(\"missing.txt\")
+run(\"echo\", \"cached\")
+run(\"cat\", \"in.txt\", always = True)
+```
+";
+
+impl Project {
+    /// Run `kizz` with `args` in the project and wait at most [`DEADLINE`] for it to
+    /// end; a run that takes longer is killed and fails the test.
+    fn run_within(
+        &self,
+        args: &[&str],
+    ) -> TestResult<Run> {
+        let mut child = self
+            .command("", args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let started = Instant::now();
+        while child.try_wait()?.is_none() {
+            if started.elapsed() > DEADLINE {
+                child.kill()?;
+                let output = child.wait_with_output()?;
+                return Err(format!(
+                    "kizz {args:?} did not end within {DEADLINE:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output()?;
+        Ok(Run {
+            status: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+/// The JSON `null`, which [`at`] gives for a pointer that names nothing.
+static NULL: Value = Value::Null;
+
+/// The value at `pointer` in `value`, or `null` when it names nothing.
+fn at<'v>(
+    value: &'v Value,
+    pointer: &str,
+) -> &'v Value {
+    value.pointer(pointer).unwrap_or(&NULL)
+}
+
+/// The elements of the JSON array at `pointer` in `value`, none when there is no
+/// array there.
+fn elements<'v>(
+    value: &'v Value,
+    pointer: &str,
+) -> impl Iterator<Item = &'v Value> + use<'v> {
+    at(value, pointer).as_array().into_iter().flatten()
+}
+
+/// The outcomes of `kind` for `path` among the JSON observations `observations`,
+/// empty when it has none.
+fn outcomes(
+    observations: &Value,
+    path: &Path,
+    kind: &str,
+) -> BTreeSet<String> {
+    let path = path.to_string_lossy();
+    elements(observations, "")
+        .filter(|observation| at(observation, "/path") == path.as_ref())
+        .flat_map(|observation| elements(observation, &format!("/access/{kind}")))
+        .filter_map(|outcome| outcome.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The outcomes of `kind` for `path` in every program of every process of the
+/// command `command` of a hierarchical JSON report.
+fn command_outcomes(
+    command: &Value,
+    path: &Path,
+    kind: &str,
+) -> BTreeSet<String> {
+    elements(command, "/processes")
+        .flat_map(|process| elements(process, "/programs"))
+        .flat_map(|program| outcomes(at(program, "/observations"), path, kind))
+        .collect()
+}
+
+/// The set of `names`.
+fn set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+/// `kizz run --output` writes each of the four renderings of a run with a cached
+/// and a running command: the cached command is listed as cached, with `complete`
+/// set to `null` and no process, the running one is the root of its own traced
+/// process tree, and the task program's own accesses, a read and a missing file's
+/// probe with `ENOENT`, are an entry of their own, named as output names the task.
+#[test]
+fn run_output_writes_each_rendering_with_a_cached_and_a_running_command() -> TestResult {
+    let project = Project::new()?;
+    project.write("kizz.md", REPORT)?;
+    project.write("in.txt", "input\n")?;
+    let first = project.run("", &["run", "report"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(!project.root.join("hierarchical.txt").exists());
+
+    let mut reports = Vec::new();
+    for (flags, name) in [
+        (&[][..], "hierarchical.txt"),
+        (&["--compact"][..], "compact.txt"),
+        (&["--json"][..], "hierarchical.json"),
+        (&["--json", "--compact"][..], "compact.json"),
+    ] {
+        let output = format!("--output={name}");
+        let args: Vec<&str> = ["run"]
+            .into_iter()
+            .chain(flags.iter().copied())
+            .chain([output.as_str(), "report"])
+            .collect();
+        let run = project.run("", &args)?;
+        assert_eq!(run.status, Some(0), "{name}: {run:?}");
+        assert!(
+            run.stdout
+                .starts_with(&text(&[&cached_line("echo cached", 1), "cached"])),
+            "{name}: {run:?}"
+        );
+        assert!(
+            run.stdout.contains("\nrun `cat in.txt` (step 2): "),
+            "{name}: {run:?}"
+        );
+        assert!(
+            run.stdout
+                .ends_with("input\nrun succeeded: kizz.md:3 (Report); 1 command ran, 1 cached\n"),
+            "{name}: {run:?}"
+        );
+        reports.push(fs::read_to_string(project.root.join(name))?);
+    }
+    let [
+        hierarchical_text,
+        compact_text,
+        hierarchical_json,
+        compact_json,
+    ] = reports.as_slice()
+    else {
+        return Err("expected four reports".into());
+    };
+    let in_file = project.root.join("in.txt");
+    let missing = project.root.join("missing.txt");
+    check_text_reports(hierarchical_text, compact_text, &in_file, &missing);
+    check_json_reports(hierarchical_json, compact_json, &in_file, &missing)
+}
+
+/// Check the text reports of
+/// [`run_output_writes_each_rendering_with_a_cached_and_a_running_command`]: the
+/// hierarchical one, `hierarchical_text`, lists the cached command, the running one
+/// with its process, and the task program's read of `in_file` and probe of
+/// `missing`; the compact one, `compact_text`, has no process and combines them.
+fn check_text_reports(
+    hierarchical_text: &str,
+    compact_text: &str,
+    in_file: &Path,
+    missing: &Path,
+) {
+    assert!(
+        hierarchical_text
+            .starts_with("kizz observation report, version 1, hierarchical\ntrace: complete\n"),
+        "{hierarchical_text}"
+    );
+    for part in [
+        "\ncommand 1: echo cached\n".to_owned(),
+        "\n  trace: cached, not traced\n".to_owned(),
+        "\ncommand 2: cat in.txt\n".to_owned(),
+        "\n  trace: complete\n".to_owned(),
+        "\n  process 1, pid ".to_owned(),
+        "\ntask program: kizz.md:3 (Report)\n".to_owned(),
+        format!("\n    {}: ok\n", in_file.display()),
+        format!("\n    {}: ENOENT\n", missing.display()),
+    ] {
+        assert!(
+            hierarchical_text.contains(&part),
+            "{part:?} in {hierarchical_text}"
+        );
+    }
+    assert!(
+        compact_text.starts_with("kizz observation report, version 1, compact\ntrace: complete\n"),
+        "{compact_text}"
+    );
+    assert!(!compact_text.contains("\n  process 1"), "{compact_text}");
+    for part in [
+        "\ntask program: kizz.md:3 (Report)\n".to_owned(),
+        format!("\n  {}: ok\n", in_file.display()),
+        format!("\n  {}: ENOENT\n", missing.display()),
+    ] {
+        assert!(compact_text.contains(&part), "{part:?} in {compact_text}");
+    }
+}
+
+/// Check the JSON reports of
+/// [`run_output_writes_each_rendering_with_a_cached_and_a_running_command`]: in
+/// both, `hierarchical_json` and `compact_json`, the format, the completeness, the
+/// totals, the cached command with `complete` set to `null`, the running command
+/// and the task program; in the hierarchical one, the running command's process
+/// with its read of `in_file` and the task program's read of `in_file` and probe of
+/// `missing`; and in the compact one, no process and the combined observations.
+fn check_json_reports(
+    hierarchical_json: &str,
+    compact_json: &str,
+    in_file: &Path,
+    missing: &Path,
+) -> TestResult {
+    let hierarchical: Value = serde_json::from_str(hierarchical_json)?;
+    let compact: Value = serde_json::from_str(compact_json)?;
+    for (report, mode) in [(&hierarchical, "hierarchical"), (&compact, "compact")] {
+        for (pointer, expected) in [
+            ("/format", Value::from("kizz-execute")),
+            ("/version", Value::from(1)),
+            ("/mode", Value::from(mode)),
+            ("/complete", Value::Bool(true)),
+            ("/totals/commands", Value::from(2)),
+            ("/totals/cached", Value::from(1)),
+            ("/commands/0/argv", serde_json::json!(["echo", "cached"])),
+            ("/commands/0/cached", Value::Bool(true)),
+            ("/commands/0/complete", Value::Null),
+            ("/commands/1/argv", serde_json::json!(["cat", "in.txt"])),
+            ("/commands/1/cached", Value::Bool(false)),
+            ("/commands/1/complete", Value::Bool(true)),
+            ("/commands/1/outcome/kind", Value::from("exited")),
+            ("/task_program/task", Value::from("kizz.md:3 (Report)")),
+        ] {
+            assert_eq!(at(report, pointer), &expected, "{pointer} in {report}");
+        }
+    }
+    assert_eq!(
+        hierarchical.pointer("/commands/0/processes"),
+        Some(&Value::Array(Vec::new()))
+    );
+    let ran = at(&hierarchical, "/commands/1");
+    assert_eq!(at(ran, "/processes/0/id"), &Value::from(1), "{ran}");
+    assert!(at(ran, "/processes/0/pid").is_u64(), "{ran}");
+    assert_eq!(
+        command_outcomes(ran, in_file, "read"),
+        set(&["ok"]),
+        "{ran}"
+    );
+    let task_program = at(&hierarchical, "/task_program/observations");
+    assert_eq!(outcomes(task_program, in_file, "read"), set(&["ok"]));
+    assert_eq!(outcomes(task_program, missing, "probe"), set(&["ENOENT"]));
+    assert!(
+        elements(&compact, "/commands").all(|command| command.get("processes").is_none()),
+        "{compact}"
+    );
+    assert_eq!(compact.pointer("/task_program/observations"), None);
+    let combined = at(&compact, "/observations");
+    assert_eq!(outcomes(combined, in_file, "read"), set(&["ok"]));
+    assert_eq!(outcomes(combined, missing, "probe"), set(&["ENOENT"]));
+    Ok(())
+}
+
+/// `--compact` or `--json` without `--output`, a missing directory for `--output`
+/// and an `--output` that names a directory are usage errors, with status 2, that
+/// run nothing and never wait for the cache lock, also while another process holds
+/// it.
+#[test]
+fn report_usage_errors_exit_with_2_also_while_the_cache_is_locked() -> TestResult {
+    let project = Project::new()?;
+    project.write("kizz.md", GREET)?;
+    let needs_output =
+        "error: --compact and --json shape the report that --output writes, so they need --output";
+    let cases = [
+        (&["run", "--compact", "greet"][..], needs_output),
+        (&["run", "--json", "greet"][..], needs_output),
+        (&["run", "--json", "--compact", "greet"][..], needs_output),
+        (
+            &["run", "--output=missing/report.txt", "greet"][..],
+            "error: the directory of --output does not exist: ",
+        ),
+        (
+            &["run", "--output=.", "greet"][..],
+            "error: --output names a directory: .",
+        ),
+    ];
+    for locked in [false, true] {
+        let lock = if locked {
+            Some(CacheLock::acquire(
+                project.cache.path(),
+                &LockDetails::current(),
+                |_| {},
+            )?)
+        } else {
+            None
+        };
+        for (args, message) in cases {
+            let run = project.run_within(args)?;
+            assert_eq!(run.status, Some(2), "{args:?}, locked {locked}: {run:?}");
+            assert!(
+                run.stderr.contains(message),
+                "{args:?}, locked {locked}: {run:?}"
+            );
+            assert!(
+                !run.stderr.contains("waiting for the kizz cache"),
+                "{args:?}, locked {locked}: {run:?}"
+            );
+            assert_eq!(run.stdout, "", "{args:?}, locked {locked}: {run:?}");
+        }
+        if let Some(lock) = lock {
+            lock.release()?;
+        }
+    }
+    assert!(!project.root.join("missing").exists());
+    assert_eq!(project.step_records()?.len(), 0);
+    Ok(())
+}
+
+/// A report that cannot be written, because the run's own command removed the
+/// directory of `--output`, is an error: a run that otherwise succeeded exits with
+/// status 2, and a run that failed keeps its status 1.
+#[test]
+fn a_report_that_cannot_be_written_makes_a_successful_run_exit_with_2() -> TestResult {
+    let project = Project::new()?;
+    let report = project.root.join("out/report.txt");
+    project.task("kizz.md", "Gone", "name=gone", "run(\"rmdir\", \"out\")")?;
+    fs::create_dir(project.root.join("out"))?;
+    let gone = project.run("", &["run", "--output=out/report.txt", "gone"])?;
+    assert_eq!(gone.status, Some(2), "{gone:?}");
+    assert!(
+        gone.stderr.contains(&format!(
+            "error: cannot write the report to {}: ",
+            report.display()
+        )),
+        "{gone:?}"
+    );
+    assert!(
+        gone.stdout
+            .ends_with("run succeeded: kizz.md:3 (Gone); 1 command ran, 0 cached\n"),
+        "{gone:?}"
+    );
+    assert!(!project.root.join("out").exists());
+
+    project.task(
+        "kizz.md",
+        "Fail",
+        "name=fail",
+        "run(\"sh\", \"-c\", \"rmdir out; exit 3\", expect = [0])",
+    )?;
+    fs::create_dir(project.root.join("out"))?;
+    let failed = project.run("", &["run", "--output=out/report.txt", "fail"])?;
+    assert_eq!(failed.status, Some(1), "{failed:?}");
+    assert!(
+        failed.stderr.contains("error: cannot write the report to "),
+        "{failed:?}"
+    );
     Ok(())
 }

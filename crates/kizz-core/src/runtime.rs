@@ -46,7 +46,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashMap},
     fmt, fs,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::PathBuf,
     sync::{
         Arc,
@@ -85,7 +85,7 @@ use starlark::{
 use crate::{
     cells,
     dotenv::{self, DotenvError},
-    files::{FileChanges, FileError, Files},
+    files::{AccessOutcomes, FileChanges, FileError, Files},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
     tasks::Task,
 };
@@ -499,6 +499,9 @@ struct TaskState<'a> {
     accesses: Cell<Accesses>,
     /// Every file the program changes.
     changes: Cell<FileChanges>,
+    /// How each file access of the program ended, when the run notes it for the
+    /// report of `kizz run --output`, and otherwise `None`.
+    outcomes: Cell<Option<AccessOutcomes>>,
     /// The step whose exit status `expect` did not accept, if any.
     unexpected: Cell<Option<UnexpectedExit>>,
     /// The number of `run()` calls that reached the executor so far, which is the
@@ -531,6 +534,9 @@ struct LoadingModule {
     accesses: Cell<Accesses>,
     /// Every file the module's top-level code changes.
     changes: Cell<FileChanges>,
+    /// How each file access of the module's top-level code ended, when the run
+    /// notes it, and otherwise `None`.
+    outcomes: Cell<Option<AccessOutcomes>>,
 }
 
 /// The error for `call`, a function that needs the running task, when `eval`
@@ -567,11 +573,12 @@ fn with_task<R>(
 }
 
 /// Call `f` with the file operations of the task that `eval` evaluates or loads a
-/// module for, so every access and every change is recorded against that task.
+/// module for, so every access and every change is recorded against that task, and
+/// the outcome of every access is noted when the run notes outcomes.
 ///
-/// The accesses and the changes are taken out of their cells for the length of
-/// `f`, which only does file operations and reaches neither cell, and put back
-/// after it.
+/// The accesses, the changes and the outcomes are taken out of their cells for the
+/// length of `f`, which only does file operations and reaches none of the cells,
+/// and put back after it.
 ///
 /// # Errors
 ///
@@ -582,18 +589,30 @@ fn with_files<R>(
     f: impl FnOnce(&mut Files<'_>) -> Result<R, RunError>,
 ) -> starlark::Result<R> {
     let extra = eval.extra;
-    let (dir, accesses, changes) = if let Some(state) =
+    let (dir, accesses, changes, outcomes) = if let Some(state) =
         extra.and_then(|extra| extra.downcast_ref::<TaskState>())
     {
-        (&state.task.dir, &state.accesses, &state.changes)
+        (
+            &state.task.dir,
+            &state.accesses,
+            &state.changes,
+            &state.outcomes,
+        )
     } else if let Some(loading) = extra.and_then(|extra| extra.downcast_ref::<LoadingModule>()) {
-        (&loading.dir, &loading.accesses, &loading.changes)
+        (
+            &loading.dir,
+            &loading.accesses,
+            &loading.changes,
+            &loading.outcomes,
+        )
     } else {
         return Err(outside_task(eval, call));
     };
     let result = cells::update(accesses, |accesses| {
         cells::update(changes, |changes| {
-            f(&mut Files::new(dir, accesses, changes))
+            cells::update(outcomes, |outcomes| {
+                f(&mut Files::new(dir, accesses, changes).noting(outcomes.as_mut()))
+            })
         })
     });
     result.map_err(starlark::Error::new_other)
@@ -1110,12 +1129,15 @@ fn env_functions(builder: &mut GlobalsBuilder) {
             }
             let file = cells::update(&state.accesses, |accesses| {
                 cells::update(&state.changes, |changes| {
-                    let mut files = Files::new(&state.task.dir, accesses, changes);
-                    if required {
-                        require_dotenv(&mut files, call, path).map(Some)
-                    } else {
-                        read_dotenv(&mut files, call, path)
-                    }
+                    cells::update(&state.outcomes, |outcomes| {
+                        let mut files = Files::new(&state.task.dir, accesses, changes)
+                            .noting(outcomes.as_mut());
+                        if required {
+                            require_dotenv(&mut files, call, path).map(Some)
+                        } else {
+                            read_dotenv(&mut files, call, path)
+                        }
+                    })
                 })
             })?;
             vars.extend(file.unwrap_or_default());
@@ -1434,6 +1456,9 @@ struct ModuleLoader<'a> {
     accesses: Accesses,
     /// Every file the modules' top-level code changed.
     changes: FileChanges,
+    /// How each module read and each file access of the modules' top-level code
+    /// ended, when the run notes it, and otherwise `None`.
+    outcomes: Option<AccessOutcomes>,
     /// The modules loaded so far, by absolute path.
     loaded: HashMap<AbsolutePath, FrozenModule>,
     /// The modules being loaded, outermost first, to find load cycles.
@@ -1480,7 +1505,7 @@ impl ModuleLoader<'_> {
         }
         let source = match fs::read_to_string(path) {
             Ok(source) => {
-                self.accesses.record(path.clone(), AccessKind::Read);
+                self.record(path, AccessKind::Read, None);
                 source
             },
             Err(error) => {
@@ -1489,7 +1514,7 @@ impl ModuleLoader<'_> {
                 } else {
                     AccessKind::Read
                 };
-                self.accesses.record(path.clone(), kind);
+                self.record(path, kind, Some(&error));
                 return Err(TaskFailure::program(format!(
                     "{from}: load(\"{id}\"): cannot read {path}: {error}"
                 )));
@@ -1511,15 +1536,32 @@ impl ModuleLoader<'_> {
             self.printer,
             &mut self.accesses,
             &mut self.changes,
+            self.outcomes.as_mut(),
         )?;
         self.sources.push((path.clone(), source));
         self.loaded.insert(path.clone(), module.clone());
         Ok(module)
     }
+
+    /// Record that loading touched the module at `path` in the way `kind` names,
+    /// and note that the read failed with `error`, or succeeded when it is `None`,
+    /// when the run notes outcomes.
+    fn record(
+        &mut self,
+        path: &AbsolutePath,
+        kind: AccessKind,
+        error: Option<&io::Error>,
+    ) {
+        if let Some(outcomes) = &mut self.outcomes {
+            outcomes.note(path.clone(), kind, error);
+        }
+        self.accesses.record(path.clone(), kind);
+    }
 }
 
 /// Evaluate and freeze one module, outside any task, recording the file accesses
-/// of its top-level code in `accesses` and the files it changed in `changes`.
+/// of its top-level code in `accesses`, the files it changed in `changes`, and,
+/// when `outcomes` is `Some`, how each access ended in it.
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a separate part of the loading context"
@@ -1533,12 +1575,14 @@ fn evaluate_module(
     printer: &TaskPrinter<'_>,
     accesses: &mut Accesses,
     changes: &mut FileChanges,
+    outcomes: Option<&mut AccessOutcomes>,
 ) -> Result<FrozenModule, TaskFailure> {
     let marker = LoadingModule {
         path: path.clone(),
         dir: task.dir.clone(),
         accesses: Cell::new(Accesses::new()),
         changes: Cell::new(FileChanges::new()),
+        outcomes: Cell::new(outcomes.is_some().then(AccessOutcomes::new)),
     };
     let result = Module::with_temp_heap(|module| {
         set_task_value(&module, task);
@@ -1559,6 +1603,9 @@ fn evaluate_module(
     });
     accesses.merge(marker.accesses.into_inner());
     changes.merge(marker.changes.into_inner());
+    if let (Some(outcomes), Some(noted)) = (outcomes, marker.outcomes.into_inner()) {
+        outcomes.merge(noted);
+    }
     result
 }
 
@@ -1583,7 +1630,7 @@ pub struct ProgramParts {
     pub modules: Vec<(PathBuf, [u8; 32])>,
 }
 
-/// The result of [`TaskProgram::load`].
+/// The result of [`TaskProgram::load`] and [`TaskProgram::load_noting`].
 #[derive(Debug)]
 pub struct ProgramLoad {
     /// Every module the task read and every module path it found missing, with the
@@ -1592,6 +1639,9 @@ pub struct ProgramLoad {
     /// Every file the modules' top-level code changed through `fs.write` and
     /// `fs.write_json`, in the order it first changed each.
     pub changes: FileChanges,
+    /// How each of those accesses ended, when the load noted it, and otherwise
+    /// `None`.
+    pub outcomes: Option<AccessOutcomes>,
     /// The loaded program, or why it could not be loaded.
     pub program: Result<TaskProgram, TaskFailure>,
 }
@@ -1608,6 +1658,8 @@ pub struct TaskProgram {
     hash: ProgramHash,
     /// The hashes of the block and of each module.
     parts: ProgramParts,
+    /// Whether its run notes how each file access ended, as the load did.
+    noting: bool,
 }
 
 impl fmt::Debug for TaskProgram {
@@ -1664,6 +1716,19 @@ impl TaskProgram {
         task: TaskInfo,
         print: &dyn PrintSink,
     ) -> ProgramLoad {
+        Self::load_noting(task, print, false)
+    }
+
+    /// Load the task program as [`TaskProgram::load`] does; when `noting` is set,
+    /// also note how each module read and each file access ended, in
+    /// [`ProgramLoad::outcomes`] and then in [`TaskRun::outcomes`] of its run, for
+    /// the observation report of `kizz run --output`.
+    #[must_use]
+    pub fn load_noting(
+        task: TaskInfo,
+        print: &dyn PrintSink,
+        noting: bool,
+    ) -> ProgramLoad {
         let globals = globals();
         let printer = TaskPrinter {
             name: task.display_name(),
@@ -1675,6 +1740,7 @@ impl TaskProgram {
             printer: &printer,
             accesses: Accesses::new(),
             changes: FileChanges::new(),
+            outcomes: noting.then(AccessOutcomes::new),
             loaded: HashMap::new(),
             loading: Vec::new(),
             sources: Vec::new(),
@@ -1694,6 +1760,7 @@ impl TaskProgram {
         let ModuleLoader {
             accesses,
             changes,
+            outcomes,
             sources,
             ..
         } = loader;
@@ -1725,11 +1792,13 @@ impl TaskProgram {
                 imports,
                 hash,
                 parts,
+                noting,
             }
         });
         ProgramLoad {
             accesses,
             changes,
+            outcomes,
             program,
         }
     }
@@ -1771,7 +1840,11 @@ impl TaskProgram {
         print: &dyn PrintSink,
     ) -> TaskRun {
         let Self {
-            task, ast, imports, ..
+            task,
+            ast,
+            imports,
+            noting,
+            ..
         } = self;
         let globals = globals();
         let printer = TaskPrinter {
@@ -1785,6 +1858,7 @@ impl TaskProgram {
             env: Cell::new(BTreeMap::new()),
             accesses: Cell::new(Accesses::new()),
             changes: Cell::new(FileChanges::new()),
+            outcomes: Cell::new(noting.then(AccessOutcomes::new)),
             unexpected: Cell::new(None),
             started: Cell::new(0),
             watched: Cell::new(Vec::new()),
@@ -1819,6 +1893,7 @@ impl TaskProgram {
         TaskRun {
             accesses: state.accesses.into_inner(),
             changes: state.changes.into_inner(),
+            outcomes: state.outcomes.into_inner(),
             result,
             unchecked,
         }
@@ -1835,6 +1910,9 @@ pub struct TaskRun {
     /// Every file the program changed through `fs.write` and `fs.write_json` while
     /// it ran, in the order it first changed each, without repeats.
     pub changes: FileChanges,
+    /// How each of those accesses ended, when the program was loaded with
+    /// [`TaskProgram::load_noting`], and otherwise `None`.
+    pub outcomes: Option<AccessOutcomes>,
     /// Whether the program succeeded, or why it failed. Unchecked steps never fail
     /// the run here; `kizz build --fail-unchecked` turns them into a failure.
     pub result: Result<(), TaskFailure>,

@@ -89,6 +89,7 @@ use kizz_trace::{AbsolutePath, AccessKind, Accesses};
 use crate::{
     engine::{Engine, NoStepEvents, StepEvents, TaskSteps},
     explain::{StepDecision, TaskIdentity},
+    run::RunObservations,
     runtime::{PrintSink, TaskFailure, TaskInfo, TaskProgram, UncheckedExit},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
 };
@@ -364,7 +365,8 @@ impl BuildReport {
     }
 }
 
-/// What one run of a task touched, for the learned order.
+/// What one run of a task touched, for the learned order, and what it observed for
+/// the report of `kizz run --output`.
 #[derive(Debug, Clone, Default)]
 struct TaskTrace {
     /// The key of each step of the run.
@@ -372,6 +374,9 @@ struct TaskTrace {
     /// Every file access the program made: module loads and the `fs` and `env`
     /// functions.
     accesses: Accesses,
+    /// The commands of the run and the outcomes of its program's accesses, when the
+    /// engine writes a report ([`Engine::with_report`]), and otherwise `None`.
+    observed: Option<RunObservations>,
 }
 
 /// The step executor that starts nothing once the build is interrupted.
@@ -422,11 +427,12 @@ impl Builder<'_> {
         &mut self,
         task: &TaskInfo,
     ) -> Result<(TaskResult, TaskTrace), StoreError> {
-        let load = TaskProgram::load(task.clone(), self.print);
+        let load = TaskProgram::load_noting(task.clone(), self.print, self.engine.reports());
         let mut accesses = load.accesses;
         let mut changes = load.changes;
-        let (result, decisions, keys, exits) = match load.program {
-            Err(failure) => (Err(failure), Vec::new(), Vec::new(), Vec::new()),
+        let mut outcomes = load.outcomes;
+        let (result, decisions, keys, exits, commands) = match load.program {
+            Err(failure) => (Err(failure), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
             Ok(program) => {
                 let steps = self
                     .engine
@@ -440,6 +446,9 @@ impl Builder<'_> {
                 let run = program.run(self.caller, &executor, self.print);
                 accesses.merge(run.accesses);
                 changes.merge(run.changes);
+                if let (Some(outcomes), Some(noted)) = (outcomes.as_mut(), run.outcomes) {
+                    outcomes.merge(noted);
+                }
                 let result = match run.result {
                     Ok(()) if self.engine.fails_unchecked() && !run.unchecked.is_empty() => {
                         Err(TaskFailure::Unchecked {
@@ -450,7 +459,13 @@ impl Builder<'_> {
                     other => other,
                 };
                 steps.finish(result.is_ok())?;
-                (result, steps.decisions(), steps.keys(), run.unchecked)
+                (
+                    result,
+                    steps.decisions(),
+                    steps.keys(),
+                    run.unchecked,
+                    steps.commands(),
+                )
             },
         };
         let position_key = |position: u32| {
@@ -494,7 +509,17 @@ impl Builder<'_> {
                 changed: changes.paths(),
                 unchecked,
             },
-            TaskTrace { keys, accesses },
+            TaskTrace {
+                keys,
+                accesses,
+                observed: outcomes.map(|outcomes| {
+                    RunObservations {
+                        commands,
+                        task_program: outcomes
+                            .observations(|errno| self.engine.tracer().error_name(errno)),
+                    }
+                }),
+            },
         ))
     }
 
@@ -590,7 +615,8 @@ pub fn build(
 /// The run stores what a build of that one task in one pass stores: the step
 /// records and positions, the task record, the task program as the last writer of
 /// each file it changed, and, unless the run was interrupted, the task's learned
-/// order.
+/// order. When the engine writes a report ([`Engine::with_report`]), it also
+/// returns the commands of the run and the outcomes of its program's accesses.
 ///
 /// # Errors
 ///
@@ -601,7 +627,7 @@ pub(crate) fn run_task_once(
     caller: &BTreeMap<String, String>,
     print: &dyn PrintSink,
     step_events: &dyn StepEvents,
-) -> Result<TaskResult, StoreError> {
+) -> Result<(TaskResult, Option<RunObservations>), StoreError> {
     let mut builder = Builder {
         engine,
         caller,
@@ -609,11 +635,12 @@ pub(crate) fn run_task_once(
         step_events,
         ran: BTreeSet::new(),
     };
-    let (result, trace) = builder.run_task(task)?;
+    let (result, mut trace) = builder.run_task(task)?;
+    let observed = trace.observed.take();
     if !engine.is_cancelled() {
         learn(engine.store(), &BTreeMap::from([(task_id(task), trace)]))?;
     }
-    Ok(result)
+    Ok((result, observed))
 }
 
 /// The outcome of a build whose pass `pass` did no work.

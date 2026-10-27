@@ -27,6 +27,22 @@
 //! if each had `always = True`, and still records each result; nothing forces
 //! caching.
 //!
+//! Report: `--output=FILE` writes the observation report of `kizz execute` for the
+//! commands of the run once it ends, in the form that `--json` and `--compact`
+//! choose, as `kizz execute` writes its own: each command that ran is the root of
+//! its own process tree, each cache hit is listed as cached, without
+//! observations, and the task program's own accesses are an entry of their own,
+//! named as output names the task. Only then does the engine ask the tracer for
+//! process trees. `--compact` or `--json` without `--output`, and an `--output`
+//! that names a directory or a file in a directory that does not exist, are usage
+//! errors, checked before the cache lock is taken, so nothing waits and nothing
+//! runs. The report is written to a new file in the directory of `--output` and
+//! renamed over it, whether the run succeeded, failed or was interrupted; it is not
+//! written when kizz could not run the task at all, such as for an unknown name or
+//! a cache that cannot be used. A report that cannot be written is an error, and a
+//! run that otherwise succeeded then exits with [`USAGE_ERROR`]; any other status
+//! stays what the run gave.
+//!
 //! Exit status: 0 when the task succeeds, [`TASK_FAILED`] when it fails,
 //! [`USAGE_ERROR`] for usage and configuration errors, an unknown name, a tie, and
 //! a cache that cannot be used, and [`INTERRUPTED`] when interrupted. Ctrl-C works
@@ -43,8 +59,8 @@ use std::{
 };
 
 use kizz_core::{
-    Engine, Render, RunReport, StepDecision, StepError, StepEvents, StepOutcome, TaskInfo,
-    select_by_name, task_label,
+    Engine, Render, ReportFormat, ReportMode, RunReport, StepDecision, StepError, StepEvents,
+    StepOutcome, TaskInfo, select_by_name, task_label,
 };
 use kizz_store::{CacheLock, LockDetails, Store, cache_dir_from_env};
 use kizz_trace::{AbsolutePath, Cancellation, CapturedOutput, StdioEcho};
@@ -57,8 +73,13 @@ use crate::{
         worker_pool, worse,
     },
     cli::{INTERRUPTED, TASK_FAILED, USAGE_ERROR},
+    execute::{checked_output, replace},
     ui,
 };
+
+/// The error of `--compact` or `--json` without `--output`.
+const REPORT_NEEDS_OUTPUT: &str =
+    "--compact and --json shape the report that --output writes, so they need --output";
 
 /// What `kizz run` runs, and how.
 #[derive(Debug, Clone)]
@@ -69,9 +90,59 @@ pub(crate) struct Options {
     pub args: Vec<String>,
     /// Run every command of the task, as if each had `always = True`.
     pub no_cache: bool,
+    /// The file that the observation report replaces, `--output`, if any.
+    pub output: Option<PathBuf>,
+    /// Whether the report combines every process's observations, `--compact`.
+    pub compact: bool,
+    /// Whether the report is JSON, `--json`.
+    pub json: bool,
     /// The options that `kizz run` shares with `kizz build`: `--explain`,
     /// `--fail-unchecked`, `--cache-unknown-syscalls`, and `--verbose`.
     pub build: build::Options,
+}
+
+/// Where and how `kizz run --output` writes its observation report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Destination {
+    /// The absolute path of the file that the report replaces.
+    path: PathBuf,
+    /// Text or JSON, as `--json` chooses.
+    format: ReportFormat,
+    /// Hierarchical or compact, as `--compact` chooses.
+    mode: ReportMode,
+}
+
+/// Where the report of `options` goes, checked against the working directory
+/// `cwd`: `None` without `--output`.
+///
+/// # Errors
+///
+/// A message when `--compact` or `--json` is given without `--output`, or when
+/// `--output` names a directory or a file in a directory that does not exist.
+fn destination(
+    cwd: &Path,
+    options: &Options,
+) -> Result<Option<Destination>, String> {
+    let Some(output) = &options.output else {
+        return if options.compact || options.json {
+            Err(REPORT_NEEDS_OUTPUT.to_owned())
+        } else {
+            Ok(None)
+        };
+    };
+    Ok(Some(Destination {
+        path: checked_output(cwd, output)?,
+        format: if options.json {
+            ReportFormat::Json
+        } else {
+            ReportFormat::Text
+        },
+        mode: if options.compact {
+            ReportMode::Compact
+        } else {
+            ReportMode::Hierarchical
+        },
+    }))
 }
 
 /// Run the task that `options` names under the current directory once, and return
@@ -82,6 +153,12 @@ pub(crate) fn run(options: &Options) -> ExitCode {
         Err(error) => {
             return failure(&format!("cannot read the current directory: {error}"));
         },
+    };
+    // The report's options are checked before the cache lock is taken, so a usage
+    // error never waits for another process.
+    let destination = match destination(&cwd, options) {
+        Ok(destination) => destination,
+        Err(message) => return failure(&message),
     };
     let cache = match cache_dir_from_env() {
         Ok(cache) => cache,
@@ -106,7 +183,7 @@ pub(crate) fn run(options: &Options) -> ExitCode {
     // When the signal thread cannot start, the run never starts: dropping it
     // releases the lock and deletes its file.
     let status = match with_interrupts(signals, &cancel, || {
-        let mut status = with_store(&cache, &cwd, options, &cancel);
+        let mut status = with_store(&cache, &cwd, options, destination.as_ref(), &cancel);
         if let Err(error) = lock.release() {
             ui::print_error(&error.to_string());
             status = worse(status);
@@ -122,12 +199,14 @@ pub(crate) fn run(options: &Options) -> ExitCode {
     ExitCode::from(status)
 }
 
-/// Open the store in `cache`, run the task that `options` names under `cwd`, and
-/// close the store; return the exit status.
+/// Open the store in `cache`, run the task that `options` names under `cwd`,
+/// writing its report to `destination`, if any, and close the store; return the
+/// exit status.
 fn with_store(
     cache: &Path,
     cwd: &Path,
     options: &Options,
+    destination: Option<&Destination>,
     cancel: &Cancellation,
 ) -> u8 {
     let store = match Store::open(cache) {
@@ -137,7 +216,7 @@ fn with_store(
             return USAGE_ERROR;
         },
     };
-    let mut status = run_named(&store, cwd, options, cancel);
+    let mut status = run_named(&store, cwd, options, destination, cancel);
     if let Err(error) = store.close() {
         ui::print_error(&error.to_string());
         status = worse(status);
@@ -145,12 +224,14 @@ fn with_store(
     status
 }
 
-/// Discover the tasks under `cwd`, select the one that `options` names, and run it
-/// once with `store`; return the exit status.
+/// Discover the tasks under `cwd`, select the one that `options` names, run it
+/// once with `store`, and write its report to `destination`, if any; return the
+/// exit status.
 fn run_named(
     store: &Store,
     cwd: &Path,
     options: &Options,
+    destination: Option<&Destination>,
     cancel: &Cancellation,
 ) -> u8 {
     let Some(pool) = worker_pool() else {
@@ -192,7 +273,8 @@ fn run_named(
     .with_fail_unchecked(options.build.engine.fail_unchecked)
     .with_no_cache(options.no_cache)
     .with_echo_every_step(true)
-    .with_command_name("kizz run");
+    .with_command_name("kizz run")
+    .with_report(destination.is_some());
     let render = Render {
         base: cwd.to_path_buf(),
         home,
@@ -211,7 +293,13 @@ fn run_named(
         "kizz run",
     );
     let status = match kizz_core::run(&engine, &task, &caller, &output, &live) {
-        Ok(report) => finish(&output, &render, &report),
+        Ok(report) => {
+            let status = finish(&output, &render, &report);
+            match destination {
+                Some(destination) => write_report(destination, &render, &report, status),
+                None => status,
+            }
+        },
         Err(error) => {
             ui::print_error(&format!("cannot use the cache: {error}"));
             USAGE_ERROR
@@ -219,6 +307,34 @@ fn run_named(
     };
     ui::print_warning_summary(&output.take_warnings());
     status
+}
+
+/// Write the observation report of the run `report` to `destination`, with its task
+/// program named as `render` names the task, and return the exit status: `status`,
+/// the run's own, or, when the report cannot be written, after kizz prints the
+/// error, [`USAGE_ERROR`] for a run that succeeded, whose status is 0, and
+/// `status` otherwise.
+fn write_report(
+    destination: &Destination,
+    render: &Render,
+    report: &RunReport,
+    status: u8,
+) -> u8 {
+    let task = render.task(&task_label(&report.result.task));
+    let Some(observed) = report.observation_report(&task) else {
+        return status;
+    };
+    let text = observed.render(destination.format, destination.mode);
+    match replace(&destination.path, text.as_bytes()) {
+        Ok(()) => status,
+        Err(error) => {
+            ui::print_error(&format!(
+                "cannot write the report to {}: {error}",
+                destination.path.display()
+            ));
+            if status == 0 { USAGE_ERROR } else { status }
+        },
+    }
 }
 
 /// Print the warnings of the run `report`, its failure, the unchecked exits, how it
@@ -359,10 +475,81 @@ fn replay(output: &CapturedOutput) {
     reason = "test code: the tests assert"
 )]
 mod tests {
-    use kizz_core::StepDecision;
+    use std::{fs, path::PathBuf};
+
+    use kizz_core::{ReportFormat, ReportMode, StepDecision};
     use kizz_store::Verdict;
 
-    use super::{Live, summary_line};
+    use super::{Destination, Live, Options, REPORT_NEEDS_OUTPUT, destination, summary_line};
+    use crate::build;
+
+    /// The options of `kizz run lint` with `output`, `--compact` when `compact` is
+    /// set and `--json` when `json` is set.
+    fn options(
+        output: Option<&str>,
+        compact: bool,
+        json: bool,
+    ) -> Options {
+        Options {
+            name: "lint".to_owned(),
+            args: Vec::new(),
+            no_cache: false,
+            output: output.map(PathBuf::from),
+            compact,
+            json,
+            build: build::Options {
+                explain: false,
+                verbose: false,
+                engine: build::EngineOptions {
+                    cache_unknown_syscalls: false,
+                    fail_unchecked: false,
+                },
+            },
+        }
+    }
+
+    /// Without `--output` there is no report, and `--compact` or `--json` alone is
+    /// an error; `--output` resolves against the working directory, with text and
+    /// hierarchical by default and each option choosing its form; a file in a
+    /// directory that does not exist and a directory are errors.
+    #[test]
+    fn the_report_options_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        fs::create_dir(cwd.join("sub")).unwrap();
+        assert_eq!(destination(cwd, &options(None, false, false)), Ok(None));
+        for (compact, json) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                destination(cwd, &options(None, compact, json)),
+                Err(REPORT_NEEDS_OUTPUT.to_owned())
+            );
+        }
+        for (compact, json, format, mode) in [
+            (false, false, ReportFormat::Text, ReportMode::Hierarchical),
+            (true, false, ReportFormat::Text, ReportMode::Compact),
+            (false, true, ReportFormat::Json, ReportMode::Hierarchical),
+            (true, true, ReportFormat::Json, ReportMode::Compact),
+        ] {
+            assert_eq!(
+                destination(cwd, &options(Some("report"), compact, json)),
+                Ok(Some(Destination {
+                    path: cwd.join("report"),
+                    format,
+                    mode,
+                }))
+            );
+        }
+        let missing = destination(cwd, &options(Some("missing/report"), false, false)).unwrap_err();
+        assert!(
+            missing.starts_with("the directory of --output does not exist"),
+            "{missing}"
+        );
+        let directory = destination(cwd, &options(Some("sub"), false, true)).unwrap_err();
+        assert!(
+            directory.starts_with("--output names a directory"),
+            "{directory}"
+        );
+    }
 
     /// A step is named by its command and its position, counting from 1.
     #[test]

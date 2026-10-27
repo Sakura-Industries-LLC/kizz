@@ -22,6 +22,13 @@
 //! with command output. JSON is written in a stable form: object keys sorted by their
 //! UTF-8 bytes, `indent` spaces per level, and a trailing newline.
 //!
+//! For the observation report of `kizz run --output`, the operations can also note
+//! how each access ended ([`Files::noting`]): into [`AccessOutcomes`], `ok` for an
+//! access whose operation succeeded, and otherwise the number of the system's
+//! error, which [`AccessOutcomes::observations`] names through the tracer's
+//! error-name query, such as `ENOENT` for a missing file's probe. Without it, as in
+//! every build, nothing more than the accesses is kept.
+//!
 //! No operation can panic ("Kizz never panics"): a glob pattern is split at its
 //! first glob component with `slice::get`, never `split_at`, and the indentation of
 //! JSON is built in space reserved with `String::try_reserve_exact`, never with
@@ -29,7 +36,7 @@
 //! for memory is an error of the write.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
@@ -37,7 +44,7 @@ use std::{
 };
 
 use globset::{GlobBuilder, GlobMatcher};
-use kizz_trace::{AbsolutePath, AccessKind, Accesses};
+use kizz_trace::{AbsolutePath, AccessKind, Accesses, Observations, Outcome};
 use serde::ser::Error as _;
 
 /// A file operation that failed.
@@ -176,6 +183,112 @@ fn now_nanos() -> u64 {
         })
 }
 
+/// How one file operation of a task program ended, before its error is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Noted {
+    /// The operation succeeded.
+    Ok,
+    /// The operation failed with the system's error of this number.
+    Errno(i32),
+    /// The operation failed with an error that has no number.
+    Unnumbered,
+}
+
+impl Noted {
+    /// How an operation ended that failed with `error`, or succeeded when it is
+    /// `None`.
+    fn of(error: Option<&io::Error>) -> Self {
+        match error {
+            None => Self::Ok,
+            Some(error) => error.raw_os_error().map_or(Self::Unnumbered, Self::Errno),
+        }
+    }
+
+    /// The outcome as a report shows it: `ok`, the error's name, which `error_name`
+    /// gives its number, or `unknown` for an error without a number.
+    fn outcome(
+        self,
+        error_name: &impl Fn(i32) -> String,
+    ) -> Outcome {
+        match self {
+            Self::Ok => Outcome::Ok,
+            Self::Errno(errno) => Outcome::Error(error_name(errno)),
+            Self::Unnumbered => Outcome::Unknown,
+        }
+    }
+}
+
+/// How the file accesses of a task program ended, for the observation report of
+/// `kizz run --output`: each path with its access kinds, and each kind with how
+/// the operations that made it ended, before the errors are named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessOutcomes {
+    /// How the accesses of each kind to each path ended.
+    noted: BTreeMap<AbsolutePath, BTreeMap<AccessKind, BTreeSet<Noted>>>,
+}
+
+impl AccessOutcomes {
+    /// No accesses.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Note that an operation touched `path` in the way `kind` names, and failed
+    /// with `error`, or succeeded when it is `None`.
+    pub fn note(
+        &mut self,
+        path: AbsolutePath,
+        kind: AccessKind,
+        error: Option<&io::Error>,
+    ) {
+        self.noted
+            .entry(path)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .insert(Noted::of(error));
+    }
+
+    /// Add every access of `other`.
+    pub fn merge(
+        &mut self,
+        other: Self,
+    ) {
+        for (path, kinds) in other.noted {
+            let known = self.noted.entry(path).or_default();
+            for (kind, outcomes) in kinds {
+                known.entry(kind).or_default().extend(outcomes);
+            }
+        }
+    }
+
+    /// Whether no access was noted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.noted.is_empty()
+    }
+
+    /// The accesses as observations: `ok`, the name that `error_name` gives the
+    /// number of an error, such as the tracer's error-name query, or `unknown` for
+    /// an error without a number.
+    #[must_use]
+    pub fn observations(
+        &self,
+        error_name: impl Fn(i32) -> String,
+    ) -> Observations {
+        let mut observations = Observations::new();
+        for (path, kinds) in &self.noted {
+            for (kind, outcomes) in kinds {
+                for noted in outcomes {
+                    observations.record(path.clone(), *kind, noted.outcome(&error_name));
+                }
+            }
+        }
+        observations
+    }
+}
+
 /// The file operations of one task: paths resolve against the task directory, and
 /// every access is recorded, with every file a write changed.
 pub struct Files<'a> {
@@ -185,6 +298,8 @@ pub struct Files<'a> {
     accesses: &'a mut Accesses,
     /// The files the task's writes changed.
     changes: &'a mut FileChanges,
+    /// How each access ended, when the run notes it for a report.
+    outcomes: Option<&'a mut AccessOutcomes>,
 }
 
 impl<'a> Files<'a> {
@@ -199,7 +314,34 @@ impl<'a> Files<'a> {
             dir,
             accesses,
             changes,
+            outcomes: None,
         }
+    }
+
+    /// The file operations, which also note how each access ended into `outcomes`
+    /// when it is `Some`, for the observation report of `kizz run --output`.
+    #[must_use]
+    pub fn noting(
+        mut self,
+        outcomes: Option<&'a mut AccessOutcomes>,
+    ) -> Self {
+        self.outcomes = outcomes;
+        self
+    }
+
+    /// Record that an operation touched `path` in the way `kind` names, and note
+    /// that it failed with `error`, or succeeded when it is `None`, when the
+    /// outcomes are noted.
+    fn record(
+        &mut self,
+        path: AbsolutePath,
+        kind: AccessKind,
+        error: Option<&io::Error>,
+    ) {
+        if let Some(outcomes) = &mut self.outcomes {
+            outcomes.note(path.clone(), kind, error);
+        }
+        self.accesses.record(path, kind);
     }
 
     /// The absolute path of `path`, relative to the task directory unless absolute.
@@ -223,15 +365,15 @@ impl<'a> Files<'a> {
     ) -> Result<Option<Vec<u8>>, FileError> {
         match fs::read(path) {
             Ok(bytes) => {
-                self.accesses.record(path.clone(), AccessKind::Read);
+                self.record(path.clone(), AccessKind::Read, None);
                 Ok(Some(bytes))
             },
             Err(error) if is_missing(&error) => {
-                self.accesses.record(path.clone(), AccessKind::Probe);
+                self.record(path.clone(), AccessKind::Probe, Some(&error));
                 Ok(None)
             },
             Err(error) => {
-                self.accesses.record(path.clone(), AccessKind::Read);
+                self.record(path.clone(), AccessKind::Read, Some(&error));
                 Err(FileError::io("cannot read", path.clone(), error))
             },
         }
@@ -275,7 +417,9 @@ impl<'a> Files<'a> {
 
     /// Write `content` to the file at `path`, creating parent directories, unless
     /// the file already holds exactly `content`. Returns whether the file was
-    /// written; a written file is noted as changed.
+    /// written; a written file is noted as changed. A write that leaves the file as
+    /// it was succeeds; each parent directory it created has the outcome of
+    /// creating them.
     ///
     /// # Errors
     ///
@@ -287,8 +431,8 @@ impl<'a> Files<'a> {
         content: &[u8],
     ) -> Result<bool, FileError> {
         let path = self.resolve(path);
-        self.accesses.record(path.clone(), AccessKind::Write);
         if fs::read(&path).is_ok_and(|existing| existing == content) {
+            self.record(path, AccessKind::Write, None);
             return Ok(false);
         }
         if let Some(parent) = path.as_path().parent() {
@@ -300,19 +444,21 @@ impl<'a> Files<'a> {
             if !missing.is_empty() {
                 let created = fs::create_dir_all(parent);
                 for dir in missing {
-                    self.accesses.record(dir, AccessKind::Write);
+                    self.record(dir, AccessKind::Write, created.as_ref().err());
                 }
-                created.map_err(|error| {
-                    FileError::io(
+                if let Err(error) = created {
+                    self.record(path.clone(), AccessKind::Write, Some(&error));
+                    return Err(FileError::io(
                         "cannot create the parent directories of",
                         path.clone(),
                         error,
-                    )
-                })?;
+                    ));
+                }
             }
         }
-        fs::write(&path, content)
-            .map_err(|error| FileError::io("cannot write", path.clone(), error))?;
+        let written = fs::write(&path, content);
+        self.record(path.clone(), AccessKind::Write, written.as_ref().err());
+        written.map_err(|error| FileError::io("cannot write", path.clone(), error))?;
         self.changes.record(path, now_nanos());
         Ok(true)
     }
@@ -361,9 +507,9 @@ impl<'a> Files<'a> {
         path: &str,
     ) -> bool {
         let path = self.resolve(path);
-        let exists = fs::metadata(&path).is_ok();
-        self.accesses.record(path, AccessKind::Probe);
-        exists
+        let found = fs::metadata(&path);
+        self.record(path, AccessKind::Probe, found.as_ref().err());
+        found.is_ok()
     }
 
     /// The names of the entries of the directory at `path`, sorted, with bytes
@@ -391,15 +537,15 @@ impl<'a> Files<'a> {
         let entries = match fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if is_missing(&error) => {
-                self.accesses.record(path.clone(), AccessKind::Probe);
+                self.record(path.clone(), AccessKind::Probe, Some(&error));
                 return Ok(None);
             },
             Err(error) => {
-                self.accesses.record(path.clone(), AccessKind::List);
+                self.record(path.clone(), AccessKind::List, Some(&error));
                 return Err(FileError::io("cannot list", path.clone(), error));
             },
         };
-        self.accesses.record(path.clone(), AccessKind::List);
+        self.record(path.clone(), AccessKind::List, None);
         let mut names = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| FileError::io("cannot list", path.clone(), error))?;
@@ -629,10 +775,107 @@ fn write_json_value(
 mod tests {
     use std::{fs, io, path::Path};
 
-    use kizz_trace::{AbsolutePath, Accesses};
+    use kizz_trace::{AbsolutePath, AccessKind, Accesses};
     use serde_json::json;
 
-    use super::{FileChanges, Files, repeated, stable_json};
+    use super::{AccessOutcomes, FileChanges, Files, repeated, stable_json};
+
+    /// The observations of `outcomes`, with `ENOENT` for the error number 2, as
+    /// `(path relative to root, "KIND OUTCOMES; ...")` pairs.
+    fn noted(
+        root: &Path,
+        outcomes: &AccessOutcomes,
+    ) -> Vec<(String, String)> {
+        let names = |errno: i32| {
+            if errno == 2 {
+                "ENOENT".to_owned()
+            } else {
+                format!("errno {errno}")
+            }
+        };
+        outcomes
+            .observations(names)
+            .iter()
+            .map(|(path, kinds)| {
+                let relative = path.as_path().strip_prefix(root).unwrap_or(path.as_path());
+                let kinds: Vec<String> = kinds
+                    .iter()
+                    .map(|(kind, outcomes)| {
+                        let outcomes: Vec<String> =
+                            outcomes.iter().map(ToString::to_string).collect();
+                        format!("{} {}", kind.name(), outcomes.join(","))
+                    })
+                    .collect();
+                (relative.display().to_string(), kinds.join("; "))
+            })
+            .collect()
+    }
+
+    /// With noting, each access has its outcome: a read, a listing and the writes
+    /// that succeed are `ok`, whether a write changes the file or not and for the
+    /// parent it creates; a missing file's probe, a missing path's existence check
+    /// and a missing directory's probe carry the system's error, `ENOENT`; and the
+    /// noted paths and kinds are exactly the recorded accesses.
+    #[test]
+    fn noted_accesses_carry_their_outcomes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("in.txt"), "in").unwrap();
+        fs::create_dir(root.path().join("sub")).unwrap();
+        fs::write(root.path().join("sub/a.txt"), "a").unwrap();
+        let dir = AbsolutePath::new(root.path()).unwrap();
+        let mut accesses = Accesses::new();
+        let mut changes = FileChanges::new();
+        let mut outcomes = AccessOutcomes::new();
+        let mut files = Files::new(&dir, &mut accesses, &mut changes).noting(Some(&mut outcomes));
+        assert_eq!(files.read_text("in.txt").unwrap(), "in");
+        assert!(files.read_text("missing.txt").is_err());
+        assert!(!files.exists("gone"));
+        assert!(files.list("nowhere").is_err());
+        assert_eq!(files.list("sub").unwrap(), ["a.txt"]);
+        assert!(files.write_bytes("out/new.txt", b"new").unwrap());
+        assert!(!files.write_bytes("in.txt", b"in").unwrap());
+        assert_eq!(noted(root.path(), &outcomes), [
+            ("gone".to_owned(), "probe ENOENT".to_owned()),
+            ("in.txt".to_owned(), "read ok; write ok".to_owned()),
+            ("missing.txt".to_owned(), "probe ENOENT".to_owned()),
+            ("nowhere".to_owned(), "probe ENOENT".to_owned()),
+            ("out".to_owned(), "write ok".to_owned()),
+            ("out/new.txt".to_owned(), "write ok".to_owned()),
+            ("sub".to_owned(), "list ok".to_owned()),
+        ]);
+        assert_eq!(
+            outcomes.observations(|errno| errno.to_string()).accesses(),
+            accesses
+        );
+    }
+
+    /// An error without a number is `unknown`; merging keeps every outcome of a
+    /// kind once; and nothing noted is empty.
+    #[test]
+    fn outcomes_merge_and_name_errors_without_numbers_unknown() {
+        let path = AbsolutePath::new("/w/f").unwrap();
+        let mut outcomes = AccessOutcomes::new();
+        assert!(outcomes.is_empty());
+        outcomes.note(path.clone(), AccessKind::Read, None);
+        let mut other = AccessOutcomes::new();
+        other.note(
+            path.clone(),
+            AccessKind::Read,
+            Some(&io::Error::other("no number")),
+        );
+        other.note(path.clone(), AccessKind::Read, None);
+        other.note(
+            path,
+            AccessKind::Probe,
+            Some(&io::Error::from_raw_os_error(13)),
+        );
+        outcomes.merge(other);
+        assert!(!outcomes.is_empty());
+        assert_eq!(noted(Path::new("/w"), &outcomes), [(
+            "f".to_owned(),
+            "read ok,unknown; probe errno 13".to_owned()
+        )]);
+    }
 
     /// The accesses as `(path relative to root, kinds)` pairs.
     fn shown(

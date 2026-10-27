@@ -1017,6 +1017,12 @@ Exit status:
 * A command's `stdin` is what its `run()` gives, or `/dev/null`, as in a build.
 * Kizz prints each command as it starts, then its output as it comes, as if every `run()` had `stream = True`.
 * A cache hit prints its command marked as cached, then replays its stored output.
+* `--output=<file>` writes an [observation report](#observation-reports) of the commands of the run.
+  `--compact` and `--json` shape it as they do for `kizz execute`.
+  Each command that ran is the root of its own process tree, and the task program's own accesses are an entry of their own.
+  A cache hit is listed as cached, without observations, so `--no-cache` observes every command.
+  `--compact` or `--json` without `--output` is a usage error.
+  A report that cannot be written is an error, and a run that otherwise succeeded then exits with 2.
 * Unchecked non-zero exits warn after the run, and `--fail-unchecked` fails the task, as in a build.
 * Exit status: 0 when the task succeeds, 1 when it fails, 2 for usage and configuration errors, and 130 when interrupted.
 

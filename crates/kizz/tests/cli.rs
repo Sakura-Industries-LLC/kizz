@@ -151,6 +151,9 @@ fn help_lists_every_subcommand() {
         ("--explain", "Print the full reason for every command"),
         ("--fail-unchecked", "leaves a non-zero exit unchecked"),
         ("--cache-unknown-syscalls", "does not know"),
+        ("--output", "Write an observation report"),
+        ("--compact", "Combine the observations of every process"),
+        ("--json", "Write the report as JSON"),
         ("NAME", "The name of the task"),
         ("ARGUMENTS", "The task's arguments, after `--`"),
     ] {

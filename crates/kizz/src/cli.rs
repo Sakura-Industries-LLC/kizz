@@ -116,6 +116,9 @@ impl Cli {
                 explain,
                 fail_unchecked,
                 cache_unknown_syscalls,
+                output,
+                compact,
+                json,
                 name,
                 args,
             } => {
@@ -123,6 +126,9 @@ impl Cli {
                     name,
                     args,
                     no_cache,
+                    output,
+                    compact,
+                    json,
                     build: crate::build::Options {
                         explain,
                         verbose: self.verbose,
@@ -263,7 +269,8 @@ pub enum Command {
     /// current directory runs once, with the cache, as a build runs it: no other
     /// task, and no further pass. The words after `--` are its arguments, which its
     /// program reads as `task.args`. Exit status: 0 when the task succeeds, 1 when
-    /// it fails, 2 for usage and configuration errors, and 130 when interrupted.
+    /// it fails, 2 for usage and configuration errors, and 130 when interrupted; a
+    /// report that cannot be written makes a run that succeeded exit with 2.
     #[bpaf(command)]
     Run {
         /// Run every command of the task, as if each had `always = True`, and still
@@ -283,6 +290,22 @@ pub enum Command {
         /// Cache commands that made system calls the tracer does not know.
         #[bpaf(long)]
         cache_unknown_syscalls: bool,
+
+        /// Write an observation report of the run's commands to this file, in an
+        /// existing directory, once the run ends: each command that ran with its
+        /// process tree, each cache hit as cached, and the task program's own
+        /// accesses.
+        #[bpaf(long, argument("FILE"))]
+        output: Option<PathBuf>,
+
+        /// Combine the observations of every process of the report into one set;
+        /// needs --output.
+        #[bpaf(long)]
+        compact: bool,
+
+        /// Write the report as JSON instead of readable text; needs --output.
+        #[bpaf(long)]
+        json: bool,
 
         /// The name of the task, which its `name=` option gives.
         #[bpaf(positional("NAME"))]
@@ -557,7 +580,8 @@ mod tests {
 
     /// `kizz run` parses its name, its options and the arguments after `--`, where
     /// words that look like options are arguments of the task; without `--` it has
-    /// no arguments, and every option is off unless given.
+    /// no arguments, and every option is off unless given, `--output` included;
+    /// `--output`, `--compact` and `--json` parse with the others.
     #[test]
     fn parses_run() {
         match parse(&["run", "lint"]).command {
@@ -566,10 +590,14 @@ mod tests {
                 explain,
                 fail_unchecked,
                 cache_unknown_syscalls,
+                output,
+                compact,
+                json,
                 name,
                 args,
             } => {
                 assert!(!no_cache && !explain && !fail_unchecked && !cache_unknown_syscalls);
+                assert!(output.is_none() && !compact && !json);
                 assert_eq!(name, "lint");
                 assert_eq!(args, Vec::<String>::new());
             },
@@ -581,6 +609,9 @@ mod tests {
             "--explain",
             "--fail-unchecked",
             "--cache-unknown-syscalls",
+            "--output=report.json",
+            "--compact",
+            "--json",
             "lint",
             "--",
             "a",
@@ -594,12 +625,29 @@ mod tests {
                 explain,
                 fail_unchecked,
                 cache_unknown_syscalls,
+                output,
+                compact,
+                json,
                 name,
                 args,
             } => {
                 assert!(no_cache && explain && fail_unchecked && cache_unknown_syscalls);
+                assert_eq!(output, Some(PathBuf::from("report.json")));
+                assert!(compact && json);
                 assert_eq!(name, "lint");
                 assert_eq!(args, ["a", "--fix", ""]);
+            },
+            other => panic!("expected run, got {other:?}"),
+        }
+        match parse(&["run", "--output", "r.txt", "lint"]).command {
+            Command::Run {
+                output,
+                compact,
+                json,
+                ..
+            } => {
+                assert_eq!(output, Some(PathBuf::from("r.txt")));
+                assert!(!compact && !json);
             },
             other => panic!("expected run, got {other:?}"),
         }

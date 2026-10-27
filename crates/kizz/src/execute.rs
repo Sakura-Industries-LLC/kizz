@@ -166,12 +166,12 @@ fn working_directory() -> Result<AbsolutePath, String> {
 
 /// The absolute path of `output`, relative to `cwd` when it is relative, once it is
 /// checked: it names a file, not a directory, and the directory that holds it
-/// exists.
+/// exists. `kizz run --output` checks its file with it too.
 ///
 /// # Errors
 ///
 /// A message that says what is wrong with `output`.
-fn checked_output(
+pub(crate) fn checked_output(
     cwd: &Path,
     output: &Path,
 ) -> Result<PathBuf, String> {
@@ -301,12 +301,12 @@ fn failure(outcome: &CommandOutcome) -> Option<String> {
 
 /// Write `content` to a new file in the directory of `path` and rename it over
 /// `path`, so `path` is replaced at once; the new file is removed when a step
-/// fails.
+/// fails. `kizz run --output` writes its report with it too.
 ///
 /// # Errors
 ///
 /// The error of creating, writing or renaming the new file.
-fn replace(
+pub(crate) fn replace(
     path: &Path,
     content: &[u8],
 ) -> io::Result<()> {

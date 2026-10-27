@@ -21,7 +21,9 @@
 //! and otherwise the name of the error, which it gets from the caller, such as the
 //! tracer's error-name query ([`kizz_trace::Tracer::error_name`]).
 //! [`find_program`] is the lookup of `run()`, for a task environment of strings,
-//! with the checked locations as accesses.
+//! with the checked locations as accesses; [`search_step_program`] is the same
+//! lookup with each checked location's outcome, for the report of `kizz run
+//! --output`.
 
 use std::{
     collections::BTreeMap,
@@ -161,14 +163,29 @@ pub fn find_program(
     env: &BTreeMap<String, String>,
     cwd: &AbsolutePath,
 ) -> Result<ProgramLookup, NoPathError> {
+    search_step_program(name, env, cwd, kizz_trace::unnamed_error).map(ProgramSearch::into_lookup)
+}
+
+/// Look up the program `name` for a step whose environment is `env` and whose
+/// working directory is `cwd`, as [`find_program`] does, keeping the outcome of
+/// each checked location, whose error `error_name` names, for the observation
+/// report of `kizz run --output`.
+///
+/// # Errors
+///
+/// Returns [`NoPathError`] when `name` has no `/` and `env` has no `PATH`.
+pub fn search_step_program(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &AbsolutePath,
+    error_name: impl Fn(i32) -> String,
+) -> Result<ProgramSearch, NoPathError> {
     let search = env.get(PATH_VARIABLE).map(OsStr::new);
-    search_program(OsStr::new(name), search, cwd, kizz_trace::unnamed_error)
-        .map(ProgramSearch::into_lookup)
-        .ok_or_else(|| {
-            NoPathError {
-                program: name.to_owned(),
-            }
-        })
+    search_program(OsStr::new(name), search, cwd, error_name).ok_or_else(|| {
+        NoPathError {
+            program: name.to_owned(),
+        }
+    })
 }
 
 /// Look up the program `name` in `search`, the value of `PATH`, or `None` when the

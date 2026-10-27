@@ -259,8 +259,9 @@ fn finish(
 /// reports: the tracer's tree, or the tree of one process when the tracer gave none,
 /// and on the first program of its first process the run's reason that the trace is
 /// incomplete, its unknown system calls and its connections that no program of the
-/// tree lists.
-fn run_tree(
+/// tree lists. The engine builds the trees of the report of `kizz run --output`
+/// with it too.
+pub(crate) fn run_tree(
     request: &RunRequest,
     result: &RunResult,
 ) -> ProcessTree {

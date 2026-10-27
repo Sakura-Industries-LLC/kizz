@@ -21,15 +21,26 @@
 //! [`Engine::with_no_cache`]) and echoes its output live
 //! ([`Engine::with_echo_every_step`]), and the [`StepEvents`] follow each step as it
 //! starts or comes from the cache.
+//!
+//! With [`Engine::with_report`] (`kizz run --output`), the run also keeps what its
+//! observation report needs ([`RunObservations`]): the command of each step that
+//! the run reached, in order, a step that ran with its process tree and a cache hit
+//! as cached, and the task program's own file accesses, its module reads included,
+//! with their outcomes, which the tracer's error-name query names.
+//! [`RunReport::observation_report`] builds the report from them, each command the
+//! root of its own process tree and the task program an entry of its own. Without
+//! the option, nothing more is kept.
 
 use std::{collections::BTreeMap, path::Component};
 
 use kizz_store::{StoreError, Verdict};
+use kizz_trace::Observations;
 use thiserror::Error;
 
 use crate::{
     build::{TaskResult, UncheckedStep, run_task_once},
     engine::{Engine, StepEvents},
+    report::{CommandInput, Report, TaskProgramInput},
     runtime::{PrintSink, TaskInfo},
     targets::is_valid_target,
     tasks::{TASK_NAME_RULE, Task},
@@ -150,6 +161,19 @@ pub fn select_by_name<'t>(
     }
 }
 
+/// What one `kizz run` observed for its observation report, which it keeps only
+/// when the engine writes one ([`Engine::with_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunObservations {
+    /// The command of each step that the run reached, in order: a step that ran,
+    /// or whose program kizz did not find, with its outcome, its process tree and
+    /// the lookup's observations, and a cache hit as cached.
+    pub commands: Vec<CommandInput>,
+    /// The task program's own file accesses, its module reads and its `fs` and
+    /// `env.load_file` accesses, each with its outcomes.
+    pub task_program: Observations,
+}
+
 /// What one `kizz run` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
@@ -157,6 +181,9 @@ pub struct RunReport {
     pub result: TaskResult,
     /// Whether cancellation was requested, so the run started nothing new.
     pub interrupted: bool,
+    /// What the run observed for its observation report, when the engine writes
+    /// one, and otherwise `None`.
+    pub observed: Option<RunObservations>,
 }
 
 impl RunReport {
@@ -189,6 +216,28 @@ impl RunReport {
             .count();
         (ran, self.result.decisions.len().saturating_sub(ran))
     }
+
+    /// The observation report of the run, whose task program is named `task`, as
+    /// output names the task, such as `kizz.md:3 (Build)`: one command for each
+    /// step that the run reached, in order, each that ran the root of its own
+    /// process tree and each cache hit cached, without observations, and the task
+    /// program's own accesses as an entry of their own. `None` when the engine
+    /// wrote no report.
+    #[must_use]
+    pub fn observation_report(
+        &self,
+        task: &str,
+    ) -> Option<Report> {
+        self.observed.as_ref().map(|observed| {
+            Report::new(
+                observed.commands.clone(),
+                Some(TaskProgramInput {
+                    task: task.to_owned(),
+                    observations: observed.task_program.clone(),
+                }),
+            )
+        })
+    }
 }
 
 /// Run `task`, made with [`TaskInfo::for_run`], once with `engine`, as `kizz run`
@@ -205,10 +254,11 @@ pub fn run(
     print: &dyn PrintSink,
     events: &dyn StepEvents,
 ) -> Result<RunReport, StoreError> {
-    let result = run_task_once(engine, task, caller, print, events)?;
+    let (result, observed) = run_task_once(engine, task, caller, print, events)?;
     Ok(RunReport {
         result,
         interrupted: engine.is_cancelled(),
+        observed,
     })
 }
 
