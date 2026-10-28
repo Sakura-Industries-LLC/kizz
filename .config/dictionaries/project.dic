@@ -195,6 +195,7 @@ ftruncate
 futimesat
 getaffinity
 getattr
+getauxval
 getdents
 getegid
 getenv
@@ -202,6 +203,7 @@ geteuid
 GETEVENTMSG
 GETFMT
 getgroups
+getguardsize
 gethostname
 getpgrp
 getpid
@@ -210,6 +212,7 @@ GETREGS
 getrlimit
 getsid
 GETSIGINFO
+getstack
 gettid
 getxattr
 getxattrat
@@ -249,6 +252,7 @@ MAXSYMLINKS
 memlock
 memtable
 minicbor
+MINSIGSTKSZ
 mkdirat
 mkfifo
 mknod
@@ -257,8 +261,10 @@ mmap
 MMSG
 mmsghdr
 monospace
+mprotect
 msghdr
 msgqueue
+munmap
 namelen
 netlink
 newfstatat
@@ -274,6 +280,7 @@ NONBLOCK
 NOTIF
 nsec
 NSYNC
+ONSTACK
 openat
 opendir
 openpt
@@ -344,6 +351,8 @@ setxattrat
 sigaction
 sigaddset
 SIGALRM
+sigaltstack
+SIGBUS
 SIGCHLD
 SIGCONT
 sigemptyset
@@ -377,6 +386,7 @@ swapon
 symlinkat
 SYSCALL
 syscalls
+sysconf
 Tgid
 tgkill
 thiserror

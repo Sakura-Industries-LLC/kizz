@@ -37,6 +37,11 @@
 //! itself, is a [`LockError`] that names what the lock guards. A lock that a
 //! panicking thread left behind is taken as it is, as `Mutex::lock` would
 //! return it with its poison.
+//!
+//! [`overflow`] holds kizz's handler of stack overflows. Once [`overflow::install`]
+//! has installed it, [`spawn`] and [`spawn_scoped`] set up each thread at the start
+//! of its work, with an alternate signal stack and the guard region of its stack,
+//! and undo that when the work ends; before then, they do nothing new.
 
 use std::{
     any::Any,
@@ -45,6 +50,8 @@ use std::{
     thread::{self, Scope, Thread},
     time::{Duration, Instant},
 };
+
+pub mod overflow;
 
 /// How long [`lock`] waits for a lock that another holder keeps before it gives
 /// up: far longer than kizz holds any lock, which is only for a few operations on
@@ -330,6 +337,7 @@ where
         let inherited = inherited.clone();
         os::spawn(name, move || {
             hooks::adopt(inherited);
+            let _overflow = overflow::guard_thread();
             slot.take().map(|work| work())
         })
     })
@@ -364,6 +372,7 @@ where
         let inherited = inherited.clone();
         os::spawn_scoped(scope, name, move || {
             hooks::adopt(inherited);
+            let _overflow = overflow::guard_thread();
             slot.take().map(|work| work())
         })
     })

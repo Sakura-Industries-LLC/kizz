@@ -19,6 +19,9 @@
 //! * Releasing the lock, explicitly or by dropping the [`CacheLock`], deletes the file
 //!   while the lock is still held, so a normal exit, or an interrupted exit that unwinds
 //!   to the release, leaves no file behind.
+//! * While the lock is held, its path is noted through `kizz_threads::overflow`, so that
+//!   kizz's handler of stack overflows deletes the file before kizz exits; the note is
+//!   dropped before a release deletes the file.
 //!
 //! The holder's start time, which messages show in UTC, is converted with checked
 //! arithmetic, so no time read from another process's file can make an operator
@@ -179,6 +182,9 @@ pub struct CacheLock {
     path: PathBuf,
     /// The locked file, `None` once released.
     file: Option<File>,
+    /// The note that makes kizz's handler of stack overflows delete the lock file,
+    /// `None` once released.
+    note: Option<kizz_threads::overflow::Note>,
 }
 
 impl CacheLock {
@@ -231,12 +237,16 @@ impl CacheLock {
         self.release_inner()
     }
 
-    /// Deletes the lock file while the lock is still held, then releases the lock by
-    /// closing the file. Does nothing when already released.
+    /// Forgets the note of the lock file, deletes the file while the lock is still
+    /// held, then releases the lock by closing the file. Does nothing when already
+    /// released.
     fn release_inner(&mut self) -> Result<(), LockError> {
         let Some(file) = self.file.take() else {
             return Ok(());
         };
+        // The handler of stack overflows must not delete a file that is no longer
+        // kizz's, so the note goes first.
+        drop(self.note.take());
         let removed = match fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 Err(LockError::Remove {
@@ -306,6 +316,7 @@ fn acquire_inner(
                     }
                 })?;
                 return Ok(CacheLock {
+                    note: Some(kizz_threads::overflow::note_lock(&path)),
                     path,
                     file: Some(file),
                 });

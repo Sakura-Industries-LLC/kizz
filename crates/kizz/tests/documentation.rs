@@ -1447,6 +1447,7 @@ fn kizz_reads_only_listed_variables() -> io::Result<()> {
         kizz_store::location::HOME,
         kizz_core::PATH_VARIABLE,
         kizz::environment::FAIL_THREAD_STARTS,
+        kizz::environment::TEST_FAULT,
     ] {
         assert!(
             read.contains(own),

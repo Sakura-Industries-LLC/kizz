@@ -748,6 +748,7 @@ To replay several log segments, SurrealKV starts a thread when it can, and other
 * The kernel releases the lock when the holding process exits for any reason, including a crash or `SIGKILL`,
   so a dead build never blocks another.
 * On a normal or interrupted exit, kizz also deletes the file, and a file left behind by a crash is taken over by the next build.
+  It also deletes the file when a thread overflows its stack, as [Kizz never panics](#kizz-never-panics) says.
 * After taking the lock, a build checks that the file it locked is still the file at that path, and retries if not.
   This closes the race between one build deleting the file and another build locking it.
 * Builds that need to run at the same time can use separate caches through `KIZZ_CACHE_DIR`.
@@ -981,6 +982,19 @@ The workspace lints forbid code that panics, and `clippy.toml` bans the library 
   It fails no step, task or command, and it changes no exit status.
 * Every other call that can panic, such as a `RefCell` borrow or `split_at`, uses a form that cannot.
 * The workspace lints and `clippy.toml` ban each kind of call that can panic, so that new code cannot bring one back.
+* Kizz does not prevent a stack overflow, such as one in Starlark's garbage collector when a program nests values too deeply.
+  It catches the overflow instead, with its own handler of `SIGSEGV` and `SIGBUS`, and stops in a controlled way.
+  The handler runs on an alternate signal stack, which the main thread and every thread that `kizz-threads` starts have.
+  Each of those threads records the guard region of its stack when it starts, where the handler can read it safely.
+  The handler acts only on a fault that the kernel reports at an address in the guard region of the faulting thread.
+  It then only makes calls that are safe in a signal handler, and it allocates nothing, takes no lock and never panics.
+  It writes a fixed error to standard error, which names the task whose program kizz was evaluating, when there is one.
+  It deletes the lock file when kizz holds one, and exits with the status of kizz's own errors: 2, or 125 for `kizz execute`.
+  It hands every other fault to the handler that was there before, so a real crash is never swallowed.
+  A command that kizz still traces dies with it, because the kernel kills a tracee whose tracer ends.
+  The cache stays as a crash leaves it, and the next build runs normally.
+  When kizz cannot install the handler, it prints a warning and runs without it, so an overflow aborts kizz as before.
+  A thread that cannot get its alternate stack or its guard region runs without them, and its overflow aborts kizz as before.
 
 ## Observing any command with `kizz execute`
 
@@ -1151,6 +1165,8 @@ crates/
 * `kizz-core` depends on `kizz-trace` and `kizz-store`, never on `kizz-trace-linux`.
 * Only the binary wires in the Linux tracer.
 * Every kizz crate that starts a thread does so through `kizz-threads`, which depends on no other kizz crate.
+* `kizz-threads` also holds kizz's handler of stack overflows, because it sets up every thread that kizz starts.
+* `kizz-core` names the task that it evaluates, and `kizz-store` the lock file that it holds, through `kizz-threads`.
 * Tests of `kizz-core` use a fake tracer.
 
 ## Technology
@@ -1499,6 +1515,10 @@ Acceptance, end to end with the real tracer and a temporary cache:
 * Tests repeat an `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` at once while it fails with `EAGAIN`, up to 100 attempts.
 * End-to-end tests run the `kizz` binary on fixture trees with `KIZZ_CACHE_DIR` set to a temporary directory.
 * Tests make thread starts fail on purpose, through a test switch that release builds lack, to check the retries and errors.
+* An end-to-end test runs `kizz build` and `kizz run` on a task program that overflows the stack under a fixed stack limit.
+  It checks the exit status, the message that names the task, that kizz did not abort, and that the lock file is gone.
+  It then checks that the next build succeeds.
+* A test switch that release builds lack makes kizz fault outside every stack guard, so the test sees kizz die of `SIGSEGV`.
 * Explanations have golden-output tests.
 * A documentation test requires a reference entry for every Starlark global and every member of `env`, `fs` and `task`.
  It also requires one for every `run()` parameter and result attribute, task option, and environment variable that kizz reads.

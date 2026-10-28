@@ -10,11 +10,18 @@
 //! cache` in the `cache` module, and `kizz execute` in the `execute` module, and the
 //! other commands are scaffolds until later phases implement them. `kizz execute`
 //! never prints the banner.
+//!
+//! Before the banner and the command, [`Cli::exec`] installs kizz's handler of
+//! stack overflows through `kizz_threads::overflow`, or prints a warning when it
+//! cannot. In builds with `debug_assertions` only, the variable `KIZZ_TEST_FAULT`
+//! then makes kizz fault outside every stack guard, for the end-to-end test.
 
 use std::{ffi::OsString, fmt, path::PathBuf, process::ExitCode, str::FromStr};
 
 use bpaf::{Args, Bpaf, ParseFailure, Parser};
 
+#[cfg(debug_assertions)]
+use crate::environment::TEST_FAULT;
 use crate::ui;
 
 /// The exit status for usage and configuration errors, and for scaffolded
@@ -63,6 +70,7 @@ impl Cli {
     pub fn exec(self) -> ExitCode {
         self.color.apply();
         let execute = matches!(self.command, Command::Execute { .. });
+        catch_overflows(execute);
         if !self.quiet && !self.no_banner && !execute {
             ui::print_banner();
         }
@@ -141,6 +149,35 @@ impl Cli {
             },
             Command::Image => stub("image", "Build container images.", None),
         }
+    }
+}
+
+/// Install kizz's handler of stack overflows, which exits with 125 after an
+/// overflow in `kizz execute` and with [`USAGE_ERROR`] in every other command. When
+/// it cannot be installed, print one warning and go on without it, so the command
+/// runs as it would without the handler.
+fn catch_overflows(execute: bool) {
+    let status = if execute {
+        kizz_core::STATUS_FAILED
+    } else {
+        USAGE_ERROR
+    };
+    if let Err(error) = kizz_threads::overflow::install(status) {
+        ui::print_warning(&format!(
+            "kizz cannot catch a stack overflow, so an overflow will abort it: {error}"
+        ));
+    }
+    #[cfg(debug_assertions)]
+    fault_on_request();
+}
+
+/// Fault outside every stack guard when [`TEST_FAULT`] is set, so that the
+/// end-to-end test sees the handler hand a real fault on; only in builds with
+/// `debug_assertions`.
+#[cfg(debug_assertions)]
+fn fault_on_request() {
+    if std::env::var_os(TEST_FAULT).is_some() {
+        kizz_threads::overflow::fault_outside_guards();
     }
 }
 

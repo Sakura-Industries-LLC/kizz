@@ -13,6 +13,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+kizz-threads = { path = "../kizz-threads", version = "0.0.1" }
 libc = "0.2.191"
 minicbor = { version = "2.3.1", features = ["alloc", "derive"] }
 surrealkv = "1.0.0"

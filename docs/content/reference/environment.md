@@ -14,7 +14,7 @@ This page covers the variables that kizz itself reads, not those that a task giv
 * `PATH` is where `kizz execute` looks up its program.
 * `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE` and `TERM` decide whether kizz styles its output, under `--color=auto`.
 * The caller's environment is what `env.caller`, `env.inherit` and `kizz execute` read.
-* `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS` and `KIZZ_TEST_FAIL_THREAD_STARTS` are for the developers of kizz.
+* `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS`, `KIZZ_TEST_FAIL_THREAD_STARTS` and `KIZZ_TEST_FAULT` are for the developers of kizz.
 
 Kizz reads each variable from its own environment, which the command was started with.
 A task's commands see a variable only when the task program puts it into the task environment.
@@ -144,3 +144,11 @@ so that tests can show how kizz waits, tries again, and finally fails with an er
 The waits of the attempts that it fails are recorded instead of spent.
 Only builds with debug assertions read it, as the test builds of kizz have, and a release build ignores it.
 A value that is not a whole number from 0 to 4294967295 is ignored, and so is the variable when it is unset, the default.
+
+## `KIZZ_TEST_FAULT`
+
+For developers: when it is set, to any value, kizz reads a page of memory that it mapped without access,
+right after it installs its handler of stack overflows.
+That fault lies outside every stack guard, so the handler hands it on, and kizz dies of `SIGSEGV` without an error of its own.
+The end-to-end test of stack overflows sets it to show that kizz never swallows a real crash.
+Only builds with debug assertions read it, as the test builds of kizz have, and a release build ignores it.

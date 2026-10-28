@@ -437,6 +437,17 @@ A program that is not found names every location checked:
 
 Commands that finished before a failure keep their cache entries.
 
+A program that nests values so deeply that kizz's stack overflows stops kizz itself, not only its task.
+Starlark's garbage collector copies nested values recursively,
+so a list wrapped in a list thousands of times can overflow the stack between two top-level statements.
+Kizz catches the overflow, prints an error that names the task, deletes the lock file and exits with 2:
+
+```text
+error: the program of task kizz.md:3 (Deep) overflowed the stack, so kizz stopped; its values are probably nested too deeply
+```
+
+The cache stays as a crash leaves it, and the next build runs normally.
+
 ### The result, `run_result`
 
 `run()` returns a value of the Starlark type `run_result`, whose attributes depend on the capture mode: `rc`, `signal`,

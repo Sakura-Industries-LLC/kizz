@@ -247,6 +247,7 @@ Kizz then closes the cache, releases and deletes the lock file, and exits with 1
 * 2 without a target, for an invalid target expression, for a configuration error, for `--parallel`,
   and for a cache that cannot be located, locked, opened or used, such as one that belongs to another machine or user.
   Kizz's own errors, such as a thread that it cannot start, also exit with 2.
+  So does an overflow of kizz's stack, as in a task program that nests values too deeply, after kizz deletes the lock file.
 * 130 when Ctrl-C interrupts the build.
 
 ### Examples
@@ -659,7 +660,8 @@ Prints the help of `kizz execute` and exits with 0.
 * The program's exit code, or 128 plus the number of the signal that killed it, such as 143 for `SIGTERM`.
 * 127 when the program is not found.
 * 126 when it is found but cannot be run or started.
-* 125 when kizz itself fails after it accepted the command line: the tracer failed, or the report could not be written.
+* 125 when kizz itself fails after it accepted the command line: the tracer failed, the report could not be written,
+  or kizz's stack overflowed.
 * 2 for a command-line error, such as a missing `--output` or a missing directory for it; then nothing runs.
 
 ### Examples
@@ -842,6 +844,7 @@ its result is not cached, and kizz exits with 130.
 * 1 when it fails.
 * 2 for a command-line or configuration error, an unknown or ambiguous name, a cache that cannot be used,
   and a report that cannot be written after a run that succeeded.
+  An overflow of kizz's stack, such as one in a task program that nests values too deeply, also exits with 2.
 * 130 when Ctrl-C interrupts the run.
 
 ### Examples

@@ -423,10 +423,19 @@ impl Builder<'_> {
     /// whether the build ran a command under that key so far; when the engine
     /// fails unchecked steps and the program succeeded, the run fails with every
     /// unchecked step instead, before its task record is stored.
+    ///
+    /// For the whole load and run, modules included, the task's location is noted
+    /// through `kizz_threads::overflow`, so that an overflow of kizz's stack while the
+    /// program is evaluated names the task.
     fn run_task(
         &mut self,
         task: &TaskInfo,
     ) -> Result<(TaskResult, TaskTrace), StoreError> {
+        let _noted = kizz_threads::overflow::note_task(&crate::warning::location(
+            &task.relative_file,
+            task.line,
+            task.heading.as_deref(),
+        ));
         let load = TaskProgram::load_noting(task.clone(), self.print, self.engine.reports());
         let mut accesses = load.accesses;
         let mut changes = load.changes;

@@ -186,4 +186,5 @@ Planned: interactive commands in `kizz run`, which [planned features](@/guide/pl
 * 1 when it fails.
 * 2 for usage and configuration errors, such as an unknown or ambiguous name,
   and when the report cannot be written after a run that succeeded.
+  An overflow of kizz's stack, such as one in a task program that nests values too deeply, also exits with 2.
 * 130 when interrupted.

@@ -1400,6 +1400,7 @@ dependencies = [
 name = "kizz-store"
 version = "0.0.1"
 dependencies = [
+ "kizz-threads",
  "libc",
  "minicbor",
  "surrealkv",
@@ -1411,6 +1412,9 @@ dependencies = [
 [[package]]
 name = "kizz-threads"
 version = "0.0.1"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "kizz-trace"

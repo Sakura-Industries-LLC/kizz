@@ -18,6 +18,11 @@ use kizz_store::location::{HOME, KIZZ_CACHE_DIR, XDG_CACHE_HOME};
 /// tests use, read it.
 pub const FAIL_THREAD_STARTS: &str = "KIZZ_TEST_FAIL_THREAD_STARTS";
 
+/// The variable that makes kizz fault outside every stack guard right after it
+/// installs its handler of stack overflows; only debug builds, which tests use,
+/// read it.
+pub const TEST_FAULT: &str = "KIZZ_TEST_FAULT";
+
 /// The variable that lets the tracer's tests skip the checks of system calls that
 /// the tracer never saw; only those tests read it, never the `kizz` command.
 pub const SKIP_BLOCKED_SYSCALLS: &str = "KIZZ_TEST_SKIP_BLOCKED_SYSCALLS";
@@ -40,4 +45,4 @@ pub const VARIABLES: [&str; 8] = [
 
 /// The variables that only the tests of kizz and its debug builds read, which the
 /// reference documents for developers.
-pub const DEVELOPER_VARIABLES: [&str; 2] = [SKIP_BLOCKED_SYSCALLS, FAIL_THREAD_STARTS];
+pub const DEVELOPER_VARIABLES: [&str; 3] = [SKIP_BLOCKED_SYSCALLS, FAIL_THREAD_STARTS, TEST_FAULT];
