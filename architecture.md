@@ -1205,6 +1205,11 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
   `zola --root docs build` builds it into `docs/public/`, which Git ignores, and fails on a broken internal link.
   Its pages link to each other with Zola's `@/` links, so the build checks every one, and external links are not checked.
   The Markdown and spelling checks cover its pages, front matter included.
+  Every page has a sidebar that stays in view while the page scrolls, and scrolls on its own when longer than the window.
+  It lists each section and page, and each command, Starlark global and member of the two reference pages as a direct link.
+  Zola's table of contents of those pages generates their entries, so a new heading appears without a change to the templates.
+  The options of each command and the entries of `run()` are in collapsible `<details>` elements that are closed by default.
+  The members of `env`, `fs`, `task` and `json` are open by default, so every command, global and member is one click away.
 * `vendor/surrealkv` holds SurrealKV 1.0.0 with kizz's patch, which `[patch.crates-io]` uses instead of the published crate.
   The workspace excludes it, and the format, Markdown and spelling checks skip it.
   Only the changes that `vendor/surrealkv/KIZZ-PATCHES.md` lists may differ from the published crate.
@@ -1499,6 +1504,11 @@ Acceptance, end to end with the real tracer and a temporary cache:
  It also requires one for every `run()` parameter and result attribute, task option, and environment variable that kizz reads.
  It also requires one for every command and option of the command line, and for every field of the observation report.
  It reads these lists from the code, so a new item without an entry fails it.
+* A site test builds the documentation site with `zola` into a temporary directory and reads the sidebar of every page.
+  It requires a visible link to each command, Starlark global and member that the documentation test reads from the code.
+  It also requires a link to every command option and `run()` parameter, inside a group that is closed by default.
+  A copy of the site with an added heading shows that a new heading appears in the sidebar without a change to the templates.
+  Like the gate's site build, it needs `zola` where the tests run.
 * The tracer conformance test of phase 10 needs a C compiler, `cc`, where the tests run.
   Every tracer must pass it: the x86_64 Linux tracer now, and any later one, for aarch64, macOS or Windows.
   Calls that only some platforms have are compiled only there, and their expected entries name those platforms.

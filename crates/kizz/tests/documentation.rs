@@ -33,6 +33,23 @@
 //! an entry that starts with `Planned:`. The unit tests at the end give the checks
 //! pages that lack one entry of each kind, and lists that gain an item, and show that
 //! each fails with a message that names the item and the page.
+//!
+//! The site tests build the documentation site with `zola` into a temporary
+//! directory, as the gate's site build does, with an environment that holds only
+//! the test's own `PATH`, and read the sidebar of every page that the templates
+//! render. Every page has the same sidebar, which links to every section and page.
+//! It has a visible link, outside every closed `<details>` element or in the
+//! `<summary>` of the innermost one with every outer one open, to each command and
+//! each Starlark global and member of the lists above, at the anchor of the heading
+//! on the built reference page whose first `<code>` names the item; a link inside a
+//! closed group to each option, positional argument, `run()` parameter and result
+//! attribute; and a link to every level 2, 3 and 4 heading of the two reference
+//! pages. A build of a copy of the site with a command, an option and a member
+//! added to the reference pages shows them in the sidebar without a change to the
+//! templates, and the unit tests give the sidebar reader small pages with a missing
+//! link, a hidden member, an option outside every closed group and a page without
+//! the sidebar, and show that each fails with a message that names the item and
+//! the page.
 
 #![allow(
     clippy::disallowed_macros,
@@ -2083,4 +2100,934 @@ fn the_variable_scan_ends_test_modules_where_their_braces_balance() {
         .map(|(number, _line)| number)
         .collect();
     assert_eq!(lines, [1, 13, 14, 15]);
+}
+
+/// The program that builds the documentation site, as the gate's site build runs it.
+const ZOLA: &str = "zola";
+
+/// The tag that opens the sidebar in every page that the site's templates render.
+const SIDEBAR_START: &str = "<nav class=\"site-nav\">";
+
+/// The tag that closes the sidebar.
+const SIDEBAR_END: &str = "</nav>";
+
+/// The root of the documentation site, with its `config.toml`.
+fn site_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs")
+}
+
+/// One page of a built site.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BuiltPage {
+    /// Its address on the site, such as `/` or `/reference/starlark/`.
+    url: String,
+    /// Its HTML.
+    html: String,
+}
+
+/// The address on the site of the page `page`, a path under `docs/content/`, such
+/// as `/reference/starlark/` for `reference/starlark.md`.
+fn page_url(page: &str) -> String {
+    format!("/{}/", page.strip_suffix(".md").unwrap_or(page))
+}
+
+/// The pages that the templates rendered into `public`, each an `index.html`, by
+/// their addresses, sorted; Zola's own `404.html` is not one of them.
+fn built_pages(public: &Path) -> io::Result<Vec<BuiltPage>> {
+    let mut pages = Vec::new();
+    let mut pending = vec![public.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in fs::read_dir(&current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name == "index.html") {
+                let relative = current
+                    .strip_prefix(public)
+                    .unwrap_or(current.as_path())
+                    .display()
+                    .to_string();
+                let url = if relative.is_empty() {
+                    "/".to_owned()
+                } else {
+                    format!("/{relative}/")
+                };
+                pages.push(BuiltPage {
+                    url,
+                    html: fs::read_to_string(&path)?,
+                });
+            }
+        }
+    }
+    pages.sort();
+    Ok(pages)
+}
+
+/// Build the site whose root is `root` into `output`, which must not exist yet,
+/// with `zola` and an environment that holds only the test's own `PATH`, and read
+/// its pages.
+fn build_site(
+    root: &Path,
+    output: &Path,
+) -> io::Result<Vec<BuiltPage>> {
+    let mut zola = Command::new(ZOLA);
+    zola.arg("--root")
+        .arg(root)
+        .arg("build")
+        .arg("--output-dir")
+        .arg(output)
+        .env_clear()
+        .current_dir(root);
+    if let Some(path) = std::env::var_os("PATH") {
+        zola.env("PATH", path);
+    }
+    let finished = zola.output().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot start `{ZOLA}`, which the site tests need where the tests run: {error}"
+            ),
+        )
+    })?;
+    if !finished.status.success() {
+        return Err(io::Error::other(format!(
+            "`{ZOLA} --root {} build` exited with {}: {}{}",
+            root.display(),
+            finished.status,
+            String::from_utf8_lossy(&finished.stdout),
+            String::from_utf8_lossy(&finished.stderr)
+        )));
+    }
+    built_pages(output)
+}
+
+/// The built page of `page`, a path under `docs/content/`, among `pages`.
+fn built_page<'pages>(
+    pages: &'pages [BuiltPage],
+    page: &str,
+) -> io::Result<&'pages BuiltPage> {
+    let url = page_url(page);
+    pages
+        .iter()
+        .find(|built| built.url == url)
+        .ok_or_else(|| io::Error::other(format!("the built site has no page {url} for {page}")))
+}
+
+/// Copy the directory `from`, with everything below it, to `to`.
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+) -> io::Result<()> {
+    let mut pending = vec![(from.to_path_buf(), to.to_path_buf())];
+    while let Some((source, target)) = pending.pop() {
+        fs::create_dir_all(&target)?;
+        for entry in fs::read_dir(&source)? {
+            let entry = entry?;
+            let destination = target.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                pending.push((entry.path(), destination));
+            } else {
+                fs::copy(entry.path(), &destination)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One tag of an HTML text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HtmlTag<'html> {
+    /// The element's name in lowercase, such as `a` or `details`.
+    name: String,
+    /// Whether the tag closes its element, as `</a>` does.
+    closing: bool,
+    /// The text after the name, up to the `>`, which holds the attributes.
+    attributes: &'html str,
+    /// The byte offset of the tag's `<`.
+    start: usize,
+    /// The byte offset just past the tag's `>`.
+    end: usize,
+}
+
+/// The tags of the HTML text `html`, in order: each `<` that a name of ASCII
+/// letters and digits follows, possibly after `/`, up to the next `>`; a
+/// declaration such as `<!DOCTYPE html>` is no tag.
+fn html_tags(html: &str) -> Vec<HtmlTag<'_>> {
+    let mut tags = Vec::new();
+    let mut offset = 0;
+    while let Some(rest) = html.get(offset..)
+        && let Some(open) = rest.find('<')
+    {
+        let start = offset.saturating_add(open);
+        let inside = start.saturating_add(1);
+        let Some(close) = html.get(inside..).and_then(|tail| tail.find('>')) else {
+            break;
+        };
+        let close = inside.saturating_add(close);
+        offset = close.saturating_add(1);
+        let text = html.get(inside..close).unwrap_or_default();
+        let (closing, text) = text
+            .strip_prefix('/')
+            .map_or((false, text), |rest| (true, rest));
+        let length = text
+            .find(|character: char| character.is_whitespace() || character == '/')
+            .unwrap_or(text.len());
+        let (name, attributes) = text.split_at_checked(length).unwrap_or((text, ""));
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        tags.push(HtmlTag {
+            name: name.to_ascii_lowercase(),
+            closing,
+            attributes,
+            start,
+            end: offset,
+        });
+    }
+    tags
+}
+
+/// `text` with the character references that Zola writes replaced by their
+/// characters.
+fn decode_entities(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The value of the attribute `name` among `attributes`, written as `name="value"`
+/// after a space, with its character references decoded.
+fn attribute(
+    attributes: &str,
+    name: &str,
+) -> Option<String> {
+    let pattern = format!("{name}=\"");
+    let mut rest = attributes;
+    while let Some(found) = rest.find(&pattern) {
+        let before = rest.get(..found).unwrap_or_default();
+        let after = rest
+            .get(found.saturating_add(pattern.len())..)
+            .unwrap_or_default();
+        if before.is_empty() || before.ends_with(char::is_whitespace) {
+            return after
+                .split_once('"')
+                .map(|(value, _rest)| decode_entities(value));
+        }
+        rest = after;
+    }
+    None
+}
+
+/// Whether `attributes` hold the boolean attribute `name`, such as `open`.
+fn has_flag(
+    attributes: &str,
+    name: &str,
+) -> bool {
+    attributes.split_whitespace().any(|word| {
+        word == name
+            || word
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+/// The sidebar of the built page `html`, from its opening `nav` tag to its closing
+/// one, or `None` when the page has no sidebar.
+fn sidebar(html: &str) -> Option<&str> {
+    let start = html.find(SIDEBAR_START)?;
+    let rest = html.get(start..)?;
+    let end = rest.find(SIDEBAR_END)?;
+    rest.get(..end.saturating_add(SIDEBAR_END.len()))
+}
+
+/// One link of a sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarLink {
+    /// The address it leads to, such as `/reference/starlark/#env-1`.
+    href: String,
+    /// Whether it shows without opening anything: outside every closed `<details>`,
+    /// or in the `<summary>` of the innermost one with every outer one open.
+    visible: bool,
+}
+
+/// A `<details>` element that a sidebar link may be in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Group {
+    /// Whether it is open by default, with the `open` attribute.
+    open: bool,
+    /// Whether the reader is inside its `<summary>`, which shows when it is closed.
+    in_summary: bool,
+}
+
+/// The links of the sidebar `sidebar`, in order, each with whether it is visible.
+fn sidebar_links(sidebar: &str) -> Vec<SidebarLink> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut links = Vec::new();
+    for tag in html_tags(sidebar) {
+        match (tag.name.as_str(), tag.closing) {
+            ("details", false) => {
+                groups.push(Group {
+                    open: has_flag(tag.attributes, "open"),
+                    in_summary: false,
+                });
+            },
+            ("details", true) => groups.truncate(groups.len().saturating_sub(1)),
+            ("summary", closing) => {
+                if let Some(group) = groups.last_mut() {
+                    group.in_summary = !closing;
+                }
+            },
+            ("a", false) => {
+                if let Some(href) = attribute(tag.attributes, "href") {
+                    links.push(SidebarLink {
+                        href,
+                        visible: groups.iter().all(|group| group.open || group.in_summary),
+                    });
+                }
+            },
+            _ => {},
+        }
+    }
+    links
+}
+
+/// One level 2, 3 or 4 heading of a built page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuiltHeading {
+    /// Its level, from 2 to 4.
+    level: usize,
+    /// Its `id`, the anchor that links to it, or empty when it has none.
+    id: String,
+    /// The texts of its `<code>` elements, in order, decoded.
+    codes: Vec<String>,
+}
+
+impl BuiltHeading {
+    /// The text of its first `<code>` element, which names its item.
+    fn name(&self) -> Option<&str> {
+        self.codes.first().map(String::as_str)
+    }
+}
+
+/// The level of the heading element `name`, for `h2`, `h3` and `h4`.
+fn heading_level(name: &str) -> Option<usize> {
+    match name {
+        "h2" => Some(2),
+        "h3" => Some(3),
+        "h4" => Some(4),
+        _ => None,
+    }
+}
+
+/// The level 2, 3 and 4 headings of the built page `html`, in order.
+fn built_headings(html: &str) -> Vec<BuiltHeading> {
+    let mut headings = Vec::new();
+    let mut current: Option<BuiltHeading> = None;
+    let mut code_start: Option<usize> = None;
+    for tag in html_tags(html) {
+        if let Some(level) = heading_level(&tag.name) {
+            if tag.closing {
+                headings.extend(current.take());
+            } else {
+                current = Some(BuiltHeading {
+                    level,
+                    id: attribute(tag.attributes, "id").unwrap_or_default(),
+                    codes: Vec::new(),
+                });
+            }
+        } else if tag.name == "code"
+            && let Some(heading) = current.as_mut()
+        {
+            if !tag.closing {
+                code_start = Some(tag.end);
+            } else if let Some(start) = code_start.take() {
+                let text = html.get(start..tag.start).unwrap_or_default();
+                heading.codes.push(decode_entities(text));
+            }
+        }
+    }
+    headings
+}
+
+/// The headings below the first heading of `level` named `name` among `headings`, up
+/// to the next heading of that level or a higher one; empty when none is named so.
+fn built_section<'headings>(
+    headings: &'headings [BuiltHeading],
+    level: usize,
+    name: &str,
+) -> &'headings [BuiltHeading] {
+    let Some(start) = headings
+        .iter()
+        .position(|heading| heading.level == level && heading.name() == Some(name))
+    else {
+        return &[];
+    };
+    let rest = headings.get(start.saturating_add(1)..).unwrap_or_default();
+    let length = rest
+        .iter()
+        .position(|heading| heading.level <= level)
+        .unwrap_or(rest.len());
+    rest.get(..length).unwrap_or_default()
+}
+
+/// The first of `headings` that has `level` and is named `name`.
+fn named_heading<'headings>(
+    headings: &'headings [BuiltHeading],
+    level: usize,
+    name: &str,
+) -> Option<&'headings BuiltHeading> {
+    headings
+        .iter()
+        .find(|heading| heading.level == level && heading.name() == Some(name))
+}
+
+/// Where a sidebar link must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Placement {
+    /// Visible without opening anything: a command, a global or a member.
+    Visible,
+    /// Inside a group that is closed by default: an option, a positional argument,
+    /// a `run()` parameter or a result attribute.
+    Closed,
+    /// Anywhere in the sidebar: any other heading of a reference page.
+    Anywhere,
+}
+
+/// A link that every sidebar needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedLink {
+    /// What it leads to, for messages, such as "the command `kizz build`".
+    item: String,
+    /// The address it must have: the reference page's address and the heading's
+    /// anchor.
+    href: String,
+    /// Where it must be.
+    placement: Placement,
+}
+
+/// The link to `heading`, found for `item` on the built page at `url`, that must
+/// have `placement`, or the problem of a missing heading or anchor.
+fn expected_link(
+    url: &str,
+    item: String,
+    heading: Option<&BuiltHeading>,
+    placement: Placement,
+) -> Result<ExpectedLink, String> {
+    match heading {
+        Some(heading) if !heading.id.is_empty() => {
+            Ok(ExpectedLink {
+                href: format!("{url}#{}", heading.id),
+                item,
+                placement,
+            })
+        },
+        _ => Err(format!("{url}: no heading with an anchor for {item}")),
+    }
+}
+
+/// The links to the commands of `helps`, visible, and to their options and
+/// positional arguments, inside closed groups, whose headings are among
+/// `headings` of the built command-line reference at `url`.
+fn command_line_links(
+    url: &str,
+    headings: &[BuiltHeading],
+    helps: &[CommandHelp],
+) -> Vec<Result<ExpectedLink, String>> {
+    let mut links = Vec::new();
+    for help in helps {
+        let command = &help.command;
+        links.push(expected_link(
+            url,
+            format!("the command `{command}`"),
+            named_heading(headings, 2, command),
+            Placement::Visible,
+        ));
+        let below = built_section(headings, 2, command);
+        let options = help
+            .options
+            .iter()
+            .flat_map(|option| &option.forms)
+            .map(|form| ("option", form));
+        let positionals = help
+            .positionals
+            .iter()
+            .map(|positional| ("positional argument", positional));
+        for (kind, name) in options.chain(positionals) {
+            let heading = below.iter().find(|heading| {
+                heading.level == 3 && heading.codes.iter().any(|code| code == name)
+            });
+            links.push(expected_link(
+                url,
+                format!("the {kind} `{name}` of `{command}`"),
+                heading,
+                Placement::Closed,
+            ));
+        }
+    }
+    links
+}
+
+/// The links to the globals and members of `names`, visible, and to `run()`'s
+/// parameters and result attributes, inside closed groups, whose headings are
+/// among `headings` of the built Starlark reference at `url`.
+fn starlark_links(
+    url: &str,
+    headings: &[BuiltHeading],
+    names: &ProgramNames,
+) -> Vec<Result<ExpectedLink, String>> {
+    let mut links = Vec::new();
+    for global in &names.globals {
+        let written = global.written();
+        links.push(expected_link(
+            url,
+            format!("the Starlark global `{written}`"),
+            named_heading(headings, 2, &written),
+            Placement::Visible,
+        ));
+    }
+    for member in &names.members {
+        let written = member.written();
+        let module = member.name.split_once('.').map_or("", |(module, _)| module);
+        links.push(expected_link(
+            url,
+            format!("the member `{written}`"),
+            named_heading(built_section(headings, 2, module), 3, &written),
+            Placement::Visible,
+        ));
+    }
+    let run = built_section(headings, 2, RUN);
+    for parameter in &names.run_parameters {
+        links.push(expected_link(
+            url,
+            format!("the `{RUN}` parameter `{parameter}`"),
+            named_heading(run, 3, parameter),
+            Placement::Closed,
+        ));
+    }
+    for attribute in &names.result_attributes {
+        links.push(expected_link(
+            url,
+            format!("the `{RUN}` result attribute `{attribute}`"),
+            named_heading(run, 4, attribute),
+            Placement::Closed,
+        ));
+    }
+    links
+}
+
+/// The links to every one of `headings` of the built reference page at `url`.
+fn heading_links(
+    url: &str,
+    headings: &[BuiltHeading],
+) -> Vec<Result<ExpectedLink, String>> {
+    headings
+        .iter()
+        .map(|heading| {
+            expected_link(
+                url,
+                format!("the level {} heading `#{}`", heading.level, heading.id),
+                Some(heading),
+                Placement::Anywhere,
+            )
+        })
+        .collect()
+}
+
+/// The problems of the sidebar `links` of the built page `page` for `expected`:
+/// each needs a link with its address, and a visible one, or one inside a closed
+/// group, as its placement says.
+fn check_links(
+    page: &str,
+    links: &[SidebarLink],
+    expected: &[ExpectedLink],
+) -> Vec<String> {
+    expected
+        .iter()
+        .filter_map(|want| {
+            let found: Vec<&SidebarLink> = links
+                .iter()
+                .filter(|link| link.href == want.href)
+                .collect();
+            let (item, href) = (&want.item, &want.href);
+            if found.is_empty() {
+                return Some(format!("{page}: the sidebar has no link to {item} ({href})"));
+            }
+            match want.placement {
+                Placement::Visible if !found.iter().any(|link| link.visible) => Some(format!(
+                    "{page}: the sidebar's link to {item} ({href}) is hidden in a closed group"
+                )),
+                Placement::Closed if found.iter().all(|link| link.visible) => Some(format!(
+                    "{page}: the sidebar's link to {item} ({href}) is outside every closed group"
+                )),
+                Placement::Visible | Placement::Closed | Placement::Anywhere => None,
+            }
+        })
+        .collect()
+}
+
+/// The problems of the sidebars of `pages`: each page needs one, the same as the
+/// first page's, with a visible link to every page but the home page.
+fn check_sidebars(pages: &[BuiltPage]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let first = pages.first().and_then(|page| sidebar(&page.html));
+    for page in pages {
+        match sidebar(&page.html) {
+            None => problems.push(format!("{}: the page has no sidebar", page.url)),
+            Some(text) if Some(text) != first => {
+                problems.push(format!(
+                    "{}: the sidebar differs from the first page's",
+                    page.url
+                ));
+            },
+            Some(_) => {},
+        }
+    }
+    let links = first.map(sidebar_links).unwrap_or_default();
+    for page in pages.iter().filter(|page| page.url != "/") {
+        if !links
+            .iter()
+            .any(|link| link.href == page.url && link.visible)
+        {
+            problems.push(format!("{}: the sidebar does not list the page", page.url));
+        }
+    }
+    problems
+}
+
+/// The problems of the sidebar of every one of `pages` for `expected`, and the
+/// problems among `expected` themselves, which name a heading that is missing.
+fn check_every_sidebar(
+    pages: &[BuiltPage],
+    expected: Vec<Result<ExpectedLink, String>>,
+) -> Vec<String> {
+    let mut wanted = Vec::new();
+    let mut problems = Vec::new();
+    for link in expected {
+        match link {
+            Ok(link) => wanted.push(link),
+            Err(problem) => problems.push(problem),
+        }
+    }
+    for page in pages {
+        let links = sidebar(&page.html).map(sidebar_links).unwrap_or_default();
+        problems.extend(check_links(&page.url, &links, &wanted));
+    }
+    problems
+}
+
+/// The site that the gate builds gives every page the same sidebar, which lists
+/// every section and page, with a visible link to every command, Starlark global
+/// and member, a link inside a closed group to every option, positional argument,
+/// `run()` parameter and result attribute, and a link to every level 2, 3 and 4
+/// heading of the two reference pages.
+#[test]
+fn the_sidebar_links_every_command_global_and_member() -> io::Result<()> {
+    let output = tempfile::tempdir()?;
+    let pages = build_site(&site_dir(), &output.path().join("public"))?;
+    assert!(
+        pages.len() > 3,
+        "the built site has too few pages: {pages:?}"
+    );
+    assert_none(&check_sidebars(&pages));
+    let helps = all_helps()?;
+    let names = program_names();
+    let command_line = built_page(&pages, COMMAND_LINE)?;
+    let starlark = built_page(&pages, STARLARK)?;
+    let command_headings = built_headings(&command_line.html);
+    let starlark_headings = built_headings(&starlark.html);
+    assert!(
+        !command_headings.is_empty() && !starlark_headings.is_empty(),
+        "the built reference pages have no headings"
+    );
+    let mut expected = command_line_links(&command_line.url, &command_headings, &helps);
+    expected.extend(starlark_links(&starlark.url, &starlark_headings, &names));
+    expected.extend(heading_links(&command_line.url, &command_headings));
+    expected.extend(heading_links(&starlark.url, &starlark_headings));
+    let placements: BTreeSet<Placement> = expected
+        .iter()
+        .flatten()
+        .map(|link| link.placement)
+        .collect();
+    assert_eq!(
+        placements.len(),
+        3,
+        "not every placement is checked: {placements:?}"
+    );
+    assert_none(&check_every_sidebar(&pages, expected));
+    Ok(())
+}
+
+/// A copy of the site with a command, `kizz shell`, and its option `--login` added
+/// to the command-line reference, and a member, `fs.remove()`, added to the
+/// Starlark reference, built with the same templates, shows the command and the
+/// member visible and the option inside a closed group in every sidebar.
+#[test]
+fn a_heading_added_later_appears_in_the_sidebar() -> io::Result<()> {
+    let work = tempfile::tempdir()?;
+    let site = site_dir();
+    let root = work.path().join("docs");
+    fs::create_dir_all(&root)?;
+    fs::copy(site.join("config.toml"), root.join("config.toml"))?;
+    for dir in ["content", "templates", "static"] {
+        copy_tree(&site.join(dir), &root.join(dir))?;
+    }
+    let command_line_path = root.join("content").join(COMMAND_LINE);
+    let added_command = replace_line(
+        &fs::read_to_string(&command_line_path)?,
+        "## `kizz graph`",
+        "## `kizz shell`\n\nA command that this test adds.\n\n### `--login`\n\nAn option that this test adds.\n\n\
+         ## `kizz graph`",
+    );
+    fs::write(&command_line_path, added_command)?;
+    let starlark_path = root.join("content").join(STARLARK);
+    let added_member = replace_line(
+        &fs::read_to_string(&starlark_path)?,
+        "## `task`",
+        "### `fs.remove()`\n\nA member that this test adds.\n\n## `task`",
+    );
+    fs::write(&starlark_path, added_member)?;
+    let pages = build_site(&root, &work.path().join("public"))?;
+    assert_none(&check_sidebars(&pages));
+    let command_line = built_page(&pages, COMMAND_LINE)?;
+    let starlark = built_page(&pages, STARLARK)?;
+    let command_headings = built_headings(&command_line.html);
+    let starlark_headings = built_headings(&starlark.html);
+    let shell = built_section(&command_headings, 2, "kizz shell");
+    let expected = vec![
+        expected_link(
+            &command_line.url,
+            "the added command `kizz shell`".to_owned(),
+            named_heading(&command_headings, 2, "kizz shell"),
+            Placement::Visible,
+        ),
+        expected_link(
+            &command_line.url,
+            "the added option `--login`".to_owned(),
+            named_heading(shell, 3, "--login"),
+            Placement::Closed,
+        ),
+        expected_link(
+            &starlark.url,
+            "the added member `fs.remove()`".to_owned(),
+            named_heading(built_section(&starlark_headings, 2, "fs"), 3, "fs.remove()"),
+            Placement::Visible,
+        ),
+    ];
+    assert_none(&check_every_sidebar(&pages, expected));
+    Ok(())
+}
+
+/// A small sidebar for the unit tests of the sidebar reader: the command-line
+/// reference with `kizz build` in a group that is closed when `build_open` is
+/// false, and the Starlark reference with `fs` in a group that is open when
+/// `fs_open` is true, holding a closed group of its own.
+fn small_sidebar(
+    build_open: bool,
+    fs_open: bool,
+) -> String {
+    let details = |open: bool| if open { "<details open>" } else { "<details>" };
+    format!(
+        "<!DOCTYPE html><html><body><nav class=\"site-nav\"><ul>\
+         <li><a href=\"/reference/command-line/\">Command line</a><ul class=\"toc\">\
+         <li>{}<summary><a href=\"/reference/command-line/#kizz-build\">kizz build</a></summary><ul>\
+         <li><a href=\"/reference/command-line/#explain\">--explain</a></li></ul></details></li></ul></li>\
+         <li><a href=\"/reference/starlark/\">Starlark API</a><ul class=\"toc\">\
+         <li>{}<summary><a href=\"/reference/starlark/#fs\">fs</a></summary><ul>\
+         <li><a href=\"/reference/starlark/#fs-read\">fs.read()</a></li>\
+         <li><details><summary><a href=\"/reference/starlark/#inner\">inner</a></summary>\
+         <a href=\"/reference/starlark/#deep\">deep</a></details></li>\
+         </ul></details></li></ul></li></ul></nav><main></main></body></html>",
+        details(build_open),
+        details(fs_open)
+    )
+}
+
+/// The links that the unit tests of the sidebar reader expect of
+/// [`small_sidebar`], with `kizz run` added, which it lacks, when `with_run` is
+/// true.
+fn small_expectations(with_run: bool) -> Vec<ExpectedLink> {
+    let link = |item: &str, href: &str, placement: Placement| {
+        ExpectedLink {
+            item: item.to_owned(),
+            href: href.to_owned(),
+            placement,
+        }
+    };
+    let mut expected = vec![
+        link(
+            "the command `kizz build`",
+            "/reference/command-line/#kizz-build",
+            Placement::Visible,
+        ),
+        link(
+            "the option `--explain`",
+            "/reference/command-line/#explain",
+            Placement::Closed,
+        ),
+        link(
+            "the Starlark global `fs`",
+            "/reference/starlark/#fs",
+            Placement::Visible,
+        ),
+        link(
+            "the member `fs.read()`",
+            "/reference/starlark/#fs-read",
+            Placement::Visible,
+        ),
+        link(
+            "the inner group",
+            "/reference/starlark/#inner",
+            Placement::Visible,
+        ),
+        link(
+            "the deep entry",
+            "/reference/starlark/#deep",
+            Placement::Closed,
+        ),
+    ];
+    if with_run {
+        expected.push(link(
+            "the command `kizz run`",
+            "/reference/command-line/#kizz-run",
+            Placement::Anywhere,
+        ));
+    }
+    expected
+}
+
+/// The sidebar reader passes a link in the `<summary>` of a closed group as
+/// visible and a link below it as hidden, and fails a missing link, a member hidden
+/// in a closed group and an option outside every closed group, each with a message
+/// that names the item and the page.
+#[test]
+fn the_sidebar_reader_judges_each_link() -> io::Result<()> {
+    let page = "/guide/";
+    let read = |html: &str| -> io::Result<Vec<SidebarLink>> {
+        sidebar(html)
+            .map(sidebar_links)
+            .ok_or_else(|| io::Error::other("the small page has no sidebar"))
+    };
+    let links = read(&small_sidebar(false, true))?;
+    assert_eq!(links.len(), 8, "{links:?}");
+    assert_none(&check_links(page, &links, &small_expectations(false)));
+    let problems = check_links(page, &links, &small_expectations(true));
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert_names(&problems, "the command `kizz run`", page);
+    let hidden = check_links(
+        page,
+        &read(&small_sidebar(false, false))?,
+        &small_expectations(false),
+    );
+    assert_names(&hidden, "the member `fs.read()`", page);
+    assert_names(&hidden, "the inner group", page);
+    assert_eq!(hidden.len(), 2, "{hidden:?}");
+    assert!(
+        hidden
+            .iter()
+            .all(|problem| problem.contains("hidden in a closed group")),
+        "{hidden:?}"
+    );
+    let outside = check_links(
+        page,
+        &read(&small_sidebar(true, true))?,
+        &small_expectations(false),
+    );
+    assert_eq!(outside.len(), 1, "{outside:?}");
+    assert_names(&outside, "the option `--explain`", page);
+    assert!(
+        outside
+            .iter()
+            .all(|problem| problem.contains("outside every closed group")),
+        "{outside:?}"
+    );
+    Ok(())
+}
+
+/// The sidebars of a small site fail when a page lacks one, when a page's differs
+/// from the first page's, and when one does not list a page, each with a message
+/// that names the page.
+#[test]
+fn sidebars_must_be_complete_and_the_same() {
+    let sidebar_of = |pages: &str| {
+        format!(
+            "<html><body><nav class=\"site-nav\"><ul>{pages}</ul></nav><main></main></body></html>"
+        )
+    };
+    let both = sidebar_of(
+        "<li><a href=\"/guide/\">Guide</a><ul><li><a href=\"/guide/run/\">Run</a></li></ul></li>",
+    );
+    let page = |url: &str, html: &str| {
+        BuiltPage {
+            url: url.to_owned(),
+            html: html.to_owned(),
+        }
+    };
+    let good = [
+        page("/", &both),
+        page("/guide/", &both),
+        page("/guide/run/", &both),
+    ];
+    assert_none(&check_sidebars(&good));
+    let guide_only = sidebar_of("<li><a href=\"/guide/\">Guide</a></li>");
+    let lacking = [
+        page("/", &guide_only),
+        page("/guide/", &guide_only),
+        page("/guide/run/", "<html><body><main></main></body></html>"),
+        page("/guide/why/", &both),
+    ];
+    let problems = check_sidebars(&lacking);
+    assert_eq!(problems, [
+        "/guide/run/: the page has no sidebar",
+        "/guide/why/: the sidebar differs from the first page's",
+        "/guide/run/: the sidebar does not list the page",
+        "/guide/why/: the sidebar does not list the page",
+    ]);
+}
+
+/// The reader of built pages finds the level 2, 3 and 4 headings with their anchors
+/// and the decoded texts of their `<code>` elements, skips declarations and the
+/// other headings, and finds the section of a heading.
+#[test]
+fn built_headings_parse() {
+    let html = "<!DOCTYPE html><h1>Command line</h1><h2 id=\"overview\">Overview</h2>\
+                <h2 id=\"kizz-build\"><code>kizz build</code></h2>\
+                <h3 id=\"h-help\"><code>-h</code>, <code>--help</code></h3>\
+                <h4 id=\"the-result\">The result, <code>run_result</code></h4>\
+                <h3 id=\"capture\"><code>capture = &quot;split&quot;</code> &amp; <code>a&lt;b&#39;</code></h3>\
+                <h2 id=\"kizz-why\"><code>kizz why</code></h2><h5 id=\"deep\">Deep</h5><p><code>kizz</code></p>";
+    let heading = |level: usize, id: &str, codes: &[&str]| {
+        BuiltHeading {
+            level,
+            id: id.to_owned(),
+            codes: codes.iter().map(|&code| code.to_owned()).collect(),
+        }
+    };
+    let headings = built_headings(html);
+    assert_eq!(headings, [
+        heading(2, "overview", &[]),
+        heading(2, "kizz-build", &["kizz build"]),
+        heading(3, "h-help", &["-h", "--help"]),
+        heading(4, "the-result", &["run_result"]),
+        heading(3, "capture", &["capture = \"split\"", "a<b'"]),
+        heading(2, "kizz-why", &["kizz why"]),
+    ]);
+    let section = built_section(&headings, 2, "kizz build");
+    assert_eq!(section.len(), 3, "{section:?}");
+    let no_headings: [BuiltHeading; 0] = [];
+    assert_eq!(built_section(&headings, 2, "kizz run"), no_headings);
+    assert_eq!(
+        named_heading(section, 3, "-h").map(|found| found.id.as_str()),
+        Some("h-help")
+    );
+    assert_eq!(
+        expected_link("/x/", "the thing".to_owned(), None, Placement::Visible),
+        Err("/x/: no heading with an anchor for the thing".to_owned())
+    );
 }

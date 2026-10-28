@@ -61,6 +61,12 @@ a {
 
 .site-nav {
     flex: 0 0 14rem;
+    position: sticky;
+    top: 0;
+    align-self: flex-start;
+    max-height: 100vh;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
     font-size: 0.95rem;
 }
 
@@ -82,6 +88,10 @@ a {
     margin-top: 0.25rem;
     padding-left: 0.75rem;
     border-left: 1px solid var(--border);
+}
+
+.site-nav summary {
+    cursor: pointer;
 }
 
 .content {
@@ -132,5 +142,10 @@ td {
 
     .site-nav {
         flex-basis: auto;
+        position: static;
+        align-self: stretch;
+        max-height: 50vh;
+        padding-bottom: 1rem;
+        border-bottom: 1px solid var(--border);
     }
 }

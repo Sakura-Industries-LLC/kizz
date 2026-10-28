@@ -23,6 +23,35 @@
                         {% for item in sub.pages %}
                         <li>
                             <a href="{{ item.permalink }}">{% if item.title %}{{ item.title }}{% else %}{{ item.slug }}{% endif %}</a>
+                            {% if item.relative_path == "reference/command-line.md" or item.relative_path == "reference/starlark.md" %}
+                            <ul class="toc">
+                                {% for entry in item.toc %}
+                                <li>
+                                    {% if entry.children %}
+                                    {% if item.relative_path == "reference/starlark.md" and entry.id != "run" %}<details open>{% else %}<details>{% endif %}
+                                        <summary><a href="{{ entry.permalink }}">{{ entry.title }}</a></summary>
+                                        <ul>
+                                            {% for child in entry.children %}
+                                            <li>
+                                                <a href="{{ child.permalink }}">{{ child.title }}</a>
+                                                {% if child.children %}
+                                                <ul>
+                                                    {% for grandchild in child.children %}
+                                                    <li><a href="{{ grandchild.permalink }}">{{ grandchild.title }}</a></li>
+                                                    {% endfor %}
+                                                </ul>
+                                                {% endif %}
+                                            </li>
+                                            {% endfor %}
+                                        </ul>
+                                    </details>
+                                    {% else %}
+                                    <a href="{{ entry.permalink }}">{{ entry.title }}</a>
+                                    {% endif %}
+                                </li>
+                                {% endfor %}
+                            </ul>
+                            {% endif %}
                         </li>
                         {% endfor %}
                     </ul>
