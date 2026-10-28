@@ -6,7 +6,9 @@
 //!
 //! Each test writes its `kizz.md` and modules into a temporary directory, parses
 //! the task block, loads and runs its program, and checks the step specifications
-//! the fake executor received, the lines the program printed, and the failure.
+//! the fake executor received, the lines the program printed, and the failure;
+//! for equivalent forms of `run()`'s list and tuple arguments, it also checks the
+//! step keys that `kizz_core::step_key` derives from the specifications.
 
 #![allow(
     clippy::disallowed_macros,
@@ -1177,6 +1179,186 @@ fn encoding_a_result_checks_it() -> TestResult {
         run.result?;
         assert_eq!(printed, ["Build it: 1 out"]);
         assert_eq!(run.unchecked.len(), 1, "{program}: {:?}", run.unchecked);
+    }
+    Ok(())
+}
+
+/// The commands of the steps `executor` received, in order.
+fn commands(executor: &FakeExecutor) -> Vec<Vec<String>> {
+    executor.steps().into_iter().map(|step| step.argv).collect()
+}
+
+/// `words` as an owned command.
+fn command(words: &[&str]) -> Vec<String> {
+    words.iter().map(|&word| word.to_owned()).collect()
+}
+
+/// Lists and tuples among `run()`'s positional arguments expand in place, first,
+/// last, in the middle, nested, as the whole command, held in a variable, and as
+/// frozen values loaded from a module; empty ones add nothing, each string stays
+/// one argument, and the same list used twice adds its strings twice.
+#[test]
+fn lists_and_tuples_in_run_expand_into_the_command() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write(
+        "lib/flags.star",
+        "FLAGS = [\"--locked\", (\"--jobs\", \"2\")]\nEMPTY = ()\n",
+    )?;
+    let task = fixture.block(
+        "load(\"lib/flags.star\", \"FLAGS\", \"EMPTY\")\nrun(\"echo\", [\"this\", \"is\", \
+         \"test\"])\nrun([\"echo\", \"this\"], \"is\", \"test\")\nrun(\"echo\", [\"this\"], \
+         \"is\", (\"test\",))\nrun(\"echo\", [[\"this\"], (\"is\", [])], \"test\")\nrun([\"echo\", \
+         \"this\", \"is\", \"test\"])\nrun((\"printf\",), [], (), [[]], \"a b\", \"\")\nverbose = \
+         []\nrun(\"tool\", verbose, \"x\")\nverbose = [\"-v\"]\nrun(\"tool\", verbose, \"x\", \
+         verbose)\nrun(\"cargo\", \"build\", FLAGS, EMPTY)\n",
+    )?;
+    let executor = FakeExecutor::new();
+    let (result, _) = run(task, &executor)?;
+    result?;
+    let this_is_test = command(&["echo", "this", "is", "test"]);
+    assert_eq!(commands(&executor), [
+        this_is_test.clone(),
+        this_is_test.clone(),
+        this_is_test.clone(),
+        this_is_test.clone(),
+        this_is_test,
+        command(&["printf", "a b", ""]),
+        command(&["tool", "x"]),
+        command(&["tool", "-v", "x", "-v"]),
+        command(&["cargo", "build", "--locked", "--jobs", "2"]),
+    ]);
+    Ok(())
+}
+
+/// `run("cargo", "test", task.args)` passes the task's arguments through, each as
+/// one argument, and adds nothing when `task.args` is empty, as under a build.
+#[test]
+fn task_args_pass_through_as_one_list() -> TestResult {
+    let fixture = Fixture::new()?;
+    let source = "run(\"cargo\", \"test\", task.args)\n";
+    let mut task = fixture.block(source)?;
+    task.args = vec!["--release".to_owned(), "a b".to_owned()];
+    let executor = FakeExecutor::new();
+    let (result, _) = run(task, &executor)?;
+    result?;
+    assert_eq!(commands(&executor), [command(&[
+        "cargo",
+        "test",
+        "--release",
+        "a b"
+    ])]);
+
+    let executor = FakeExecutor::new();
+    let (result, _) = run(fixture.block(source)?, &executor)?;
+    result?;
+    assert_eq!(commands(&executor), [command(&["cargo", "test"])]);
+    Ok(())
+}
+
+/// Each error of the expansion fails the task with its exact message, and the
+/// failing call starts no step: a wrong type at the top and nested, for `int`,
+/// `bool`, `NoneType`, `dict`, `range` and `run_result`, a list or tuple that
+/// contains itself, and more than a million values; a call whose arguments hold no
+/// string at all fails as a call without a program.
+#[test]
+fn invalid_run_arguments_fail_the_task_and_start_no_step() -> TestResult {
+    let fixture = Fixture::new()?;
+    let no_program = "run() needs a program: run(\"program\", \"argument\", ...)";
+    for (source, message) in [
+        (
+            "run(\"p\", \"a\", 5)\n",
+            "run(): argument 3 is of type int, not a string, list or tuple",
+        ),
+        (
+            "run(\"p\", [True])\n",
+            "run(): argument 2 at [0] is of type bool, not a string, list or tuple",
+        ),
+        (
+            "run(\"p\", [\"a\", [None]])\n",
+            "run(): argument 2 at [1][0] is of type NoneType, not a string, list or tuple",
+        ),
+        (
+            "run({\"p\": 1})\n",
+            "run(): argument 1 is of type dict, not a string, list or tuple",
+        ),
+        (
+            "run(\"p\", (\"a\", range(3)))\n",
+            "run(): argument 2 at [1] is of type range, not a string, list or tuple",
+        ),
+        (
+            "run([], 5)\n",
+            "run(): argument 2 is of type int, not a string, list or tuple",
+        ),
+        (
+            "a = [\"x\"]\na.append(a)\nrun(\"p\", a)\n",
+            "run(): argument 2 at [1] is a list that contains itself",
+        ),
+        (
+            "a = []\nb = [a]\na.append(b)\nrun(\"p\", a)\n",
+            "run(): argument 2 at [0][0] is a list that contains itself",
+        ),
+        (
+            "l = []\nt = (\"a\", l)\nl.append(t)\nrun(\"p\", t)\n",
+            "run(): argument 2 at [1][0] is a tuple that contains itself",
+        ),
+        (
+            "a = [\"x\"]\nfor _ in range(21):\n    a = [a, a]\nrun(\"p\", a)\n",
+            "run(): the arguments expand to more than 1000000 strings, lists and tuples",
+        ),
+        ("run([])\n", no_program),
+        ("run([], ())\n", no_program),
+        ("run([[]])\n", no_program),
+    ] {
+        let executor = FakeExecutor::new();
+        let message_seen = program_message(run(fixture.block(source)?, &executor)?.0)?;
+        assert!(
+            message_seen.contains(message),
+            "{message:?} in {message_seen}"
+        );
+        assert_eq!(executor.steps(), [], "{source}");
+    }
+
+    let executor = FakeExecutor::new();
+    let task = fixture.block("r = run(\"first\")\nrun(\"p\", [r])\n")?;
+    let message = program_message(run(task, &executor)?.0)?;
+    assert!(
+        message.contains(
+            "run(): argument 2 at [0] is of type run_result, not a string, list or tuple"
+        ),
+        "{message}"
+    );
+    assert_eq!(commands(&executor), [command(&["first"])]);
+    Ok(())
+}
+
+/// `run("echo", ["this", "is", "test"])`, `run(["echo", "this"], "is", "test")`,
+/// `run(("echo",), [["this"], ("is", [])], "test")` and
+/// `run("echo", "this", "is", "test")` give equal step specifications, so one
+/// program hash and occurrence give them one step key.
+#[test]
+fn equivalent_forms_give_one_step_specification_and_key() -> TestResult {
+    let fixture = Fixture::new()?;
+    let mut specs = Vec::new();
+    for source in [
+        "run(\"echo\", [\"this\", \"is\", \"test\"])\n",
+        "run([\"echo\", \"this\"], \"is\", \"test\")\n",
+        "run((\"echo\",), [[\"this\"], (\"is\", [])], \"test\")\n",
+        "run(\"echo\", \"this\", \"is\", \"test\")\n",
+    ] {
+        let executor = FakeExecutor::new();
+        let (result, _) = run(fixture.block(source)?, &executor)?;
+        result?;
+        let [spec] = <[StepSpec; 1]>::try_from(executor.steps())
+            .map_err(|steps| format!("one step, not {steps:?}"))?;
+        specs.push(spec);
+    }
+    let program = hash(fixture.block("run(\"echo\", \"this\", \"is\", \"test\")\n"))?;
+    let first = specs.first().ok_or("no specification")?;
+    assert_eq!(first.argv, command(&["echo", "this", "is", "test"]));
+    let key = kizz_core::step_key(program, first, 0)?;
+    for spec in &specs {
+        assert_eq!(spec, first);
+        assert_eq!(kizz_core::step_key(program, spec, 0)?, key);
     }
     Ok(())
 }

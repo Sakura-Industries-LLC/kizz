@@ -760,6 +760,8 @@ By default there are none, and `task.args` is an empty list.
 Words after `--` that look like options, such as `--fix`, are arguments of the task.
 A word after the name without `--` is a command-line error, and so is an argument that is not valid UTF-8; both exit with 2.
 The arguments are not part of the task program's hash: they reach commands only through what the program does with them.
+A program passes them all to a command with `run("cargo", "test", task.args)`, because `run()` expands a list in place:
+each argument stays one word, and an empty `task.args` adds nothing.
 
 ### `--no-cache`
 

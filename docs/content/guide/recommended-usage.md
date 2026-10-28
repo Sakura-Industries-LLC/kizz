@@ -87,6 +87,35 @@ The path is relative to the file that loads it.
 A module's `run()`, `env` and `fs` calls belong to the task that calls them.
 Every module is part of the task program, so editing it runs the commands of every task that loads it again.
 
+## Build commands from lists
+
+`run()` expands a list or tuple among its positional arguments in place, at any depth, and an empty list adds nothing.
+Use that to build a command by logic, and to hold an optional argument in a variable that is `[]` when it is not wanted,
+rather than write one `run()` call for each combination:
+
+````markdown
+## Test
+
+```starlark test name=test
+env.inherit("PATH", "HOME")
+release = ["--release"] if "release" in task.args else []
+run("cargo", "test", "--locked", release, expect = [0])
+```
+````
+
+`kizz build test` and `kizz run test` run `cargo test --locked`,
+and `kizz run test -- release` runs `cargo test --locked --release`.
+To pass every argument of `kizz run` through, give `task.args` itself, which adds nothing when it is empty:
+
+```starlark
+run("cargo", "test", task.args, expect = [0])
+```
+
+Each string stays one argument, never split on spaces, so an optional pair of words goes in one list,
+such as `["--features", "json"]`, never as `"--features json"`.
+Kizz prints, explains, records and keys each command by its expanded strings, so the output shows the words that ran.
+Only strings, lists and tuples are accepted; convert any other value with `str()` first.
+
 ## Mark commands with effects outside files as always
 
 A cache hit does not repeat a command, so an upload, a database update, a notification or a download would be skipped.

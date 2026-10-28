@@ -276,6 +276,16 @@ result = run(
 
 * Kizz runs the program directly, without a shell.
   Use `run("sh", "-c", "...")` when shell features are wanted.
+* Each positional argument is a string, or a list or tuple whose elements are strings, lists or tuples.
+  Each list or tuple expands in place, in order and at any depth, so the command is the flat sequence of its strings.
+  An empty list or tuple adds nothing, and each string stays exactly one argument, never split on spaces.
+  So `run("echo", ["this", "is", "test"])` and `run(["echo", "this"], "is", "test")` are the same step, with the same key.
+  A program can build its arguments by logic, and an optional argument can be a variable that holds `[]` when not wanted.
+  After the expansion the first string is the program, and an expansion without any string fails as a call without a program.
+  Any other value fails the task with an error that names its argument, its index path within the lists, and its type.
+  A list or tuple that contains itself, directly or through other lists or tuples, fails the task with an error.
+  An expansion that would visit more than 1,000,000 values, counting strings, lists and tuples, fails the task.
+  The step key, the printed command, explanations, `kizz why`, reports and the cache all see the expanded command.
 * A program name without `/` is looked up in the `PATH` of the task environment, never in kizz's own.
   Every location kizz checks is recorded as a dependency of the step, so a program that appears earlier in `PATH` re-runs the step.
   If the task environment has no `PATH`, a bare program name is an error that says to set or inherit `PATH`.

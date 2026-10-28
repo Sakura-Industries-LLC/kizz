@@ -72,6 +72,7 @@ result = run(
 
 Runs one command, a *step* of the task, traces it, and returns its result.
 The positional arguments are the program and its arguments, and every other parameter is a keyword argument with a default.
+A positional argument can also be a list or tuple, which expands in place, as [`argv`](@/reference/starlark.md#argv) describes.
 `run()` works only in a task, not while a module loads.
 
 Each call goes through these stages:
@@ -98,23 +99,68 @@ Each call goes through these stages:
 The [caching guide](@/guide/caching.md) explains the cache check,
 and the [caching controls](@/reference/kizz-md.md#caching-controls) list every option that changes it.
 
-A step's record holds every parameter as the call gave it, the program that ran, the exit status, the raw captured output,
-the paths with their states, the machine state, the network connections and the unknown system calls.
+A step's record holds every parameter as the call gave it, with the positional arguments as their expanded strings,
+the program that ran, the exit status, the raw captured output, the paths with their states, the machine state,
+the network connections and the unknown system calls.
 Explanations use it to say what changed, and `kizz why` shows it.
 
 ### `argv`
 
-The positional arguments: the program, then its arguments, each a string.
+The positional arguments: the program, then its arguments.
+Each is a string, or a list or tuple whose elements are strings, lists or tuples.
 
-* Type: one or more strings, given positionally, such as `run("go", "test", "./...")`.
-  There is no default: `run()` without a program fails the task with `run() needs a program: run("program", "argument", ...)`.
+* Type: one or more values given positionally, each a string, a list or a tuple, such as `run("go", "test", "./...")`.
+  Each list or tuple expands in place, in order and at any depth, so the command is the flat sequence of its strings.
+  An empty list or tuple, `[]` or `()`, adds nothing.
+  Each string stays exactly one argument: kizz never splits it on spaces, and an empty string is an empty argument.
+  After the expansion the first string is the program.
+  There is no default: a call whose arguments hold no string at all, such as `run()`, `run([])` or `run([], ())`,
+  fails the task with `run() needs a program: run("program", "argument", ...)`.
 * What it does: kizz runs the program directly, without a shell, with these arguments.
   Use `run("sh", "-c", "...")` for shell features such as pipes.
   The program is looked up as [Program lookup](@/reference/starlark.md#program-lookup) describes.
-* Step key: part of it, word by word, so a changed argument gives another step key.
+* Step key: part of it, word by word, as the expanded strings, so a changed argument gives another step key.
+  Forms that expand to the same strings are the same step:
+  `run("echo", ["this", "is", "test"])` and `run(["echo", "this"], "is", "test")` both run `echo this is test`,
+  and in the same task program, at the same occurrence, they have the same step key and share one cache record.
+  Two such calls in one run of a task are identical commands, so the second has the next occurrence number.
+  The printed command, explanations, `kizz why`, reports and the step record all show the expanded strings.
 * Tracks: the arguments themselves, through the step key.
   A program found through `PATH` is a dependency, with every location the lookup checked.
 * Side effects: those of the command, which kizz does not limit.
+
+Lists let a program build its command by logic, rather than write every argument literally.
+An optional argument can be a variable that holds the argument in a list when it is wanted, and `[]` when it is not:
+
+```starlark
+release = ["--release"] if "release" in task.args else []
+run("cargo", "build", "--locked", release, expect = [0])
+```
+
+Under `kizz run` with the argument `release`, this runs `cargo build --locked --release`, and otherwise `cargo build --locked`.
+In the same way, `run("cargo", "test", task.args)` passes the arguments of `kizz run` through, each as one argument,
+and with no arguments it runs `cargo test`.
+The same list may appear more than once: with `opt = ["-v"]`, `run("tool", opt, "x", opt)` runs `tool -v x -v`.
+
+Only strings, lists and tuples are accepted, and no other value is converted to a string.
+Any other value, such as an int, a bool, `None`, a dict, a `range` or a `run_result`,
+fails the task with an error that names its argument, its index path and its type,
+such as `run(): argument 3 is of type int, not a string, list or tuple` for `run("head", "-n", 5)`,
+or `run(): argument 2 at [1][0] is of type NoneType, not a string, list or tuple` for `run("p", ["a", [None]])`.
+Arguments are counted from 1 among the positional arguments, and the index path is Starlark indexing into that argument,
+so `argument 2 at [1][0]` names `x[1][0]`, where `x` is the second positional argument.
+The type is the name that Starlark's `type()` gives; `str()` converts a number when one is wanted, as in `str(5)`.
+
+A list or tuple that contains itself, directly or through other lists or tuples, fails the task where it is met again,
+such as `run(): argument 2 at [1] is a list that contains itself` for `a = ["x"]`, `a.append(a)` and `run("p", a)`; for a tuple,
+the message says `tuple`.
+
+The expansion visits at most 1,000,000 values, counting every string, list and tuple, the positional arguments included.
+Arguments that would expand further, such as `a = ["x"]` followed by twenty-one rounds of `a = [a, a]`,
+fail the task with `run(): the arguments expand to more than 1000000 strings, lists and tuples`.
+
+These checks come in the order of the arguments, so `run([], 5)` fails on the type of argument 2, not as a call without a program.
+A call whose arguments fail to expand starts no command and stores no record.
 
 ### `stdin`
 
@@ -364,6 +410,9 @@ error: kizz.md:33 (Expect) failed:
 These fail the task at the `run()` call, with a Starlark error and the stack:
 
 * a call outside a task, while a module loads;
+* a positional argument, or a value inside one, that is neither a string nor a list or tuple,
+  a list or tuple that contains itself, or arguments that expand to more than 1,000,000 values,
+  each with the message that [`argv`](@/reference/starlark.md#argv) gives;
 * a call without a program, an invalid `capture`, or an unknown `machine` part;
 * an invalid `ignore` or `track` pattern;
 * a bare program name without `PATH`;
@@ -789,6 +838,9 @@ It takes no parameters, tracks nothing and has no side effect.
 who = task.args[0] if task.args else "world"
 run("echo", "hello,", who, expect = [0])
 ```
+
+Because `run()` expands a list in place, `run("cargo", "test", task.args)` passes every argument to the command,
+each as one argument, and adds nothing when `task.args` is empty.
 
 ## `json`
 

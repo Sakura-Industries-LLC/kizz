@@ -1008,3 +1008,102 @@ fn a_report_that_cannot_be_written_makes_a_successful_run_exit_with_2() -> TestR
     );
     Ok(())
 }
+
+/// An optional argument held in a variable that is `[]` unless `task.args` asks for
+/// it: `kizz run` without the switch prints the command without the argument, and
+/// the command's output shows that it was not given; with the switch, both show it;
+/// and a run without the switch again finds the first command in the cache.
+#[test]
+fn an_optional_argument_in_a_variable_is_switched_on_and_off() -> TestResult {
+    let project = Project::new()?;
+    project.task(
+        "kizz.md",
+        "Greet",
+        "name=greet",
+        "loud = [\"loudly\"] if \"loud\" in task.args else []\nrun(\"echo\", \"hello\", loud)",
+    )?;
+
+    let plain = project.run("", &["run", "greet"])?;
+    assert_eq!(plain.status, Some(0), "{plain:?}");
+    assert_eq!(
+        plain.stdout,
+        text(&[
+            &run_line("echo hello", 1, NEVER_RUN),
+            "hello",
+            "run succeeded: kizz.md:3 (Greet); 1 command ran, 0 cached",
+        ])
+    );
+
+    let loud = project.run("", &["run", "greet", "--", "loud"])?;
+    assert_eq!(loud.status, Some(0), "{loud:?}");
+    let lines: Vec<&str> = loud.stdout.lines().collect();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|line| line.starts_with("run `echo hello loudly` (step 1): ")),
+        "{loud:?}"
+    );
+    assert_eq!(
+        lines.get(1..),
+        Some(
+            &[
+                "hello loudly",
+                "run succeeded: kizz.md:3 (Greet); 1 command ran, 0 cached",
+            ][..]
+        )
+    );
+
+    let again = project.run("", &["run", "greet"])?;
+    assert_eq!(again.status, Some(0), "{again:?}");
+    assert_eq!(
+        again.stdout,
+        text(&[
+            &cached_line("echo hello", 1),
+            "hello",
+            "run succeeded: kizz.md:3 (Greet); 0 commands ran, 1 cached",
+        ])
+    );
+    Ok(())
+}
+
+/// `run("echo", ["this", "is", "test"])` and `run(["echo", "this"], "is", "test")`
+/// are one step: a task that chooses between them by its `task.args`, which are not
+/// part of the task program hash, runs the first form, and a second `kizz run` with
+/// the other form prints the command as cached, with one record in the cache.
+#[test]
+fn equivalent_forms_share_one_cache_record() -> TestResult {
+    let project = Project::new()?;
+    project.task(
+        "kizz.md",
+        "Same",
+        "name=same",
+        "if \"joined\" in task.args:\n    run([\"echo\", \"this\"], \"is\", \"test\")\nelse:\n    \
+         run(\"echo\", [\"this\", \"is\", \"test\"])",
+    )?;
+    let echo = "echo this is test";
+
+    let first = project.run("", &["run", "same"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        text(&[
+            &run_line(echo, 1, NEVER_RUN),
+            "this is test",
+            "run succeeded: kizz.md:3 (Same); 1 command ran, 0 cached",
+        ])
+    );
+
+    let second = project.run("", &["run", "same", "--", "joined"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(
+        second.stdout,
+        text(&[
+            &cached_line(echo, 1),
+            "this is test",
+            "run succeeded: kizz.md:3 (Same); 0 commands ran, 1 cached",
+        ])
+    );
+    let records = project.step_records()?;
+    assert_eq!(records.len(), 1, "{records:?}");
+    Ok(())
+}

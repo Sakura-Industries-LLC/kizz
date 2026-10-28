@@ -17,7 +17,8 @@ use kizz_trace::{AbsolutePath, CaptureMode, CapturedOutput, Termination};
 /// One step, as a `run()` call in a task program specifies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepSpec {
-    /// The argument vector exactly as written: the program, then its arguments.
+    /// The argument vector: the program, then its arguments, each string exactly as
+    /// written, after `run()` expanded the lists and tuples among its arguments.
     pub argv: Vec<String>,
     /// The text for standard input, or `None` to connect `/dev/null`.
     pub stdin: Option<String>,

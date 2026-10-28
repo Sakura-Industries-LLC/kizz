@@ -149,7 +149,8 @@ pub struct StepSpecRecord {
     /// The absolute working directory.
     #[cbor(n(1), with = "path_bytes")]
     pub cwd: PathBuf,
-    /// The argument vector as written: the program, then its arguments.
+    /// The argument vector as run: the program, then its arguments, each string as
+    /// written, after the expansion of any lists and tuples.
     #[n(2)]
     pub argv: Vec<String>,
     /// The exact environment passed to the process, sorted by name.

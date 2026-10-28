@@ -74,6 +74,18 @@ kizz run greet -- kizz
   when the program passes an argument to a command, a new argument runs that command again.
 * Under `kizz run`, `task.selected` is an empty list, because no target selected the task.
 
+To pass every argument through to a command, give `task.args` to `run()` as one positional argument:
+
+```starlark
+run("cargo", "test", task.args)
+```
+
+`run()` expands the list in place, so for a task named `test` with this call,
+`kizz run test -- --release foo` runs `cargo test --release foo`, each argument as one word, and `kizz run test` runs `cargo test`,
+because an empty `task.args` adds nothing.
+A variable that holds `[]` or a list of words works the same way for an argument that only some runs need;
+the [`argv` entry](@/reference/starlark.md#argv) of the reference gives every rule.
+
 ## Live output and cached replay
 
 `kizz run` shows each command as it starts, then its output as it comes, as if every `run()` had `stream = True`.

@@ -17,6 +17,12 @@
 //! them, and calling `run()` while a module is being loaded, outside any task, is
 //! an error.
 //!
+//! Each positional argument of `run()` is a string, or a list or tuple of strings,
+//! lists or tuples, which expands in place, in order and at any depth, into the
+//! step's command. The expansion walks the values with its own stack, fails on a
+//! list or tuple that contains itself, and stops past a million values, so it never
+//! recurses without bound and always ends.
+//!
 //! The task environment starts empty, and only the `env` functions change it;
 //! `env.caller` and `env.inherit` read the caller environment that
 //! [`TaskProgram::run`] is given, never the process environment. The task
@@ -44,7 +50,7 @@
 
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     io::{self, ErrorKind},
     path::PathBuf,
@@ -73,13 +79,14 @@ use starlark::{
     starlark_module,
     syntax::{AstModule, Dialect},
     values::{
-        AllocValue, Heap, StarlarkValue, Value, ValueLike,
+        AllocValue, Heap, StarlarkValue, Value, ValueIdentity, ValueLike,
         dict::{Dict, UnpackDictEntries},
+        list::ListRef,
         list_or_tuple::UnpackListOrTuple,
         none::{NoneOr, NoneType},
         starlark_value,
         structs::AllocStruct,
-        tuple::UnpackTuple,
+        tuple::{TupleRef, UnpackTuple},
     },
 };
 
@@ -399,6 +406,137 @@ impl TaskFailure {
     }
 }
 
+/// The most values that the expansion of `run()`'s positional arguments visits:
+/// the positional arguments, and every string, list and tuple inside them, alike.
+/// The bound keeps the expansion of lists that share lists, which can double at each
+/// level, under a million steps, and it refuses no command that Linux could start.
+const MAX_ARGUMENT_VALUES: usize = 1_000_000;
+
+/// Where a value among `run()`'s positional arguments is: the positional argument,
+/// counted from 1, and the index path within it, as Starlark indexing writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArgumentPlace {
+    /// The positional argument, counted from 1.
+    argument: usize,
+    /// The index into each list or tuple on the way to the value, outermost first;
+    /// empty for the positional argument itself.
+    path: Vec<usize>,
+}
+
+impl fmt::Display for ArgumentPlace {
+    /// `3` for a positional argument itself, and `2 at [1][0]` for `x[1][0]` where
+    /// `x` is the second positional argument.
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "{}", self.argument)?;
+        if !self.path.is_empty() {
+            f.write_str(" at ")?;
+            for index in &self.path {
+                write!(f, "[{index}]")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A list or tuple that the expansion of `run()`'s positional arguments is inside.
+struct ArgumentFrame<'v> {
+    /// The elements of the list or tuple.
+    items: &'v [Value<'v>],
+    /// The index of the next element to visit.
+    next: usize,
+    /// The identity of the list or tuple, which the cycle check holds while the
+    /// expansion is inside it.
+    identity: ValueIdentity<'v>,
+}
+
+/// The elements of `value` and its type, `list` or `tuple`, when it is a list or a
+/// tuple, frozen or not.
+fn list_or_tuple_items(value: Value<'_>) -> Option<(&[Value<'_>], &'static str)> {
+    if let Some(list) = ListRef::from_value(value) {
+        return Some((list.content(), value.get_type()));
+    }
+    TupleRef::from_value(value).map(|tuple| (tuple.content(), value.get_type()))
+}
+
+/// The command that `run()`'s positional arguments `arguments` give: each string as
+/// one argument, unchanged, and each list or tuple expanded in place, in order and at
+/// any depth.
+///
+/// The walk uses an explicit stack of frames, never recursion, so no depth of nesting
+/// can overflow the thread's stack. The identities of the lists and tuples on the
+/// current path are held in a set, so a list or tuple met again inside itself is an
+/// error, while the same list used twice side by side is not. Every visited value
+/// counts towards [`MAX_ARGUMENT_VALUES`], so lists that share lists end promptly.
+/// Errors come in the order of the walk.
+///
+/// # Errors
+///
+/// Returns [`RunError::ArgumentType`] for a value that is neither a string nor a list
+/// or tuple, [`RunError::SelfContaining`] for a list or tuple met again inside
+/// itself, and [`RunError::TooManyValues`] past the bound.
+fn expand_arguments(arguments: &[Value<'_>]) -> Result<Vec<String>, RunError> {
+    let mut argv = Vec::new();
+    let mut visited: usize = 0;
+    for (position, &argument) in arguments.iter().enumerate() {
+        let number = position.saturating_add(1);
+        let mut stack: Vec<ArgumentFrame<'_>> = Vec::new();
+        let mut on_path: HashSet<ValueIdentity<'_>> = HashSet::new();
+        let mut pending = Some(argument);
+        loop {
+            if let Some(value) = pending.take() {
+                if visited >= MAX_ARGUMENT_VALUES {
+                    return Err(RunError::TooManyValues);
+                }
+                visited = visited.saturating_add(1);
+                let place = || {
+                    ArgumentPlace {
+                        argument: number,
+                        path: stack
+                            .iter()
+                            .map(|frame| frame.next.saturating_sub(1))
+                            .collect(),
+                    }
+                };
+                if let Some(text) = value.unpack_str() {
+                    argv.push(text.to_owned());
+                } else if let Some((items, kind)) = list_or_tuple_items(value) {
+                    let identity = value.identity();
+                    if !on_path.insert(identity) {
+                        return Err(RunError::SelfContaining {
+                            place: place(),
+                            kind,
+                        });
+                    }
+                    stack.push(ArgumentFrame {
+                        items,
+                        next: 0,
+                        identity,
+                    });
+                } else {
+                    return Err(RunError::ArgumentType {
+                        place: place(),
+                        kind: value.get_type(),
+                    });
+                }
+            }
+            let Some(frame) = stack.last_mut() else {
+                break;
+            };
+            if let Some(&item) = frame.items.get(frame.next) {
+                frame.next = frame.next.saturating_add(1);
+                pending = Some(item);
+            } else {
+                on_path.remove(&frame.identity);
+                stack.pop();
+            }
+        }
+    }
+    Ok(argv)
+}
+
 /// Errors that `run()`, the `env` and `fs` functions, and module loading raise
 /// inside Starlark.
 #[derive(Debug, thiserror::Error)]
@@ -415,6 +553,31 @@ enum RunError {
     /// `run()` was called with no program.
     #[error("run() needs a program: run(\"program\", \"argument\", ...)")]
     NoProgram,
+    /// A positional argument of `run()`, or a value inside one, is neither a string
+    /// nor a list or tuple.
+    #[error("run(): argument {place} is of type {kind}, not a string, list or tuple")]
+    ArgumentType {
+        /// Where the value is.
+        place: ArgumentPlace,
+        /// The value's type, as Starlark's `type()` names it.
+        kind: &'static str,
+    },
+    /// A list or tuple among the positional arguments of `run()` contains itself,
+    /// directly or through other lists or tuples.
+    #[error("run(): argument {place} is a {kind} that contains itself")]
+    SelfContaining {
+        /// Where the list or tuple is met again inside itself.
+        place: ArgumentPlace,
+        /// `list` or `tuple`.
+        kind: &'static str,
+    },
+    /// The positional arguments of `run()` would expand to more values than
+    /// [`MAX_ARGUMENT_VALUES`].
+    #[error(
+        "run(): the arguments expand to more than {max} strings, lists and tuples",
+        max = MAX_ARGUMENT_VALUES
+    )]
+    TooManyValues,
     /// `capture` was neither `"split"` nor `"merged"`.
     #[error("run(): capture must be \"split\" or \"merged\", not \"{0}\"")]
     Capture(String),
@@ -724,7 +887,9 @@ impl PrintHandler for TaskPrinter<'_> {
 fn kizz_globals(builder: &mut GlobalsBuilder) {
     /// Run a command and return its result.
     ///
-    /// The positional arguments are the program, then its arguments. With
+    /// The positional arguments are the program, then its arguments. Each is a
+    /// string, or a list or tuple of strings, lists or tuples, which expands in
+    /// place, in order and at any depth, so `[]` adds nothing. With
     /// `expect = None`, `run()` always returns; with a list of exit codes, the task
     /// fails when the exit code is not in it or a signal killed the command. A
     /// non-zero exit or a signal without `expect` is unchecked unless the program
@@ -735,7 +900,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
                   keywords"
     )]
     fn run<'v>(
-        #[starlark(args)] argv: UnpackTuple<&str>,
+        #[starlark(args)] argv: UnpackTuple<Value<'v>>,
         #[starlark(require = named, default = NoneOr::None)] stdin: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] env: NoneOr<
             UnpackDictEntries<&str, NoneOr<&str>>,
@@ -760,7 +925,8 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
         else {
             return Err(outside_task(eval, "run()"));
         };
-        if argv.items.is_empty() {
+        let argv = expand_arguments(&argv.items).map_err(starlark::Error::new_other)?;
+        if argv.is_empty() {
             return Err(starlark::Error::new_other(RunError::NoProgram));
         }
         let capture = match capture {
@@ -797,7 +963,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             }
         }
         let step = StepSpec {
-            argv: argv.items.iter().map(|&arg| arg.to_owned()).collect(),
+            argv,
             stdin: stdin.into_option().map(str::to_owned),
             env: step_env,
             cwd: cwd
@@ -2253,6 +2419,188 @@ mod tests {
         );
         assert_eq!(padded_source(2, "x").unwrap(), "\n\nx");
         assert_eq!(padded_source(0, "x").unwrap(), "x");
+    }
+}
+
+/// Unit tests of `expand_arguments`, the expansion of `run()`'s positional
+/// arguments, on Starlark values that small programs build, or that a test
+/// allocates directly: each form of the expansion, the errors with their exact
+/// messages, the cycle check, the bound, and a nesting deep enough that a recursive
+/// walk would overflow the stack.
+#[cfg(test)]
+#[allow(clippy::disallowed_macros, reason = "test code: the tests assert")]
+mod argument_tests {
+    use starlark::{
+        environment::{Globals, Module},
+        eval::Evaluator,
+        syntax::{AstModule, Dialect},
+        values::{Heap, tuple::TupleRef},
+    };
+
+    use super::{MAX_ARGUMENT_VALUES, expand_arguments};
+
+    /// The expansion of the positional arguments that `source` gives, a Starlark
+    /// program whose last statement is the tuple of the arguments, or the message of
+    /// the expansion's error.
+    fn expand(source: &str) -> Result<Vec<String>, String> {
+        Module::with_temp_heap(|module| {
+            let ast =
+                AstModule::parse("arguments.star", source.to_owned(), &Dialect::Extended).unwrap();
+            let globals = Globals::standard();
+            let mut eval = Evaluator::new(&module);
+            let value = eval.eval_module(ast, &globals).unwrap();
+            let arguments = TupleRef::from_value(value).unwrap();
+            expand_arguments(arguments.content()).map_err(|error| error.to_string())
+        })
+    }
+
+    /// `items` as owned strings.
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|&item| item.to_owned()).collect()
+    }
+
+    /// Lists and tuples expand in place, in order and at any depth, wherever they
+    /// stand: first, last, in the middle, nested, or as the whole command; empty ones
+    /// add nothing; each string, one with spaces and an empty one included, stays one
+    /// argument; and the same list used twice, side by side, adds its strings twice.
+    #[test]
+    fn lists_and_tuples_expand_in_place_and_strings_stay_whole() {
+        let this_is_test = strings(&["echo", "this", "is", "test"]);
+        for source in [
+            "(\"echo\", \"this\", \"is\", \"test\")",
+            "(\"echo\", [\"this\", \"is\", \"test\"])",
+            "([\"echo\", \"this\"], \"is\", \"test\")",
+            "(\"echo\", [\"this\"], \"is\", (\"test\",))",
+            "(\"echo\", [[\"this\"], (\"is\", [])], \"test\")",
+            "((\"echo\",), [[\"this\"], (\"is\", [])], \"test\")",
+            "([\"echo\", \"this\", \"is\", \"test\"],)",
+            "(((\"echo\", [[[\"this\"]]]), \"is\"), [], (), [[]], \"test\")",
+        ] {
+            assert_eq!(expand(source), Ok(this_is_test.clone()), "{source}");
+        }
+        assert_eq!(
+            expand("(\"printf\", [\"%s|\", \"a b\"], \"\", [\"\"])"),
+            Ok(strings(&["printf", "%s|", "a b", "", ""]))
+        );
+        assert_eq!(
+            expand("opt = [\"-v\"]\n(\"tool\", opt, \"x\", [opt, opt])"),
+            Ok(strings(&["tool", "-v", "x", "-v", "-v"]))
+        );
+        assert_eq!(
+            expand("flags = []\n(\"tool\", flags, \"x\")"),
+            Ok(strings(&["tool", "x"]))
+        );
+    }
+
+    /// Arguments of nothing but empty lists and tuples, and no arguments at all,
+    /// expand to no string, which `run()` then refuses as a call without a program.
+    #[test]
+    fn empty_lists_and_tuples_expand_to_nothing() {
+        for source in ["()", "([],)", "([], ())", "([[]],)", "(([(), [[]]],),)"] {
+            assert_eq!(expand(source), Ok(Vec::new()), "{source}");
+        }
+    }
+
+    /// A value that is neither a string nor a list or tuple fails with its argument,
+    /// its index path within the lists, and its type, as Starlark's `type()` names
+    /// it, and the first such value in the order of the walk is the one named.
+    #[test]
+    fn other_values_fail_with_their_place_and_type() {
+        for (source, message) in [
+            (
+                "(\"p\", \"a\", 5)",
+                "run(): argument 3 is of type int, not a string, list or tuple",
+            ),
+            (
+                "(\"p\", True)",
+                "run(): argument 2 is of type bool, not a string, list or tuple",
+            ),
+            (
+                "(\"p\", [\"a\", [None]])",
+                "run(): argument 2 at [1][0] is of type NoneType, not a string, list or tuple",
+            ),
+            (
+                "([{\"a\": 1}],)",
+                "run(): argument 1 at [0] is of type dict, not a string, list or tuple",
+            ),
+            (
+                "(\"p\", (\"a\", range(3)))",
+                "run(): argument 2 at [1] is of type range, not a string, list or tuple",
+            ),
+            (
+                "([], 5)",
+                "run(): argument 2 is of type int, not a string, list or tuple",
+            ),
+            (
+                "a = [\"x\"]\na.append(a)\n(\"p\", [1], a)",
+                "run(): argument 2 at [0] is of type int, not a string, list or tuple",
+            ),
+        ] {
+            assert_eq!(expand(source), Err(message.to_owned()), "{source}");
+        }
+    }
+
+    /// A list or tuple that contains itself, directly, through another list, or
+    /// through a list inside a tuple, fails where it is met again, with its own
+    /// type, and the walk ends.
+    #[test]
+    fn a_list_or_tuple_that_contains_itself_fails() {
+        for (source, message) in [
+            (
+                "a = [\"x\"]\na.append(a)\n(\"p\", a)",
+                "run(): argument 2 at [1] is a list that contains itself",
+            ),
+            (
+                "a = []\nb = [a]\na.append(b)\n(\"p\", a)",
+                "run(): argument 2 at [0][0] is a list that contains itself",
+            ),
+            (
+                "l = []\nt = (\"a\", l)\nl.append(t)\n(\"p\", t)",
+                "run(): argument 2 at [1][0] is a tuple that contains itself",
+            ),
+        ] {
+            assert_eq!(expand(source), Err(message.to_owned()), "{source}");
+        }
+    }
+
+    /// The expansion visits at most [`MAX_ARGUMENT_VALUES`] values: a list of
+    /// 999,999 strings is 1,000,000 values and expands, one more string fails, and so
+    /// do twenty-one doublings of a shared list, which would expand to 2,097,152
+    /// strings, before the walk goes further.
+    #[test]
+    fn the_expansion_stops_past_a_million_values() {
+        let limit = "run(): the arguments expand to more than 1000000 strings, lists and tuples";
+        assert_eq!(MAX_ARGUMENT_VALUES, 1_000_000);
+        assert_eq!(
+            expand("([\"x\"] * 999999,)").as_ref().map(Vec::len),
+            Ok(999_999)
+        );
+        assert_eq!(expand("([\"x\"] * 1000000,)"), Err(limit.to_owned()));
+        assert_eq!(
+            expand("a = [\"x\"]\nfor _ in range(21):\n    a = [a, a]\n(a,)"),
+            Err(limit.to_owned())
+        );
+    }
+
+    /// A string inside 100,000 nested lists, passed inside a tuple, expands to that
+    /// string, because the walk keeps its own stack rather than recursing. The lists
+    /// are allocated directly on a heap, where no garbage collection runs: Starlark's
+    /// collector, which the evaluator runs between a module's top-level statements,
+    /// copies nested values recursively, so building this nesting in a program can
+    /// overflow the stack in the collector, before any `run()` call.
+    #[test]
+    fn a_deep_nesting_expands_without_recursion() {
+        Heap::temp(|heap| {
+            let mut nested = heap.alloc("deep");
+            for _ in 0..100_000 {
+                nested = heap.alloc(vec![nested]);
+            }
+            let arguments = [heap.alloc("p"), heap.alloc((nested,))];
+            assert_eq!(
+                expand_arguments(&arguments).map_err(|error| error.to_string()),
+                Ok(strings(&["p", "deep"]))
+            );
+        });
     }
 }
 

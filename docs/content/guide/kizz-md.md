@@ -166,6 +166,21 @@ These members of `task` describe the running task:
 Output that a program captures and passes to a later command, as arguments, `stdin`, variables or a file,
 becomes a dependency of that later command, so it runs again exactly when that output changes.
 
+A positional argument can also be a list or tuple of strings, lists or tuples, which expands in place, at any depth,
+so `run("echo", ["this", "is", "test"])` runs the same command as `run(["echo", "this"], "is", "test")`.
+An empty list adds nothing, and each string stays one argument, never split on spaces.
+So a program can build a command by logic rather than write it out literally,
+and an optional argument can be a variable that holds `[]` when it is not wanted:
+
+```starlark
+env.inherit("PATH", "HOME")
+verbose = ["--verbose"] if "verbose" in task.args else []
+run("cargo", "test", verbose, "--locked", expect = [0])
+```
+
+`run("cargo", "test", task.args)` passes the arguments of `kizz run` through, each as one argument.
+The [`argv` entry](@/reference/starlark.md#argv) of the reference gives every rule and error of the expansion.
+
 ## The task environment
 
 Every task starts with an empty environment.
