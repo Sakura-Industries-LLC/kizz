@@ -5,7 +5,10 @@
 # e.g. `v0.0.1`. Library crate versions are independent and not checked.
 #
 # Only x86_64 Linux is built: the tracer (`kizz-trace-linux`) supports no other
-# architecture and refuses to compile for one.
+# architecture and refuses to compile for one. It is also written against glibc
+# (its `ptrace` request type, rlimit resource type and `pthread_t`), so the
+# binary targets glibc, not musl. Built on Ubuntu 24.04, it needs glibc 2.39 or
+# newer on the machine that runs it.
 #
 # The site is deployed only after the release is published, so the published
 # documentation always belongs to a released version.
@@ -25,7 +28,7 @@ concurrency:
 
 env:
   RUST_TOOLCHAIN: "1.99.1"
-  TARGET: x86_64-unknown-linux-musl
+  TARGET: x86_64-unknown-linux-gnu
   ZOLA_VERSION: "v0.23.6"
   ZOLA_SHA256: "8f5132b3522412d04e395e0b25f6d68613ad272a873e54a2b3ebf664873024a4"
   CARGO_TERM_COLOR: always
@@ -58,7 +61,7 @@ jobs:
           fi
 
   build:
-    name: Build x86_64-unknown-linux-musl
+    name: Build x86_64-unknown-linux-gnu
     needs: check-version
     runs-on: ubuntu-24.04
     permissions:
@@ -73,11 +76,6 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ env.TARGET }}
-      - name: Install musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
-          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release --locked -p kizz --target "${TARGET}"
       - name: Package
