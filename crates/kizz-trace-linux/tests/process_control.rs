@@ -11,6 +11,15 @@
 //! work of its mode when the tracer starts the executable with the helper variable
 //! set in the request's explicit environment.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: tests and helper processes start plain std threads, and the tests \
+              assert, lock and print"
+)]
+
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -109,6 +118,8 @@ fn request(
         stdin: None,
         capture: CaptureMode::Split,
         echo: false,
+        tree: false,
+        terminal: false,
     })
 }
 

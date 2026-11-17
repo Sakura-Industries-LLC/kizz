@@ -33,7 +33,7 @@ pub enum Warning {
         /// Why it could not be read.
         reason: String,
     },
-    /// A `starlark` block without targets, which is not a task.
+    /// A `starlark` block with neither targets nor a name, which is not a task.
     UntaggedBlock {
         /// The `kizz.md` that holds the block.
         file: PathBuf,
@@ -73,7 +73,7 @@ impl fmt::Display for Warning {
             } => {
                 write!(
                     f,
-                    "{}: this starlark block has no targets, so it is not a task",
+                    "{}: this starlark block has neither targets nor a name, so it is not a task",
                     location(file, *line, heading.as_deref())
                 )
             },

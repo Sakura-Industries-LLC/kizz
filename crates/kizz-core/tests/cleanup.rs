@@ -5,11 +5,20 @@
 //! Cache cleanup in temporary caches: what `clean` removes because the files are
 //! gone and which owners it takes out of the records it keeps, and what
 //! `plan_reset` selects for the tasks under a directory, by the owners of the step
-//! records.
+//! records. Last writers that name a step and those that name a task program are
+//! mixed, and both are cleaned and reset by path alike.
 //!
 //! The tests write the records straight into a store in a temporary cache, and
 //! `clean` checks real paths in a temporary directory. The tests of owners that the
 //! engine stores are in `tests/owners.rs`.
+
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
 
 use std::{
     collections::BTreeSet,
@@ -18,11 +27,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kizz_core::{clean, plan_reset};
+use kizz_core::{WorkerPool, clean, plan_reset};
 use kizz_store::{
     AccessBits, BuildId, Capture, ContentHash, EntryCounts, FileMeta, LastWriter, LearnedOrder,
-    Observation, PathKey, PathState, PositionKey, RecordedOutput, RunReason, StepExit, StepKey,
-    StepPosition, StepRecord, StepSpecRecord, Store, TaskId, TaskRecord, Verdict,
+    Observation, Owner, PathKey, PathState, PositionKey, RecordedOutput, RunReason, StepExit,
+    StepKey, StepPosition, StepRecord, StepSpecRecord, Store, TaskId, TaskRecord, Verdict,
+    WrittenBy,
 };
 
 /// The result of a test.
@@ -38,6 +48,7 @@ fn observation(
         access: AccessBits(AccessBits::READ),
         tracked: false,
         state,
+        attributes: None,
     }
 }
 
@@ -51,6 +62,7 @@ fn file() -> PathState {
             inode: 1,
             device: 1,
             mode: 0o100_644,
+            owner: Owner { uid: 1, gid: 1 },
         },
         hash: Some(ContentHash([1; 32])),
     }
@@ -73,8 +85,10 @@ fn step(
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
             occurrence: 0,
+            machine: Vec::new(),
         },
         program: None,
         observations,
@@ -91,6 +105,9 @@ fn step(
         failure: None,
         not_cached: None,
         owners: BTreeSet::new(),
+        unknown_system_calls: Vec::new(),
+        connections: Vec::new(),
+        machine: kizz_store::MachineStateRecord::default(),
     }
 }
 
@@ -159,12 +176,20 @@ fn position(step: StepKey) -> StepPosition {
     }
 }
 
-/// The last-writer entry of a step of `task`.
-fn writer(task: &TaskId) -> LastWriter {
+/// A last writer that is a step of a task.
+const BY_STEP: WrittenBy = WrittenBy::Step {
+    step: StepKey([0; 32]),
+    position: 0,
+};
+
+/// The last-writer entry of `by`, a step or the program of `task`.
+fn writer(
+    task: &TaskId,
+    by: WrittenBy,
+) -> LastWriter {
     LastWriter {
         task: task.clone(),
-        step: StepKey([0; 32]),
-        position: 0,
+        by,
         build: BuildId(1),
         written_at_nanos: 1,
     }
@@ -269,12 +294,12 @@ fn put_clean_entries(
     )?;
     put_task(&mut txn, &task(keep), KEPT_STEP, &[&task(gone)])?;
     put_task(&mut txn, &task(gone), IN_GONE_DIR, &[&task(keep)])?;
-    for path in [
-        keep.join("in.txt"),
-        keep.join("deleted.txt"),
-        gone.join("in.txt"),
+    for (path, by) in [
+        (keep.join("in.txt"), WrittenBy::Program),
+        (keep.join("deleted.txt"), BY_STEP),
+        (gone.join("in.txt"), WrittenBy::Program),
     ] {
-        txn.put(&PathKey(path), &writer(&task(keep)))?;
+        txn.put(&PathKey(path), &writer(&task(keep), by))?;
     }
     txn.commit()?;
     Ok(())
@@ -306,7 +331,7 @@ fn clean_removes_entries_about_gone_paths_and_keeps_the_rest() -> TestResult {
 
     fs::remove_dir_all(&gone)?;
     fs::remove_file(keep.join("deleted.txt"))?;
-    let cleaned = clean(&store)?;
+    let cleaned = clean(&store, &WorkerPool::new()?)?;
     assert_eq!(cleaned.removed, EntryCounts {
         tasks: 1,
         steps: 3,
@@ -348,7 +373,10 @@ fn clean_removes_entries_about_gone_paths_and_keeps_the_rest() -> TestResult {
     assert_eq!(files, [keep.join("in.txt"), keep.join("kizz.md")]);
 
     // Nothing is left to clean.
-    assert_eq!(clean(&store)?.removed, EntryCounts::default());
+    assert_eq!(
+        clean(&store, &WorkerPool::new()?)?.removed,
+        EntryCounts::default()
+    );
     store.close()?;
     Ok(())
 }
@@ -415,8 +443,12 @@ fn put_reset_entries(
         },
         &position(SUB_STEP),
     )?;
-    for path in [sub.join("out"), subway.join("out"), root.join("out")] {
-        txn.put(&PathKey(path), &writer(&in_sub))?;
+    for (path, by) in [
+        (sub.join("out"), WrittenBy::Program),
+        (subway.join("out"), BY_STEP),
+        (root.join("out"), WrittenBy::Program),
+    ] {
+        txn.put(&PathKey(path), &writer(&in_sub, by))?;
     }
     txn.commit()?;
     Ok(())

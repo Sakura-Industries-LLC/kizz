@@ -9,6 +9,10 @@
 //! It reads the cache under the cache lock, as the cache commands do, so it waits
 //! for a running build and says what it is waiting for. Environment values are
 //! shown only with `--verbose`, because they can be secrets.
+//!
+//! The report and its warnings go through the `ui` helpers, which drop a write
+//! that fails, such as one to a closed pipe, where the `print!` macros would panic
+//! ("Kizz never panics"); the command still exits with the status of its work.
 
 use std::{
     env,
@@ -60,12 +64,12 @@ pub(crate) fn run(
     };
     let render = Render {
         base: cwd,
-        home: env::var_os("HOME")
+        home: env::var_os(kizz_store::location::HOME)
             .map(PathBuf::from)
             .filter(|home| home.is_absolute()),
         verbose,
     };
-    print!("{}", render.why(&report));
+    ui::print_text(&render.why(&report));
     let warnings: Vec<String> = report
         .warnings()
         .iter()

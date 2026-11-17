@@ -1,0 +1,1019 @@
+use std::io;
+use std::sync::Arc;
+
+use crc32fast::Hasher;
+use lz4_flex::block::{compress_into, get_maximum_output_size};
+
+use super::{
+	sealed,
+	segment_held,
+	sync_poisoned,
+	BufferedFileWriter,
+	CompressionType,
+	Error,
+	IOError,
+	RecordType,
+	Result,
+	SyncGate,
+	WritableFile,
+	BLOCK_SIZE,
+	HEADER_SIZE,
+	SYNC_MARK_LEN,
+};
+use crate::tde::{FileCipher, TAG_LEN};
+
+/// What a writer of a sealed segment seals its batches with.
+struct Sealer {
+	/// The cipher of the segment. It cannot be cloned, and no other cipher of the segment can
+	/// seal: the key is made for one writer.
+	cipher: FileCipher,
+
+	/// The index of the next batch of the segment, which is also the position it is sealed at. It
+	/// moves on before a batch is sealed and is never given back, whatever happens to the batch.
+	next_index: u64,
+}
+
+/// What a writer has said of how far its segment is synced, see [`RecordType::SyncMark`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marks {
+	/// The segment holds no marks: it is sealed, or marks are off.
+	Off,
+	/// A new segment, whose first append starts with its leading mark.
+	Leading,
+	/// The synced length that the writer's last mark claimed. An append writes a mark first
+	/// when the synced length differs from it.
+	Last(u64),
+}
+
+/// Writer for WAL records.
+pub struct Writer {
+	/// The underlying buffered file writer.
+	dest: BufferedFileWriter,
+
+	/// Current offset within the current block (0 to BLOCK_SIZE).
+	block_offset: usize,
+
+	/// If true, writes are not automatically flushed. User must call
+	/// write_buffer().
+	manual_flush: bool,
+
+	/// The compression type to use for records.
+	compression_type: CompressionType,
+
+	/// Set when an append failed. The writer then refuses appends until it is
+	/// replaced, which a rotation does. A failed fsync is tracked by the file's
+	/// `SyncGate` instead, because the fsyncs outside the WAL lock record it too.
+	poisoned: bool,
+
+	/// Set on the writer that replaces a segment whose fsync failed: the segments below this
+	/// number hold records of unknown durability, so the writer refuses every append and sync
+	/// until the memtables tagged with them are in tables and the hold is released.
+	held: Option<u64>,
+
+	/// What seals the batches of the segment, if the segment is sealed.
+	sealer: Option<Sealer>,
+
+	/// Set when an append failed and the segment could not be cut back to its last whole record,
+	/// so that it may hold the start of a record, or whole records that were never acknowledged.
+	uncut: bool,
+
+	/// Whether appends write sync marks, and what the last one said. Never in a sealed segment.
+	marks: Marks,
+}
+
+impl Writer {
+	/// Creates a new Writer for the given buffered file writer.
+	///
+	/// # Parameters
+	/// - `dest`: The buffered file writer to write records to.
+	/// - `manual_flush`: If true, user must call write_buffer() to flush.
+	/// - `compression_type`: The compression type to use.
+	pub fn new(
+		dest: BufferedFileWriter,
+		manual_flush: bool,
+		compression_type: CompressionType,
+		block_offset: usize,
+	) -> Self {
+		Self {
+			dest,
+			block_offset,
+			manual_flush,
+			compression_type,
+			poisoned: false,
+			held: None,
+			sealer: None,
+			uncut: false,
+			marks: Marks::Off,
+		}
+	}
+
+	/// Has the appends to this plaintext segment write sync marks, see [`RecordType::SyncMark`].
+	///
+	/// A `new_segment` gets its leading mark with its first append, which is what tells recovery
+	/// that the segment holds marks. A segment that already holds records (one this writer
+	/// reopened) gets none: it may have been written by a binary that writes no marks, and
+	/// recovery reads it as such. Its later appends write marks all the same, from the first fsync
+	/// on, which covers everything in the file: the writer knows nothing of what it synced before.
+	pub(crate) fn write_sync_marks(&mut self, new_segment: bool) {
+		if self.sealer.is_none() {
+			self.marks = if new_segment {
+				Marks::Leading
+			} else {
+				Marks::Last(0)
+			};
+		}
+	}
+
+	/// Frames a mark of how far the segment is synced into the buffer: the leading mark of a new
+	/// segment, or a mark of a synced length that moved on since the last mark. Nothing if the
+	/// segment holds no marks. A mark is one physical record that never crosses a block: a block
+	/// with too little room left for it is padded with zeros first.
+	///
+	/// The synced length is the one the last fsync to complete covered, see `SyncGate::synced`,
+	/// so a mark never claims bytes that an fsync in flight may not cover.
+	fn write_sync_mark_unflushed(&mut self) -> Result<()> {
+		let synced = self.dest.synced();
+		match self.marks {
+			Marks::Off => return Ok(()),
+			Marks::Last(last) if last == synced => return Ok(()),
+			Marks::Leading | Marks::Last(_) => {}
+		}
+		self.switch_block_unless_room(HEADER_SIZE + SYNC_MARK_LEN)?;
+		self.emit_physical_record(RecordType::SyncMark, &synced.to_be_bytes())?;
+		self.marks = Marks::Last(synced);
+		Ok(())
+	}
+
+	/// Starts a sealed segment on the new, empty file behind `dest`: writes its header record, and
+	/// makes it durable before the writer is returned, so that no batch is appended, and none can
+	/// be acknowledged, to a segment whose header may not survive a crash.
+	///
+	/// `header` and `cipher` come from `sealed::new_header`, which draws the salt: a segment never
+	/// reuses one. If anything here fails the file is the caller's to dispose of; nothing was
+	/// sealed under its key.
+	pub(crate) fn start_sealed(
+		dest: BufferedFileWriter,
+		header: &[u8; sealed::HEADER_PAYLOAD_LEN],
+		cipher: FileCipher,
+		compression_type: CompressionType,
+	) -> Result<Self> {
+		let mut writer = Self::new(dest, false, compression_type, 0);
+		writer.sealer = Some(Sealer {
+			cipher,
+			next_index: sealed::FIRST_INDEX,
+		});
+		writer.emit_physical_record(RecordType::SegmentHeader, header)?;
+		writer.write_buffer()?;
+		writer.dest.sync()?;
+		Ok(writer)
+	}
+
+	/// Whether the segment is sealed and an append failed in it without the segment being cut back,
+	/// so that it may end in damage that records acknowledged after it would sit behind.
+	pub(crate) fn left_uncut(&self) -> bool {
+		self.sealer.is_some() && self.uncut
+	}
+
+	/// Test-only: makes the next cut back of the segment fail.
+	#[cfg(test)]
+	pub(crate) fn fail_truncate(&mut self) {
+		self.dest.fail_truncate();
+	}
+
+	/// Test-only: the index that the next batch of a sealed segment is sealed at.
+	#[cfg(test)]
+	pub(crate) fn next_index(&self) -> Option<u64> {
+		self.sealer.as_ref().map(|sealer| sealer.next_index)
+	}
+
+	/// Test-only: sets the index that the next batch of a sealed segment is sealed at, as a bug
+	/// that rewinds the count would.
+	#[cfg(test)]
+	pub(crate) fn set_next_index(&mut self, index: u64) {
+		if let Some(sealer) = self.sealer.as_mut() {
+			sealer.next_index = index;
+		}
+	}
+
+	/// Test-only: the smallest position that the cipher of a sealed segment would still seal.
+	#[cfg(test)]
+	pub(crate) fn cipher_next_position(&self) -> Option<u64> {
+		self.sealer.as_ref().map(|sealer| sealer.cipher.next_position())
+	}
+
+	/// Makes the write after the next `ops` of them fail once (see
+	/// [`BufferedFileWriter::fail_after_ops`]).
+	#[cfg(test)]
+	pub(crate) fn fail_after_ops(&mut self, ops: usize) {
+		self.dest.fail_after_ops(ops);
+	}
+
+	/// How many `write(2)` calls have reached the segment (see
+	/// [`BufferedFileWriter::file_writes`]).
+	#[cfg(test)]
+	pub(crate) fn file_writes(&self) -> usize {
+		self.dest.file_writes()
+	}
+
+	/// Test-only: whether anything was appended since the last successful fsync.
+	#[cfg(test)]
+	pub(crate) fn pending_sync(&self) -> bool {
+		self.dest.pending_sync()
+	}
+
+	/// Whether an fsync of the segment failed. The writer then refuses every append and sync.
+	pub(crate) fn sync_failed(&self) -> bool {
+		self.dest.sync_failed()
+	}
+
+	/// Whether an append or an fsync of the segment failed, so that only a replacement of the
+	/// writer lets commits through.
+	pub(crate) fn is_poisoned(&self) -> bool {
+		self.poisoned || self.dest.sync_failed()
+	}
+
+	/// Holds the writer: it refuses every append and sync until `release_hold`, because the
+	/// segments below `below` are not all in tables.
+	pub(crate) fn hold(&mut self, below: u64) {
+		self.held = Some(below);
+	}
+
+	/// The segment number below which everything must be in tables for the hold to end.
+	pub(crate) fn held(&self) -> Option<u64> {
+		self.held
+	}
+
+	/// Ends the hold.
+	pub(crate) fn release_hold(&mut self) {
+		self.held = None;
+	}
+
+	/// The gate every fsync of the segment goes through.
+	pub(crate) fn sync_gate(&self) -> Arc<SyncGate> {
+		self.dest.gate()
+	}
+
+	/// The length of the segment once everything appended is written, if known.
+	pub(crate) fn len(&self) -> Option<u64> {
+		self.dest.len()
+	}
+
+	/// Adds a record to the WAL.
+	///
+	/// The record is automatically fragmented if it doesn't fit in the current
+	/// block. If manual_flush is false, the data is automatically flushed to
+	/// disk.
+	///
+	/// # Parameters
+	/// - `slice`: The data to write.
+	///
+	/// # Returns
+	/// - Ok(()) if successful.
+	/// - Err if an I/O error occurs.
+	pub fn add_record(&mut self, slice: &[u8]) -> Result<()> {
+		if self.sealer.is_some() {
+			return self.add_sealed(slice, &[slice.len()]);
+		}
+		let compressed = self.compress_records(slice, &[slice.len()])?;
+		let slice = compressed.as_ref().map_or(slice, |(blocks, _)| &blocks[..]);
+		self.guard_append(|writer| {
+			writer.write_sync_mark_unflushed()?;
+			writer.write_record(slice)
+		})
+	}
+
+	/// Adds several records, `buf[ends[i - 1]..ends[i]]` being record `i` (`ends[-1]` is 0),
+	/// each framed exactly as `add_record` frames it, with one flush for all of them.
+	///
+	/// All or nothing: if any step fails the whole call counts as one failed append, so
+	/// `guard_append` cuts the segment back to where it was before the first record and
+	/// poisons the writer. A record of the group that was already complete is cut off too,
+	/// because none of the group was acknowledged.
+	///
+	/// The caller guarantees that every record is non-empty and that `ends` is increasing and
+	/// within `buf`.
+	///
+	/// A record that cannot be compressed, for want of memory or because it is too long for an LZ4
+	/// block, fails the call before anything is appended: the segment is untouched and the writer
+	/// is not poisoned.
+	pub fn add_records(&mut self, buf: &[u8], ends: &[usize]) -> Result<()> {
+		if self.sealer.is_some() {
+			return self.add_sealed(buf, ends);
+		}
+		let compressed = self.compress_records(buf, ends)?;
+		let (buf, ends) =
+			compressed.as_ref().map_or((buf, ends), |(blocks, ends)| (&blocks[..], &ends[..]));
+		self.guard_append(|writer| {
+			// Every append ends in a flush, so the file length is known and the segment can be
+			// cut back to it. Checked once the writer is known not to be poisoned: a failed
+			// cut can leave bytes in the buffer, and that must be an error, not a panic.
+			debug_assert!(writer.dest.is_flushed());
+			writer.write_sync_mark_unflushed()?;
+			let mut start = 0;
+			for &end in ends {
+				writer.write_record_unflushed(&buf[start..end])?;
+				start = end;
+			}
+			if !writer.manual_flush {
+				writer.write_buffer()?;
+			}
+			Ok(())
+		})
+	}
+
+	/// Adds batches to a sealed segment, `buf[ends[i - 1]..ends[i]]` being batch `i`: each is
+	/// compressed if the segment is, sealed as a message of its own with the next index, and the
+	/// sealed records are framed and appended together, as the plaintext ones are.
+	///
+	/// Nothing is sealed in a writer that cannot append. A batch that cannot be compressed fails
+	/// the call before an index is taken, like a plaintext one, and so does an allocation that is
+	/// refused. From the first index on, every failure ends the writer: an index that was taken is
+	/// never taken again, and a segment never gets a second batch under an index that a failed
+	/// append may have left in the file, so the next batch goes to a segment of its own, under a
+	/// salt of its own. If the append fails after the sealing, the segment is cut back as a
+	/// plaintext one is, so that the batches that were not acknowledged are not in it; the indices
+	/// are used up all the same.
+	fn add_sealed(&mut self, buf: &[u8], ends: &[usize]) -> Result<()> {
+		self.check_writable()?;
+		let compressed = self.compress_records(buf, ends)?;
+		let (buf, ends) =
+			compressed.as_ref().map_or((buf, ends), |(blocks, ends)| (&blocks[..], &ends[..]));
+		let (sealed, sealed_ends) = self.seal_records(buf, ends)?;
+		self.guard_append(|writer| {
+			debug_assert!(writer.dest.is_flushed());
+			let mut start = 0;
+			for &end in &sealed_ends {
+				writer.write_record_unflushed(&sealed[start..end])?;
+				start = end;
+			}
+			if !writer.manual_flush {
+				writer.write_buffer()?;
+			}
+			Ok(())
+		})
+	}
+
+	/// Seals the records of `buf` (`buf[ends[i - 1]..ends[i]]` being record `i`) one by one, at
+	/// consecutive indices, into one buffer with where each sealed record ends.
+	///
+	/// The room is reserved first, exactly and fallibly, so the sealing itself allocates nothing
+	/// and a refused allocation fails the call with no index taken. Every index is taken before the
+	/// record is sealed with it, and a record that cannot be sealed ends the writer.
+	fn seal_records(&mut self, buf: &[u8], ends: &[usize]) -> Result<(Vec<u8>, Vec<usize>)> {
+		let compression = self.compression_type;
+		let Some(sealer) = self.sealer.as_mut() else {
+			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "the segment is not sealed")));
+		};
+
+		let total = ends
+			.len()
+			.checked_mul(TAG_LEN)
+			.and_then(|tags| tags.checked_add(buf.len()))
+			.ok_or_else(record_too_long)?;
+		let mut sealed = Vec::new();
+		sealed.try_reserve_exact(total).map_err(|e| Error::from(io::Error::from(e)))?;
+		let mut sealed_ends = Vec::new();
+		sealed_ends.try_reserve_exact(ends.len()).map_err(|e| Error::from(io::Error::from(e)))?;
+
+		let mut start = 0;
+		for &end in ends {
+			let index = sealer.next_index;
+			sealer.next_index = index.saturating_add(1);
+
+			let from = sealed.len();
+			sealed.extend_from_slice(&buf[start..end]);
+			start = end;
+			let at = sealed::record_context(index, compression);
+			match sealer.cipher.seal_detached(&at, &mut sealed[from..]) {
+				Ok(tag) => sealed.extend_from_slice(&tag),
+				Err(e) => {
+					self.poisoned = true;
+					return Err(e.into());
+				}
+			}
+			sealed_ends.push(sealed.len());
+		}
+		Ok((sealed, sealed_ends))
+	}
+
+	fn write_record(&mut self, slice: &[u8]) -> Result<()> {
+		self.write_record_unflushed(slice)?;
+
+		// Flush if not in manual mode
+		if !self.manual_flush {
+			self.write_buffer()?;
+		}
+
+		Ok(())
+	}
+
+	/// Frames `data`, compressed already if the segment is, into the buffer without flushing it.
+	/// Everything else that makes a record what it is on disk happens here: fragmentation,
+	/// padding and the headers, so a group of records can only ever be framed the way a single
+	/// one is.
+	fn write_record_unflushed(&mut self, data: &[u8]) -> Result<()> {
+		let mut ptr = data;
+		let mut begin = true;
+
+		// Fragment the record if necessary and emit it
+		while begin || !ptr.is_empty() {
+			// Switch to new block if less than HEADER_SIZE bytes remain
+			self.switch_block_unless_room(HEADER_SIZE)?;
+
+			// Calculate how much data fits in the current block
+			let avail = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
+			let fragment_length = ptr.len().min(avail);
+			let fragment = &ptr[..fragment_length];
+
+			// Determine record type
+			let is_end = fragment_length == ptr.len();
+			let record_type = if begin && is_end {
+				RecordType::Full
+			} else if begin {
+				RecordType::First
+			} else if is_end {
+				RecordType::Last
+			} else {
+				RecordType::Middle
+			};
+
+			// Write the physical record
+			self.emit_physical_record(record_type, fragment)?;
+
+			// Advance pointer
+			ptr = &ptr[fragment_length..];
+			begin = false;
+		}
+
+		Ok(())
+	}
+
+	/// The records of `buf` (`buf[ends[i - 1]..ends[i]]` being record `i`) as the bytes that go
+	/// into the segment: one LZ4 block per record, joined, with where each ends, if the segment
+	/// is compressed. `None` if it is not, and the caller's own bytes go in as they are.
+	///
+	/// A separate step, done before an append is guarded, so that a failure here cannot poison
+	/// the writer. The room for every block is reserved at once and exactly, and fallibly, so the
+	/// blocks themselves cannot abort the process (`lz4_flex` still allocates its small hash
+	/// table for each record). A record that an LZ4 block cannot describe is an error.
+	fn compress_records(
+		&self,
+		buf: &[u8],
+		ends: &[usize],
+	) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+		if self.compression_type != CompressionType::Lz4 {
+			return Ok(None);
+		}
+
+		let records = || {
+			ends.iter().scan(0, |start, &end| {
+				let record = &buf[*start..end];
+				*start = end;
+				Some(record)
+			})
+		};
+		let mut capacity = 0usize;
+		for record in records() {
+			let (_, block) = lz4_block_size(record.len()).ok_or_else(record_too_long)?;
+			capacity = capacity.checked_add(block).ok_or_else(record_too_long)?;
+		}
+		let mut blocks = Vec::new();
+		blocks.try_reserve_exact(capacity).map_err(|e| Error::from(io::Error::from(e)))?;
+		let mut block_ends = Vec::new();
+		block_ends.try_reserve_exact(ends.len()).map_err(|e| Error::from(io::Error::from(e)))?;
+
+		for record in records() {
+			// Into the room reserved above, so nothing here allocates.
+			push_lz4_block(&mut blocks, record)?;
+			block_ends.push(blocks.len());
+		}
+		Ok(Some((blocks, block_ends)))
+	}
+
+	/// Adds a compression type record at the start of the WAL.
+	///
+	/// This should be called before any data records are written.
+	pub fn add_compression_type_record(&mut self) -> Result<()> {
+		self.guard_append(|writer| writer.write_compression_type_record())
+	}
+
+	fn write_compression_type_record(&mut self) -> Result<()> {
+		// Should be the first record
+		if self.block_offset != 0 {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::Other,
+				"Compression type record must be first",
+			)));
+		}
+
+		if self.compression_type == CompressionType::None {
+			return Ok(());
+		}
+
+		// Encode compression type (just the type as u8 for now)
+		let data = [self.compression_type as u8];
+
+		// Emit as SetCompressionType record
+		self.emit_physical_record(RecordType::SetCompressionType, &data)?;
+
+		if !self.manual_flush {
+			self.write_buffer()?;
+		}
+
+		Ok(())
+	}
+
+	/// Writes any buffered data to the file.
+	///
+	/// Flushes to OS cache (fast) but does NOT fsync to disk.
+	/// For durability, call sync() explicitly when needed.
+	pub fn write_buffer(&mut self) -> Result<()> {
+		self.dest.flush() // Fast: OS cache only, no fsync
+	}
+
+	/// Syncs data to disk (slow, durable).
+	///
+	/// Should be called when durability is required (e.g., transaction commit). If the fsync
+	/// fails, the writer refuses every later append and sync, see `SyncGate`.
+	pub fn sync(&mut self) -> Result<()> {
+		if self.held.is_some() {
+			return Err(segment_held());
+		}
+		self.dest.sync() // Slow: flush + fsync to disk
+	}
+
+	/// Closes the writer, syncing and flushing all data.
+	pub fn close(&mut self) -> Result<()> {
+		self.sync()?;
+		self.dest.close()
+	}
+
+	/// [`close`](Self::close), and then, if the segment holds marks, a trailing mark of the length
+	/// that the last fsync covered, synced too: recovery then knows that the whole segment was on
+	/// disk, and refuses damage anywhere in it. A writer that took no append writes none.
+	pub(crate) fn close_with_trailing_mark(&mut self) -> Result<()> {
+		self.sync()?;
+		if matches!(self.marks, Marks::Last(_)) && self.check_writable().is_ok() {
+			self.guard_append(|writer| {
+				writer.write_sync_mark_unflushed()?;
+				writer.write_buffer()
+			})?;
+			self.sync()?;
+		}
+		self.dest.close()
+	}
+
+	/// Runs an append. If it fails, part of a record may be in the segment, and
+	/// recovery stops at the first damaged record, so every record acknowledged
+	/// after it would be dropped. The segment is cut back to the last complete
+	/// record, and the writer refuses further appends until a rotation replaces
+	/// it: a disk that failed once may fail again, and if the cut itself failed
+	/// the state of the segment is unknown.
+	///
+	/// A segment whose fsync failed takes no append either, and neither does a held one. The
+	/// refusal comes first, so it cuts nothing and poisons nothing.
+	fn guard_append<T>(&mut self, append: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+		self.check_writable()?;
+
+		// With bytes still buffered the file is shorter than the writer's length, and
+		// cutting it there would extend it.
+		let last_good_len = self.dest.len().filter(|_| self.dest.is_flushed());
+		let last_good_block_offset = self.block_offset;
+		let last_good_marks = self.marks;
+
+		let result = append(self);
+		if result.is_err() {
+			self.poisoned = true;
+			match last_good_len.map(|len| self.dest.truncate(len)) {
+				Some(Ok(())) => {
+					self.block_offset = last_good_block_offset;
+					self.marks = last_good_marks;
+				}
+				Some(Err(e)) => {
+					self.uncut = true;
+					tracing::error!("Failed to cut a partial record off the WAL segment: {e}")
+				}
+				None => {
+					self.uncut = true;
+					tracing::error!(
+						"A WAL append failed with the segment length unknown, \
+						so a partial record may remain"
+					)
+				}
+			}
+		}
+		result
+	}
+
+	/// Whether the writer takes an append: it is not held, no fsync of the segment failed and no
+	/// append did. The refusals come in this order, and none of them touches the segment.
+	fn check_writable(&self) -> Result<()> {
+		if self.held.is_some() {
+			return Err(segment_held());
+		}
+		if self.dest.sync_failed() {
+			return Err(sync_poisoned());
+		}
+		if self.poisoned {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::Other,
+				"WAL writer is poisoned by an earlier failed append",
+			)));
+		}
+		Ok(())
+	}
+
+	/// Switches to a new block if less than `room` bytes are left in this one, padding what is
+	/// left with zeros.
+	///
+	/// A fragment of a record needs a header's room, so the padding in front of one is less than
+	/// [`HEADER_SIZE`] bytes, which the reader discards when `buffer_remaining() < HEADER_SIZE`. A
+	/// sync mark needs its whole length, so the padding in front of one can be longer, and the
+	/// reader takes that for a record of type zero, which pads a block.
+	fn switch_block_unless_room(&mut self, room: usize) -> Result<()> {
+		const ZEROS: [u8; HEADER_SIZE + SYNC_MARK_LEN] = [0u8; HEADER_SIZE + SYNC_MARK_LEN];
+		debug_assert!(room <= ZEROS.len(), "no physical record needs more room than a mark");
+		let leftover = BLOCK_SIZE - self.block_offset;
+		if leftover < room {
+			self.dest.append(&ZEROS[..leftover])?;
+			self.block_offset = 0;
+		}
+		Ok(())
+	}
+
+	/// Emits a single physical record to the file.
+	fn emit_physical_record(&mut self, record_type: RecordType, data: &[u8]) -> Result<()> {
+		let length = data.len();
+		if length > 0xffff {
+			return Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Record too large")));
+		}
+
+		// Physical record must fit entirely in current block
+		debug_assert!(
+			self.block_offset + HEADER_SIZE + length <= BLOCK_SIZE,
+			"Record exceeds block boundary: offset={}, header={}, data={}, block_size={}",
+			self.block_offset,
+			HEADER_SIZE,
+			length,
+			BLOCK_SIZE
+		);
+
+		// Calculate CRC correctly: CRC(type_byte || data)
+		// Must match Reader's calculate_crc32 function
+		let type_byte = record_type as u8;
+		let mut hasher = Hasher::new();
+		hasher.update(&[type_byte]); // Add type byte
+		hasher.update(data); // Add data
+		let crc = hasher.finalize(); // Single CRC over both
+
+		// Write header (7-byte format)
+		let mut header = [0u8; HEADER_SIZE];
+		header[..4].copy_from_slice(&crc.to_be_bytes());
+		header[4..6].copy_from_slice(&(length as u16).to_be_bytes());
+		header[6] = record_type as u8;
+
+		self.dest.append(&header)?;
+		self.dest.append(data)?;
+
+		self.block_offset += HEADER_SIZE + length;
+
+		Ok(())
+	}
+}
+
+/// The bytes of the length that an LZ4 block of a record starts with.
+const LZ4_LEN_SIZE: usize = 4;
+
+fn record_too_long() -> Error {
+	Error::IO(IOError::new(io::ErrorKind::InvalidInput, "record is too long for an LZ4 block"))
+}
+
+/// The length that the LZ4 block of a record of `len` bytes starts with, and the most bytes the
+/// block takes, that length included. `None` if the record is longer than a `u32` can say, or
+/// the block would not be addressable.
+fn lz4_block_size(len: usize) -> Option<(u32, usize)> {
+	let prefix = u32::try_from(len).ok()?;
+	// `get_maximum_output_size` multiplies `len` by 110, which would wrap where `usize` is narrow.
+	let block = (len <= usize::MAX / 110).then(|| get_maximum_output_size(len))?;
+	Some((prefix, block.checked_add(LZ4_LEN_SIZE)?))
+}
+
+/// Appends the LZ4 block of `record` to `blocks`: the length of the record as a little-endian
+/// `u32`, which `lz4_flex::decompress_size_prepended` reads, and the compressed bytes. Allocates
+/// only if `blocks` lacks room for the most the block can take.
+fn push_lz4_block(blocks: &mut Vec<u8>, record: &[u8]) -> Result<()> {
+	let (prefix, size) = lz4_block_size(record.len()).ok_or_else(record_too_long)?;
+	let at = blocks.len();
+	blocks.extend_from_slice(&prefix.to_le_bytes());
+	blocks.resize(at + size, 0);
+	let written = compress_into(record, &mut blocks[at + LZ4_LEN_SIZE..])
+		.map_err(|e| Error::IO(IOError::new(io::ErrorKind::InvalidData, &e.to_string())))?;
+	blocks.truncate(at + LZ4_LEN_SIZE + written);
+	Ok(())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use std::fs::File;
+
+	use tempdir::TempDir;
+
+	use super::*;
+	use crate::wal::reader::Reader;
+
+	#[test]
+	fn test_writer_basic() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let file_path = temp_dir.path().join("test.wal");
+		let file = File::create(&file_path).unwrap();
+		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
+
+		// Write a simple record
+		writer.add_record(b"Hello, World!").unwrap();
+
+		writer.close().unwrap();
+
+		// Verify file exists and has content
+		let metadata = std::fs::metadata(&file_path).unwrap();
+		assert!(metadata.len() > 0);
+	}
+
+	#[test]
+	fn test_manual_flush() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let file_path = temp_dir.path().join("test.wal");
+		let file = File::create(&file_path).unwrap();
+		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+
+		let mut writer = Writer::new(buffered_writer, true, CompressionType::None, 0);
+
+		// Write without auto-flush
+		writer.add_record(b"Test").unwrap();
+
+		// Manual flush
+		writer.write_buffer().unwrap();
+
+		writer.close().unwrap();
+	}
+
+	#[test]
+	fn test_fragmentation() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let file_path = temp_dir.path().join("test.wal");
+		let file = File::create(&file_path).unwrap();
+		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
+
+		// Write a large record that will be fragmented
+		let large_data = vec![b'A'; BLOCK_SIZE * 2];
+		writer.add_record(&large_data).unwrap();
+
+		writer.close().unwrap();
+
+		let metadata = std::fs::metadata(&file_path).unwrap();
+		assert!(metadata.len() > BLOCK_SIZE as u64 * 2);
+	}
+
+	/// A record of `len` bytes that no other `index` shares and that does not compress, so a
+	/// record written in the wrong place or a fragment of it repeated cannot look right by
+	/// accident, and an LZ4 record is as long as it is large.
+	fn payload(index: usize, len: usize) -> Vec<u8> {
+		let mut x = (index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+		(0..len)
+			.map(|_| {
+				x ^= x << 13;
+				x ^= x >> 7;
+				x ^= x << 17;
+				x as u8
+			})
+			.collect()
+	}
+
+	/// Record sizes on both sides of every boundary that matters: empty-ish, a header's
+	/// worth, a block less its header (a record that exactly fills a block) and one byte
+	/// either side, and records of several blocks.
+	const SIZES: [usize; 10] = [1, 2, 7, 100, 32_760, 32_761, 32_762, 40_000, 70_000, 150_000];
+
+	/// Filler record sizes that leave the next record starting at block offsets all over the
+	/// block: near the start, mid-block, with 9 down to 7 bytes left (room for a header and
+	/// little else), with each number of bytes left that is less than a header (so the next
+	/// record is preceded by that much padding) and with no byte left at all.
+	const FILLERS: [usize; 16] = [
+		1, 6, 33, 1_000, 16_384, 32_000, 32_752, 32_753, 32_754, 32_755, 32_756, 32_757, 32_758,
+		32_759, 32_760, 32_761,
+	];
+
+	/// Writes the `fillers` and then `records`, each with one `add_record`.
+	fn write_one_by_one(
+		path: &std::path::Path,
+		compression: CompressionType,
+		fillers: &[Vec<u8>],
+		records: &[Vec<u8>],
+	) {
+		// No `close()`: every append ends in a flush, and an fsync per file is most of the time
+		// the tests below take.
+		let mut writer = new_writer(path, compression);
+		for record in fillers.iter().chain(records) {
+			writer.add_record(record).unwrap();
+		}
+	}
+
+	fn new_writer(path: &std::path::Path, compression: CompressionType) -> Writer {
+		let buffered_writer = BufferedFileWriter::new(File::create(path).unwrap(), BLOCK_SIZE);
+		let mut writer = Writer::new(buffered_writer, false, compression, 0);
+		if compression != CompressionType::None {
+			writer.add_compression_type_record().unwrap();
+		}
+		writer
+	}
+
+	/// The segment bytes of `add_record` for every size and filler: a digest captured before
+	/// a group of records could be written in one go, and before the header and the padding
+	/// stopped being allocated. Any change to either, to the fragmentation or to the CRC shows
+	/// up here. Uncompressed: the bytes of an LZ4 block belong to the `lz4_flex` version.
+	#[test]
+	fn add_record_framing_is_unchanged() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let mut bytes = Vec::new();
+		for (f, filler) in FILLERS.iter().enumerate() {
+			let path = temp_dir.path().join(format!("{f}.wal"));
+			let records: Vec<Vec<u8>> =
+				SIZES.iter().enumerate().map(|(i, len)| payload(i, *len)).collect();
+			write_one_by_one(&path, CompressionType::None, &[payload(f, *filler)], &records);
+			bytes.extend(std::fs::read(&path).unwrap());
+		}
+		let digest =
+			(bytes.len() as u64, crc32fast::hash(&bytes), xxhash_rust::xxh3::xxh3_64(&bytes));
+		assert_eq!(digest, (6_113_672, 1_569_578_704, 8_097_485_968_888_641_860));
+	}
+
+	/// `records` as one buffer and the end of each record in it.
+	fn join(records: &[Vec<u8>]) -> (Vec<u8>, Vec<usize>) {
+		let mut buf = Vec::new();
+		let mut ends = Vec::new();
+		for record in records {
+			buf.extend_from_slice(record);
+			ends.push(buf.len());
+		}
+		(buf, ends)
+	}
+
+	/// Every record in `path`, the way recovery reads them.
+	fn read_records(path: &std::path::Path) -> Vec<Vec<u8>> {
+		let mut reader = Reader::new(File::open(path).unwrap());
+		let mut records = Vec::new();
+		loop {
+			match reader.read() {
+				Ok((record, _)) => records.push(record.to_vec()),
+				Err(Error::IO(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return records,
+				Err(e) => panic!("{} must read end to end: {e}", path.display()),
+			}
+		}
+	}
+
+	/// A group written by `add_records` is the same bytes as the same records written by one
+	/// `add_record` each, wherever in a block the group starts and however the records fall
+	/// across block boundaries, and reads back as exactly one record per input.
+	fn assert_a_group_is_framed_like_one_append_per_record(
+		compression: CompressionType,
+		fillers: &[usize],
+	) {
+		let temp_dir = TempDir::new("test").unwrap();
+		let (one, grouped) = (temp_dir.path().join("one.wal"), temp_dir.path().join("group.wal"));
+		// Position `i` of a group has its own payload for each size, so a record written in
+		// the wrong place does not look right by accident.
+		let pool: Vec<Vec<Vec<u8>>> =
+			(1..=5).map(|i| SIZES.iter().map(|len| payload(i, *len)).collect()).collect();
+		for (f, filler) in fillers.iter().enumerate() {
+			let filler = payload(f + 100, *filler);
+			for start in 0..SIZES.len() {
+				for per_group in 1..=5 {
+					let records: Vec<Vec<u8>> = (0..per_group)
+						.map(|i| pool[i][(start + i) % SIZES.len()].clone())
+						.collect();
+					let at = format!(
+						"{compression:?}, {} byte filler, {per_group} records from size #{start}",
+						filler.len()
+					);
+
+					write_one_by_one(&one, compression, std::slice::from_ref(&filler), &records);
+
+					let mut writer = new_writer(&grouped, compression);
+					writer.add_record(&filler).unwrap();
+					let (buf, ends) = join(&records);
+					writer.add_records(&buf, &ends).unwrap();
+
+					assert_eq!(
+						std::fs::read(&one).unwrap(),
+						std::fs::read(&grouped).unwrap(),
+						"{at}: a group must not change a byte"
+					);
+					let mut want = vec![filler.clone()];
+					want.extend(records);
+					assert_eq!(read_records(&grouped), want, "{at}: one record per input");
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn a_group_is_framed_like_one_append_per_record() {
+		assert_a_group_is_framed_like_one_append_per_record(CompressionType::None, &FILLERS);
+	}
+
+	/// Compression happens per record inside the group, so the records are as long as their
+	/// LZ4 blocks and not as long as the input, and still fall where one append puts them.
+	#[test]
+	fn a_compressed_group_is_framed_like_one_append_per_record() {
+		assert_a_group_is_framed_like_one_append_per_record(
+			CompressionType::Lz4,
+			&[1, 1_000, 32_000, 32_755, 32_760],
+		);
+	}
+
+	/// The point of a group: one `write(2)` for any number of records that fit the 32 KiB
+	/// buffer, where one `add_record` each takes one per record. A larger group is written
+	/// in pieces as the buffer fills, and still in far fewer than one per record.
+	#[test]
+	fn a_group_reaches_the_file_in_one_write() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let records: Vec<Vec<u8>> = (0..8).map(|i| payload(i, 200 + i)).collect();
+		let (buf, ends) = join(&records);
+
+		let mut one_by_one = new_writer(&temp_dir.path().join("one.wal"), CompressionType::None);
+		for record in &records {
+			one_by_one.add_record(record).unwrap();
+		}
+		assert_eq!(one_by_one.file_writes(), records.len());
+
+		let mut grouped = new_writer(&temp_dir.path().join("group.wal"), CompressionType::None);
+		grouped.add_records(&buf, &ends).unwrap();
+		assert_eq!(grouped.file_writes(), 1, "8 records in 32 KiB are one write");
+		grouped.add_records(&buf, &ends).unwrap();
+		assert_eq!(grouped.file_writes(), 2, "and the next group is one more");
+
+		// Twenty records of 10 KB, 200 KB together: about a write per buffer's worth, and far
+		// fewer than one per record.
+		let large: Vec<Vec<u8>> = (0..20).map(|i| payload(i, 10_000)).collect();
+		let (buf, ends) = join(&large);
+		let mut grouped = new_writer(&temp_dir.path().join("large.wal"), CompressionType::None);
+		grouped.add_records(&buf, &ends).unwrap();
+		let writes = grouped.file_writes();
+		assert!(
+			writes >= buf.len().div_ceil(BLOCK_SIZE),
+			"{writes} writes cannot hold {} bytes",
+			buf.len()
+		);
+		assert!(writes <= large.len() / 2, "{writes} writes for {} records", large.len());
+		assert_eq!(read_records(&temp_dir.path().join("large.wal")), large);
+	}
+
+	/// The block of a record is the one `lz4_flex::compress_prepend_size` makes, whatever the
+	/// record holds, so segments written before the block was made in place read as they did.
+	#[test]
+	fn an_lz4_block_is_the_one_lz4_flex_makes() {
+		let mut records: Vec<Vec<u8>> = [0, 1, 2, 17, 100, 4_096, 70_000, 300_000]
+			.into_iter()
+			.enumerate()
+			.map(|(i, len)| payload(i, len))
+			.collect();
+		records.extend([0, 1, 100, 70_000, 300_000].map(|len| vec![b'z'; len]));
+		records.push((0..50_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect());
+		for record in records {
+			let (_, size) = lz4_block_size(record.len()).unwrap();
+			let mut blocks = Vec::with_capacity(size);
+			push_lz4_block(&mut blocks, &record).unwrap();
+			assert_eq!(blocks.capacity(), size, "no room was asked for beyond the bound");
+			assert_eq!(
+				blocks,
+				lz4_flex::compress_prepend_size(&record),
+				"a record of {} bytes",
+				record.len()
+			);
+			assert_eq!(lz4_flex::decompress_size_prepended(&blocks).unwrap(), record);
+		}
+	}
+
+	/// An LZ4 block says the length of its record in a `u32`: a longer record is refused, and
+	/// the longest one that is not has a block that is addressable.
+	#[test]
+	fn an_lz4_block_refuses_a_record_longer_than_its_length_field_says() {
+		assert_eq!(lz4_block_size(0).map(|(prefix, _)| prefix), Some(0));
+		assert_eq!(lz4_block_size(1).map(|(prefix, _)| prefix), Some(1));
+		#[cfg(target_pointer_width = "64")]
+		{
+			let longest = u32::MAX as usize;
+			let (prefix, size) = lz4_block_size(longest).unwrap();
+			assert_eq!(prefix, u32::MAX);
+			assert_eq!(size, get_maximum_output_size(longest) + LZ4_LEN_SIZE);
+			for len in [longest + 1, longest + 2, 1 << 33, usize::MAX] {
+				assert!(lz4_block_size(len).is_none(), "a record of {len} bytes");
+			}
+		}
+		#[cfg(not(target_pointer_width = "64"))]
+		assert!(lz4_block_size(usize::MAX).is_none());
+	}
+}

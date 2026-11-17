@@ -13,33 +13,145 @@
 //! The end-to-end test copies the fixture into a temporary directory and runs
 //! `kizz build coverage-build` there. It resets the copy's cache entries with
 //! `kizz cache reset`, runs `kizz build coverage-test`, and compares the observations of
-//! the one step record with the entries of `expected.txt` for the platform it runs on.
+//! the one step record with the entries of `expected.txt` for the platform it runs on:
+//! each path's kinds, the type of its state and, for a path whose extended attributes
+//! the program read, the `user.` names of the attributes recorded with it.
 //! Every run of `kizz` gets a temporary cache and an explicit environment of only
 //! `KIZZ_CACHE_DIR` and `PATH`. Paths outside the copy, such as those of the dynamic
-//! loader and the C library, are not compared.
+//! loader and the C library, are not compared with the expectation file, but the
+//! loader that the program's `PT_INTERP` header names must be recorded with the exec
+//! kind. The record must also hold every part of the machine state that the program
+//! started with, with the kernel release that the test reads itself through `uname`,
+//! a non-empty affinity, and a non-zero total memory and file-system size.
 //!
 //! The other tests check `expected.txt` itself: that it is consistent, and that each
 //! tracked system call that `architecture.md` lists, the same list as
 //! [`TRACKED_SYSTEM_CALLS`], has an entry for its success and, for a call that takes a
 //! path, one for its failure with `ENOENT`, on which a tracer that missed the call
-//! would record something else. Unit tests cover the parser and the comparison.
+//! would record something else. The same holds for the kernel's implicit loads of
+//! [`IMPLICIT_LOADS`]. Unit tests cover the parser and the comparison.
+//!
+//! The expectation file also lists the connections that the run must record, on
+//! lines of their own: the portable core and the Linux section connect and send to
+//! Unix sockets under their output directories and, through UDP sockets, to
+//! loopback addresses on fixed ports, one for each call. The end-to-end test
+//! compares the record's connections with those for its platform exactly, and the
+//! build must warn about them once and repeat the warning in its summary. Each
+//! call that connects has a connection line of its own, made through `syscall()`.
+//!
+//! Another end-to-end test builds `coverage-changes` in its own copy, after
+//! `coverage-build` and a reset: each of its steps, [`CHANGES`], runs the program in
+//! a mode that reads or runs one committed file under `in/changes` through one way
+//! in which a command first reads a file, and then rewrites it, so its result is not
+//! cached and its reason names that file with the command as its writer; the
+//! `control` step writes its file before it reads it, so its result is cached.
+//!
+//! The availability gate covers the tracked calls that a kernel may lack because a
+//! newer Linux added them, [`GATED_CALLS`]: `file_getattr`, `file_setattr` and the
+//! `xattrat` calls. The tracer tracks them on every kernel, but the program makes
+//! each once with arguments that cannot succeed, reports whether it is available in
+//! a line of its output, and makes a group's calls only where every call that the
+//! group needs is available. A call that returns `ENOSYS` is unavailable: `ENOSYS`
+//! means that the kernel lacks the call, or that a seccomp filter installed before
+//! kizz's own refuses it. The entries of those groups carry a mark after their
+//! platform that names the gated calls they need, and an entry is expected only
+//! where each of them is available. So where a call is available, each of its
+//! entries is recorded exactly; where it is unavailable, the exact comparison
+//! requires that nothing is recorded at its entries' paths. The test checks each
+//! gated call itself in its own process, which no tracer follows, and a report that
+//! disagrees is a problem; for each unavailable call it writes a notice that starts
+//! with `NOTICE:` to its standard error. The static checks do not depend on the
+//! kernel: every tracked call keeps the entries that only it explains.
+//!
+//! Two more end-to-end tests build `coverage-incomplete` in copies of their own,
+//! after `coverage-build` and a reset. Each of its steps runs the program in a mode
+//! that makes one call of [`UNTRACEABLE_SYSTEM_CALLS`], the list that
+//! `architecture.md` gives under [`UNTRACEABLE_HEADING`], so its result is not
+//! cached and its reason names the call, or one of [`UNKNOWN_NUMBERS`], which the
+//! tracer does not know, so its result is not cached and its reason names the
+//! number, and the build warns about it and repeats the warning in its summary.
+//! With `--cache-unknown-syscalls` the steps of the numbers are cached, with the
+//! numbers in their records; a later build without the option finds them cached
+//! and warns about neither, and `kizz why` lists their numbers. Of the calls,
+//! `open_tree_attr` and `fchroot` are checked only where they are available, as
+//! the test's own check and the program's report, which must agree, find; where one
+//! is unavailable, its step need not be marked, and a notice names it.
+//!
+//! A seccomp filter installed before kizz's own can refuse a call before the tracer
+//! sees it. A call or number that the tracer never saw, whose step is cached and
+//! lists no unknown system call, fails these two tests with a message
+//! that names it and [`SKIP_VARIABLE`], unless that variable is `1` in the test's
+//! environment: then its checks are skipped, and a notice that starts with
+//! `NOTICE:` names it. Either way its step must have exited with 0, and its mode
+//! must report the call with an error. A call or number that the tracer saw is
+//! checked in full.
+//!
+//! Two more tests run the program through the Linux tracer in the test process,
+//! with the process tree and without a cache, after `kizz build coverage-build` in
+//! copies of their own, with the request that `coverage-test` makes. The first
+//! requires that the tree combines to exactly the run's accesses over every path,
+//! and to its connections; that under the task directory its paths, kinds and
+//! outcomes are exactly those of the expectation file, where an entry's outcomes
+//! for a kind are the outcomes of its sources that add that kind, under the same
+//! availability gate and notice; that process 1 runs `./coverage`, that the child
+//! that runs the program again lists it as inherited and then as the program of its
+//! `exec`, that each path that a successful `exec` names, each script included, is
+//! a program of its own, and that the second thread's read belongs to process 1.
+//! The second runs each mode of `coverage-incomplete` the same way and requires
+//! that its tree lists the call's reason, or the unknown number, on the program
+//! that made it, under the same gate for `open_tree_attr` and `fchroot` and the
+//! same variable for calls and numbers that the tracer never saw, with their
+//! notices.
+//!
+//! Two more tests run the program with `kizz execute` in copies of their own, after
+//! `kizz build coverage-build`, with `kizz`'s environment of `KIZZ_CACHE_DIR` and
+//! `PATH` (E9). The first runs `kizz execute --compact --json -- ./coverage` in the
+//! copy and requires that under the task directory the report's paths, kinds and
+//! outcomes are exactly those of the expectation file, under the same availability
+//! gate and notice, and that the report is complete; it then runs
+//! `kizz execute --json` in a second copy of the built copy and requires that the
+//! hierarchical report's observations and connections, combined over every
+//! program, are exactly the compact report's, with the paths under each copy taken
+//! relative to it. The second runs each mode of `coverage-incomplete` with
+//! `kizz execute --json` and requires that each report says that the trace is
+//! incomplete and names the call or the number, under the same gate for
+//! `open_tree_attr` and `fchroot` and the same variable for calls and numbers that
+//! the tracer never saw, with their notices.
+
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
+    ffi::{CStr, OsStr, OsString},
     fmt::{self, Write as _},
     fs,
-    os::unix::fs::symlink,
+    io::{self, Write as _},
+    mem::MaybeUninit,
+    os::unix::{ffi::OsStrExt as _, fs::symlink},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
 };
 
 use kizz_store::{
-    AccessBits, PathState, RecordedOutput, SpecialKind, StepExit, StepKey, StepRecord, Store,
+    AccessBits, Attribute, Attributes, ChangedRead, Connection, KernelRecord, MachineStateRecord,
+    NotCachedReason, PathState, RecordedOutput, SpecialKind, StepExit, StepKey, StepRecord, Store,
     TaskId,
 };
-use kizz_trace_linux::TRACKED_SYSTEM_CALLS;
+use kizz_trace::{
+    AbsolutePath, AccessKind, Cancellation, CaptureMode, CapturedOutput, IncompleteReason,
+    ProcessTree, Program, RunRequest, RunResult, StdioEcho, Termination, Tracer,
+};
+use kizz_trace_linux::{LinuxTracer, TRACKED_SYSTEM_CALLS, UNTRACEABLE_SYSTEM_CALLS};
+use libc::c_long;
+use serde_json::Value;
 
 /// The result of a test or a test helper.
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -66,16 +178,119 @@ const SUCCESS_LINE: &str = "coverage: every call returned what it expected";
 /// The index of the `coverage-test` block in the fixture's `kizz.md`.
 const TEST_BLOCK: u32 = 1;
 
+/// The index of the `coverage-changes` block in the fixture's `kizz.md`.
+const CHANGES_BLOCK: u32 = 2;
+
+/// The index of the `coverage-incomplete` block in the fixture's `kizz.md`.
+const INCOMPLETE_BLOCK: u32 = 3;
+
+/// The line of `architecture.md` that introduces the system calls that mark a run
+/// as incompletely traced.
+const UNTRACEABLE_HEADING: &str = "System calls that mark the run as incompletely traced, by \
+                                   x86_64 name:";
+
+/// The calls that mark a run and that a kernel may lack because a newer Linux added
+/// them, in the order of [`UNTRACEABLE_SYSTEM_CALLS`].
+const GATED_UNTRACEABLE: [&str; 2] = ["fchroot", "open_tree_attr"];
+
+/// The system calls that the `coverage-incomplete` task makes and that the tracer
+/// does not know.
+const UNKNOWN_NUMBERS: [u32; 2] = [400, 1_000_000];
+
+/// The variable that, set to `1` in the environment of the test process, makes the
+/// tests of `coverage-incomplete` skip, with a notice, each call or number that the
+/// tracer never saw, because a seccomp filter installed before kizz's own may have
+/// refused it. Only test code reads it, and only [`skip_mode`].
+const SKIP_VARIABLE: &str = "KIZZ_TEST_SKIP_BLOCKED_SYSCALLS";
+
+/// Each mode of the `coverage-changes` task, after its `change-` prefix, with the
+/// file under the task directory that it reads or runs and then rewrites, or
+/// `None` for the control, which writes its file before it reads it.
+const CHANGES: [(&str, Option<&str>); 9] = [
+    ("open", Some("in/changes/open.txt")),
+    ("openat", Some("in/changes/openat.txt")),
+    ("openat2", Some("in/changes/openat2.txt")),
+    ("fopen", Some("in/changes/fopen.txt")),
+    ("execve", Some("in/changes/execve")),
+    ("execveat", Some("in/changes/execveat")),
+    ("execv", Some("in/changes/execv")),
+    ("interpreter", Some("in/changes/interpreter")),
+    ("control", None),
+];
+
 /// The tracked system calls that take no path, only a descriptor, so they have no
 /// `ENOENT` entry.
-const DESCRIPTOR_CALLS: [&str; 6] = [
+const DESCRIPTOR_CALLS: [&str; 12] = [
+    "fstatfs",
+    "fgetxattr",
+    "flistxattr",
+    "fsetxattr",
+    "fremovexattr",
     "getdents",
     "getdents64",
     "fchdir",
     "ftruncate",
     "fchmod",
     "fchown",
+    "fallocate",
 ];
+
+/// The errors with which a call that reads or lists extended attributes fails and
+/// still adds the xattr kind, because each answers from the attributes.
+const ATTRIBUTE_ANSWERS: [&str; 3] = ["ENODATA", "ERANGE", "EOPNOTSUPP"];
+
+/// The namespace of the extended attributes that the expectation file names: the
+/// one that the fixture sets. Names in other namespaces, such as `security.`,
+/// depend on the machine and are not compared.
+const USER_NAMESPACE: &str = "user.";
+
+/// The implicit loads of the kernel that the coverage check requires, each as the
+/// name of its `kernel` source and an outcome: the interpreter of a script that a
+/// process runs, the interpreter of that interpreter, which is a script itself,
+/// and a missing interpreter.
+const IMPLICIT_LOADS: [(&str, &str); 3] = [
+    ("interpreter", "ok"),
+    ("interpreter_of_interpreter", "ok"),
+    ("interpreter", "ENOENT"),
+];
+
+/// The tracked calls that a kernel may lack because a newer Linux added them, in
+/// the order of [`TRACKED_SYSTEM_CALLS`]: Linux 6.17 added `file_getattr` and
+/// `file_setattr`, and Linux 6.13 the `xattrat` calls.
+const GATED_CALLS: [&str; 6] = [
+    "file_getattr",
+    "getxattrat",
+    "listxattrat",
+    "setxattrat",
+    "removexattrat",
+    "file_setattr",
+];
+
+/// The start of the line in which the program reports that a gated call is
+/// available, before the call's name.
+const AVAILABLE_LINE: &str = "coverage: available: ";
+
+/// The start of the line in which the program reports that a gated call is
+/// unavailable, because it returned `ENOSYS`, before the call's name.
+const UNAVAILABLE_LINE: &str = "coverage: unavailable: ";
+
+/// The path on which the availability check makes each gated call: the root,
+/// outside every task directory.
+const CHECKED_PATH: &CStr = c"/";
+
+/// The attribute name that the availability check passes to the `xattrat` calls
+/// that take one.
+const CHECKED_ATTRIBUTE: &CStr = c"user.kizz";
+
+/// The first field of a connection line of the expectation file.
+const CONNECTION_FIELD: &str = "connection";
+
+/// The calls that record a connection, which the connection lines name.
+const CONNECTING_CALLS: [&str; 4] = ["connect", "sendto", "sendmsg", "sendmmsg"];
+
+/// The number of system calls that the tracer tracks, as `architecture.md` lists
+/// them.
+const TRACKED_COUNT: usize = 76;
 
 /// An access kind, as "What is recorded" names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,15 +305,18 @@ enum Kind {
     Write,
     /// The path was run as a program.
     Exec,
+    /// The path's extended attributes were read or listed.
+    Xattr,
 }
 
 /// Every kind with its name and its bit in the store, in order.
-const KINDS: [(Kind, &str, u8); 5] = [
+const KINDS: [(Kind, &str, u8); 6] = [
     (Kind::Read, "read", AccessBits::READ),
     (Kind::Probe, "probe", AccessBits::PROBE),
     (Kind::List, "list", AccessBits::LIST),
     (Kind::Write, "write", AccessBits::WRITE),
     (Kind::Exec, "exec", AccessBits::EXEC),
+    (Kind::Xattr, "xattr", AccessBits::XATTR),
 ];
 
 /// A set of access kinds.
@@ -221,7 +439,7 @@ impl State {
                     hash: hash.is_some(),
                 }
             },
-            PathState::Directory { listing } => {
+            PathState::Directory { listing, .. } => {
                 Self::Dir {
                     listing: listing.is_some(),
                 }
@@ -302,6 +520,120 @@ impl fmt::Display for State {
     }
 }
 
+/// The `user.` names of one side of a path's recorded extended attributes, sorted,
+/// or `None` when they could not be read.
+type Names = Option<Vec<String>>;
+
+/// The extended attributes recorded with a path, by their `user.` names: those of
+/// the path itself and, for a symbolic link, those of what it points to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttributeNames {
+    /// The path's own attributes.
+    own: Names,
+    /// For a symbolic link, the attributes of what it points to, or `None` when
+    /// they were not recorded.
+    pointee: Option<Names>,
+}
+
+impl AttributeNames {
+    /// The `user.` names of the recorded `attributes`.
+    fn from_recorded(attributes: &Attributes) -> Self {
+        let names = |list: &[Attribute]| -> Vec<String> {
+            list.iter()
+                .map(|attribute| String::from_utf8_lossy(&attribute.name).into_owned())
+                .filter(|name| name.starts_with(USER_NAMESPACE))
+                .collect()
+        };
+        Self {
+            own: attributes.own.as_deref().map(names),
+            pointee: attributes.pointee.as_deref().map(|list| Some(names(list))),
+        }
+    }
+}
+
+/// One side of [`AttributeNames`] as the expectation file writes it: `-` when the
+/// attributes could not be read, or else the names joined with `,`, possibly none.
+fn names_text(names: Option<&[String]>) -> String {
+    names.map_or_else(|| "-".to_owned(), |names| names.join(","))
+}
+
+/// One side of [`AttributeNames`] from its text, as [`names_text`] writes it.
+fn parse_names(text: &str) -> Result<Names, String> {
+    if text == "-" {
+        return Ok(None);
+    }
+    if text.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let names: Vec<String> = text.split(',').map(str::to_owned).collect();
+    if names.iter().any(|name| !name.starts_with(USER_NAMESPACE)) {
+        return Err(format!(
+            "the attribute names `{text}` are not all in `user.`"
+        ));
+    }
+    Ok(Some(names))
+}
+
+/// The recorded state of a path, with its extended attributes when they were
+/// recorded. The expectation file writes it as the state, followed, when the
+/// attributes were recorded, by `@` and their names, and for a symbolic link by `/`
+/// and the names of what it points to, such as `file@user.kizz` or
+/// `symlink:t:file@/user.kizz`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observed {
+    /// The type of the state.
+    state: State,
+    /// The recorded extended attributes, or `None` when none were recorded.
+    attributes: Option<AttributeNames>,
+}
+
+impl Observed {
+    /// A state without recorded attributes.
+    const fn plain(state: State) -> Self {
+        Self {
+            state,
+            attributes: None,
+        }
+    }
+}
+
+impl FromStr for Observed {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let Some((state, attributes)) = text.split_once('@') else {
+            return Ok(Self::plain(text.parse()?));
+        };
+        let (own, pointee) = match attributes.split_once('/') {
+            Some((own, pointee)) => (own, Some(parse_names(pointee)?)),
+            None => (attributes, None),
+        };
+        Ok(Self {
+            state: state.parse()?,
+            attributes: Some(AttributeNames {
+                own: parse_names(own)?,
+                pointee,
+            }),
+        })
+    }
+}
+
+impl fmt::Display for Observed {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "{}", self.state)?;
+        if let Some(attributes) = &self.attributes {
+            write!(f, "@{}", names_text(attributes.own.as_deref()))?;
+            if let Some(pointee) = &attributes.pointee {
+                write!(f, "/{}", names_text(pointee.as_deref()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The platforms that an entry names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Platform {
@@ -365,6 +697,9 @@ enum Origin {
     Libc,
     /// Kizz's own start of the program, a traced `execve`.
     Kizz,
+    /// A file that the kernel loads to run a program, without a system call of its
+    /// own: an interpreter that a `#!` line names, or an ELF loader.
+    Kernel,
 }
 
 /// One call that touches an entry's path.
@@ -393,6 +728,14 @@ impl Source {
     ) -> bool {
         self.origin == Origin::Sys && self.name == name
     }
+
+    /// Whether this is the implicit load `name` of the kernel.
+    fn is_implicit_load(
+        &self,
+        name: &str,
+    ) -> bool {
+        self.origin == Origin::Kernel && self.name == name
+    }
 }
 
 impl FromStr for Source {
@@ -409,6 +752,7 @@ impl FromStr for Source {
             "sys" => Origin::Sys,
             "libc" => Origin::Libc,
             "kizz" => Origin::Kizz,
+            "kernel" => Origin::Kernel,
             _ => return Err(format!("unknown origin `{origin}` in `{text}`")),
         };
         let valid_name = !name.is_empty()
@@ -440,12 +784,45 @@ struct Entry {
     path: String,
     /// The access kinds that must be recorded.
     kinds: Kinds,
-    /// The type of the state that must be recorded.
-    state: State,
+    /// The type of the state that must be recorded, with the names of its recorded
+    /// extended attributes.
+    state: Observed,
     /// The platforms that expect the entry.
     platform: Platform,
+    /// The gated calls that the entry's mark names, which its group needs: the
+    /// entry is expected only where each of them is available.
+    needs: Vec<String>,
     /// Every call that touches the path in the run.
     sources: Vec<Source>,
+}
+
+/// Whether `name` is a well-formed call name: letters, digits and `_`.
+fn is_call_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// The platform and the names of the mark of a `PLATFORM[/CALL+...]` field.
+fn parse_platform(text: &str) -> Result<(Platform, Vec<String>), String> {
+    let (platform, mark) = match text.split_once('/') {
+        Some((platform, mark)) => (platform, Some(mark)),
+        None => (text, None),
+    };
+    let platform = PLATFORMS
+        .iter()
+        .find(|(_, name)| *name == platform)
+        .map(|(known, _)| *known)
+        .ok_or_else(|| format!("unknown platform `{platform}`"))?;
+    let Some(mark) = mark else {
+        return Ok((platform, Vec::new()));
+    };
+    let needs: Vec<String> = mark.split('+').map(str::to_owned).collect();
+    if !needs.iter().all(|name| is_call_name(name)) {
+        return Err(format!("the mark of `{text}` is not CALL+..."));
+    }
+    Ok((platform, needs))
 }
 
 /// Whether `path` is a relative path as the tracer reports it: no root, no empty
@@ -473,11 +850,8 @@ fn parse_entry(
             "line {line}: {path} is not a normalized relative path"
         ));
     }
-    let platform = PLATFORMS
-        .iter()
-        .find(|(_, name)| name == platform)
-        .map(|(known, _)| *known)
-        .ok_or_else(|| format!("line {line}: unknown platform `{platform}`"))?;
+    let (platform, needs) =
+        parse_platform(platform).map_err(|error| format!("line {line}: {error}"))?;
     let sources = sources
         .iter()
         .map(|source| source.parse())
@@ -493,18 +867,20 @@ fn parse_entry(
             .parse()
             .map_err(|error| format!("line {line}: {error}"))?,
         platform,
+        needs,
         sources,
     })
 }
 
-/// Parse an expectation file: one entry per line, with blank lines and lines that
-/// start with `#` ignored. Returns every entry, or every error.
+/// Parse an expectation file: one entry per line, with blank lines, lines that
+/// start with `#`, and connection lines ignored. Returns every entry, or every
+/// error.
 fn parse_expectations(text: &str) -> Result<Vec<Entry>, Vec<String>> {
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     for (line, content) in (1_usize..).zip(text.lines()) {
         let content = content.trim();
-        if content.is_empty() || content.starts_with('#') {
+        if content.is_empty() || content.starts_with('#') || is_connection_line(content) {
             continue;
         }
         match parse_entry(line, content) {
@@ -519,10 +895,197 @@ fn parse_expectations(text: &str) -> Result<Vec<Entry>, Vec<String>> {
     }
 }
 
+/// Whether `content`, a trimmed line of the expectation file, is a connection line:
+/// its first field is [`CONNECTION_FIELD`].
+fn is_connection_line(content: &str) -> bool {
+    content.split_whitespace().next() == Some(CONNECTION_FIELD)
+}
+
+/// One connection line of the expectation file: a connection that the run must
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedConnection {
+    /// The line, counting from one.
+    line: usize,
+    /// The platforms that expect the connection.
+    platform: Platform,
+    /// The destination, as [`connection_text`] writes a recorded one.
+    destination: String,
+    /// Where the call that made the connection comes from.
+    origin: Origin,
+    /// The call that made the connection, one of [`CONNECTING_CALLS`].
+    call: String,
+}
+
+/// Whether `text` is a destination as the expectation file writes it: an IPv4 or
+/// IPv6 address and port in the form that the standard library writes it,
+/// `unix:` and a normalized relative path, or `abstract:` and a name.
+fn is_destination(text: &str) -> bool {
+    if let Some(path) = text.strip_prefix("unix:") {
+        return is_normal_relative(path);
+    }
+    if let Some(name) = text.strip_prefix("abstract:") {
+        return !name.is_empty();
+    }
+    text.parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| address.to_string() == text)
+}
+
+/// Parse one connection line, the `line`-th of the file:
+/// `connection PLATFORM DESTINATION ORIGIN:CALL`.
+fn parse_connection(
+    line: usize,
+    text: &str,
+) -> Result<ExpectedConnection, String> {
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let [keyword, platform, destination, source] = fields.as_slice() else {
+        return Err(format!(
+            "line {line}: a connection is {CONNECTION_FIELD} PLATFORM DESTINATION ORIGIN:CALL"
+        ));
+    };
+    if *keyword != CONNECTION_FIELD {
+        return Err(format!("line {line}: `{text}` is not a connection line"));
+    }
+    let (platform, needs) =
+        parse_platform(platform).map_err(|error| format!("line {line}: {error}"))?;
+    if !needs.is_empty() {
+        return Err(format!("line {line}: a connection carries no mark"));
+    }
+    if !is_destination(destination) {
+        return Err(format!("line {line}: `{destination}` is not a destination"));
+    }
+    let origin = match source.split_once(':') {
+        Some(("sys", call)) if CONNECTING_CALLS.contains(&call) => (Origin::Sys, call),
+        Some(("libc", call)) if CONNECTING_CALLS.contains(&call) => (Origin::Libc, call),
+        _ => {
+            return Err(format!(
+                "line {line}: `{source}` is not sys or libc and a call that connects"
+            ));
+        },
+    };
+    Ok(ExpectedConnection {
+        line,
+        platform,
+        destination: (*destination).to_owned(),
+        origin: origin.0,
+        call: origin.1.to_owned(),
+    })
+}
+
+/// Parse the connection lines of an expectation file. Returns every connection,
+/// or every error.
+fn parse_connections(text: &str) -> Result<Vec<ExpectedConnection>, Vec<String>> {
+    let mut connections = Vec::new();
+    let mut errors = Vec::new();
+    for (line, content) in (1_usize..).zip(text.lines()) {
+        let content = content.trim();
+        if !is_connection_line(content) {
+            continue;
+        }
+        match parse_connection(line, content) {
+            Ok(connection) => connections.push(connection),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(connections)
+    } else {
+        Err(errors)
+    }
+}
+
+/// The problems of `connections` as a whole: a destination listed twice for a
+/// platform, and a call of [`CONNECTING_CALLS`] without a connection that it makes
+/// through `syscall()` on Linux.
+fn connection_problems(connections: &[ExpectedConnection]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, connection) in connections.iter().enumerate() {
+        for other in connections.iter().skip(index.saturating_add(1)) {
+            if connection.destination == other.destination
+                && connection.platform.overlaps(other.platform)
+            {
+                problems.push(format!(
+                    "lines {} and {}: {} is listed twice for a platform",
+                    connection.line, other.line, connection.destination
+                ));
+            }
+        }
+    }
+    for call in CONNECTING_CALLS {
+        let made = connections.iter().any(|connection| {
+            connection.origin == Origin::Sys
+                && connection.call == call
+                && connection.platform.overlaps(Platform::Linux)
+        });
+        if !made {
+            problems.push(format!(
+                "{call} has no connection that it makes through syscall() on Linux"
+            ));
+        }
+    }
+    problems
+}
+
+/// The connection `connection` of a record, as the expectation file writes it, with
+/// a Unix socket path relative to `dir`, or absolute when it is outside.
+fn connection_text(
+    connection: &Connection,
+    dir: &Path,
+) -> String {
+    match connection {
+        Connection::UnixPath { path } => {
+            format!("unix:{}", path.strip_prefix(dir).unwrap_or(path).display())
+        },
+        Connection::UnixAbstract { name } => format!("abstract:{}", name.escape_ascii()),
+        Connection::Ipv4 { .. } | Connection::Ipv6 { .. } => connection.to_string(),
+    }
+}
+
+/// The connections of `record`, as the expectation file writes them, relative to
+/// `dir`.
+fn recorded_connections(
+    record: &StepRecord,
+    dir: &Path,
+) -> BTreeSet<String> {
+    record
+        .connections
+        .iter()
+        .map(|connection| connection_text(connection, dir))
+        .collect()
+}
+
+/// The destinations of `connections` for the platform the test runs on.
+fn expected_connections_here(connections: &[ExpectedConnection]) -> BTreeSet<String> {
+    connections
+        .iter()
+        .filter(|connection| connection.platform.is_current())
+        .map(|connection| connection.destination.clone())
+        .collect()
+}
+
+/// Every difference between the `expected` and the `recorded` connections: each
+/// expected one that was not recorded, and each recorded one that was not
+/// expected.
+fn connection_differences(
+    expected: &BTreeSet<String>,
+    recorded: &BTreeSet<String>,
+) -> Vec<String> {
+    let missing = expected
+        .difference(recorded)
+        .map(|destination| format!("missing connection: {destination}"));
+    let unexpected = recorded
+        .difference(expected)
+        .map(|destination| format!("unexpected connection: {destination}"));
+    missing.chain(unexpected).collect()
+}
+
 /// The problems of `entries` as a whole, given the names of the tracked system
 /// calls: an entry's kinds that are not the union of its sources' kinds, a system
-/// call that is not tracked, a failed call that adds more than a probe, a start by
-/// kizz that is not a successful `execve`, and a path listed twice for a platform.
+/// call that is not tracked, an implicit load that is not known, a failed call
+/// that adds more than a probe, unless it adds only the xattr kind and failed with
+/// one of [`ATTRIBUTE_ANSWERS`], a start by kizz that is not a successful `execve`,
+/// the problems of a mark that [`mark_problems`] finds, and a path listed twice for
+/// a platform.
 fn consistency_problems(
     entries: &[Entry],
     tracked: &[&str],
@@ -538,7 +1101,18 @@ fn consistency_problems(
                     entry.line, source.name
                 ));
             }
-            if !source.succeeded() && source.kinds != Kinds(BTreeSet::from([Kind::Probe])) {
+            if source.origin == Origin::Kernel
+                && !IMPLICIT_LOADS.iter().any(|(name, _)| *name == source.name)
+            {
+                problems.push(format!(
+                    "line {}: {} is not a known implicit load",
+                    entry.line, source.name
+                ));
+            }
+            let answered = source.kinds == Kinds(BTreeSet::from([Kind::Xattr]))
+                && ATTRIBUTE_ANSWERS.contains(&source.outcome.as_str());
+            let probed = source.kinds == Kinds(BTreeSet::from([Kind::Probe]));
+            if !source.succeeded() && !probed && !answered {
                 problems.push(format!(
                     "line {}: the failed call {} adds {}, not a probe",
                     entry.line, source.name, source.kinds
@@ -557,6 +1131,7 @@ fn consistency_problems(
                 entry.line, entry.path, entry.kinds
             ));
         }
+        problems.extend(mark_problems(entry));
     }
     for (index, entry) in entries.iter().enumerate() {
         for other in entries.iter().skip(index.saturating_add(1)) {
@@ -571,18 +1146,50 @@ fn consistency_problems(
     problems
 }
 
-/// Whether a tracer that missed the system call `name` would record `entry`
-/// differently: the call is its only source, or adds a kind that no other source
-/// adds.
+/// The problems of the mark of `entry`: a name that is not one of [`GATED_CALLS`],
+/// a name given twice, and a source of a gated call that the mark does not name.
+fn mark_problems(entry: &Entry) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, name) in entry.needs.iter().enumerate() {
+        if !GATED_CALLS.contains(&name.as_str()) {
+            problems.push(format!(
+                "line {}: the mark names {name}, which is not a gated call",
+                entry.line
+            ));
+        }
+        if entry
+            .needs
+            .iter()
+            .take(index)
+            .any(|earlier| earlier == name)
+        {
+            problems.push(format!("line {}: the mark names {name} twice", entry.line));
+        }
+    }
+    for source in &entry.sources {
+        let gated = source.origin == Origin::Sys && GATED_CALLS.contains(&source.name.as_str());
+        if gated && !entry.needs.contains(&source.name) {
+            problems.push(format!(
+                "line {}: the gated call {} is a source, but the mark does not name it",
+                entry.line, source.name
+            ));
+        }
+    }
+    problems
+}
+
+/// Whether a tracer that missed the sources that `missed` selects would record
+/// `entry` differently: they are its only sources, or add a kind that no other
+/// source adds.
 fn detects(
     entry: &Entry,
-    name: &str,
+    missed: impl Fn(&Source) -> bool,
 ) -> bool {
     let mut own = Kinds::default();
     let mut others = Kinds::default();
     let mut has_others = false;
     for source in &entry.sources {
-        if source.is_system_call(name) {
+        if missed(source) {
             own.extend(&source.kinds);
         } else {
             others.extend(&source.kinds);
@@ -595,7 +1202,8 @@ fn detects(
 /// The problems of the coverage of `tracked` by `entries`, which are the entries for
 /// one platform: a call without an entry on which it succeeded, or for a call that
 /// takes a path, failed with `ENOENT`, and that would be recorded differently
-/// without it.
+/// without it; and an implicit load of [`IMPLICIT_LOADS`] without an entry with
+/// its outcome that would be recorded differently without it.
 fn coverage_problems(
     entries: &[&Entry],
     tracked: &[&str],
@@ -612,7 +1220,7 @@ fn coverage_problems(
                     .sources
                     .iter()
                     .any(|source| source.is_system_call(name) && source.outcome == outcome)
-                    && detects(entry, name)
+                    && detects(entry, |source| source.is_system_call(name))
             });
             if !detected {
                 problems.push(format!(
@@ -621,18 +1229,36 @@ fn coverage_problems(
             }
         }
     }
+    for (name, outcome) in IMPLICIT_LOADS {
+        let selects = |source: &Source| source.is_implicit_load(name) && source.outcome == outcome;
+        let detected = entries
+            .iter()
+            .any(|entry| entry.sources.iter().any(selects) && detects(entry, selects));
+        if !detected {
+            problems.push(format!(
+                "the implicit load {name} has no entry with outcome {outcome} that only it explains"
+            ));
+        }
+    }
     problems
 }
 
 /// The tracked system calls that `architecture.md`'s text lists: every name in
 /// backticks in the bullets under [`TRACKED_HEADING`], in order.
 fn spec_tracked_calls(text: &str) -> Result<Vec<String>, String> {
-    let mut lines = text
-        .lines()
-        .skip_while(|line| *line != TRACKED_HEADING)
-        .skip(1);
-    if text.lines().all(|line| line != TRACKED_HEADING) {
-        return Err(format!("architecture.md has no line `{TRACKED_HEADING}`"));
+    spec_calls(text, TRACKED_HEADING)
+}
+
+/// The system calls that `architecture.md`'s text lists under `heading`: every name
+/// in backticks in the bullets after that line, with their continuation lines, in
+/// order.
+fn spec_calls(
+    text: &str,
+    heading: &str,
+) -> Result<Vec<String>, String> {
+    let mut lines = text.lines().skip_while(|line| *line != heading).skip(1);
+    if text.lines().all(|line| line != heading) {
+        return Err(format!("architecture.md has no line `{heading}`"));
     }
     let mut names = Vec::new();
     let mut started = false;
@@ -645,13 +1271,15 @@ fn spec_tracked_calls(text: &str) -> Result<Vec<String>, String> {
         }
     }
     if names.is_empty() {
-        return Err("architecture.md lists no tracked system call".to_owned());
+        return Err(format!(
+            "architecture.md lists no system call under `{heading}`"
+        ));
     }
     Ok(names)
 }
 
-/// What a path's record holds: its kinds and its state.
-type Recorded = BTreeMap<String, (Kinds, State)>;
+/// What a path's record holds: its kinds and its state, with its attributes.
+type Recorded = BTreeMap<String, (Kinds, Observed)>;
 
 /// One difference between the expected and the recorded paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,23 +1289,23 @@ enum Difference {
         /// The path.
         path: String,
         /// The expected kinds and state.
-        expected: (Kinds, State),
+        expected: (Kinds, Observed),
     },
     /// A recorded path that was not expected.
     Unexpected {
         /// The path.
         path: String,
         /// The recorded kinds and state.
-        recorded: (Kinds, State),
+        recorded: (Kinds, Observed),
     },
     /// A path recorded with other kinds or another state than expected.
     Mismatched {
         /// The path.
         path: String,
         /// The expected kinds and state.
-        expected: (Kinds, State),
+        expected: (Kinds, Observed),
         /// The recorded kinds and state.
-        recorded: (Kinds, State),
+        recorded: (Kinds, Observed),
     },
 }
 
@@ -765,10 +1393,13 @@ fn recorded_under(
             };
             Some((
                 name,
-                (
-                    Kinds::from_bits(observation.access),
-                    State::from_recorded(&observation.state),
-                ),
+                (Kinds::from_bits(observation.access), Observed {
+                    state: State::from_recorded(&observation.state),
+                    attributes: observation
+                        .attributes
+                        .as_ref()
+                        .map(AttributeNames::from_recorded),
+                }),
             ))
         })
         .collect()
@@ -785,6 +1416,12 @@ fn fixture_dir() -> PathBuf {
 fn fixture_entries() -> TestResult<Vec<Entry>> {
     let text = fs::read_to_string(fixture_dir().join(EXPECTATIONS))?;
     parse_expectations(&text).map_err(|errors| errors.join("\n").into())
+}
+
+/// The connections of the fixture's expectation file.
+fn fixture_connections() -> TestResult<Vec<ExpectedConnection>> {
+    let text = fs::read_to_string(fixture_dir().join(EXPECTATIONS))?;
+    parse_connections(&text).map_err(|errors| errors.join("\n").into())
 }
 
 /// The names of [`TRACKED_SYSTEM_CALLS`].
@@ -894,7 +1531,8 @@ fn output_of(record: &StepRecord) -> String {
 }
 
 /// The problems of the one step record that `coverage-test`, the task `task`,
-/// recorded in `steps`, and its captured output.
+/// recorded in `steps`, and its captured output: it must be cached, so complete,
+/// and list no system call that the tracer does not know.
 fn record_problems(
     steps: &[(StepKey, StepRecord)],
     task: &TaskId,
@@ -925,6 +1563,12 @@ fn record_problems(
     if let Some(reason) = &record.not_cached {
         problems.push(format!("the result is not cached: {reason}"));
     }
+    if !record.unknown_system_calls.is_empty() {
+        problems.push(format!(
+            "the step record lists unknown system calls: {:?}",
+            record.unknown_system_calls
+        ));
+    }
     if record.ignored != 0 {
         problems.push(format!("{} accesses were ignored", record.ignored));
     }
@@ -937,11 +1581,77 @@ fn record_problems(
     (problems, Some(record.clone()))
 }
 
-/// The expected kinds and states of `entries` for the platform the test runs on.
-fn expected_here(entries: &[Entry]) -> Recorded {
+/// The kernel release that `uname` reports, which the test reads itself.
+fn uname_release() -> TestResult<String> {
+    let mut names = MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: the pointer is valid for writing a `utsname`.
+    if unsafe { libc::uname(names.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: `uname` succeeded, so it initialized `names`.
+    let names = unsafe { names.assume_init() };
+    // SAFETY: `uname` ends every field with a zero byte within the field.
+    Ok(unsafe { CStr::from_ptr(names.release.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// The problems of the machine state `machine` of the `coverage-test` record: it
+/// must hold every part, with the kernel release `release`, a non-empty affinity,
+/// and a non-zero total memory and file-system size.
+fn machine_problems(
+    machine: &MachineStateRecord,
+    release: &str,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    match &machine.kernel {
+        Some(kernel) if kernel.release == release => {},
+        other => {
+            problems.push(format!(
+                "the recorded kernel is {other:?}, not release {release}"
+            ));
+        },
+    }
+    if machine.limits.as_ref().is_none_or(Vec::is_empty) {
+        problems.push(format!(
+            "the recorded resource limits are {:?}",
+            machine.limits
+        ));
+    }
+    if machine.affinity.as_ref().is_none_or(Vec::is_empty) {
+        problems.push(format!("the recorded affinity is {:?}", machine.affinity));
+    }
+    if machine.memory.is_none_or(|memory| memory.total == 0) {
+        problems.push(format!("the recorded memory is {:?}", machine.memory));
+    }
+    if machine.filesystem.is_none() {
+        problems.push("the record holds no file system".to_owned());
+    }
+    if machine.disk.is_none_or(|disk| disk.size == 0) {
+        problems.push(format!("the recorded disk is {:?}", machine.disk));
+    }
+    problems
+}
+
+/// Whether each gated call is available, by name: unavailable when its check
+/// returned `ENOSYS`.
+type Availability = BTreeMap<String, bool>;
+
+/// The expected kinds and states of `entries` for the platform the test runs on,
+/// where every gated call that an entry's mark names is available in `available`.
+fn expected_here(
+    entries: &[Entry],
+    available: &Availability,
+) -> Recorded {
     entries
         .iter()
-        .filter(|entry| entry.platform.is_current())
+        .filter(|entry| {
+            entry.platform.is_current()
+                && entry
+                    .needs
+                    .iter()
+                    .all(|name| available.get(name) == Some(&true))
+        })
         .map(|entry| {
             (
                 entry.path.clone(),
@@ -951,19 +1661,193 @@ fn expected_here(entries: &[Entry]) -> Recorded {
         .collect()
 }
 
+/// The address of `pointer`, as a system-call argument.
+fn address<T>(pointer: *const T) -> c_long {
+    c_long::try_from(pointer.expose_provenance()).unwrap_or_default()
+}
+
+/// Make the gated call `name` once, in this process, which no tracer follows, on
+/// [`CHECKED_PATH`], with arguments that the kernel rejects with `EINVAL` before it
+/// looks the path up: a structure size of 0 for `getxattrat`, `setxattrat`,
+/// `file_getattr` and `file_setattr`, and a flag that the call does not accept for
+/// `listxattrat` and `removexattrat`. Returns the error number of the failure, or
+/// `None` if the call succeeded.
+fn check_call(name: &str) -> TestResult<Option<i32>> {
+    let number = TRACKED_SYSTEM_CALLS
+        .iter()
+        .find(|call| call.name == name)
+        .ok_or_else(|| format!("{name} is not tracked"))?
+        .number;
+    let mut buffer = [0_u8; 64];
+    let place = address(buffer.as_mut_ptr().cast_const());
+    let size = c_long::try_from(buffer.len())?;
+    let path = address(CHECKED_PATH.as_ptr());
+    let attribute = address(CHECKED_ATTRIBUTE.as_ptr());
+    let cwd = c_long::from(libc::AT_FDCWD);
+    let unaccepted = c_long::from(libc::AT_REMOVEDIR);
+    let arguments: [c_long; 6] = match name {
+        "file_getattr" | "file_setattr" => [cwd, path, place, 0, 0, 0],
+        "getxattrat" | "setxattrat" => [cwd, path, 0, attribute, place, 0],
+        "listxattrat" => [cwd, path, unaccepted, place, size, 0],
+        "removexattrat" => [cwd, path, unaccepted, attribute, 0, 0],
+        _ => return Err(format!("{name} is not a gated call").into()),
+    };
+    let [a0, a1, a2, a3, a4, a5] = arguments;
+    // SAFETY: the pointers name live memory: two NUL-terminated strings and
+    // `buffer`, which is writable for its whole length; the kernel rejects the
+    // arguments before it uses them, or the call is unavailable.
+    let result = unsafe { libc::syscall(number, a0, a1, a2, a3, a4, a5) };
+    if result >= 0 {
+        return Ok(None);
+    }
+    Ok(io::Error::last_os_error().raw_os_error())
+}
+
+/// The word for whether a call is `available`.
+const fn availability_word(available: bool) -> &'static str {
+    if available {
+        "available"
+    } else {
+        "unavailable"
+    }
+}
+
+/// Whether each of [`GATED_CALLS`] is available, checked in this process with
+/// [`check_call`]: `ENOSYS` means that the kernel lacks the call, or that a seccomp
+/// filter installed before kizz's own refuses it, so the call is unavailable, and
+/// `EINVAL` that it is available; any other result is a problem, and the call then
+/// counts as available.
+fn own_availability() -> TestResult<(Availability, Vec<String>)> {
+    let mut available = Availability::new();
+    let mut problems = Vec::new();
+    for name in GATED_CALLS {
+        let error = check_call(name)?;
+        let has = error != Some(libc::ENOSYS);
+        if has && error != Some(libc::EINVAL) {
+            let result = error.map_or_else(
+                || "success".to_owned(),
+                |error| io::Error::from_raw_os_error(error).to_string(),
+            );
+            problems.push(format!(
+                "the test's check of {name} returned {result}, not EINVAL or ENOSYS"
+            ));
+        }
+        available.insert(name.to_owned(), has);
+    }
+    Ok((available, problems))
+}
+
+/// The availability of each gated call that the program reported in `output`, in
+/// its lines that start with [`AVAILABLE_LINE`] or [`UNAVAILABLE_LINE`], with the
+/// problems of the report: a gated call without a line, a call with more than one,
+/// and a name that is not a gated call.
+fn reported_availability(output: &str) -> (Availability, Vec<String>) {
+    let mut reported = Availability::new();
+    let mut problems = Vec::new();
+    for line in output.lines() {
+        let parsed = line
+            .strip_prefix(AVAILABLE_LINE)
+            .map(|name| (name, true))
+            .or_else(|| {
+                line.strip_prefix(UNAVAILABLE_LINE)
+                    .map(|name| (name, false))
+            });
+        let Some((name, has)) = parsed else {
+            continue;
+        };
+        if !GATED_CALLS.contains(&name) {
+            problems.push(format!(
+                "the program reported {name}, which is not a gated call"
+            ));
+        } else if reported.insert(name.to_owned(), has).is_some() {
+            problems.push(format!("the program reported {name} more than once"));
+        }
+    }
+    for name in GATED_CALLS {
+        if !reported.contains_key(name) {
+            problems.push(format!(
+                "the program did not report whether {name} is available"
+            ));
+        }
+    }
+    (reported, problems)
+}
+
+/// The gated calls whose availability the program's report, `reported`, gives
+/// otherwise than the test's own check, `own`, each as a problem.
+fn disagreements(
+    reported: &Availability,
+    own: &Availability,
+) -> Vec<String> {
+    GATED_CALLS
+        .iter()
+        .filter_map(|name| {
+            let (by_program, by_test) = (*reported.get(*name)?, *own.get(*name)?);
+            (by_program != by_test).then(|| {
+                format!(
+                    "the program reported {name} {}, but the test's own check found it {}",
+                    availability_word(by_program),
+                    availability_word(by_test)
+                )
+            })
+        })
+        .collect()
+}
+
+/// The notice that names `test` and each gated call that `available` marks
+/// unavailable, or `None` when there is none.
+fn unavailable_notice(
+    test: &str,
+    available: &Availability,
+) -> Option<String> {
+    let missing: Vec<&str> = GATED_CALLS
+        .iter()
+        .copied()
+        .filter(|name| available.get(*name) == Some(&false))
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "NOTICE: {test}: {} returned ENOSYS (the kernel lacks the call, or a seccomp filter \
+             installed before kizz's own refuses it), so the test required that nothing was \
+             recorded at their paths instead of checking their accesses",
+            missing.join(", ")
+        )
+    })
+}
+
+/// Write the notice of [`unavailable_notice`], if any, to the standard error of
+/// this process through [`io::stderr`], which the test harness does not capture,
+/// so the output of a passing run shows it.
+fn write_notice(
+    test: &str,
+    available: &Availability,
+) -> io::Result<()> {
+    unavailable_notice(test, available).map_or(Ok(()), |notice| writeln!(io::stderr(), "{notice}"))
+}
+
 /// Run the fixture's two builds and the reset in a copy of it, and compare the
-/// step that `coverage-test` recorded with the expectation file. Every problem is
-/// reported at once, with the output of `kizz` and of the program.
+/// step that `coverage-test` recorded with the expectation file, leaving out the
+/// entries that name an unavailable gated call, as the test's own check and the
+/// program's report, which must agree, find. The step's connections must be
+/// exactly those of the expectation file for the platform, and the build must warn
+/// about them once, naming them, and repeat the warning in its summary. Every
+/// problem is reported at once, with the output of `kizz` and of the program, and
+/// a notice names each unavailable gated call.
 #[test]
 fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
+    let (available, mut problems) = own_availability()?;
+    write_notice(
+        "the_tracer_records_every_access_of_the_coverage_program",
+        &available,
+    )?;
     let entries = fixture_entries()?;
+    let connections = fixture_connections()?;
     let dir = tempfile::tempdir()?;
     let copy = dir.path().canonicalize()?.join(FIXTURE);
     copy_tree(&fixture_dir(), &copy)?;
     let cache = tempfile::tempdir()?;
     let copy_text = copy.to_str().ok_or("the copy's path is not UTF-8")?;
 
-    let mut problems = Vec::new();
     let mut runs = Vec::new();
     for args in [
         &["build", "coverage-build"][..],
@@ -983,6 +1867,15 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     if run.status != Some(0) {
         problems.push("kizz build coverage-test failed".to_owned());
     }
+    problems.extend(warning_problems(&run, &[
+        "`./coverage`",
+        "connected to",
+        "127.0.0.1:47011",
+        "127.0.0.1:47012",
+        "Unix socket `out/core/stream.sock`",
+        "kizz cannot see what came back, and its result is still cached",
+        "`always = True` runs a command on every build",
+    ]));
     runs.push(run);
 
     let task = TaskId {
@@ -993,8 +1886,18 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     problems.extend(found);
     let mut report = String::new();
     if let Some(record) = &record {
-        let differences = compare(&expected_here(&entries), &recorded_under(record, &copy));
+        let (reported, report_problems) = reported_availability(&output_of(record));
+        problems.extend(report_problems);
+        problems.extend(disagreements(&reported, &available));
+        let expected = expected_here(&entries, &available);
+        let differences = compare(&expected, &recorded_under(record, &copy));
         problems.extend(differences.iter().map(ToString::to_string));
+        problems.extend(loader_problems(record, &copy));
+        problems.extend(machine_problems(&record.machine, &uname_release()?));
+        problems.extend(connection_differences(
+            &expected_connections_here(&connections),
+            &recorded_connections(record, &copy),
+        ));
         writeln!(report, "program output:\n{}", output_of(record))?;
     }
     for run in &runs {
@@ -1009,6 +1912,1893 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     Ok(())
 }
 
+/// The problems of the step record of the `coverage-changes` step in `mode`, the
+/// task `task`, in `steps`: it must have ended with exit code 0 after the program
+/// printed its summary line, and, when `rewritten` names a file under `copy`, not
+/// be cached, for the one reason that the command wrote that file after it first
+/// read it; the control must be cached.
+fn change_problems(
+    steps: &[(StepKey, StepRecord)],
+    task: &TaskId,
+    copy: &Path,
+    mode: &str,
+    rewritten: Option<&str>,
+) -> Vec<String> {
+    let argv = ["./coverage".to_owned(), format!("change-{mode}")];
+    let Some((_, record)) = steps
+        .iter()
+        .find(|(_, record)| record.spec.argv == argv && record.owners.contains(task))
+    else {
+        return vec![format!("no step record of the {mode} step")];
+    };
+    let mut problems = Vec::new();
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!("the {mode} step ended with {:?}", record.exit));
+    }
+    if !output_of(record)
+        .lines()
+        .any(|line| line.starts_with(SUCCESS_LINE))
+    {
+        problems.push(format!(
+            "the {mode} step did not print its summary line: {}",
+            output_of(record)
+        ));
+    }
+    let expected = rewritten.map(|file| {
+        NotCachedReason::ChangedAfterRead {
+            files: vec![ChangedRead {
+                path: copy.join(file),
+                written: true,
+            }],
+        }
+    });
+    if record.not_cached != expected {
+        problems.push(format!(
+            "the {mode} step is marked {:?}, not {expected:?}",
+            record.not_cached
+        ));
+    }
+    problems
+}
+
+/// Build `coverage-changes` in a copy of the fixture, after `coverage-build` and a
+/// reset: each step that rewrites the file it first read or ran is not cached, with
+/// the reason that names that file and the command as its writer, without a
+/// warning, and the control, which writes its file before it reads it, is cached.
+#[test]
+fn each_way_of_first_reading_a_file_is_checked_for_a_rewrite() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let copy = dir.path().canonicalize()?.join(FIXTURE);
+    copy_tree(&fixture_dir(), &copy)?;
+    let cache = tempfile::tempdir()?;
+    let copy_text = copy.to_str().ok_or("the copy's path is not UTF-8")?;
+
+    let mut problems = Vec::new();
+    let mut runs = Vec::new();
+    for args in [
+        &["build", "coverage-build"][..],
+        &["cache", "reset", copy_text, "--yes"][..],
+        &["build", "coverage-changes"][..],
+    ] {
+        let run = run_kizz(&copy, cache.path(), args)?;
+        if run.status != Some(0) {
+            problems.push(format!("kizz {} failed", args.join(" ")));
+        }
+        runs.push(run);
+    }
+    if runs
+        .iter()
+        .any(|run| run.stderr.contains("something else changed"))
+    {
+        problems.push("a step that rewrote its own input was warned about".to_owned());
+    }
+    let steps = step_records(cache.path())?;
+    if steps.len() != CHANGES.len() {
+        problems.push(format!(
+            "the cache holds {} step records after building coverage-changes, not {}",
+            steps.len(),
+            CHANGES.len()
+        ));
+    }
+    let task = TaskId {
+        file: copy.join("kizz.md"),
+        index: CHANGES_BLOCK,
+    };
+    for (mode, rewritten) in CHANGES {
+        problems.extend(change_problems(&steps, &task, &copy, mode, rewritten));
+    }
+    let mut report = String::new();
+    for run in &runs {
+        writeln!(report, "{run}")?;
+    }
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{report}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// The `x86_64` number of `name`, a call that marks a run.
+fn untraceable_number(name: &str) -> TestResult<c_long> {
+    Ok(UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .find(|call| call.name == name)
+        .ok_or_else(|| format!("{name} does not mark a run"))?
+        .number)
+}
+
+/// Whether each of [`GATED_UNTRACEABLE`] is available, checked in this process,
+/// which no tracer follows, with arguments that cannot succeed: `fchroot` on an
+/// invalid descriptor, and `open_tree_attr` on `/` with a flag that it does not
+/// accept. `ENOSYS` means that the kernel lacks the call, or that a seccomp filter
+/// installed before kizz's own refuses it, so the call is unavailable; any other
+/// result means that it is available.
+fn own_untraceable_availability() -> TestResult<Availability> {
+    let mut available = Availability::new();
+    for name in GATED_UNTRACEABLE {
+        let number = untraceable_number(name)?;
+        let arguments: [c_long; 3] = match name {
+            "fchroot" => [-1, 0, 0],
+            _ => {
+                [
+                    c_long::from(libc::AT_FDCWD),
+                    address(CHECKED_PATH.as_ptr()),
+                    c_long::from(libc::AT_REMOVEDIR),
+                ]
+            },
+        };
+        let [a0, a1, a2] = arguments;
+        // SAFETY: the one pointer names a NUL-terminated string; the kernel rejects
+        // the arguments before it acts, or the call is unavailable.
+        let result = unsafe { libc::syscall(number, a0, a1, a2, 0, 0, 0) };
+        let error = (result < 0)
+            .then(|| io::Error::last_os_error().raw_os_error())
+            .flatten();
+        available.insert(name.to_owned(), error != Some(libc::ENOSYS));
+    }
+    Ok(available)
+}
+
+/// Write to the standard error of this process, through [`io::stderr`], which the
+/// test harness does not capture, a notice that names `test` and each of
+/// [`GATED_UNTRACEABLE`] that `available` marks unavailable, if any.
+fn write_untraceable_notice(
+    test: &str,
+    available: &Availability,
+) -> io::Result<()> {
+    let missing: Vec<&str> = GATED_UNTRACEABLE
+        .iter()
+        .copied()
+        .filter(|name| available.get(*name) == Some(&false))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        io::stderr(),
+        "NOTICE: {test}: {} returned ENOSYS (the kernel lacks the call, or a seccomp filter \
+         installed before kizz's own refuses it), so the test did not require that their \
+         steps mark the run",
+        missing.join(", ")
+    )
+}
+
+/// The step record of the `coverage-incomplete` step that runs the program in
+/// `mode`, the task `task`, in `steps`.
+fn incomplete_record<'a>(
+    steps: &'a [(StepKey, StepRecord)],
+    task: &TaskId,
+    mode: &str,
+) -> Option<&'a StepRecord> {
+    let argv = ["./coverage".to_owned(), mode.to_owned()];
+    steps
+        .iter()
+        .find(|(_, record)| record.spec.argv == argv && record.owners.contains(task))
+        .map(|(_, record)| record)
+}
+
+/// Whether `value`, the value of [`SKIP_VARIABLE`], or `None` when it is unset,
+/// turns skipping on: only `1` does, and unset, empty or any other value leaves the
+/// tests strict.
+fn skips_blocked(value: Option<&OsStr>) -> bool {
+    value == Some(OsStr::new("1"))
+}
+
+/// Whether this test process skips the calls and numbers that the tracer never
+/// saw: the one place that reads [`SKIP_VARIABLE`], from the environment that the
+/// test process was started with.
+fn skip_mode() -> bool {
+    skips_blocked(std::env::var_os(SKIP_VARIABLE).as_deref())
+}
+
+/// A call or number that a step of `coverage-incomplete` makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    /// A call that marks a run, by name.
+    Call(&'static str),
+    /// A system call that the tracer does not know, by number.
+    Number(u32),
+}
+
+impl Made {
+    /// The mode of the program that makes it.
+    fn mode(self) -> String {
+        match self {
+            Self::Call(name) => format!("incomplete-{name}"),
+            Self::Number(number) => format!("unknown-{number}"),
+        }
+    }
+
+    /// The start of the line in which that mode reports what the call returned,
+    /// before the result.
+    fn report(self) -> String {
+        match self {
+            Self::Call(name) => format!("coverage: made {name}: "),
+            Self::Number(number) => format!("coverage: made system call {number}: "),
+        }
+    }
+
+    /// The call in a message: a name in backticks, or a number after "system call".
+    fn quoted(self) -> String {
+        match self {
+            Self::Call(name) => format!("`{name}`"),
+            Self::Number(number) => format!("system call {number}"),
+        }
+    }
+}
+
+impl fmt::Display for Made {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        match self {
+            Self::Call(name) => f.write_str(name),
+            Self::Number(number) => write!(f, "system call {number}"),
+        }
+    }
+}
+
+/// Whether the tracer saw the call or number that the `coverage-incomplete` step of
+/// `record` made, judged in the build that ran it: only a step that is cached and
+/// lists no system call that the tracer does not know made a call that the tracer
+/// never saw. A step that is not cached, for any reason, or that lists an unknown
+/// system call, made one that it saw, and gets the full check.
+fn tracer_saw(record: &StepRecord) -> bool {
+    record.not_cached.is_some() || !record.unknown_system_calls.is_empty()
+}
+
+/// The problems of the step of `record`, which made `made` and whose call the
+/// tracer never saw, that hold whether or not the tests skip it: it must have
+/// exited with 0, and its mode must have reported the call once, with an error,
+/// because a call that a filter refuses fails.
+fn unseen_problems(
+    record: &StepRecord,
+    made: Made,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!("the step of {made} ended with {:?}", record.exit));
+    }
+    let output = output_of(record);
+    let report = made.report();
+    let results: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(report.as_str()))
+        .collect();
+    if !matches!(results.as_slice(), [result] if *result != "success") {
+        problems.push(format!(
+            "the tracer never saw {}, but its step did not report it once with an error: \
+             {output}",
+            made.quoted()
+        ));
+    }
+    problems
+}
+
+/// The calls and numbers that a test skipped because the tracer never saw them, and
+/// whether it may skip them.
+#[derive(Debug)]
+struct Skips {
+    /// Whether [`SKIP_VARIABLE`] is `1`, as [`skips_blocked`] reads it.
+    skip: bool,
+    /// Each call and number skipped so far, in order.
+    skipped: Vec<Made>,
+}
+
+impl Skips {
+    /// No call skipped yet, in the mode `skip`.
+    const fn new(skip: bool) -> Self {
+        Self {
+            skip,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// The problems of `made`, which the tracer never saw, with `ran`, the problems
+    /// of its step that hold in both modes: with skipping off, also a problem that
+    /// names it and [`SKIP_VARIABLE`]; with skipping on, it is skipped instead, unless
+    /// `ran` holds a problem, which fails the test anyway.
+    fn never_saw(
+        &mut self,
+        made: Made,
+        ran: Vec<String>,
+    ) -> Vec<String> {
+        let mut problems = ran;
+        if self.skip {
+            if problems.is_empty() {
+                self.skipped.push(made);
+            }
+        } else {
+            problems.push(format!(
+                "the tracer never saw {}; if a seccomp filter installed before kizz refuses it, \
+                 set {SKIP_VARIABLE}=1",
+                made.quoted()
+            ));
+        }
+        problems
+    }
+
+    /// The notice that names `test`, [`SKIP_VARIABLE`] and each call and number
+    /// skipped, or `None` when none was.
+    fn notice(
+        &self,
+        test: &str,
+    ) -> Option<String> {
+        (!self.skipped.is_empty()).then(|| {
+            let skipped: Vec<String> = self.skipped.iter().map(ToString::to_string).collect();
+            format!(
+                "NOTICE: {test}: the tracer never saw {}, which a seccomp filter installed \
+                 before kizz's own may have refused, so {SKIP_VARIABLE}=1 skipped their checks",
+                skipped.join(", ")
+            )
+        })
+    }
+
+    /// Write the notice of [`Skips::notice`], if any, to the standard error of this
+    /// process through [`io::stderr`], which the test harness does not capture, so
+    /// the output of a passing run shows it.
+    fn write_notice(
+        &self,
+        test: &str,
+    ) -> io::Result<()> {
+        self.notice(test)
+            .map_or(Ok(()), |notice| writeln!(io::stderr(), "{notice}"))
+    }
+}
+
+/// The problems of the step of `coverage-incomplete`, the task `task`, that makes
+/// the call `name`, in `steps`, as [`call_problems`] gives them.
+fn untraceable_problems(
+    steps: &[(StepKey, StepRecord)],
+    task: &TaskId,
+    name: &'static str,
+    available: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let Some(record) = incomplete_record(steps, task, &Made::Call(name).mode()) else {
+        return vec![format!("no step record of the {name} step")];
+    };
+    call_problems(record, name, available, skips)
+}
+
+/// The problems of `record`, the step of `coverage-incomplete` that makes the call
+/// `name`, which `available` gives as available or not. For a gated call, the
+/// program's report must agree with `available`. Where the call is available and
+/// the tracer never saw it, [`Skips::never_saw`] judges it. Otherwise the step must
+/// have exited with 0 and list no unknown system call; where the call is available,
+/// its result must be not cached, with an incomplete reason that names the call,
+/// and where it is unavailable, it may also be cached.
+fn call_problems(
+    record: &StepRecord,
+    name: &'static str,
+    available: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if GATED_UNTRACEABLE.contains(&name) {
+        let output = output_of(record);
+        let reported: Vec<bool> = output
+            .lines()
+            .filter_map(|line| {
+                if line == format!("{AVAILABLE_LINE}{name}") {
+                    Some(true)
+                } else if line == format!("{UNAVAILABLE_LINE}{name}") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if reported != [available] {
+            problems.push(format!(
+                "the {name} step reported {reported:?}, but the test's own check found it {}: \
+                 {output}",
+                availability_word(available)
+            ));
+        }
+    }
+    if available && !tracer_saw(record) {
+        let made = Made::Call(name);
+        problems.extend(skips.never_saw(made, unseen_problems(record, made)));
+        return problems;
+    }
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!("the {name} step ended with {:?}", record.exit));
+    }
+    if !record.unknown_system_calls.is_empty() {
+        problems.push(format!(
+            "the {name} step lists unknown system calls: {:?}",
+            record.unknown_system_calls
+        ));
+    }
+    let named = format!("`{name}`");
+    let names_call = matches!(
+        &record.not_cached,
+        Some(NotCachedReason::Incomplete { detail }) if detail.contains(&named)
+    );
+    if (available || record.not_cached.is_some()) && !names_call {
+        problems.push(format!(
+            "the {name} step is marked {:?}, not incompletely traced for {named}",
+            record.not_cached
+        ));
+    }
+    problems
+}
+
+/// The problems of the step of `coverage-incomplete`, the task `task`, that makes
+/// the system call `number`, in `steps`, as [`number_problems`] gives them.
+fn unknown_problems(
+    steps: &[(StepKey, StepRecord)],
+    task: &TaskId,
+    number: u32,
+    cached: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let Some(record) = incomplete_record(steps, task, &Made::Number(number).mode()) else {
+        return vec![format!(
+            "no step record of the step of system call {number}"
+        )];
+    };
+    number_problems(record, number, cached, skips)
+}
+
+/// The problems of `record`, the step of `coverage-incomplete` that makes the system
+/// call `number`. Where the tracer never saw it, [`Skips::never_saw`] judges it.
+/// Otherwise the step must have exited with 0, list only that number, and be not
+/// cached for it, unless `cached`, when it must be cached.
+fn number_problems(
+    record: &StepRecord,
+    number: u32,
+    cached: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    if !tracer_saw(record) {
+        let made = Made::Number(number);
+        return skips.never_saw(made, unseen_problems(record, made));
+    }
+    let mut problems = Vec::new();
+    if record.exit != (StepExit::Exited { code: 0 }) {
+        problems.push(format!(
+            "the step of system call {number} ended with {:?}",
+            record.exit
+        ));
+    }
+    if record.unknown_system_calls != [number] {
+        problems.push(format!(
+            "the step of system call {number} lists {:?}",
+            record.unknown_system_calls
+        ));
+    }
+    let expected = (!cached).then(|| {
+        NotCachedReason::UnknownSystemCalls {
+            numbers: vec![number],
+        }
+    });
+    if record.not_cached != expected {
+        problems.push(format!(
+            "the step of system call {number} is marked {:?}, not {expected:?}",
+            record.not_cached
+        ));
+    }
+    problems
+}
+
+/// The problems of the warnings of `run` that hold every one of `parts`: there must
+/// be exactly one, which starts with `warning: `, and the summary must repeat it
+/// once, indented by two spaces.
+fn warning_problems(
+    run: &Run,
+    parts: &[&str],
+) -> Vec<String> {
+    let holds = |line: &str| parts.iter().all(|part| line.contains(part));
+    let warned = run
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("warning: ") && holds(line))
+        .count();
+    let repeated = run
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("  ") && holds(line))
+        .count();
+    if (warned, repeated) == (1, 1) {
+        Vec::new()
+    } else {
+        vec![format!(
+            "kizz {} warned {warned} times and repeated it {repeated} times in its summary, not \
+             once each, about {parts:?}",
+            run.args.join(" ")
+        )]
+    }
+}
+
+/// A copy of the fixture with its cache after `coverage-build`, a reset, and a
+/// build of `coverage-incomplete`.
+struct IncompleteBuild {
+    /// The temporary directory that holds the copy.
+    _dir: tempfile::TempDir,
+    /// The copy, the task directory.
+    copy: PathBuf,
+    /// The cache.
+    cache: tempfile::TempDir,
+    /// The runs of `kizz`, in order.
+    runs: Vec<Run>,
+    /// The problems found so far: each run that failed.
+    problems: Vec<String>,
+}
+
+impl IncompleteBuild {
+    /// Copy the fixture, build `coverage-build`, reset the copy's entries, and build
+    /// `coverage-incomplete` with `options` before the target.
+    fn new(options: &[&str]) -> TestResult<Self> {
+        let dir = tempfile::tempdir()?;
+        let copy = dir.path().canonicalize()?.join(FIXTURE);
+        copy_tree(&fixture_dir(), &copy)?;
+        let cache = tempfile::tempdir()?;
+        let copy_text = copy.to_str().ok_or("the copy's path is not UTF-8")?;
+        let mut incomplete: Vec<&str> = vec!["build"];
+        incomplete.extend_from_slice(options);
+        incomplete.push("coverage-incomplete");
+        let mut built = Self {
+            _dir: dir,
+            copy: copy.clone(),
+            cache,
+            runs: Vec::new(),
+            problems: Vec::new(),
+        };
+        for args in [
+            &["build", "coverage-build"][..],
+            &["cache", "reset", copy_text, "--yes"][..],
+            &incomplete[..],
+        ] {
+            built.run(args)?;
+        }
+        Ok(built)
+    }
+
+    /// Run `kizz` with `args` in the copy and keep the run, with a problem when it
+    /// fails.
+    fn run(
+        &mut self,
+        args: &[&str],
+    ) -> TestResult<&Run> {
+        let run = run_kizz(&self.copy, self.cache.path(), args)?;
+        if run.status != Some(0) {
+            self.problems
+                .push(format!("kizz {} failed", args.join(" ")));
+        }
+        self.runs.push(run);
+        self.runs.last().ok_or_else(|| "no run".into())
+    }
+
+    /// The task `coverage-incomplete`.
+    fn task(&self) -> TaskId {
+        TaskId {
+            file: self.copy.join("kizz.md"),
+            index: INCOMPLETE_BLOCK,
+        }
+    }
+
+    /// The problems of the steps of the calls that mark a run in `steps`, whose
+    /// availability `available` gives, with the skips of `skips`, and of the
+    /// warnings of `run` about those that are available and that the tracer saw.
+    fn untraceable_problems(
+        &self,
+        steps: &[(StepKey, StepRecord)],
+        available: &Availability,
+        run: &Run,
+        skips: &mut Skips,
+    ) -> Vec<String> {
+        let task = self.task();
+        let mut problems = Vec::new();
+        for call in UNTRACEABLE_SYSTEM_CALLS {
+            let has = available.get(call.name).copied().unwrap_or(true);
+            problems.extend(untraceable_problems(steps, &task, call.name, has, skips));
+            let seen = incomplete_record(steps, &task, &Made::Call(call.name).mode())
+                .is_some_and(tracer_saw);
+            if has && seen {
+                let command = format!("incomplete-{}`", call.name);
+                let named = format!("`{}`", call.name);
+                problems.extend(warning_problems(run, &[
+                    command.as_str(),
+                    "was traced incompletely",
+                    named.as_str(),
+                ]));
+            }
+        }
+        problems
+    }
+
+    /// Fail with every problem, the runs of `kizz` and the output of every step.
+    fn assert_no_problems(
+        &self,
+        problems: &[String],
+    ) -> TestResult {
+        let mut report = String::new();
+        for (_, record) in step_records(self.cache.path())? {
+            writeln!(
+                report,
+                "{}: {:?}\n{}",
+                record.spec.argv.join(" "),
+                record.not_cached,
+                output_of(&record)
+            )?;
+        }
+        for run in &self.runs {
+            writeln!(report, "{run}")?;
+        }
+        assert!(
+            problems.is_empty(),
+            "{} problems:\n{}\n\n{report}",
+            problems.len(),
+            problems.join("\n")
+        );
+        Ok(())
+    }
+}
+
+/// Build `coverage-incomplete` in a copy of the fixture, after `coverage-build` and
+/// a reset. The list of `architecture.md` is [`UNTRACEABLE_SYSTEM_CALLS`]. The step
+/// of each call is not cached, with an incomplete reason that names the call, and
+/// the build warns about it; where `open_tree_attr` or `fchroot` is unavailable, as
+/// the test's own check and the program's report find, the step may be cached, and
+/// a notice names the call. The step of each unknown number is not cached, with
+/// the reason that names the number, its record lists only that number, and the
+/// build warns about it, names the option, and repeats the warning in its summary.
+/// A call or number that the tracer never saw fails the test, unless
+/// [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn each_call_that_marks_a_run_and_each_unknown_number_leaves_its_result_uncached() -> TestResult {
+    let test = "each_call_that_marks_a_run_and_each_unknown_number_leaves_its_result_uncached";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let spec =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../architecture.md"))?;
+    let listed = spec_calls(&spec, UNTRACEABLE_HEADING)?;
+    let names: Vec<&str> = UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .map(|call| call.name)
+        .collect();
+    let built = IncompleteBuild::new(&[])?;
+    let mut problems = built.problems.clone();
+    if listed != names {
+        problems.push(format!(
+            "architecture.md lists {listed:?}, but the tracer marks the run for {names:?}"
+        ));
+    }
+    let steps = step_records(built.cache.path())?;
+    let expected_steps = UNTRACEABLE_SYSTEM_CALLS
+        .len()
+        .saturating_add(UNKNOWN_NUMBERS.len());
+    if steps.len() != expected_steps {
+        problems.push(format!(
+            "the cache holds {} step records after building coverage-incomplete, not \
+             {expected_steps}",
+            steps.len()
+        ));
+    }
+    let run = built.runs.last().ok_or("no build")?;
+    let task = built.task();
+    problems.extend(built.untraceable_problems(&steps, &available, run, &mut skips));
+    for number in UNKNOWN_NUMBERS {
+        let seen =
+            incomplete_record(&steps, &task, &Made::Number(number).mode()).is_some_and(tracer_saw);
+        problems.extend(unknown_problems(&steps, &task, number, false, &mut skips));
+        if !seen {
+            continue;
+        }
+        let made = format!(
+            "made system call {number}, which the tracer does not know, so its result was not \
+             cached and it runs again on the next build"
+        );
+        problems.extend(warning_problems(run, &[
+            format!("unknown-{number}`").as_str(),
+            made.as_str(),
+            "`kizz build --cache-unknown-syscalls`",
+        ]));
+    }
+    skips.write_notice(test)?;
+    built.assert_no_problems(&problems)
+}
+
+/// Build `coverage-incomplete` with `--cache-unknown-syscalls` in a copy of the
+/// fixture, after `coverage-build` and a reset: the steps of the unknown numbers are
+/// cached and list their numbers, the build warns that the option cached them and
+/// repeats the warning in its summary, and the steps of the calls that mark a run
+/// are still not cached. A following build without the option finds the steps of
+/// the numbers cached and warns about neither, and `kizz why` lists their numbers.
+/// A call or number that the tracer never saw fails the test, unless
+/// [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn with_the_option_the_steps_of_unknown_numbers_are_cached() -> TestResult {
+    let test = "with_the_option_the_steps_of_unknown_numbers_are_cached";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let mut built = IncompleteBuild::new(&["--cache-unknown-syscalls"])?;
+    let mut problems = Vec::new();
+    let steps = step_records(built.cache.path())?;
+    let task = built.task();
+    let run = built.runs.last().ok_or("no build")?;
+    problems.extend(built.untraceable_problems(&steps, &available, run, &mut skips));
+    let mut unseen = BTreeSet::new();
+    for number in UNKNOWN_NUMBERS {
+        let seen =
+            incomplete_record(&steps, &task, &Made::Number(number).mode()).is_some_and(tracer_saw);
+        problems.extend(unknown_problems(&steps, &task, number, true, &mut skips));
+        if !seen {
+            unseen.insert(number);
+            continue;
+        }
+        let made = format!(
+            "made system call {number}, which the tracer does not know; its result was cached \
+             because `kizz build --cache-unknown-syscalls` was given"
+        );
+        let command = format!("unknown-{number}`");
+        problems.extend(warning_problems(run, &[command.as_str(), made.as_str()]));
+    }
+
+    let again = built.run(&["build", "coverage-incomplete"])?;
+    if again.stderr.contains("which the tracer does not know") {
+        problems.push("a build that found the unknown numbers cached warned about them".to_owned());
+    }
+    let later = step_records(built.cache.path())?;
+    for number in UNKNOWN_NUMBERS {
+        let mode = Made::Number(number).mode();
+        let ran_at = |records: &[(StepKey, StepRecord)]| {
+            incomplete_record(records, &task, &mode).map(|record| record.ran_at_nanos)
+        };
+        if ran_at(&later).is_none() || ran_at(&later) != ran_at(&steps) {
+            problems.push(format!(
+                "the step of system call {number} ran again in a build without the option"
+            ));
+        }
+        if !unseen.contains(&number) {
+            problems.extend(unknown_problems(&later, &task, number, true, &mut skips));
+        }
+    }
+
+    let why = built.run(&["why"])?;
+    for number in UNKNOWN_NUMBERS {
+        if unseen.contains(&number) {
+            continue;
+        }
+        let line = format!("system calls that the tracer does not know: {number}");
+        if !why.stdout.lines().any(|shown| shown.trim() == line) {
+            problems.push(format!("kizz why does not show `{line}`"));
+        }
+    }
+    problems.extend(built.problems.iter().cloned());
+    skips.write_notice(test)?;
+    built.assert_no_problems(&problems)
+}
+
+/// The outcomes of each access kind of each path, as names: `ok`, the name of an
+/// error, or `unknown`, by the path relative to the task directory.
+type PathOutcomes = BTreeMap<String, BTreeMap<Kind, BTreeSet<String>>>;
+
+/// The outcomes that `entries` expect for the platform the test runs on, where
+/// every gated call that an entry's mark names is available in `available`: for
+/// each kind of an entry, the outcomes of its sources that add that kind.
+fn expected_outcomes(
+    entries: &[Entry],
+    available: &Availability,
+) -> PathOutcomes {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.platform.is_current()
+                && entry
+                    .needs
+                    .iter()
+                    .all(|name| available.get(name) == Some(&true))
+        })
+        .map(|entry| {
+            let kinds = entry
+                .kinds
+                .0
+                .iter()
+                .map(|kind| {
+                    let outcomes = entry
+                        .sources
+                        .iter()
+                        .filter(|source| source.kinds.0.contains(kind))
+                        .map(|source| source.outcome.clone())
+                        .collect();
+                    (*kind, outcomes)
+                })
+                .collect();
+            (entry.path.clone(), kinds)
+        })
+        .collect()
+}
+
+/// The kind of the test that names the tracer's access kind `kind`.
+fn kind_of(kind: AccessKind) -> Option<Kind> {
+    KINDS
+        .iter()
+        .find(|(_, name, _)| *name == kind.name())
+        .map(|(kind, ..)| *kind)
+}
+
+/// The outcomes that `tree` records under `dir`, combined over its programs, by
+/// the path relative to `dir`; `dir` itself is `.`.
+fn tree_outcomes(
+    tree: &ProcessTree,
+    dir: &Path,
+) -> PathOutcomes {
+    tree.observations()
+        .iter()
+        .filter_map(|(path, kinds)| {
+            let relative = path.as_path().strip_prefix(dir).ok()?;
+            let name = if relative.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                relative.to_string_lossy().into_owned()
+            };
+            let kinds = kinds
+                .iter()
+                .filter_map(|(kind, outcomes)| {
+                    Some((
+                        kind_of(*kind)?,
+                        outcomes.iter().map(ToString::to_string).collect(),
+                    ))
+                })
+                .collect();
+            Some((name, kinds))
+        })
+        .collect()
+}
+
+/// The outcomes of each kind, such as `read:ok probe:ENOENT,ok`, or `(none)`.
+fn outcomes_text(kinds: &BTreeMap<Kind, BTreeSet<String>>) -> String {
+    if kinds.is_empty() {
+        return "(none)".to_owned();
+    }
+    kinds
+        .iter()
+        .map(|(kind, outcomes)| {
+            let outcomes: Vec<&str> = outcomes.iter().map(String::as_str).collect();
+            format!("{}:{}", Kinds(BTreeSet::from([*kind])), outcomes.join(","))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every difference between the `expected` and the `recorded` outcomes, in path
+/// order: a path that is missing, unexpected, or recorded with other kinds or
+/// outcomes.
+fn outcome_differences(
+    expected: &PathOutcomes,
+    recorded: &PathOutcomes,
+) -> Vec<String> {
+    let paths: BTreeSet<&String> = expected.keys().chain(recorded.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            match (expected.get(path), recorded.get(path)) {
+                (Some(want), None) => {
+                    Some(format!(
+                        "missing from the tree: {path}, expected {}",
+                        outcomes_text(want)
+                    ))
+                },
+                (None, Some(got)) => {
+                    Some(format!(
+                        "unexpected in the tree: {path}, recorded {}",
+                        outcomes_text(got)
+                    ))
+                },
+                (Some(want), Some(got)) if want != got => {
+                    Some(format!(
+                        "mismatched in the tree: {path}, expected {}, recorded {}",
+                        outcomes_text(want),
+                        outcomes_text(got)
+                    ))
+                },
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The request that `coverage-test` makes in `copy`, the task directory, with the
+/// mode `mode` after the program's name when it is given, as `coverage-incomplete`
+/// makes it, and with the process tree: the program `./coverage`, an empty
+/// environment, merged capture and no `stdin`.
+fn coverage_request(
+    copy: &Path,
+    mode: Option<&str>,
+) -> TestResult<RunRequest> {
+    let mut args = vec![OsString::from("./coverage")];
+    args.extend(mode.map(OsString::from));
+    Ok(RunRequest {
+        program: AbsolutePath::new(copy.join("coverage"))?,
+        args,
+        env: BTreeMap::new(),
+        cwd: AbsolutePath::new(copy)?,
+        stdin: None,
+        capture: CaptureMode::Merged,
+        echo: false,
+        tree: true,
+        terminal: false,
+    })
+}
+
+/// Run `request` through the Linux tracer in this test process, without echo or
+/// cancellation.
+fn trace(request: &RunRequest) -> TestResult<RunResult> {
+    Ok(LinuxTracer::new().run(request, &StdioEcho, &Cancellation::new())?)
+}
+
+/// The captured output of a run, both streams.
+fn captured_text(output: &CapturedOutput) -> String {
+    match output {
+        CapturedOutput::Merged { output } => String::from_utf8_lossy(output).into_owned(),
+        CapturedOutput::Split { stdout, stderr } => {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(stdout),
+                String::from_utf8_lossy(stderr)
+            )
+        },
+    }
+}
+
+/// A short description of `program`: its path, whether it is inherited, and its
+/// arguments.
+fn program_text(program: &Program) -> String {
+    format!(
+        "{}{} {:?}",
+        program.path,
+        if program.inherited {
+            " (inherited)"
+        } else {
+            ""
+        },
+        program.args
+    )
+}
+
+/// The problems of `tree`, the tree of `result`: it must combine to exactly the
+/// run's accesses, over every path, and to its connections and unknown system
+/// calls; its processes must be numbered from 1 through their number, in order,
+/// and every process but the first must have a parent in the tree.
+fn combination_problems(
+    tree: &ProcessTree,
+    result: &RunResult,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let combined = tree.accesses();
+    if combined != result.accesses {
+        let differing: Vec<String> = combined
+            .iter()
+            .chain(&result.accesses)
+            .filter(|(path, kinds)| {
+                combined.get(path) != Some(**kinds) || result.accesses.get(path) != Some(**kinds)
+            })
+            .map(|(path, _)| path.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        problems.push(format!(
+            "the tree does not combine to the run's accesses at {differing:?}"
+        ));
+    }
+    if tree.connections() != result.connections {
+        problems.push(format!(
+            "the tree's connections {:?} are not the run's {:?}",
+            tree.connections(),
+            result.connections
+        ));
+    }
+    if tree.unknown_system_calls() != result.unknown_system_calls {
+        problems.push(format!(
+            "the tree's unknown system calls {:?} are not the run's {:?}",
+            tree.unknown_system_calls(),
+            result.unknown_system_calls
+        ));
+    }
+    for (number, process) in (1_u32..).zip(&tree.processes) {
+        if process.number != number {
+            problems.push(format!(
+                "process {} is listed as number {number}",
+                process.number
+            ));
+        }
+        let parented = process
+            .parent
+            .is_some_and(|parent| tree.process(parent).is_some() && parent != number);
+        if number > 1 && !parented {
+            problems.push(format!(
+                "process {number} has the parent {:?}, which is not in the tree",
+                process.parent
+            ));
+        }
+    }
+    problems
+}
+
+/// The problems of the programs of `tree`, the tree of the coverage program in
+/// `copy`, whose expected entries for this platform are `entries` where
+/// `available` allows them: process 1's first program is the program with the
+/// arguments `./coverage`; the child that runs the program again lists it as
+/// inherited and then as the program of its `exec`; each path that a successful
+/// `exec` names, scripts included, is a program of its own; and the second thread's
+/// read belongs to the program of process 1, so the thread is no process.
+fn program_problems(
+    tree: &ProcessTree,
+    copy: &Path,
+    entries: &[Entry],
+    available: &Availability,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let program = copy.join("coverage");
+    let named = [OsString::from("./coverage")];
+    match tree.process(1).and_then(|process| process.programs.first()) {
+        Some(first)
+            if first.path.as_path() == program && first.args == named && !first.inherited => {},
+        other => {
+            problems.push(format!(
+                "process 1's first program is {:?}, not {} with the arguments ./coverage",
+                other.map(program_text),
+                program.display()
+            ));
+        },
+    }
+    let again = tree.processes.iter().any(|process| {
+        matches!(process.programs.as_slice(), [inherited, ran, ..]
+            if inherited.inherited
+                && inherited.path.as_path() == program
+                && inherited.args == named
+                && !ran.inherited
+                && ran.path.as_path() == program
+                && ran.args.get(1).map(OsString::as_os_str) == Some(OsStr::new("child-core")))
+    });
+    if !again {
+        problems.push(
+            "no process lists the program as inherited and then runs it again with execv"
+                .to_owned(),
+        );
+    }
+    let started: BTreeSet<&Path> = tree
+        .programs()
+        .filter(|(_, program)| !program.inherited)
+        .map(|(_, program)| program.path.as_path())
+        .collect();
+    let execs = ["execve", "execveat", "execv"];
+    for entry in entries {
+        let here = entry.platform.is_current()
+            && entry
+                .needs
+                .iter()
+                .all(|name| available.get(name) == Some(&true));
+        let ran = entry.sources.iter().any(|source| {
+            matches!(source.origin, Origin::Sys | Origin::Libc)
+                && execs.contains(&source.name.as_str())
+                && source.succeeded()
+        });
+        let path = copy.join(&entry.path);
+        if here && ran && !started.contains(path.as_path()) {
+            problems.push(format!(
+                "line {}: {} ran, but it is no program of the tree",
+                entry.line, entry.path
+            ));
+        }
+    }
+    let thread_read = copy.join("in/core/thread.txt");
+    let readers: Vec<(u32, bool)> = tree
+        .programs()
+        .filter(|(_, program)| {
+            program
+                .observations
+                .iter()
+                .any(|(path, _)| path.as_path() == thread_read)
+        })
+        .map(|(process, program)| (process.number, program.inherited))
+        .collect();
+    if readers != [(1, false)] {
+        problems.push(format!(
+            "the second thread's read belongs to {readers:?}, not to the program of process 1"
+        ));
+    }
+    problems
+}
+
+/// Copy the fixture into a temporary directory and build the program there with
+/// `kizz build coverage-build`, with a temporary cache. Return the temporary
+/// directory, the copy, and the build's run.
+fn built_copy() -> TestResult<(tempfile::TempDir, PathBuf, Run)> {
+    let dir = tempfile::tempdir()?;
+    let copy = dir.path().canonicalize()?.join(FIXTURE);
+    copy_tree(&fixture_dir(), &copy)?;
+    let cache = tempfile::tempdir()?;
+    let run = run_kizz(&copy, cache.path(), &["build", "coverage-build"])?;
+    Ok((dir, copy, run))
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, through the Linux tracer in this test process with the request that
+/// `coverage-test` makes and the process tree, without a cache. The tree must
+/// combine to exactly the run's accesses; under the task directory its paths,
+/// kinds and outcomes must be exactly those of the expectation file, each kind
+/// with the outcomes of the entry's sources that add it, leaving out the entries
+/// that name an unavailable gated call, as the test's own check and the program's
+/// report, which must agree, find; and its processes and programs must be those
+/// that [`program_problems`] requires. A notice names each unavailable gated call.
+#[test]
+fn the_process_tree_of_the_coverage_program_holds_every_outcome() -> TestResult {
+    let test = "the_process_tree_of_the_coverage_program_holds_every_outcome";
+    let (available, mut problems) = own_availability()?;
+    write_notice(test, &available)?;
+    let entries = fixture_entries()?;
+    let (_dir, copy, build) = built_copy()?;
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    let result = trace(&coverage_request(&copy, None)?)?;
+    let output = captured_text(&result.output);
+    if result.termination != Termination::Exited(0) {
+        problems.push(format!("the program ended with {}", result.termination));
+    }
+    if !output.lines().any(|line| line.starts_with(SUCCESS_LINE)) {
+        problems.push("the program did not print its summary line".to_owned());
+    }
+    if !result.is_complete() || !result.unknown_system_calls.is_empty() {
+        problems.push(format!(
+            "the run is incomplete, {:?}, or made unknown system calls, {:?}",
+            result.incomplete, result.unknown_system_calls
+        ));
+    }
+    let (reported, report_problems) = reported_availability(&output);
+    problems.extend(report_problems);
+    problems.extend(disagreements(&reported, &available));
+    match &result.tree {
+        Some(tree) => {
+            problems.extend(combination_problems(tree, &result));
+            problems.extend(outcome_differences(
+                &expected_outcomes(&entries, &available),
+                &tree_outcomes(tree, &copy),
+            ));
+            problems.extend(program_problems(tree, &copy, &entries, &available));
+        },
+        None => problems.push("the result holds no process tree".to_owned()),
+    }
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\nprogram output:\n{output}\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// The problems of a run of `coverage-incomplete`'s mode for `made`, whose result
+/// is `result` and whose output is `output`, when the tracer never saw the call or
+/// number: the program must have exited with 0, and its mode must have reported
+/// the call once, with an error.
+fn unseen_run_problems(
+    result: &RunResult,
+    output: &str,
+    made: Made,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if result.termination != Termination::Exited(0) {
+        problems.push(format!(
+            "the run of {made} ended with {}",
+            result.termination
+        ));
+    }
+    let report = made.report();
+    let results: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix(report.as_str()))
+        .collect();
+    if !matches!(results.as_slice(), [answer] if *answer != "success") {
+        problems.push(format!(
+            "the tracer never saw {}, but its run did not report it once with an error: \
+             {output}",
+            made.quoted()
+        ));
+    }
+    problems
+}
+
+/// The problems of the run of the coverage program in `copy` in the mode of
+/// `coverage-incomplete` that makes `made`, which `available` gives as available or
+/// not, through the Linux tracer with the process tree. The tree must combine to
+/// the run's accesses. For a gated call, the program's report must agree with
+/// `available`. A call or number that the tracer never saw is judged by
+/// [`Skips::never_saw`] where it is available, and needs no reason where it is
+/// not. Otherwise the run must have exited with 0, and the program that made it,
+/// the one that process 1 runs with the mode's arguments, must list the call's
+/// reason, or the number, which no other program lists.
+fn made_problems(
+    copy: &Path,
+    made: Made,
+    available: bool,
+    skips: &mut Skips,
+) -> TestResult<Vec<String>> {
+    let request = coverage_request(copy, Some(&made.mode()))?;
+    let result = trace(&request)?;
+    let output = captured_text(&result.output);
+    let Some(tree) = &result.tree else {
+        return Ok(vec![format!("the run of {made} holds no process tree")]);
+    };
+    let mut problems = combination_problems(tree, &result);
+    if let Made::Call(name) = made
+        && GATED_UNTRACEABLE.contains(&name)
+    {
+        let reported: Vec<bool> = output
+            .lines()
+            .filter_map(|line| {
+                if line == format!("{AVAILABLE_LINE}{name}") {
+                    Some(true)
+                } else if line == format!("{UNAVAILABLE_LINE}{name}") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if reported != [available] {
+            problems.push(format!(
+                "the run of {name} reported {reported:?}, but the test's own check found it {}",
+                availability_word(available)
+            ));
+        }
+    }
+    let saw = !result.is_complete() || !result.unknown_system_calls.is_empty();
+    if !saw {
+        if available {
+            problems.extend(skips.never_saw(made, unseen_run_problems(&result, &output, made)));
+        } else if result.termination != Termination::Exited(0) {
+            problems.push(format!(
+                "the run of {made} ended with {}",
+                result.termination
+            ));
+        }
+        return Ok(problems);
+    }
+    if result.termination != Termination::Exited(0) {
+        problems.push(format!(
+            "the run of {made} ended with {}",
+            result.termination
+        ));
+    }
+    let lists = |program: &Program| {
+        match made {
+            Made::Call(name) => {
+                let named = format!("`{name}`");
+                program.incomplete.iter().any(|reason| {
+                    matches!(reason, IncompleteReason::UntraceableSystemCall { detail }
+                        if detail.contains(&named))
+                })
+            },
+            Made::Number(number) => program.unknown_system_calls.contains(&number),
+        }
+    };
+    let listing: Vec<(u32, String)> = tree
+        .programs()
+        .filter(|(_, program)| lists(program))
+        .map(|(process, program)| (process.number, program_text(program)))
+        .collect();
+    let maker = tree.process(1).and_then(|process| {
+        process.programs.iter().find(|program| {
+            !program.inherited && program.path == request.program && program.args == request.args
+        })
+    });
+    let expected = maker.map(|program| (1, program_text(program)));
+    if listing.len() != 1 || listing.first() != expected.as_ref() {
+        problems.push(format!(
+            "{} is listed by {listing:?}, not by the program that made it, {expected:?}",
+            made.quoted()
+        ));
+    }
+    Ok(problems)
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, in each mode of `coverage-incomplete` through the Linux tracer in this
+/// test process with the process tree: each tree combines to its run's accesses
+/// and lists the call's reason, or the unknown number, on the program that made
+/// it. Where `open_tree_attr` or `fchroot` is unavailable, as the test's own check
+/// and the program's report find, its run need not be marked, and a notice names
+/// it. A call or number that the tracer never saw fails the test, unless
+/// [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn the_process_tree_lists_each_incomplete_reason_on_its_program() -> TestResult {
+    let test = "the_process_tree_lists_each_incomplete_reason_on_its_program";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let (_dir, copy, build) = built_copy()?;
+    let mut problems = Vec::new();
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    for call in UNTRACEABLE_SYSTEM_CALLS {
+        let has = available.get(call.name).copied().unwrap_or(true);
+        problems.extend(made_problems(
+            &copy,
+            Made::Call(call.name),
+            has,
+            &mut skips,
+        )?);
+    }
+    for number in UNKNOWN_NUMBERS {
+        problems.extend(made_problems(
+            &copy,
+            Made::Number(number),
+            true,
+            &mut skips,
+        )?);
+    }
+    skips.write_notice(test)?;
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// Run `kizz execute` with `flags` in `copy`, with the cache `cache`, for
+/// `./coverage` with `mode` after it when it is given, writing the report to
+/// `report`; return the run and the report, parsed.
+fn execute_coverage(
+    copy: &Path,
+    cache: &Path,
+    flags: &[&str],
+    report: &Path,
+    mode: Option<&str>,
+) -> TestResult<(Run, Value)> {
+    let output = format!(
+        "--output={}",
+        report.to_str().ok_or("the report's path is not UTF-8")?
+    );
+    let mut args = vec!["execute"];
+    args.extend(flags);
+    args.extend([output.as_str(), "--", "./coverage"]);
+    args.extend(mode);
+    let run = run_kizz(copy, cache, &args)?;
+    let text = fs::read_to_string(report)
+        .map_err(|error| format!("no report at {}: {error}\n{run}", report.display()))?;
+    let value = serde_json::from_str(&text)?;
+    Ok((run, value))
+}
+
+/// The text of a path of a report of `kizz execute` in `copy`: relative to `copy`
+/// after `./` when it is under it, and as it is otherwise, so the reports of two
+/// copies compare.
+fn copy_relative(
+    path: &str,
+    copy: &Path,
+) -> String {
+    Path::new(path).strip_prefix(copy).map_or_else(
+        |_| path.to_owned(),
+        |relative| format!("./{}", relative.display()),
+    )
+}
+
+/// Each observation of a JSON report of `kizz execute` in `copy`, by its path as
+/// [`copy_relative`] gives it, with each kind's outcomes, and its connections, each
+/// as its kind and its address, path or name: the compact report's lists, or every
+/// program's of a hierarchical report, combined.
+type ReportObservations = (
+    BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    BTreeSet<String>,
+);
+
+/// The value at the JSON pointer `pointer` in `value`, or `null` when there is
+/// none.
+fn json_at<'a>(
+    value: &'a Value,
+    pointer: &str,
+) -> &'a Value {
+    value.pointer(pointer).unwrap_or(&Value::Null)
+}
+
+/// The [`ReportObservations`] of `report`, a JSON report of `kizz execute` in
+/// `copy`.
+fn report_observations(
+    report: &Value,
+    copy: &Path,
+) -> ReportObservations {
+    let mut observation_lists = Vec::new();
+    let mut connection_lists = Vec::new();
+    if json_at(report, "/mode") == "compact" {
+        observation_lists.push(json_at(report, "/observations"));
+        connection_lists.push(json_at(report, "/connections"));
+    } else {
+        for command in json_at(report, "/commands")
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for process in json_at(command, "/processes")
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for program in json_at(process, "/programs")
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    observation_lists.push(json_at(program, "/observations"));
+                    connection_lists.push(json_at(program, "/connections"));
+                }
+            }
+        }
+    }
+    let mut observations: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    for observation in observation_lists
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+    {
+        let path = copy_relative(
+            json_at(observation, "/path").as_str().unwrap_or_default(),
+            copy,
+        );
+        let kinds = observations.entry(path).or_default();
+        for (kind, outcomes) in json_at(observation, "/access")
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            kinds.entry(kind.clone()).or_default().extend(
+                outcomes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|outcome| outcome.as_str().map(str::to_owned)),
+            );
+        }
+    }
+    let connections = connection_lists
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .map(|connection| {
+            let kind = json_at(connection, "/kind").as_str().unwrap_or_default();
+            let target = ["/address", "/path", "/name"]
+                .into_iter()
+                .find_map(|key| json_at(connection, key).as_str())
+                .unwrap_or_default();
+            format!("{kind} {}", copy_relative(target, copy))
+        })
+        .collect();
+    (observations, connections)
+}
+
+/// The outcomes that the JSON report `report` of `kizz execute` records under
+/// `dir`, combined over every observation, by the path relative to `dir`; `dir`
+/// itself is `.`.
+fn report_outcomes(
+    report: &Value,
+    dir: &Path,
+) -> PathOutcomes {
+    let mut outcomes = PathOutcomes::new();
+    for (path, kinds) in report_observations(report, dir).0 {
+        let Some(relative) = path
+            .strip_prefix("./")
+            .or_else(|| (path == ".").then_some(""))
+        else {
+            continue;
+        };
+        let name = if relative.is_empty() {
+            ".".to_owned()
+        } else {
+            relative.to_owned()
+        };
+        let entry = outcomes.entry(name).or_default();
+        for (kind, names) in kinds {
+            if let Some((kind, ..)) = KINDS.iter().find(|(_, name, _)| *name == kind) {
+                entry.entry(*kind).or_default().extend(names);
+            }
+        }
+    }
+    outcomes
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, with `kizz execute --compact --json` in the copy (E9): under the task
+/// directory, its report's paths, kinds and outcomes must be exactly those of the
+/// expectation file, each kind with the outcomes of the entry's sources that add
+/// it, leaving out the entries that name an unavailable gated call, as the test's
+/// own check and the program's report, which must agree, find; the report must be
+/// complete, and kizz must exit with the program's 0. The same program, run with
+/// `kizz execute --json` in a second copy of the built copy, gives a hierarchical
+/// report whose observations and connections, combined over every program, are
+/// exactly the compact report's, with the paths under each copy taken relative to
+/// it. A notice names each unavailable gated call.
+#[test]
+fn kizz_execute_reports_every_outcome_of_the_coverage_program() -> TestResult {
+    let test = "kizz_execute_reports_every_outcome_of_the_coverage_program";
+    let (available, mut problems) = own_availability()?;
+    write_notice(test, &available)?;
+    let entries = fixture_entries()?;
+    let (dir, copy, build) = built_copy()?;
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    let second = dir.path().canonicalize()?.join("second");
+    copy_tree(&copy, &second)?;
+    let cache = tempfile::tempdir()?;
+    let reports = tempfile::tempdir()?;
+    let compact_report = reports.path().join("compact.json");
+    let (compact_run, compact) = execute_coverage(
+        &copy,
+        cache.path(),
+        &["--compact", "--json"],
+        &compact_report,
+        None,
+    )?;
+    let output = format!("{}{}", compact_run.stdout, compact_run.stderr);
+    if compact_run.status != Some(0) {
+        problems.push(format!("kizz execute ended with {:?}", compact_run.status));
+    }
+    if !output.lines().any(|line| line.starts_with(SUCCESS_LINE)) {
+        problems.push("the program did not print its summary line".to_owned());
+    }
+    let (complete, mode) = (json_at(&compact, "/complete"), json_at(&compact, "/mode"));
+    if *complete != true || *mode != "compact" {
+        problems.push(format!(
+            "the compact report is not complete, or not compact: complete {complete}, mode {mode}"
+        ));
+    }
+    let (reported, report_problems) = reported_availability(&output);
+    problems.extend(report_problems);
+    problems.extend(disagreements(&reported, &available));
+    problems.extend(outcome_differences(
+        &expected_outcomes(&entries, &available),
+        &report_outcomes(&compact, &copy),
+    ));
+
+    let hierarchical_report = reports.path().join("hierarchical.json");
+    let (hierarchical_run, hierarchical) = execute_coverage(
+        &second,
+        cache.path(),
+        &["--json"],
+        &hierarchical_report,
+        None,
+    )?;
+    if hierarchical_run.status != Some(0) {
+        problems.push(format!(
+            "kizz execute --json ended with {:?}",
+            hierarchical_run.status
+        ));
+    }
+    let combined = report_observations(&hierarchical, &second);
+    let listed = report_observations(&compact, &copy);
+    if combined.0.is_empty() {
+        problems.push("the hierarchical report holds no observation".to_owned());
+    }
+    let paths: BTreeSet<&String> = combined.0.keys().chain(listed.0.keys()).collect();
+    for path in paths {
+        let (from_hierarchical, from_compact) = (combined.0.get(path), listed.0.get(path));
+        if from_hierarchical != from_compact {
+            problems.push(format!(
+                "{path}: the hierarchical report combines to {from_hierarchical:?}, and the \
+                 compact one lists {from_compact:?}"
+            ));
+        }
+    }
+    if combined.1 != listed.1 {
+        problems.push(format!(
+            "the hierarchical report's connections {:?} are not the compact one's {:?}",
+            combined.1, listed.1
+        ));
+    }
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{compact_run}\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// The problems of the report `report` of `kizz execute` for the mode of
+/// `coverage-incomplete` that makes `made`, whose run is `run`, which `available`
+/// gives as available or not. For a gated call, the program's report must agree
+/// with `available`. A report that names no reason, so that the tracer never saw
+/// the call or number, is judged by [`Skips::never_saw`] where it is available, and
+/// needs nothing more where it is not. Otherwise kizz must have exited with the
+/// program's 0, and the report must be incomplete, at the top and for the command,
+/// and name the call in an `untraceable_system_call` reason, or the number in an
+/// `unknown_system_call` reason.
+fn execute_made_problems(
+    report: &Value,
+    run: &Run,
+    made: Made,
+    available: bool,
+    skips: &mut Skips,
+) -> Vec<String> {
+    let output = format!("{}{}", run.stdout, run.stderr);
+    let mut problems = Vec::new();
+    if let Made::Call(name) = made
+        && GATED_UNTRACEABLE.contains(&name)
+    {
+        let reported: Vec<bool> = output
+            .lines()
+            .filter_map(|line| {
+                if line == format!("{AVAILABLE_LINE}{name}") {
+                    Some(true)
+                } else if line == format!("{UNAVAILABLE_LINE}{name}") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if reported != [available] {
+            problems.push(format!(
+                "the run of {name} reported {reported:?}, but the test's own check found it {}",
+                availability_word(available)
+            ));
+        }
+    }
+    let command = json_at(report, "/commands/0");
+    let reasons = json_at(command, "/incomplete")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let (complete, command_complete) =
+        (json_at(report, "/complete"), json_at(command, "/complete"));
+    if reasons.is_empty() && *complete == true {
+        if available {
+            let mut ran = Vec::new();
+            if run.status != Some(0) {
+                ran.push(format!(
+                    "kizz execute of {made} ended with {:?}",
+                    run.status
+                ));
+            }
+            let answers: Vec<&str> = output
+                .lines()
+                .filter_map(|line| line.strip_prefix(made.report().as_str()))
+                .collect();
+            if !matches!(answers.as_slice(), [answer] if *answer != "success") {
+                ran.push(format!(
+                    "the tracer never saw {}, but its run did not report it once with an \
+                     error: {output}",
+                    made.quoted()
+                ));
+            }
+            problems.extend(skips.never_saw(made, ran));
+        } else if run.status != Some(0) {
+            problems.push(format!(
+                "kizz execute of {made} ended with {:?}",
+                run.status
+            ));
+        }
+        return problems;
+    }
+    if run.status != Some(0) {
+        problems.push(format!(
+            "kizz execute of {made} ended with {:?}",
+            run.status
+        ));
+    }
+    if *complete != false || *command_complete != false {
+        problems.push(format!(
+            "the report of {made} is not incomplete: complete {complete}, the command's \
+             {command_complete}"
+        ));
+    }
+    let names = |reason: &Value| {
+        match made {
+            Made::Call(name) => {
+                json_at(reason, "/kind") == "untraceable_system_call"
+                    && json_at(reason, "/detail")
+                        .as_str()
+                        .is_some_and(|detail| detail.contains(&format!("`{name}`")))
+            },
+            Made::Number(number) => {
+                json_at(reason, "/kind") == "unknown_system_call"
+                    && *json_at(reason, "/number") == number
+            },
+        }
+    };
+    if !reasons.iter().any(names) {
+        problems.push(format!(
+            "the report of {made} does not name {}: {reasons:?}",
+            made.quoted()
+        ));
+    }
+    problems
+}
+
+/// Run the coverage program, built by `kizz build coverage-build` in a copy of the
+/// fixture, in each mode of `coverage-incomplete` with `kizz execute --json` in the
+/// copy: each report says that the trace is incomplete, at the top and for the
+/// command, and names the call or the unknown number, while kizz exits with the
+/// program's 0. Where `open_tree_attr` or `fchroot` is unavailable, as the test's
+/// own check and the program's report find, its report need not be incomplete, and
+/// a notice names it. A call or number that the tracer never saw fails the test,
+/// unless [`SKIP_VARIABLE`] is `1`, when a notice names it instead.
+#[test]
+fn kizz_execute_reports_each_incomplete_reason() -> TestResult {
+    let test = "kizz_execute_reports_each_incomplete_reason";
+    let available = own_untraceable_availability()?;
+    write_untraceable_notice(test, &available)?;
+    let mut skips = Skips::new(skip_mode());
+    let (_dir, copy, build) = built_copy()?;
+    let mut problems = Vec::new();
+    if build.status != Some(0) {
+        problems.push("kizz build coverage-build failed".to_owned());
+    }
+    let cache = tempfile::tempdir()?;
+    let reports = tempfile::tempdir()?;
+    let made: Vec<(Made, bool)> = UNTRACEABLE_SYSTEM_CALLS
+        .iter()
+        .map(|call| {
+            (
+                Made::Call(call.name),
+                available.get(call.name).copied().unwrap_or(true),
+            )
+        })
+        .chain(UNKNOWN_NUMBERS.map(|number| (Made::Number(number), true)))
+        .collect();
+    for (made, has) in made {
+        let report = reports.path().join(format!("{}.json", made.mode()));
+        let (run, value) = execute_coverage(
+            &copy,
+            cache.path(),
+            &["--json"],
+            &report,
+            Some(&made.mode()),
+        )?;
+        problems.extend(execute_made_problems(&value, &run, made, has, &mut skips));
+    }
+    skips.write_notice(test)?;
+    assert!(
+        problems.is_empty(),
+        "{} problems:\n{}\n\n{build}",
+        problems.len(),
+        problems.join("\n")
+    );
+    Ok(())
+}
+
+/// An entry's expected outcomes are, for each of its kinds, the outcomes of its
+/// sources that add that kind, and the comparison names each path that the tree
+/// records otherwise.
+#[test]
+fn outcomes_are_expected_from_the_sources_that_add_each_kind() -> TestResult {
+    let entry = parse_entry(
+        1,
+        "out/core probe+write dir all libc:mkdir:ok:write libc:mkdir:EEXIST:probe",
+    )?;
+    let expected = expected_outcomes(&[entry], &Availability::new());
+    let want: PathOutcomes = BTreeMap::from([(
+        "out/core".to_owned(),
+        BTreeMap::from([
+            (Kind::Probe, BTreeSet::from(["EEXIST".to_owned()])),
+            (Kind::Write, BTreeSet::from(["ok".to_owned()])),
+        ]),
+    )]);
+    assert_eq!(expected, want);
+    assert_eq!(outcome_differences(&expected, &want), Vec::<String>::new());
+    let mut recorded = want.clone();
+    recorded
+        .get_mut("out/core")
+        .and_then(|kinds| kinds.get_mut(&Kind::Probe))
+        .ok_or("no probe")?
+        .insert("ok".to_owned());
+    recorded.insert("extra".to_owned(), BTreeMap::new());
+    assert_eq!(outcome_differences(&expected, &recorded), [
+        "unexpected in the tree: extra, recorded (none)",
+        "mismatched in the tree: out/core, expected probe:EEXIST write:ok, recorded \
+         probe:EEXIST,ok write:ok",
+    ]);
+    assert_eq!(outcome_differences(&recorded, &BTreeMap::new()).len(), 2);
+    assert_eq!(kind_of(AccessKind::Xattr), Some(Kind::Xattr));
+    Ok(())
+}
+
+/// The little-endian field of `size` bytes, at most eight, at `offset` in `bytes`.
+fn field(
+    bytes: &[u8],
+    offset: usize,
+    size: usize,
+) -> TestResult<usize> {
+    let end = offset.checked_add(size).ok_or("the field overflows")?;
+    let slice = bytes.get(offset..end).ok_or("the file is too short")?;
+    let mut word = [0_u8; 8];
+    word.get_mut(..size)
+        .ok_or("the field is too wide")?
+        .copy_from_slice(slice);
+    Ok(usize::try_from(u64::from_le_bytes(word))?)
+}
+
+/// The loader that the 64-bit ELF executable at `path` names in its `PT_INTERP`
+/// program header, or `None` when it has none.
+fn elf_loader(path: &Path) -> TestResult<Option<PathBuf>> {
+    let bytes = fs::read(path)?;
+    if !bytes.starts_with(b"\x7fELF") || bytes.get(4) != Some(&2) {
+        return Err(format!("{} is not a 64-bit ELF file", path.display()).into());
+    }
+    let start = field(&bytes, 32, 8)?;
+    let size = field(&bytes, 54, 2)?;
+    let count = field(&bytes, 56, 2)?;
+    for index in 0..count {
+        let header = index
+            .checked_mul(size)
+            .and_then(|offset| offset.checked_add(start))
+            .ok_or("the program headers overflow")?;
+        if field(&bytes, header, 4)? != 3 {
+            continue;
+        }
+        let offset = field(&bytes, header.checked_add(8).ok_or("overflow")?, 8)?;
+        let length = field(&bytes, header.checked_add(32).ok_or("overflow")?, 8)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or("the loader path overflows")?;
+        let name = bytes.get(offset..end).ok_or("the loader path is cut")?;
+        let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+        return Ok(Some(PathBuf::from(OsStr::from_bytes(name))));
+    }
+    Ok(None)
+}
+
+/// The problems of the loader of the program in `copy`, the task directory: `cc`
+/// links dynamically by default, so the program must have a `PT_INTERP` header,
+/// and `record` must hold the loader it names, outside the copy, with the exec
+/// kind.
+fn loader_problems(
+    record: &StepRecord,
+    copy: &Path,
+) -> Vec<String> {
+    let loader = match elf_loader(&copy.join("coverage")) {
+        Ok(Some(loader)) => loader,
+        Ok(None) => return vec!["the program has no PT_INTERP program header".to_owned()],
+        Err(error) => return vec![format!("could not read the program's loader: {error}")],
+    };
+    let mut problems = Vec::new();
+    if loader.starts_with(copy) {
+        problems.push(format!("the loader {} is in the copy", loader.display()));
+    }
+    let executed = record.observations.iter().any(|observation| {
+        observation.path == loader && observation.access.contains(AccessBits::EXEC)
+    });
+    if !executed {
+        problems.push(format!(
+            "the loader {} is not recorded with the exec kind",
+            loader.display()
+        ));
+    }
+    problems
+}
+
 /// The list of tracked system calls in `architecture.md` has the names of
 /// [`TRACKED_SYSTEM_CALLS`], in order, and each one has expected entries for this
 /// platform that a tracer missing it would record differently: one on which it
@@ -1021,7 +3811,7 @@ fn every_tracked_system_call_has_entries_that_only_it_explains() -> TestResult {
     let listed = spec_tracked_calls(&spec)?;
     let tracked = tracked_names();
     assert_eq!(listed, tracked);
-    assert_eq!(tracked.len(), 46);
+    assert_eq!(tracked.len(), TRACKED_COUNT);
     let entries = fixture_entries()?;
     let here: Vec<&Entry> = entries
         .iter()
@@ -1034,13 +3824,154 @@ fn every_tracked_system_call_has_entries_that_only_it_explains() -> TestResult {
 
 /// The expectation file is consistent: each entry's kinds are the union of its
 /// sources' kinds, each system call is tracked, each failed call adds only a probe,
-/// and no path is listed twice for a platform.
+/// each mark names only gated calls, each once, and every gated call among the
+/// entry's sources, and no path is listed twice for a platform.
 #[test]
 fn the_expectation_file_is_consistent() -> TestResult {
     let entries = fixture_entries()?;
     let problems = consistency_problems(&entries, &tracked_names());
     assert!(problems.is_empty(), "{}", problems.join("\n"));
     Ok(())
+}
+
+/// The connection lines of the expectation file are consistent: no destination is
+/// listed twice for a platform, each call that connects has a connection that it
+/// makes through `syscall()` on Linux, and each destination of a Unix socket path
+/// is under `out`, which the program creates.
+#[test]
+fn the_expected_connections_are_consistent() -> TestResult {
+    let connections = fixture_connections()?;
+    let problems = connection_problems(&connections);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    for connection in &connections {
+        if let Some(path) = connection.destination.strip_prefix("unix:") {
+            assert!(path.starts_with("out/"), "line {}: {path}", connection.line);
+        }
+    }
+    assert!(!expected_connections_here(&connections).is_empty());
+    Ok(())
+}
+
+/// The parser reads every field of a connection line, which the parser of entries
+/// skips, and rejects a malformed one with its line.
+#[test]
+fn the_parser_reads_connections() {
+    let text = "# A comment.\nin/a.txt read file+hash all libc:open:ok:read\nconnection all \
+                127.0.0.1:80 libc:connect\n  connection linux unix:out/s sys:sendmmsg\nconnection \
+                linux-x86_64 [::1]:443 sys:sendto\nconnection all abstract:kizz libc:sendmsg\n";
+    let connections = parse_connections(text).unwrap();
+    assert_eq!(connections, vec![
+        ExpectedConnection {
+            line: 3,
+            platform: Platform::All,
+            destination: "127.0.0.1:80".to_owned(),
+            origin: Origin::Libc,
+            call: "connect".to_owned(),
+        },
+        ExpectedConnection {
+            line: 4,
+            platform: Platform::Linux,
+            destination: "unix:out/s".to_owned(),
+            origin: Origin::Sys,
+            call: "sendmmsg".to_owned(),
+        },
+        ExpectedConnection {
+            line: 5,
+            platform: Platform::LinuxX86,
+            destination: "[::1]:443".to_owned(),
+            origin: Origin::Sys,
+            call: "sendto".to_owned(),
+        },
+        ExpectedConnection {
+            line: 6,
+            platform: Platform::All,
+            destination: "abstract:kizz".to_owned(),
+            origin: Origin::Libc,
+            call: "sendmsg".to_owned(),
+        },
+    ]);
+    assert_eq!(parse_expectations(text).unwrap().len(), 1);
+    for bad in [
+        "connection all 127.0.0.1:80",
+        "connection all 127.0.0.1 libc:connect",
+        "connection all 127.000.0.1:80 libc:connect",
+        "connection all unix:/abs sys:connect",
+        "connection all unix:./x sys:connect",
+        "connection all abstract: sys:connect",
+        "connection all 127.0.0.1:80 sys:bind",
+        "connection all 127.0.0.1:80 kizz:connect",
+        "connection all 127.0.0.1:80 connect",
+        "connection linux/getxattrat 127.0.0.1:80 sys:connect",
+        "connection nowhere 127.0.0.1:80 sys:connect",
+    ] {
+        let errors = parse_connections(bad).unwrap_err();
+        assert_eq!(errors.len(), 1, "{bad}");
+        assert!(errors[0].starts_with("line 1: "), "{bad}: {errors:?}");
+    }
+}
+
+/// The problems of connection lines name a destination listed twice for a platform
+/// and each call that connects without a connection through `syscall()` on Linux.
+#[test]
+fn connection_problems_name_repeats_and_missing_calls() {
+    let text = "connection all 127.0.0.1:1 sys:connect\nconnection linux 127.0.0.1:1 \
+                sys:sendto\nconnection macos 127.0.0.1:2 sys:sendmsg\nconnection linux \
+                127.0.0.1:3 libc:sendmmsg\n";
+    let connections = parse_connections(text).unwrap();
+    assert_eq!(connection_problems(&connections), vec![
+        "lines 1 and 2: 127.0.0.1:1 is listed twice for a platform".to_owned(),
+        "sendmsg has no connection that it makes through syscall() on Linux".to_owned(),
+        "sendmmsg has no connection that it makes through syscall() on Linux".to_owned(),
+    ]);
+}
+
+/// A record's connections read as the expectation file writes them, a Unix socket
+/// path relative to the task directory, or absolute outside it; the comparison
+/// names each missing and each unexpected connection.
+#[test]
+fn recorded_connections_are_compared_with_the_expected_ones() {
+    let dir = Path::new("/t");
+    let shown: Vec<String> = [
+        Connection::Ipv4 {
+            address: [127, 0, 0, 1],
+            port: 80,
+        },
+        Connection::Ipv6 {
+            address: std::net::Ipv6Addr::LOCALHOST.octets(),
+            port: 443,
+            scope: 0,
+        },
+        Connection::UnixPath {
+            path: PathBuf::from("/t/out/s"),
+        },
+        Connection::UnixPath {
+            path: PathBuf::from("/run/s"),
+        },
+        Connection::UnixAbstract {
+            name: b"k\0".to_vec(),
+        },
+    ]
+    .iter()
+    .map(|connection| connection_text(connection, dir))
+    .collect();
+    assert_eq!(shown, [
+        "127.0.0.1:80",
+        "[::1]:443",
+        "unix:out/s",
+        "unix:/run/s",
+        "abstract:k\\x00"
+    ]);
+    let set = |items: &[&str]| -> BTreeSet<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    };
+    assert_eq!(
+        connection_differences(&set(&["a", "b"]), &set(&["b", "c"])),
+        ["missing connection: a", "unexpected connection: c"]
+    );
+    assert_eq!(
+        connection_differences(&set(&["a"]), &set(&["a"])),
+        Vec::<String>::new()
+    );
 }
 
 /// Every path of the expectation file is in the fixture's committed inputs or under
@@ -1069,7 +4000,7 @@ fn the_parser_reads_entries() {
     assert_eq!(first.line, 3);
     assert_eq!(first.path, "in/a.txt");
     assert_eq!(first.kinds, "probe+read".parse().unwrap());
-    assert_eq!(first.state, State::File { hash: true });
+    assert_eq!(first.state, Observed::plain(State::File { hash: true }));
     assert_eq!(first.platform, Platform::Linux);
     assert_eq!(first.sources, vec![
         Source {
@@ -1085,12 +4016,93 @@ fn the_parser_reads_entries() {
             kinds: "probe".parse().unwrap(),
         },
     ]);
-    assert_eq!(entries[1].state, State::Symlink {
-        target: "../t".to_owned(),
-        pointee: Box::new(State::Dir { listing: false }),
-    });
+    assert_eq!(
+        entries[1].state,
+        Observed::plain(State::Symlink {
+            target: "../t".to_owned(),
+            pointee: Box::new(State::Dir { listing: false }),
+        })
+    );
     assert_eq!(entries[1].state.to_string(), "symlink:../t:dir");
     assert_eq!(entries[1].platform, Platform::All);
+}
+
+/// A state with recorded attributes names their `user.` names after `@`, `-` for
+/// attributes that could not be read, and for a symbolic link those of what it
+/// points to after `/`; it is written back as it was read, and names outside
+/// `user.` are rejected.
+#[test]
+fn states_with_recorded_attributes_are_read_and_written() {
+    let names = |list: &[&str]| Some(list.iter().map(|name| (*name).to_owned()).collect());
+    let cases = [
+        (
+            "file@user.a,user.b",
+            State::File { hash: false },
+            AttributeNames {
+                own: names(&["user.a", "user.b"]),
+                pointee: None,
+            },
+        ),
+        ("file+hash@", State::File { hash: true }, AttributeNames {
+            own: names(&[]),
+            pointee: None,
+        }),
+        ("absent@-", State::Absent, AttributeNames {
+            own: None,
+            pointee: None,
+        }),
+        (
+            "symlink:t:file@/user.kizz",
+            State::Symlink {
+                target: "t".to_owned(),
+                pointee: Box::new(State::File { hash: false }),
+            },
+            AttributeNames {
+                own: names(&[]),
+                pointee: Some(names(&["user.kizz"])),
+            },
+        ),
+    ];
+    for (text, state, attributes) in cases {
+        let observed: Observed = text.parse().unwrap();
+        assert_eq!(observed, Observed {
+            state,
+            attributes: Some(attributes),
+        });
+        assert_eq!(observed.to_string(), text);
+    }
+    assert!("file@security.selinux".parse::<Observed>().is_err());
+    assert!("folder@user.a".parse::<Observed>().is_err());
+}
+
+/// Recorded attributes keep only their `user.` names, for the path and for what a
+/// link points to, and attributes that could not be read stay apart from none.
+#[test]
+fn recorded_attributes_keep_their_user_names() {
+    use kizz_store::ContentHash;
+
+    let attribute = |name: &str| {
+        Attribute {
+            name: name.as_bytes().to_vec(),
+            hash: ContentHash([0; 32]),
+        }
+    };
+    let recorded = Attributes {
+        own: Some(vec![attribute("security.selinux"), attribute("user.a")]),
+        pointee: Some(vec![attribute("trusted.x")]),
+    };
+    assert_eq!(AttributeNames::from_recorded(&recorded), AttributeNames {
+        own: Some(vec!["user.a".to_owned()]),
+        pointee: Some(Some(Vec::new())),
+    });
+    let unreadable = Attributes {
+        own: None,
+        pointee: None,
+    };
+    assert_eq!(AttributeNames::from_recorded(&unreadable), AttributeNames {
+        own: None,
+        pointee: None,
+    });
 }
 
 /// The parser reports every malformed line, with its number.
@@ -1119,8 +4131,10 @@ fn the_parser_reports_every_error() {
 }
 
 /// The consistency check finds kinds that are not the union of the sources' kinds,
-/// untracked system calls, failed calls that add more than a probe, and a path
-/// listed twice for overlapping platforms, but not for disjoint ones.
+/// untracked system calls, unknown implicit loads, failed calls and loads that add
+/// more than a probe, except a failed read of attributes that adds only the xattr
+/// kind with an error that answers from the attributes, and a path listed twice for
+/// overlapping platforms, but not for disjoint ones.
 #[test]
 fn the_consistency_check_finds_each_problem() {
     let text = "a read+write file all sys:openat:ok:read\n\
@@ -1130,22 +4144,438 @@ fn the_consistency_check_finds_each_problem() {
                 d probe file linux-x86_64 sys:stat:ok:probe\n\
                 e probe file linux-x86_64 sys:stat:ok:probe\n\
                 e probe file linux-aarch64 sys:statx:ok:probe\n\
-                f exec file+hash all kizz:execveat:ok:exec\n";
+                f exec file+hash all kizz:execveat:ok:exec\n\
+                g exec file+hash linux kernel:loader:ok:exec\n\
+                h exec absent linux kernel:interpreter:ENOENT:exec\n\
+                i exec file+hash linux kernel:interpreter_of_interpreter:ok:exec\n\
+                j xattr file@ linux sys:getxattr:ENODATA:xattr\n\
+                k xattr file@user.a linux sys:getxattr:ERANGE:xattr\n\
+                l xattr file@ linux sys:getxattr:EACCES:xattr\n";
     let entries = parse_expectations(text).unwrap();
-    let problems = consistency_problems(&entries, &["openat", "stat", "statx"]);
+    let problems = consistency_problems(&entries, &["openat", "stat", "statx", "getxattr"]);
     assert_eq!(problems, vec![
         "line 1: a has the kinds read+write, but its sources add read",
         "line 2: read is not a tracked system call",
         "line 3: the failed call openat adds read, not a probe",
         "line 3: c has the kinds probe, but its sources add read",
         "line 8: kizz starts a program only with a successful execve",
+        "line 9: loader is not a known implicit load",
+        "line 10: the failed call interpreter adds exec, not a probe",
+        "line 14: the failed call getxattr adds xattr, not a probe",
         "lines 4 and 5: d is listed twice for a platform",
     ]);
+}
+
+/// The availability of [`GATED_CALLS`] with only the calls of `unavailable`
+/// missing.
+fn availability_without(unavailable: &[&str]) -> Availability {
+    GATED_CALLS
+        .iter()
+        .map(|name| ((*name).to_owned(), !unavailable.contains(name)))
+        .collect()
+}
+
+/// The parser reads the mark after a platform, the gated calls joined with `+`, and
+/// reports an empty, malformed or nested mark, and a mark after an unknown platform.
+#[test]
+fn the_parser_reads_marks_and_reports_malformed_ones() {
+    let text = "a probe file linux/file_getattr sys:file_getattr:ok:probe\n\
+                b write file linux/file_getattr+file_setattr sys:file_setattr:ok:write\n\
+                c probe file linux sys:stat:ok:probe\n";
+    let entries = parse_expectations(text).unwrap();
+    let marks: Vec<(Platform, Vec<String>)> = entries
+        .iter()
+        .map(|entry| (entry.platform, entry.needs.clone()))
+        .collect();
+    assert_eq!(marks, vec![
+        (Platform::Linux, vec!["file_getattr".to_owned()]),
+        (Platform::Linux, vec![
+            "file_getattr".to_owned(),
+            "file_setattr".to_owned()
+        ]),
+        (Platform::Linux, Vec::new()),
+    ]);
+    let text = "a probe file linux/ sys:stat:ok:probe\n\
+                a probe file linux/a++b sys:stat:ok:probe\n\
+                a probe file linux/a/b sys:stat:ok:probe\n\
+                a probe file mars/a sys:stat:ok:probe\n";
+    let errors = parse_expectations(text).unwrap_err();
+    let lines: Vec<&str> = errors
+        .iter()
+        .map(|error| error.split(':').next().unwrap())
+        .collect();
+    assert_eq!(lines, vec!["line 1", "line 2", "line 3", "line 4"]);
+}
+
+/// The consistency check finds a mark that names a call that is not gated, a mark
+/// that names a call twice, and a source of a gated call that the mark does not
+/// name, but accepts a marked entry whose sources are other calls.
+#[test]
+fn the_consistency_check_finds_each_problem_of_marks() {
+    let text = "a xattr file linux/getxattrat sys:getxattrat:ok:xattr\n\
+                b probe file linux/stat sys:stat:ok:probe\n\
+                c probe absent linux/getxattrat+getxattrat sys:getxattrat:ENOENT:probe\n\
+                d probe file linux sys:file_getattr:ok:probe\n\
+                e probe+write file linux/file_setattr sys:file_getattr:ok:probe \
+                sys:file_setattr:ok:write\n\
+                f write file linux/file_getattr+file_setattr sys:openat:ok:write\n";
+    let entries = parse_expectations(text).unwrap();
+    let tracked = [
+        "getxattrat",
+        "stat",
+        "file_getattr",
+        "file_setattr",
+        "openat",
+    ];
+    assert_eq!(consistency_problems(&entries, &tracked), vec![
+        "line 2: the mark names stat, which is not a gated call",
+        "line 3: the mark names getxattrat twice",
+        "line 4: the gated call file_getattr is a source, but the mark does not name it",
+        "line 5: the gated call file_getattr is a source, but the mark does not name it",
+    ]);
+}
+
+/// The program's availability lines are read in any place of its output; a gated
+/// call without a line, one with two, and a name that is not gated are problems,
+/// and so is a report that disagrees with the test's own check.
+#[test]
+fn availability_lines_are_read_and_their_problems_reported() {
+    let output = "coverage: available: file_getattr\n\
+                  coverage: unavailable: getxattrat\n\
+                  mismatch: openat x: expected success, got ENOENT\n\
+                  coverage: available: listxattrat\n\
+                  coverage: available: setxattrat\n\
+                  coverage: unavailable: removexattrat\n\
+                  coverage: available: file_setattr\n\
+                  coverage: every call returned what it expected, 1 checks\n";
+    let (reported, problems) = reported_availability(output);
+    assert_eq!(
+        reported,
+        availability_without(&["getxattrat", "removexattrat"])
+    );
+    assert_eq!(problems, Vec::<String>::new());
+    assert_eq!(
+        disagreements(&reported, &availability_without(&["getxattrat"])),
+        vec![
+            "the program reported removexattrat unavailable, but the test's own check found \
+             it available"
+        ]
+    );
+    let output = "coverage: available: file_getattr\n\
+                  coverage: unavailable: file_getattr\n\
+                  coverage: available: stat\n\
+                  coverage: available: getxattrat\n\
+                  coverage: available: listxattrat\n\
+                  coverage: available: setxattrat\n\
+                  coverage: available: removexattrat\n";
+    let (_, problems) = reported_availability(output);
+    assert_eq!(problems, vec![
+        "the program reported file_getattr more than once",
+        "the program reported stat, which is not a gated call",
+        "the program did not report whether file_setattr is available",
+    ]);
+}
+
+/// The expected paths leave out exactly the entries whose mark names an
+/// unavailable call, and keep every entry where every gated call is available.
+#[test]
+fn expected_paths_leave_out_the_entries_of_unavailable_calls() {
+    let text = "a read file+hash linux sys:openat:ok:read\n\
+                b probe file linux/file_getattr sys:file_getattr:ok:probe\n\
+                c write file linux/file_getattr+file_setattr sys:file_setattr:ok:write\n\
+                d xattr file@user.kizz linux/getxattrat sys:getxattrat:ok:xattr\n\
+                e write file linux/file_getattr+file_setattr sys:openat:ok:write\n";
+    let entries = parse_expectations(text).unwrap();
+    let paths = |available: &Availability| -> Vec<String> {
+        expected_here(&entries, available).into_keys().collect()
+    };
+    assert_eq!(paths(&availability_without(&[])), vec![
+        "a", "b", "c", "d", "e"
+    ]);
+    assert_eq!(paths(&availability_without(&["file_setattr"])), vec![
+        "a", "b", "d"
+    ]);
+    assert_eq!(
+        paths(&availability_without(&["file_getattr", "getxattrat"])),
+        vec!["a"]
+    );
+}
+
+/// The notice names the test and each unavailable gated call, in order, and there
+/// is none when every gated call is available.
+#[test]
+fn the_notice_names_the_test_and_each_unavailable_call() {
+    assert_eq!(unavailable_notice("t", &availability_without(&[])), None);
+    assert_eq!(
+        unavailable_notice("t", &availability_without(&["file_setattr", "getxattrat"])),
+        Some(
+            "NOTICE: t: getxattrat, file_setattr returned ENOSYS (the kernel lacks the call, or \
+             a seccomp filter installed before kizz's own refuses it), so the test required \
+             that nothing was recorded at their paths instead of checking their accesses"
+                .to_owned()
+        )
+    );
+}
+
+/// A step record of `coverage-incomplete` with `not_cached`, the unknown system
+/// calls `unknown`, the exit code `code` and the captured output `output`.
+fn incomplete_step(
+    not_cached: Option<NotCachedReason>,
+    unknown: &[u32],
+    code: i32,
+    output: &str,
+) -> StepRecord {
+    use kizz_store::{Capture, ContentHash, RunReason, StepSpecRecord};
+
+    StepRecord {
+        spec: StepSpecRecord {
+            program_hash: ContentHash([0; 32]),
+            cwd: PathBuf::from("/t"),
+            argv: vec!["./coverage".to_owned()],
+            env: BTreeMap::new(),
+            stdin: None,
+            capture: Capture::Merged,
+            stream: false,
+            always: false,
+            ignore: Vec::new(),
+            track: Vec::new(),
+            timestamps: false,
+            expect: None,
+            occurrence: 0,
+            machine: Vec::new(),
+        },
+        program: None,
+        observations: Vec::new(),
+        ignored: 0,
+        exit: StepExit::Exited { code },
+        output: RecordedOutput::Merged {
+            output: output.as_bytes().to_vec(),
+        },
+        duration_nanos: 0,
+        ran_at_nanos: 0,
+        reason: RunReason::NeverRun,
+        recorded_at_nanos: 0,
+        failure: None,
+        not_cached,
+        owners: BTreeSet::new(),
+        unknown_system_calls: unknown.to_vec(),
+        connections: Vec::new(),
+        machine: MachineStateRecord::default(),
+    }
+}
+
+/// The incomplete reason of a run in which a process made `name`.
+fn marked(name: &str) -> NotCachedReason {
+    NotCachedReason::Incomplete {
+        detail: format!("a system call that kizz cannot trace: process 7 made `{name}`"),
+    }
+}
+
+/// Only the value `1` of the variable turns skipping on: unset, empty, `0` and
+/// `true` leave the tests strict.
+#[test]
+fn only_the_value_1_turns_skipping_on() {
+    assert!(skips_blocked(Some(OsStr::new("1"))));
+    for value in [None, Some(""), Some("0"), Some("true")] {
+        assert!(!skips_blocked(value.map(OsStr::new)), "{value:?}");
+    }
+}
+
+/// A step that is not cached, whatever its reason, or that lists an unknown system
+/// call, cached or not, made a call that the tracer saw; only a cached step that
+/// lists none made one that it never saw.
+#[test]
+fn step_records_are_judged_as_seen_or_never_seen() {
+    let seen = [
+        incomplete_step(Some(marked("acct")), &[], 0, ""),
+        incomplete_step(
+            Some(NotCachedReason::UnknownSystemCalls { numbers: vec![400] }),
+            &[400],
+            0,
+            "",
+        ),
+        incomplete_step(None, &[400], 0, ""),
+        incomplete_step(
+            Some(NotCachedReason::ChangedAfterRead { files: Vec::new() }),
+            &[],
+            0,
+            "",
+        ),
+    ];
+    for record in &seen {
+        assert!(tracer_saw(record), "{:?}", record.not_cached);
+    }
+    let unseen = incomplete_step(None, &[], 0, "");
+    assert!(!tracer_saw(&unseen), "{:?}", unseen.not_cached);
+}
+
+/// In both modes, a step that exited with 0 and reported its call or number with an
+/// error, but is not cached for a reason other than the call's, was seen: it gets
+/// the full check, which fails on its reason and numbers, and it is never skipped.
+#[test]
+fn a_step_not_cached_for_another_reason_is_checked_in_full_in_both_modes() {
+    let changed = || Some(NotCachedReason::ChangedAfterRead { files: Vec::new() });
+    let call = incomplete_step(changed(), &[], 0, "coverage: made acct: EPERM\n");
+    let number = incomplete_step(
+        changed(),
+        &[],
+        0,
+        "coverage: made system call 400: ENOSYS\n",
+    );
+    for on in [false, true] {
+        let mut skips = Skips::new(on);
+        assert_eq!(call_problems(&call, "acct", true, &mut skips), vec![
+            "the acct step is marked Some(ChangedAfterRead { files: [] }), not incompletely \
+             traced for `acct`"
+        ]);
+        assert_eq!(number_problems(&number, 400, false, &mut skips), vec![
+            "the step of system call 400 lists []".to_owned(),
+            "the step of system call 400 is marked Some(ChangedAfterRead { files: [] }), not \
+             Some(UnknownSystemCalls { numbers: [400] })"
+                .to_owned(),
+        ]);
+        assert_eq!(number_problems(&number, 400, true, &mut skips), vec![
+            "the step of system call 400 lists []".to_owned(),
+            "the step of system call 400 is marked Some(ChangedAfterRead { files: [] }), not None"
+                .to_owned(),
+        ]);
+        assert_eq!(skips.skipped, Vec::new(), "skipping {on}");
+        assert_eq!(skips.notice("t"), None, "skipping {on}");
+    }
+}
+
+/// A call or number that the tracer never saw, whose step exited with 0 and
+/// reported it with an error, fails with a message that names it and the variable
+/// when skipping is off, and is skipped, with no problem, when it is on.
+#[test]
+fn a_call_that_the_tracer_never_saw_fails_unless_skipping_is_on() {
+    let call = incomplete_step(None, &[], 0, "coverage: made acct: EPERM\n");
+    let number = incomplete_step(None, &[], 0, "coverage: made system call 400: ENOSYS\n");
+
+    let mut strict = Skips::new(false);
+    assert_eq!(call_problems(&call, "acct", true, &mut strict), vec![
+        "the tracer never saw `acct`; if a seccomp filter installed before kizz refuses it, set \
+         KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1"
+    ]);
+    assert_eq!(number_problems(&number, 400, false, &mut strict), vec![
+        "the tracer never saw system call 400; if a seccomp filter installed before kizz refuses \
+         it, set KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1"
+    ]);
+    assert_eq!(strict.skipped, Vec::new());
+
+    let mut skipping = Skips::new(true);
+    assert_eq!(
+        call_problems(&call, "acct", true, &mut skipping),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        number_problems(&number, 400, true, &mut skipping),
+        Vec::<String>::new()
+    );
+    assert_eq!(skipping.skipped, vec![
+        Made::Call("acct"),
+        Made::Number(400)
+    ]);
+}
+
+/// In both modes, a call or number that the tracer saw and mishandled fails, and so
+/// does one that it never saw whose step did not exit with 0 or did not report the
+/// call with an error; none of them is skipped. A gated call that is unavailable
+/// follows decision 8, not the variable.
+#[test]
+fn mishandled_or_failed_calls_fail_in_both_modes() {
+    let ok_call = "coverage: made acct: EPERM\n";
+    let ok_number = "coverage: made system call 400: ENOSYS\n";
+    for on in [false, true] {
+        let mut skips = Skips::new(on);
+        // Seen, with a reason that names another call.
+        let wrong = incomplete_step(Some(marked("chroot")), &[], 0, ok_call);
+        assert_eq!(call_problems(&wrong, "acct", true, &mut skips).len(), 1);
+        // Seen, with an extra number.
+        let extra = incomplete_step(
+            Some(NotCachedReason::UnknownSystemCalls {
+                numbers: vec![400, 401],
+            }),
+            &[400, 401],
+            0,
+            ok_number,
+        );
+        assert_eq!(number_problems(&extra, 400, false, &mut skips).len(), 2);
+        // Seen, and cached without the option.
+        let cached = incomplete_step(None, &[400], 0, ok_number);
+        assert_eq!(number_problems(&cached, 400, false, &mut skips).len(), 1);
+        // Never seen, but the step failed.
+        let failed = incomplete_step(None, &[], 1, ok_call);
+        assert!(
+            call_problems(&failed, "acct", true, &mut skips)
+                .contains(&"the step of acct ended with Exited { code: 1 }".to_owned())
+        );
+        // Never seen, but the call succeeded or was not reported.
+        for output in ["coverage: made acct: success\n", ""] {
+            let unreported = incomplete_step(None, &[], 0, output);
+            let problems = call_problems(&unreported, "acct", true, &mut skips);
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains("did not report it once with an error")),
+                "{problems:?}"
+            );
+        }
+        let unreported = incomplete_step(None, &[], 0, "coverage: made system call 401: ENOSYS\n");
+        let problems = number_problems(&unreported, 400, false, &mut skips);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("did not report it once with an error")),
+            "{problems:?}"
+        );
+        // Unavailable under decision 8: cached and reported as unavailable.
+        let unavailable = incomplete_step(
+            None,
+            &[],
+            0,
+            "coverage: unavailable: fchroot\ncoverage: made fchroot: ENOSYS\n",
+        );
+        assert_eq!(
+            call_problems(&unavailable, "fchroot", false, &mut skips),
+            Vec::<String>::new()
+        );
+        assert_eq!(skips.skipped, Vec::new(), "skipping {on}");
+    }
+}
+
+/// The notice of the skipped calls and numbers names the test, the variable and
+/// each of them, in order, and there is none when nothing was skipped.
+#[test]
+fn the_skip_notice_names_the_test_the_variable_and_each_skipped_call() {
+    let mut skips = Skips::new(true);
+    assert_eq!(skips.notice("t"), None);
+    assert_eq!(
+        skips.never_saw(Made::Call("acct"), Vec::new()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        skips.never_saw(Made::Number(400), Vec::new()),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        skips.notice("t"),
+        Some(
+            "NOTICE: t: the tracer never saw acct, system call 400, which a seccomp filter \
+             installed before kizz's own may have refused, so KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1 \
+             skipped their checks"
+                .to_owned()
+        )
+    );
+    let mut strict = Skips::new(false);
+    assert_eq!(strict.never_saw(Made::Call("acct"), Vec::new()).len(), 1);
+    assert_eq!(strict.notice("t"), None);
 }
 
 /// The coverage check requires, for each call, an entry on which it succeeded and,
 /// for a call with a path, one on which it failed with `ENOENT`, each of which it
 /// alone explains: as the only source, or with a kind that no other source adds.
+/// It requires the same of each implicit load of the kernel, with its outcome.
 #[test]
 fn the_coverage_check_requires_entries_that_only_the_call_explains() {
     let text = "a probe+write dir linux sys:mkdirat:ok:write sys:mkdirat:EEXIST:probe \
@@ -1153,7 +4583,11 @@ fn the_coverage_check_requires_entries_that_only_the_call_explains() {
                 b probe absent linux sys:mkdirat:ENOENT:probe\n\
                 c probe file linux sys:openat:ok:probe sys:stat:ok:probe\n\
                 d probe absent linux sys:openat:ENOENT:probe sys:stat:ENOENT:probe\n\
-                e list dir linux sys:getdents64:ok:list\n";
+                e list dir linux sys:getdents64:ok:list\n\
+                f exec file+hash linux kernel:interpreter:ok:exec\n\
+                g exec file+hash linux kizz:execve:ok:exec \
+                kernel:interpreter_of_interpreter:ok:exec\n\
+                h probe absent linux kernel:interpreter:ENOENT:probe\n";
     let entries = parse_expectations(text).unwrap();
     let all: Vec<&Entry> = entries.iter().collect();
     let problems = coverage_problems(&all, &["mkdirat", "openat", "getdents64", "fchmod"]);
@@ -1161,7 +4595,15 @@ fn the_coverage_check_requires_entries_that_only_the_call_explains() {
         "openat has no entry with outcome ok that only it explains",
         "openat has no entry with outcome ENOENT that only it explains",
         "fchmod has no entry with outcome ok that only it explains",
+        "the implicit load interpreter_of_interpreter has no entry with outcome ok that only it \
+         explains",
     ]);
+    // An interpreter of an interpreter that only that load explains.
+    let text = format!("{text}i exec file+hash linux kernel:interpreter_of_interpreter:ok:exec\n");
+    let entries = parse_expectations(&text).unwrap();
+    let all: Vec<&Entry> = entries.iter().collect();
+    let problems = coverage_problems(&all, &["mkdirat", "getdents64"]);
+    assert_eq!(problems, Vec::<String>::new());
 }
 
 /// The list of tracked calls is read from the bullets under its heading, with the
@@ -1174,6 +4616,11 @@ fn the_spec_list_is_read_from_its_bullets() {
         "open", "creat", "stat", "lstat", "access"
     ]);
     assert!(spec_tracked_calls("nothing here").is_err());
+    let both = format!("{text}\n{UNTRACEABLE_HEADING}\n\n* c: `mount`,\n  `chroot`\n\nafter `x`\n");
+    assert_eq!(spec_calls(&both, UNTRACEABLE_HEADING).unwrap(), vec![
+        "mount", "chroot"
+    ]);
+    assert_eq!(spec_tracked_calls(&both).unwrap().len(), 5);
 }
 
 /// The comparison reports a missing, an unexpected, and a mismatched entry
@@ -1206,8 +4653,11 @@ fn the_comparison_reports_every_difference_together() {
 /// with their kinds and the types of their states.
 #[test]
 fn recorded_observations_are_taken_relative_to_the_task_directory() {
-    use kizz_store::{Capture, ContentHash, FileMeta, Observation, RunReason, StepSpecRecord};
+    use kizz_store::{
+        Capture, ContentHash, FileMeta, Observation, Owner, RunReason, StepSpecRecord,
+    };
 
+    let owner = Owner { uid: 1, gid: 1 };
     let meta = FileMeta {
         size: 1,
         mtime_nanos: 0,
@@ -1215,6 +4665,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         inode: 1,
         device: 1,
         mode: 0o100_644,
+        owner,
     };
     let observation = |path: &str, access: u8, state: PathState| {
         Observation {
@@ -1222,7 +4673,21 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
             access: AccessBits(access),
             tracked: false,
             state,
+            attributes: None,
         }
+    };
+    let read_attributes = Observation {
+        path: PathBuf::from("/t/x"),
+        access: AccessBits(AccessBits::XATTR),
+        tracked: false,
+        state: PathState::File { meta, hash: None },
+        attributes: Some(Attributes {
+            own: Some(vec![Attribute {
+                name: b"user.a".to_vec(),
+                hash: ContentHash([2; 32]),
+            }]),
+            pointee: None,
+        }),
     };
     let record = StepRecord {
         spec: StepSpecRecord {
@@ -1236,8 +4701,10 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
             expect: None,
             occurrence: 0,
+            machine: Vec::new(),
         },
         program: None,
         observations: vec![
@@ -1246,7 +4713,10 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
                 hash: Some(ContentHash([1; 32])),
             }),
             observation("/t", AccessBits::PROBE, PathState::Directory {
+                mode: 0o040_755,
+                owner,
                 listing: None,
+                times: meta.times(),
             }),
             observation(
                 "/t/a/../b",
@@ -1258,6 +4728,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
                 pointee: Box::new(PathState::Absent),
             }),
             observation("/tt/c", AccessBits::LIST, PathState::Absent),
+            read_attributes,
         ],
         ignored: 0,
         exit: StepExit::Exited { code: 0 },
@@ -1269,6 +4740,9 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         failure: None,
         not_cached: None,
         owners: BTreeSet::new(),
+        unknown_system_calls: Vec::new(),
+        connections: Vec::new(),
+        machine: MachineStateRecord::default(),
     };
     let recorded: Vec<String> = recorded_under(&record, Path::new("/t"))
         .into_iter()
@@ -1278,5 +4752,50 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         ". probe dir",
         "a/../b read+probe file",
         "l write symlink:x:absent",
+        "x xattr file@user.a",
     ]);
+}
+
+/// The machine-state check of the conformance test accepts a state with every part
+/// and the expected kernel release, and names each part that is missing, empty, or
+/// zero, and a kernel release that differs.
+#[test]
+fn the_machine_state_check_names_each_missing_part() {
+    use kizz_store::{DiskRecord, FileSystemRecord, LimitRecord, MemoryRecord};
+
+    let complete = MachineStateRecord {
+        kernel: Some(KernelRecord {
+            release: "6.12.0".to_owned(),
+            version: "#1".to_owned(),
+        }),
+        limits: Some(vec![LimitRecord {
+            resource: "nofile".to_owned(),
+            soft: Some(1),
+            hard: None,
+        }]),
+        affinity: Some(vec![0]),
+        memory: Some(MemoryRecord {
+            total: 1,
+            available: 0,
+        }),
+        filesystem: Some(FileSystemRecord { kind: 1, flags: 0 }),
+        disk: Some(DiskRecord { size: 1, free: 0 }),
+    };
+    assert_eq!(machine_problems(&complete, "6.12.0"), Vec::<String>::new());
+    assert_eq!(machine_problems(&complete, "6.13.0").len(), 1);
+    let empty = MachineStateRecord {
+        limits: Some(Vec::new()),
+        affinity: Some(Vec::new()),
+        memory: Some(MemoryRecord {
+            total: 0,
+            available: 0,
+        }),
+        disk: Some(DiskRecord { size: 0, free: 0 }),
+        ..MachineStateRecord::default()
+    };
+    assert_eq!(machine_problems(&empty, "6.12.0").len(), 6);
+    assert_eq!(
+        machine_problems(&MachineStateRecord::default(), "6.12.0").len(),
+        6
+    );
 }

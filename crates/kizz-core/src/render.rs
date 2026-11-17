@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 
 use kizz_store::{
     AccessBits, Capture, ChangedInput, EnvChange, Explanation, ModuleChange, ModuleChangeKind,
-    Reason, SelfInflicted, TaskLabel, Verdict, Writer,
+    NotCachedReason, Reason, SelfInflicted, TaskLabel, Verdict, Writer, changed_reads_text,
+    machine_changes_text,
 };
 
 use crate::{explain::RepeatedWarning, warning::location};
@@ -60,6 +61,11 @@ const fn capture(mode: Capture) -> &'static str {
     }
 }
 
+/// A boolean as a task program writes it: `True` or `False`.
+const fn starlark_bool(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
+}
+
 /// `stdin` text as verbose output shows it, or `/dev/null` for none.
 fn stdin_text(text: Option<&str>) -> String {
     text.map_or_else(|| "/dev/null".to_owned(), |text| format!("{text:?}"))
@@ -86,6 +92,7 @@ pub fn access_kinds(bits: AccessBits) -> String {
         (AccessBits::LIST, "list"),
         (AccessBits::WRITE, "write"),
         (AccessBits::EXEC, "exec"),
+        (AccessBits::XATTR, "xattr"),
     ]
     .into_iter()
     .filter(|(bit, _)| bits.contains(*bit))
@@ -124,6 +131,20 @@ impl Render {
         path: &Path,
     ) -> String {
         quoted(&self.path(path))
+    }
+
+    /// Why a run could not be cached, with the files that changed after the command
+    /// read them shown as other paths are, each with who changed it.
+    #[must_use]
+    pub fn not_cached(
+        &self,
+        why: &NotCachedReason,
+    ) -> String {
+        if let NotCachedReason::ChangedAfterRead { files } = why {
+            changed_reads_text(files, |path| self.quoted_path(path))
+        } else {
+            why.to_string()
+        }
     }
 
     /// A task as output names it: `path/kizz.md:LINE (Heading)`, or the path alone
@@ -168,6 +189,12 @@ impl Render {
                 format!("{} in an earlier build", self.step_of(task, *position))
             },
             Writer::Outside => "something outside kizz".to_owned(),
+            Writer::ProgramThisBuild { task } => {
+                format!("the program of {} in this build", self.task(task))
+            },
+            Writer::ProgramEarlierBuild { task } => {
+                format!("the program of {} in an earlier build", self.task(task))
+            },
         }
     }
 
@@ -401,9 +428,32 @@ impl Render {
                     patterns(new)
                 )
             },
+            Reason::TimestampsChanged { old, new } => {
+                format!(
+                    "the `timestamps` option changed from {} to {}",
+                    starlark_bool(*old),
+                    starlark_bool(*new)
+                )
+            },
+            Reason::MachineNamesChanged { old, new } => {
+                format!(
+                    "the `machine` names changed from {} to {}",
+                    patterns(old),
+                    patterns(new)
+                )
+            },
             Reason::InputsChanged { inputs } => self.inputs_short(inputs),
+            Reason::MachineChanged { changes } => {
+                format!(
+                    "the machine state changed: {}",
+                    machine_changes_text(changes)
+                )
+            },
             Reason::Always => "marked `always`".to_owned(),
+            Reason::TaskCacheNever => "its task is marked `cache=never`".to_owned(),
+            Reason::RunNoCache => "`kizz run --no-cache` was given".to_owned(),
             Reason::NotCached { why, inputs } => {
+                let why = self.not_cached(why);
                 if inputs.is_empty() {
                     format!("the previous run could not be cached: {why}")
                 } else {
@@ -450,8 +500,16 @@ impl Render {
                 lines.extend(self.inputs_full(inputs));
                 lines
             },
+            Reason::MachineChanged { changes } => {
+                let mut lines = vec!["the machine state changed:".to_owned()];
+                lines.extend(changes.iter().map(|change| format!("  {change}")));
+                lines
+            },
             Reason::NotCached { why, inputs } => {
-                let mut lines = vec![format!("the previous run could not be cached: {why}")];
+                let mut lines = vec![format!(
+                    "the previous run could not be cached: {}",
+                    self.not_cached(why)
+                )];
                 if !inputs.is_empty() {
                     lines.push(format!("{} changed since:", count(inputs.len(), "input")));
                     lines.extend(self.inputs_full(inputs));
@@ -465,7 +523,11 @@ impl Render {
             | Reason::CaptureChanged { .. }
             | Reason::IgnoreChanged { .. }
             | Reason::TrackChanged { .. }
-            | Reason::Always => vec![self.reason_line(reason)],
+            | Reason::TimestampsChanged { .. }
+            | Reason::MachineNamesChanged { .. }
+            | Reason::Always
+            | Reason::TaskCacheNever
+            | Reason::RunNoCache => vec![self.reason_line(reason)],
         }
     }
 
@@ -564,6 +626,11 @@ impl Render {
 
 /// Unit tests for the rendering of the parts of explanations.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use kizz_store::TaskId;
 
@@ -606,6 +673,10 @@ mod tests {
         assert_eq!(
             access_kinds(AccessBits(AccessBits::READ | AccessBits::LIST)),
             "read, list"
+        );
+        assert_eq!(
+            access_kinds(AccessBits(AccessBits::EXEC | AccessBits::XATTR)),
+            "exec, xattr"
         );
     }
 

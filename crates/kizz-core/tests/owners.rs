@@ -17,7 +17,16 @@
 //!
 //! and any other argument does nothing.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
+    collections::BTreeSet,
     error::Error,
     fs, io,
     os::unix::fs::PermissionsExt as _,
@@ -27,7 +36,7 @@ use std::{
 
 use kizz_core::{
     Engine, ProgramHash, ProgramParts, StepExecutor as _, StepSpec, TaskIdentity, TaskSteps,
-    plan_reset,
+    WorkerPool, plan_reset,
 };
 use kizz_store::{
     EntryCounts, LearnedOrder, StepKey, StepPosition, StepRecord, Store, TaskId, TaskRecord,
@@ -35,7 +44,7 @@ use kizz_store::{
 };
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    FirstReads, OutputStream, ProcessTree, RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -45,8 +54,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// The program hash of every task: tasks with the same block share step keys.
 const PROGRAM: [u8; 32] = [7; 32];
 
-/// A tracer that runs nothing, reads the files a step's arguments name, and counts
-/// its runs.
+/// A tracer that runs nothing, reads the files a step's arguments name, noting their
+/// metadata as first reads as the Linux tracer does, and counts its runs.
 #[derive(Default)]
 struct FakeTracer {
     /// The number of runs so far.
@@ -72,6 +81,8 @@ impl Tracer for FakeTracer {
             *runs = runs.saturating_add(1);
         }
         let mut accesses = Accesses::new();
+        let mut first_reads = FirstReads::new();
+        first_reads.note_at(&request.program, &accesses);
         accesses.record(request.program.clone(), AccessKind::Exec);
         let mut termination = Termination::Exited(0);
         for arg in request.args.iter().skip(1) {
@@ -87,15 +98,39 @@ impl Tracer for FakeTracer {
                         source: None,
                     }
                 })?;
+                first_reads.note_at(&path, &accesses);
                 accesses.record(path, AccessKind::Read);
             }
         }
         Ok(RunResult {
             termination,
             output: CapturedOutput::empty(request.capture),
+            tree: request
+                .tree
+                .then(|| ProcessTree::of_request(request, &accesses, Some(termination))),
             accesses,
             incomplete: None,
+            first_reads,
+            unknown_system_calls: BTreeSet::new(),
+            connections: BTreeSet::new(),
         })
+    }
+
+    /// These tests read no extended attributes, so there are none.
+    fn extended_attributes(
+        &self,
+        _path: &std::path::Path,
+        _follow: bool,
+    ) -> std::io::Result<kizz_trace::ExtendedAttributes> {
+        Ok(kizz_trace::ExtendedAttributes::new())
+    }
+
+    /// These tests name no machine state, so the fake knows no part.
+    fn machine_state(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> kizz_trace::MachineState {
+        kizz_trace::MachineState::default()
     }
 }
 
@@ -217,6 +252,8 @@ impl Fixture {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
+            machine: Vec::new(),
             expect: None,
         })
     }
@@ -255,7 +292,14 @@ impl Fixture {
         tasks: &[(&TaskIdentity, &[&StepSpec])],
     ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let mut built = Built {
             ran: Vec::new(),
             keys: Vec::new(),
@@ -288,7 +332,14 @@ impl Fixture {
         step: &StepSpec,
     ) -> TestResult<StepKey> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let run = engine.task(
             ProgramHash::from_bytes(PROGRAM),
             AbsolutePath::new(&self.root)?,

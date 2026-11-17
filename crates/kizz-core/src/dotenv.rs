@@ -140,6 +140,11 @@ fn parse_double_quoted(inner: &str) -> Result<(String, &str), String> {
 
 /// Unit tests for the dotenv parser.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::collections::BTreeMap;
 

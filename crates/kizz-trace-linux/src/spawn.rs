@@ -4,20 +4,32 @@
 
 //! Starting a traced program.
 //!
-//! The tracer forks, and before the program runs the child moves into a process
-//! group of its own, connects its standard input, output and error, enters the
-//! working directory, sets `PR_SET_NO_NEW_PRIVS`, comes under `ptrace` with
-//! `PTRACE_TRACEME`, and stops itself. The tracer then sets the options that follow
-//! forks, clones and `exec` and kill the traced processes if the tracer dies, and
-//! resumes the child, which installs the seccomp-bpf filter and runs the program
-//! with `execve`.
+//! The tracer forks, and before the program runs the child of a build moves into a
+//! process group of its own and connects its standard input, output and error; then
+//! every child empties its signal mask, resets `SIGPIPE` to its default action,
+//! enters the working directory, sets `PR_SET_NO_NEW_PRIVS`, comes under `ptrace`
+//! with `PTRACE_TRACEME`, and stops itself. The tracer then sets the options that
+//! follow forks, clones and `exec` and kill the traced processes if the tracer
+//! dies, and resumes the child, which installs the seccomp-bpf filter and runs the
+//! program with `execve`.
 //!
-//! The own process group keeps a terminal's Ctrl-C, which the terminal sends to its
-//! foreground process group, away from the traced tree: it reaches only the
-//! tracer's process, which interrupts the tree on cancellation, so the program
-//! receives the interrupt exactly once. The child's standard streams are pipes or
-//! `/dev/null`, never the terminal, so leaving the terminal's process group changes
-//! nothing else.
+//! The own process group of a build's command keeps a terminal's Ctrl-C, which the
+//! terminal sends to its foreground process group, away from the traced tree: it
+//! reaches only the tracer's process, which interrupts the tree on cancellation, so
+//! the program receives the interrupt exactly once. The child's standard streams
+//! are pipes or `/dev/null`, never the terminal, so leaving the terminal's process
+//! group changes nothing else.
+//!
+//! A command that keeps the terminal ([`RunRequest::terminal`]) skips both steps:
+//! it stays in the process group and session of the tracer's process, and keeps
+//! that process's standard input, output and error, so a terminal's input and
+//! signals reach it as they would reach the tracer's process.
+//!
+//! The empty signal mask and the default `SIGPIPE`, which the Rust runtime of the
+//! tracer's process ignores, hold in both ways. Every other disposition is
+//! inherited: a signal that the tracer's process ignores stays ignored in the
+//! program, because `execve` keeps it ignored, and one that it handles is at its
+//! default action in the program, because `execve` resets handlers.
 //!
 //! Between `fork` and `execve` the child runs only async-signal-safe `libc` calls on
 //! data prepared before the fork, because other threads of the tracer's process may
@@ -36,10 +48,10 @@ use std::{
     ptr,
 };
 
-use kizz_trace::{Accesses, RunRequest, TraceError};
+use kizz_trace::{Accesses, ProcessTree, RunRequest, TraceError};
 use libc::{c_char, c_int, pid_t, sock_filter, sock_fprog};
 
-use crate::sys;
+use crate::{processes, sys};
 
 /// The options set on the first traced process, which every process and thread it
 /// starts inherits: stop at seccomp `SECCOMP_RET_TRACE` actions, mark the stop at
@@ -140,23 +152,30 @@ pub(crate) struct ChildFailure {
 
 impl ChildFailure {
     /// The error for a request whose child failed this way, with the paths it
-    /// touched while it tried to start the program.
+    /// touched while it tried to start the program and, when the request asked for
+    /// it, the tree of that one process.
     pub(crate) fn into_error(
         self,
         request: &RunRequest,
         accesses: Accesses,
+        tree: Option<ProcessTree>,
     ) -> TraceError {
         let source = io::Error::from_raw_os_error(self.errno);
         let program = request.program.clone();
         match self.step {
             Step::Exec if matches!(self.errno, libc::ENOENT | libc::ENOTDIR) => {
-                TraceError::ProgramNotFound { program, accesses }
+                TraceError::ProgramNotFound {
+                    program,
+                    accesses,
+                    tree,
+                }
             },
             Step::Exec if matches!(self.errno, libc::EACCES | libc::ENOEXEC | libc::EISDIR) => {
                 TraceError::ProgramNotExecutable {
                     program,
                     source,
                     accesses,
+                    tree,
                 }
             },
             Step::Stdio | Step::Signals | Step::WorkingDirectory | Step::Exec => {
@@ -164,6 +183,7 @@ impl ChildFailure {
                     program,
                     source,
                     accesses,
+                    tree,
                 }
             },
             Step::NoNewPrivileges
@@ -238,14 +258,24 @@ pub(crate) struct ChildStdio {
     pub stderr: Option<OwnedFd>,
 }
 
-/// Everything the child uses, as raw values that need no allocation.
-struct ChildPlan {
+/// The descriptors that a build's child moves onto its standard input, output and
+/// error, as raw values.
+#[derive(Clone, Copy)]
+struct Streams {
     /// The descriptor for standard input.
     stdin: c_int,
     /// The descriptor for standard output.
     stdout: c_int,
     /// The descriptor for standard error.
     stderr: c_int,
+}
+
+/// Everything the child uses, as raw values that need no allocation.
+struct ChildPlan {
+    /// The streams of a build's child, which then moves into a process group of its
+    /// own, or `None` for a child that keeps the terminal: its process group,
+    /// session and standard streams stay those of the tracer's process.
+    streams: Option<Streams>,
     /// The write end of the failure pipe.
     report: c_int,
     /// The working directory.
@@ -296,16 +326,18 @@ unsafe fn child(plan: &ChildPlan) -> ! {
     // SAFETY: every call below is async-signal-safe and gets valid arguments from
     // `plan`.
     unsafe {
-        // First, so that a terminal's Ctrl-C reaches the child, which still runs
-        // the tracer's signal handlers, for as short a time as possible.
-        if libc::setpgid(0, 0) == -1 {
-            fail(plan.report, Step::ProcessGroup);
-        }
-        if libc::dup2(plan.stdin, libc::STDIN_FILENO) == -1
-            || libc::dup2(plan.stdout, libc::STDOUT_FILENO) == -1
-            || libc::dup2(plan.stderr, libc::STDERR_FILENO) == -1
-        {
-            fail(plan.report, Step::Stdio);
+        if let Some(streams) = plan.streams {
+            // First, so that a terminal's Ctrl-C reaches the child, which still
+            // runs the tracer's signal handlers, for as short a time as possible.
+            if libc::setpgid(0, 0) == -1 {
+                fail(plan.report, Step::ProcessGroup);
+            }
+            if libc::dup2(streams.stdin, libc::STDIN_FILENO) == -1
+                || libc::dup2(streams.stdout, libc::STDOUT_FILENO) == -1
+                || libc::dup2(streams.stderr, libc::STDERR_FILENO) == -1
+            {
+                fail(plan.report, Step::Stdio);
+            }
         }
         if libc::sigprocmask(libc::SIG_SETMASK, plan.empty_mask, ptr::null_mut()) == -1
             || libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR
@@ -403,20 +435,25 @@ pub(crate) fn read_failure(report: OwnedFd) -> io::Result<Option<ChildFailure>> 
 
 /// A started child: stopped under `ptrace` with the options set and then resumed,
 /// or already exited with a failure to report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Started {
-    /// The child is traced and running towards its program.
-    Running(pid_t),
-    /// The child exited before it came under `ptrace`; the failure pipe says why.
-    Exited,
+    /// The child, with this process ID, is traced and running towards its
+    /// program; the descriptor names it for good, also after its ID is released,
+    /// so the caller can collect it with `sys::reap` once the tracing thread has
+    /// ended, when no wait of the loop collected it.
+    Running(pid_t, OwnedFd),
+    /// The child, with this process ID, exited before it came under `ptrace`; the
+    /// failure pipe says why.
+    Exited(pid_t),
 }
 
 /// Fork the child for `request`, bring it under `ptrace`, set the options, and
 /// resume it.
 ///
 /// Must be called from the thread that will make every later `ptrace` request and
-/// wait for the traced processes. `report` is the write end of the failure pipe;
-/// it is closed in the tracer's process once the child has it.
+/// wait for the traced processes. `stdio` holds the child's standard streams, or
+/// is `None` for a command that keeps the terminal. `report` is the write end of
+/// the failure pipe; it is closed in the tracer's process once the child has it.
 ///
 /// # Errors
 ///
@@ -426,7 +463,7 @@ pub(crate) fn start(
     request: &RunRequest,
     program: &Program,
     filter: &[sock_filter],
-    stdio: &ChildStdio,
+    stdio: Option<&ChildStdio>,
     report: OwnedFd,
 ) -> Result<Started, TraceError> {
     let argv = pointers(&program.args);
@@ -445,11 +482,16 @@ pub(crate) fn start(
     let mut empty_mask: libc::sigset_t = unsafe { mem::zeroed() };
     // SAFETY: `empty_mask` is a valid `sigset_t`.
     unsafe { libc::sigemptyset(&raw mut empty_mask) };
-    let stdout = stdio.stdout.as_raw_fd();
+    let streams = stdio.map(|stdio| {
+        let stdout = stdio.stdout.as_raw_fd();
+        Streams {
+            stdin: stdio.stdin.as_raw_fd(),
+            stdout,
+            stderr: stdio.stderr.as_ref().map_or(stdout, AsRawFd::as_raw_fd),
+        }
+    });
     let plan = ChildPlan {
-        stdin: stdio.stdin.as_raw_fd(),
-        stdout,
-        stderr: stdio.stderr.as_ref().map_or(stdout, AsRawFd::as_raw_fd),
+        streams,
         report: report.as_raw_fd(),
         cwd: program.cwd.as_ptr(),
         path: program.path.as_ptr(),
@@ -472,12 +514,15 @@ pub(crate) fn start(
             program: request.program.clone(),
             source,
             accesses: Accesses::new(),
+            tree: request
+                .tree
+                .then(|| processes::failed_start(None, request, None)),
         });
     }
     let status = sys::wait_for(pid)
         .map_err(|error| tracer_error("could not wait for the child to stop", error))?;
     if !libc::WIFSTOPPED(status) {
-        return Ok(Started::Exited);
+        return Ok(Started::Exited(pid));
     }
     if libc::WSTOPSIG(status) != libc::SIGSTOP {
         abandon(pid);
@@ -489,6 +534,18 @@ pub(crate) fn start(
             source: None,
         });
     }
+    // The child is stopped and not collected, so its ID still names it, and the
+    // descriptor is taken while that holds.
+    let handle = match sys::process_handle(pid) {
+        Ok(handle) => handle,
+        Err(error) => {
+            abandon(pid);
+            return Err(tracer_error(
+                "could not open a descriptor of the child",
+                error,
+            ));
+        },
+    };
     if let Err(error) = sys::set_options(pid, TRACE_OPTIONS) {
         abandon(pid);
         return Err(tracer_error("could not set the ptrace options", error));
@@ -497,11 +554,16 @@ pub(crate) fn start(
         abandon(pid);
         return Err(tracer_error("could not resume the child", error));
     }
-    Ok(Started::Running(pid))
+    Ok(Started::Running(pid, handle))
 }
 
 /// Unit tests for the child's failure reports.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{collections::BTreeMap, ffi::OsString};
 
@@ -519,6 +581,8 @@ mod tests {
             stdin: None,
             capture: CaptureMode::Split,
             echo: false,
+            tree: false,
+            terminal: false,
         }
     }
 
@@ -534,7 +598,7 @@ mod tests {
     fn failures_map_to_the_interface_errors() {
         let request = request("/missing");
         let failure =
-            |step, errno| ChildFailure { step, errno }.into_error(&request, Accesses::new());
+            |step, errno| ChildFailure { step, errno }.into_error(&request, Accesses::new(), None);
         assert!(matches!(
             failure(Step::Exec, libc::ENOENT),
             TraceError::ProgramNotFound { .. }
@@ -566,8 +630,14 @@ mod tests {
             (Step::Exec, libc::EACCES),
             (Step::Exec, libc::E2BIG),
         ] {
-            let error = ChildFailure { step, errno }.into_error(&request, accesses.clone());
+            let tree = processes::failed_start(None, &request, Some(7));
+            let error = ChildFailure { step, errno }.into_error(
+                &request,
+                accesses.clone(),
+                Some(tree.clone()),
+            );
             assert_eq!(error.accesses(), Some(&accesses), "{error}");
+            assert_eq!(error.tree(), Some(&tree), "{error}");
         }
     }
 

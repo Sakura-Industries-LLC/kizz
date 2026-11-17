@@ -23,38 +23,128 @@
  *
  * Run with a mode and the task directory as its arguments, the program is a child
  * that a process of the run started with exec, and it makes only the calls of that
- * mode on paths of its own.
+ * mode on paths of its own. Run as the interpreter of a fixture script, with the
+ * argument `interpreted` first, it makes no call and exits with 0.
+ *
+ * Run with one argument, a mode that starts with `change-`, the program is a step of
+ * the coverage-changes task: it first reads or runs one committed file under
+ * in/changes through the one call of that mode, then rewrites that file with
+ * content of another size, so the step's result is not cached. The `control` mode
+ * instead creates a file under out/changes, reads it and rewrites it, which stays
+ * cached. Each mode touches only its own paths; the modes through the C library,
+ * fopen and execv, are in the portable core, and the others are Linux calls.
  *
  * Linux names some paths through out/linux/made-link, a symbolic link to
  * out/linux/made: a file created through the link is recorded under the link's
  * name, and a later call on out/linux/made, or on a descriptor that names it, is
  * then the only call recorded on that path, so a tracer that missed it would record
  * the path differently.
+ *
+ * Linux also sets the extended attribute user.kizz, only on files that it creates
+ * under out/linux, through out/linux/made-link, before a call reads, lists or
+ * removes it under out/linux/made. It watches paths through an inotify instance and
+ * a fanotify group that it creates itself, and with file_setattr it sets only the
+ * file attributes that file_getattr read.
+ *
+ * Six tracked calls are newer than some kernels that run the test: file_getattr
+ * and file_setattr, which Linux 6.17 added, and getxattrat, listxattrat,
+ * setxattrat and removexattrat, which Linux 6.13 added. Before the Linux section
+ * makes any of them, the program makes each once on /, outside the task directory,
+ * with arguments that the kernel rejects with EINVAL before it looks the path up:
+ * a structure size of 0, or a flag that the call does not accept. So the check can
+ * neither succeed nor change anything, and it records nothing under the task
+ * directory. A call that returns ENOSYS is unavailable: ENOSYS means that the
+ * kernel lacks the call, or that a seccomp filter installed before kizz's own
+ * refuses it. EINVAL means that the call is available; any other result is a
+ * mismatch, and the call then counts as available. For each of the six, in the
+ * order of TRACKED_SYSTEM_CALLS, the program prints "coverage: available: NAME" or
+ * "coverage: unavailable: NAME" before its summary line. It makes the calls of a
+ * group, and creates its files, only where every gated call that the group needs
+ * is available: the group of file_setattr needs file_getattr too, because it sets
+ * only the attributes that file_getattr read. The entries of those groups in
+ * expected.txt name the calls they need.
+ *
+ * Run with one argument that starts with `incomplete-`, the program is a step of
+ * the coverage-incomplete task: it makes only the one call that the mode names, a
+ * call that marks the run as incompletely traced, in a way that changes nothing if
+ * it succeeds, and exits with 0 whatever the call returns. For open_tree_attr and
+ * fchroot, which a kernel may lack, it also prints "coverage: available: NAME", or
+ * "coverage: unavailable: NAME" when the call failed with ENOSYS. With
+ * `unknown-400` or `unknown-1000000`, it makes only that system call, which the
+ * tracer does not know, and exits with 0 whatever it returns; those modes exist only
+ * on x86_64, whose table the numbers belong to.
+ *
+ * The main program also calls unshare without CLONE_NEWNS and setns with another
+ * namespace type, which leave the run completely traced.
+ *
+ * Both sections also bind, connect and send to Unix sockets under their output
+ * directories, the portable core through the C library and the Linux section
+ * through syscall(), and connect and send through UDP sockets to the loopback
+ * addresses on fixed ports, one for each call: the portable core to 127.0.0.1,
+ * the only loopback address that every platform has, and the Linux section to
+ * distinct addresses in 127.0.0.0/8. Connecting a UDP socket and sending a
+ * datagram succeed whether or not anything listens, so the results do not depend
+ * on the machine. Each Unix socket that a send call sends to is a datagram socket
+ * of its own, bound to its own path, so the path of each call has that call as its
+ * only probe.
+ *
+ * The Linux section makes each openat2 with RESOLVE_IN_ROOT through
+ * repeat_while_raced, which repeats it at once while it fails with EAGAIN, up to 100
+ * attempts in all: Linux gives that error when a rename or mount anywhere on the
+ * machine races with a .. step of the lookup, and the tracer records nothing for it.
+ * Before those calls, the program checks the repeat with scripted attempts.
  */
 
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #ifdef __linux__
+#include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/syscall.h>
 #endif
 
 /* The line that the program prints when every call returned what it expected. */
 #define SUCCESS_LINE "coverage: every call returned what it expected"
+
+/*
+ * The mode in which the program, run as the interpreter of the fixture script
+ * in/linux/interp/inner at the end of the chain from in/linux/interp/outer,
+ * makes no call and exits with 0.
+ */
+#define INTERPRETED "interpreted"
+
+/* The start of each mode of the coverage-changes task. */
+#define CHANGE_PREFIX "change-"
+/* The committed inputs of the coverage-changes task. */
+#define CHANGES "in/changes"
+/* The output directory of the control mode of the coverage-changes task. */
+#define CHANGES_OUT "out/changes"
+/* The start of each mode of the coverage-incomplete task for a call that marks the run. */
+#define INCOMPLETE_PREFIX "incomplete-"
+/* The start of each mode of the coverage-incomplete task for a number that the tracer
+ * does not know. */
+#define UNKNOWN_PREFIX "unknown-"
 
 /* Serializes the counters and the output of the threads. */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -87,6 +177,16 @@ static const char *error_name(int error)
         return "EINVAL";
     case EBADF:
         return "EBADF";
+    case ERANGE:
+        return "ERANGE";
+#ifdef ENODATA
+    case ENODATA:
+        return "ENODATA";
+#endif
+#ifdef EOPNOTSUPP
+    case EOPNOTSUPP:
+        return "EOPNOTSUPP";
+#endif
     default:
         return strerror(error);
     }
@@ -210,6 +310,74 @@ static const char *in_task(char *buffer, size_t size, const char *relative)
     return buffer;
 }
 
+/* The payload of every datagram that the program sends. */
+static char payload[] = "kizz";
+
+/* The address of the Unix socket `path`, with its length, its NUL byte included, in `length`. */
+static struct sockaddr_un unix_address(const char *path, socklen_t *length)
+{
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof address.sun_path, "%s", path);
+    *length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(address.sun_path) + 1);
+    return address;
+}
+
+/* The IPv4 address 127.0.0.`last`, a loopback address, with `port`. */
+static struct sockaddr_in loopback(unsigned last, unsigned short port)
+{
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof address);
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl((127u << 24) | last);
+    return address;
+}
+
+/* Open a socket of `domain` and `type`, for `what`, and check the result. */
+static int open_socket(const char *what, int domain, int type)
+{
+    return (int)EXPECT(0, "socket", what, socket(domain, type, 0));
+}
+
+/*
+ * The portable core's sockets, through the C library: a Unix stream socket bound to
+ * out/core/stream.sock that a second socket connects to, a connection to the missing
+ * out/core/missing.sock, and UDP sockets that connect to 127.0.0.1 port 47011 and send
+ * to 127.0.0.1 port 47012.
+ */
+static void core_sockets(void)
+{
+    socklen_t length;
+    struct sockaddr_un stream = unix_address("out/core/stream.sock", &length);
+    int listener = open_socket("out/core/stream.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "bind", "out/core/stream.sock", bind(listener, (struct sockaddr *)&stream, length));
+    EXPECT(0, "listen", "out/core/stream.sock", listen(listener, 1));
+    int client = open_socket("out/core/stream.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "connect", "out/core/stream.sock",
+           connect(client, (struct sockaddr *)&stream, length));
+    close_fd(client);
+    close_fd(listener);
+
+    struct sockaddr_un missing = unix_address("out/core/missing.sock", &length);
+    client = open_socket("out/core/missing.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(ENOENT, "connect", "out/core/missing.sock",
+           connect(client, (struct sockaddr *)&missing, length));
+    close_fd(client);
+
+    struct sockaddr_in connected = loopback(1, 47011);
+    int udp = open_socket("127.0.0.1:47011", AF_INET, SOCK_DGRAM);
+    EXPECT(0, "connect", "127.0.0.1:47011",
+           connect(udp, (struct sockaddr *)&connected, sizeof connected));
+    close_fd(udp);
+    struct sockaddr_in sent = loopback(1, 47012);
+    udp = open_socket("127.0.0.1:47012", AF_INET, SOCK_DGRAM);
+    EXPECT(0, "sendto", "127.0.0.1:47012",
+           sendto(udp, payload, sizeof payload - 1, 0, (struct sockaddr *)&sent, sizeof sent));
+    close_fd(udp);
+}
+
 /* The second thread of the portable core, which makes calls of its own. */
 static void *core_thread(void *argument)
 {
@@ -300,6 +468,9 @@ static void core(void)
     write_stream("out/core/touched");
     EXPECT(0, "utimes", "out/core/touched", utimes("out/core/touched", NULL));
 
+    /* Sockets. */
+    core_sockets();
+
     /* A second thread. */
     pthread_t thread;
     int created = pthread_create(&thread, NULL, core_thread, NULL);
@@ -334,6 +505,8 @@ static void core(void)
 #define MADE "out/linux/made"
 /* A symbolic link to MADE, through which files are created. */
 #define MADE_LINK "out/linux/made-link"
+/* The fixture's #! scripts. */
+#define INTERP "in/linux/interp"
 
 /* A descriptor of in/linux/at. */
 static int in_fd = -1;
@@ -350,6 +523,117 @@ struct open_how_argument {
 /* The resolve flag of openat2 that makes the directory descriptor the root. */
 #ifndef RESOLVE_IN_ROOT
 #define RESOLVE_IN_ROOT 0x10
+#endif
+
+#ifdef SYS_openat2
+/* The most attempts that repeat_while_raced makes of one call. */
+#define RACE_ATTEMPTS 100
+
+/*
+ * Make `attempt` with `argument` at once, and again at once while it fails with
+ * EAGAIN, at most RACE_ATTEMPTS times in all. Store the number of attempts made in
+ * `made` unless it is NULL, and return the last result, with errno as the last
+ * attempt left it.
+ *
+ * Linux fails an openat2 with RESOLVE_IN_ROOT or RESOLVE_BENEATH with EAGAIN when a
+ * rename or mount anywhere on the machine races with a .. step of its lookup, and
+ * openat2(2) lets the caller repeat the call. The tracer records nothing for such a
+ * failure, so a repeated call leaves exactly what one call without the race would
+ * have recorded, and expected.txt holds whether or not a call was repeated.
+ */
+static long repeat_while_raced(long (*attempt)(void *), void *argument, int *made)
+{
+    long result;
+    int attempts = 0;
+    do {
+        errno = 0;
+        result = attempt(argument);
+        attempts++;
+    } while (result < 0 && errno == EAGAIN && attempts < RACE_ATTEMPTS);
+    if (made != NULL) {
+        *made = attempts;
+    }
+    return result;
+}
+
+/* The arguments of an openat2 that scoped_openat2 makes. */
+struct scoped_open {
+    /* The directory descriptor, the root of the lookup. */
+    int dirfd;
+    /* The path to look up. */
+    const char *path;
+    /* The flags and resolution, with RESOLVE_IN_ROOT. */
+    struct open_how_argument *how;
+};
+
+/* Make the openat2 that `argument`, a struct scoped_open, describes, once. */
+static long scoped_openat2(void *argument)
+{
+    const struct scoped_open *call = argument;
+    return syscall(SYS_openat2, call->dirfd, call->path, call->how, sizeof *call->how);
+}
+
+/* A scripted attempt of repeat_while_raced, in place of a system call. */
+struct scripted_attempt {
+    /* How many attempts fail with EAGAIN before the last result. */
+    int raced;
+    /* The result after those: 0 for success, or -1 with `error`. */
+    long last;
+    /* The error number of a last result of -1. */
+    int error;
+    /* The number of attempts made so far. */
+    int made;
+};
+
+/* Make one scripted attempt of `argument`, a struct scripted_attempt. */
+static long scripted(void *argument)
+{
+    struct scripted_attempt *script = argument;
+    script->made++;
+    if (script->made <= script->raced) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (script->last < 0) {
+        errno = script->error;
+    }
+    return script->last;
+}
+
+/*
+ * Check repeat_while_raced with scripted attempts, so that a broken repeat makes
+ * the program report a mismatch: EAGAIN once and then a success gives the success
+ * after 2 attempts, and 99 times and then a success after exactly 100; EAGAIN on
+ * every attempt gives EAGAIN after exactly 100 attempts, with no further attempt;
+ * and ENOENT, or a success, return after 1 attempt. Each result and each number of
+ * attempts is counted through check, and the checks touch no path.
+ */
+static void check_repeat_while_raced(void)
+{
+    static const struct {
+        const char *name;
+        int raced;
+        long last;
+        int error;
+        int expected;
+        int attempts;
+    } cases[] = {
+        {"EAGAIN once, then success", 1, 0, 0, 0, 2},
+        {"EAGAIN 99 times, then success", 99, 0, 0, 0, 100},
+        {"EAGAIN always", 1000, 0, 0, EAGAIN, 100},
+        {"ENOENT", 0, -1, ENOENT, ENOENT, 1},
+        {"success", 0, 0, 0, 0, 1},
+    };
+    for (size_t item = 0; item < sizeof cases / sizeof cases[0]; item++) {
+        struct scripted_attempt script = {cases[item].raced, cases[item].last, cases[item].error,
+                                          0};
+        int made = 0;
+        EXPECT(cases[item].expected, "repeat_while_raced", cases[item].name,
+               repeat_while_raced(scripted, &script, &made));
+        int counted = made == cases[item].attempts && script.made == cases[item].attempts;
+        check("repeat_while_raced attempts", cases[item].name, counted ? 0 : -1, 0, 0);
+    }
+}
 #endif
 
 /* A buffer large enough for every kernel stat structure. */
@@ -463,6 +747,23 @@ static void copy_program(const char *link, const char *path)
     close_fd(to);
 }
 
+/*
+ * Run the fixture script `path` with execve in a child, from the task directory,
+ * and check that the script exits with 0 when `expected` is 0, or else that
+ * execve fails with `expected`.
+ */
+static void run_script(const char *path, int expected)
+{
+    char *arguments[] = {(char *)path, NULL};
+    char *environment[] = {NULL};
+    pid_t pid = start_child(path);
+    if (pid == 0) {
+        EXPECT(expected, "execve", path, syscall(SYS_execve, path, arguments, environment));
+        _exit(expected != 0 && mismatches == 0 ? 0 : 1);
+    }
+    wait_child(path, pid);
+}
+
 /* Opening files: open, openat, openat2 and creat. */
 static void linux_open(void)
 {
@@ -537,12 +838,15 @@ static void linux_open(void)
                            syscall(SYS_openat, AT_FDCWD, "in/linux/root",
                                    O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     struct open_how_argument in_root = {O_RDONLY | O_CLOEXEC, 0, RESOLVE_IN_ROOT};
+    check_repeat_while_raced();
+    struct scoped_open escape = {root, "escape-link", &in_root};
     fd = (int)EXPECT(0, "openat2", "escape-link",
-                     syscall(SYS_openat2, root, "escape-link", &in_root, sizeof in_root));
+                     repeat_while_raced(scoped_openat2, &escape, NULL));
     read_some("escape-link", fd);
     close_fd(fd);
+    struct scoped_open inner = {root, "/inner.txt", &in_root};
     fd = (int)EXPECT(0, "openat2", "/inner.txt",
-                     syscall(SYS_openat2, root, "/inner.txt", &in_root, sizeof in_root));
+                     repeat_while_raced(scoped_openat2, &inner, NULL));
     read_some("/inner.txt", fd);
     close_fd(fd);
     close_fd(root);
@@ -772,6 +1076,15 @@ static void linux_listings_and_processes(void)
                    environment, 0));
 #endif
 
+    /*
+     * #! scripts: the kernel runs in/linux/interp/outer through its interpreter
+     * in/linux/interp/middle, a script whose interpreter in/linux/interp/inner is
+     * a script whose interpreter is the program in the mode INTERPRETED;
+     * in/linux/interp/broken names a missing interpreter.
+     */
+    run_script(INTERP "/outer", 0);
+    run_script(INTERP "/broken", ENOENT);
+
     /* chdir, then a relative path, in a child. */
     pid = start_child("chdir");
     if (pid == 0) {
@@ -998,9 +1311,572 @@ static void linux_changes(void)
     close_fd(fd);
 }
 
-/* The Linux section: every tracked system call, made through syscall(). */
+/* The extended attribute that the Linux section sets, only on files that it creates. */
+#define ATTRIBUTE "user.kizz"
+/* The value of ATTRIBUTE. */
+#define ATTRIBUTE_VALUE "coverage"
+
+/*
+ * The numbers of the calls that older C library headers lack. Each was added after
+ * the system call tables were unified, so it has the same number on every
+ * architecture, as the kernel's x86_64 table and its generic table give it.
+ */
+#ifndef SYS_fchmodat2
+#define SYS_fchmodat2 452
+#endif
+#ifndef SYS_setxattrat
+#define SYS_setxattrat 463
+#endif
+#ifndef SYS_getxattrat
+#define SYS_getxattrat 464
+#endif
+#ifndef SYS_listxattrat
+#define SYS_listxattrat 465
+#endif
+#ifndef SYS_removexattrat
+#define SYS_removexattrat 466
+#endif
+#ifndef SYS_file_getattr
+#define SYS_file_getattr 468
+#endif
+#ifndef SYS_file_setattr
+#define SYS_file_setattr 469
+#endif
+
+/* The class of a fanotify group that an unprivileged process may create since Linux
+ * 5.13: FAN_CLASS_NOTIF (0) with FAN_REPORT_FID, and FAN_CLOEXEC. */
+#define FANOTIFY_CLASS 0x201
+/* FAN_MARK_ADD, which adds a mark. */
+#define FANOTIFY_MARK_ADD 0x1
+/* FAN_OPEN, the event of opening a file. */
+#define FANOTIFY_OPEN 0x20
+/* IN_OPEN, the event of opening a file. */
+#define INOTIFY_OPEN 0x20
+
+/* `struct file_attr`, which file_getattr and file_setattr take: FILE_ATTR_SIZE_VER0 bytes. */
+struct file_attr_argument {
+    uint64_t xflags;
+    uint32_t extsize;
+    uint32_t nextents;
+    uint32_t projid;
+    uint32_t cowextsize;
+};
+
+/* `struct xattr_args`, which the xattrat calls take: where a value is, and its size. */
+struct xattr_args_argument {
+    uint64_t value;
+    uint32_t size;
+    uint32_t flags;
+};
+
+/* `struct file_handle` with room for MAX_HANDLE_SZ bytes of the handle. */
+struct handle_argument {
+    uint32_t bytes;
+    int32_t type;
+    unsigned char handle[128];
+};
+
+/* A buffer for the values and names of extended attributes. */
+static char attribute_buffer[256];
+
+/* Set ATTRIBUTE on the file MADE_LINK/name, which is also MADE/name. */
+static void set_attribute(const char *name)
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, MADE_LINK "/%s", name);
+    EXPECT(0, "setxattr", path,
+           syscall(SYS_setxattr, path, ATTRIBUTE, ATTRIBUTE_VALUE, strlen(ATTRIBUTE_VALUE), 0));
+}
+
+/* Create MADE_LINK/name and set ATTRIBUTE on it. */
+static void make_with_attribute(const char *name)
+{
+    make(name);
+    set_attribute(name);
+}
+
+/* The arguments of an xattrat call whose value is `size` bytes at `value`. */
+static struct xattr_args_argument xattr_args(const void *value, size_t size)
+{
+    struct xattr_args_argument arguments = {(uint64_t)(uintptr_t)value, (uint32_t)size, 0};
+    return arguments;
+}
+
+/*
+ * The tracked calls that a kernel may lack because a newer Linux added them, in
+ * the order of TRACKED_SYSTEM_CALLS.
+ */
+enum gated_call {
+    GATED_FILE_GETATTR,
+    GATED_GETXATTRAT,
+    GATED_LISTXATTRAT,
+    GATED_SETXATTRAT,
+    GATED_REMOVEXATTRAT,
+    GATED_FILE_SETATTR,
+};
+
+/* The number of gated calls. */
+#define GATED_CALLS 6
+
+/* The name of each gated call. */
+static const char *const gated_names[GATED_CALLS] = {
+    "file_getattr", "getxattrat", "listxattrat", "setxattrat", "removexattrat", "file_setattr",
+};
+
+/* Whether each gated call is available, as check_availability found. */
+static int gated_available[GATED_CALLS];
+
+/* A flag that listxattrat and removexattrat do not accept. */
+#define UNACCEPTED_FLAG AT_REMOVEDIR
+
+/* The path of each availability check: the root, outside the task directory. */
+#define CHECKED_PATH "/"
+
+/*
+ * Make the gated call `call` once on CHECKED_PATH with arguments that the kernel
+ * rejects with EINVAL before it looks the path up, where it has the call: a
+ * structure size of 0, or a flag that the call does not accept. The call can
+ * neither succeed nor change anything.
+ */
+static long check_call(enum gated_call call)
+{
+    struct xattr_args_argument arguments = xattr_args(attribute_buffer, sizeof attribute_buffer);
+    struct file_attr_argument attributes;
+    memset(&attributes, 0, sizeof attributes);
+    switch (call) {
+    case GATED_FILE_GETATTR:
+        return syscall(SYS_file_getattr, AT_FDCWD, CHECKED_PATH, &attributes, 0, 0);
+    case GATED_GETXATTRAT:
+        return syscall(SYS_getxattrat, AT_FDCWD, CHECKED_PATH, 0, ATTRIBUTE, &arguments, 0);
+    case GATED_LISTXATTRAT:
+        return syscall(SYS_listxattrat, AT_FDCWD, CHECKED_PATH, UNACCEPTED_FLAG, attribute_buffer,
+                       sizeof attribute_buffer);
+    case GATED_SETXATTRAT:
+        return syscall(SYS_setxattrat, AT_FDCWD, CHECKED_PATH, 0, ATTRIBUTE, &arguments, 0);
+    case GATED_REMOVEXATTRAT:
+        return syscall(SYS_removexattrat, AT_FDCWD, CHECKED_PATH, UNACCEPTED_FLAG, ATTRIBUTE);
+    case GATED_FILE_SETATTR:
+        return syscall(SYS_file_setattr, AT_FDCWD, CHECKED_PATH, &attributes, 0, 0);
+    }
+    /* No other call is gated; a success here would be a mismatch. */
+    return 0;
+}
+
+/*
+ * Check whether each gated call is available: ENOSYS means that the kernel lacks
+ * the call, or that a seccomp filter installed before kizz's own refuses it, so the
+ * call is unavailable, and EINVAL that it is available; any other result is a
+ * mismatch, and the call then counts as available. Print one line for each, in
+ * order.
+ */
+static void check_availability(void)
+{
+    for (int index = 0; index < GATED_CALLS; index++) {
+        errno = 0;
+        long result = check_call((enum gated_call)index);
+        int error = errno;
+        gated_available[index] = !(result < 0 && error == ENOSYS);
+        if (gated_available[index]) {
+            check(gated_names[index], CHECKED_PATH, result, error, EINVAL);
+        }
+    }
+    for (int index = 0; index < GATED_CALLS; index++) {
+        printf("coverage: %s: %s\n", gated_available[index] ? "available" : "unavailable",
+               gated_names[index]);
+    }
+    fflush(stdout);
+}
+
+/*
+ * File systems, file attributes, file handles and watches: statfs and fstatfs,
+ * file_getattr and file_setattr, name_to_handle_at, inotify_add_watch and
+ * fanotify_mark, each on files made through out/linux/made-link.
+ */
+static void linux_file_systems_and_watches(void)
+{
+    struct file_attr_argument attributes;
+    struct handle_argument handle;
+    int mount_id = 0;
+    int fd;
+
+    make("statfs");
+    EXPECT(0, "statfs", MADE "/statfs", syscall(SYS_statfs, MADE "/statfs", &stat_buffer));
+    EXPECT(ENOENT, "statfs", OUT "/statfs-missing",
+           syscall(SYS_statfs, OUT "/statfs-missing", &stat_buffer));
+    fd = make_fd("fstatfs");
+    EXPECT(0, "fstatfs", MADE "/fstatfs", syscall(SYS_fstatfs, fd, &stat_buffer));
+    close_fd(fd);
+
+    /* The group of file_getattr, only where it is available. */
+    memset(&attributes, 0, sizeof attributes);
+    if (gated_available[GATED_FILE_GETATTR]) {
+        make("file_getattr");
+        EXPECT(0, "file_getattr", MADE "/file_getattr",
+               syscall(SYS_file_getattr, AT_FDCWD, MADE "/file_getattr", &attributes,
+                       sizeof attributes, 0));
+        fd = make_fd("file_getattr-empty");
+        EXPECT(0, "file_getattr", MADE "/file_getattr-empty",
+               syscall(SYS_file_getattr, fd, "", &attributes, sizeof attributes, AT_EMPTY_PATH));
+        close_fd(fd);
+        EXPECT(ENOENT, "file_getattr", OUT "/file_getattr-missing",
+               syscall(SYS_file_getattr, AT_FDCWD, OUT "/file_getattr-missing", &attributes,
+                       sizeof attributes, 0));
+    }
+
+    /*
+     * The group of file_setattr, which sets only the attributes that file_getattr
+     * read through the link, only where both calls are available.
+     */
+    if (gated_available[GATED_FILE_GETATTR] && gated_available[GATED_FILE_SETATTR]) {
+        make("file_setattr");
+        EXPECT(0, "file_getattr", MADE_LINK "/file_setattr",
+               syscall(SYS_file_getattr, AT_FDCWD, MADE_LINK "/file_setattr", &attributes,
+                       sizeof attributes, 0));
+        EXPECT(0, "file_setattr", MADE "/file_setattr",
+               syscall(SYS_file_setattr, AT_FDCWD, MADE "/file_setattr", &attributes,
+                       sizeof attributes, 0));
+        EXPECT(ENOENT, "file_setattr", OUT "/file_setattr-missing",
+               syscall(SYS_file_setattr, AT_FDCWD, OUT "/file_setattr-missing", &attributes,
+                       sizeof attributes, 0));
+    }
+
+    make("name_to_handle_at");
+    handle.bytes = sizeof handle.handle;
+    EXPECT(0, "name_to_handle_at", MADE "/name_to_handle_at",
+           syscall(SYS_name_to_handle_at, AT_FDCWD, MADE "/name_to_handle_at", &handle,
+                   &mount_id, 0));
+    handle.bytes = sizeof handle.handle;
+    EXPECT(ENOENT, "name_to_handle_at", OUT "/name_to_handle_at-missing",
+           syscall(SYS_name_to_handle_at, AT_FDCWD, OUT "/name_to_handle_at-missing", &handle,
+                   &mount_id, 0));
+
+    /* Watches, through an inotify instance and a fanotify group of the program's own. */
+    int watcher = (int)EXPECT(0, "inotify_init1", "(none)",
+                              syscall(SYS_inotify_init1, O_CLOEXEC));
+    make("inotify");
+    EXPECT(0, "inotify_add_watch", MADE "/inotify",
+           syscall(SYS_inotify_add_watch, watcher, MADE "/inotify", INOTIFY_OPEN));
+    EXPECT(ENOENT, "inotify_add_watch", OUT "/inotify-missing",
+           syscall(SYS_inotify_add_watch, watcher, OUT "/inotify-missing", INOTIFY_OPEN));
+    close_fd(watcher);
+    int group = (int)EXPECT(0, "fanotify_init", "(none)",
+                            syscall(SYS_fanotify_init, FANOTIFY_CLASS, O_RDONLY | O_CLOEXEC));
+    make("fanotify");
+    EXPECT(0, "fanotify_mark", MADE "/fanotify",
+           syscall(SYS_fanotify_mark, group, FANOTIFY_MARK_ADD, (uint64_t)FANOTIFY_OPEN,
+                   AT_FDCWD, MADE "/fanotify"));
+    EXPECT(ENOENT, "fanotify_mark", OUT "/fanotify-missing",
+           syscall(SYS_fanotify_mark, group, FANOTIFY_MARK_ADD, (uint64_t)FANOTIFY_OPEN,
+                   AT_FDCWD, OUT "/fanotify-missing"));
+    close_fd(group);
+}
+
+/*
+ * Reading and listing extended attributes: getxattr, lgetxattr, fgetxattr and
+ * getxattrat, listxattr, llistxattr, flistxattr and listxattrat, each on a file whose
+ * attribute was set through out/linux/made-link; getxattr also through a link to
+ * such a file, and with ENODATA and ERANGE, which record the xattr kind.
+ */
+static void linux_attribute_reads(void)
+{
+    struct xattr_args_argument arguments = xattr_args(attribute_buffer, sizeof attribute_buffer);
+    int fd;
+
+    make_with_attribute("getxattr");
+    EXPECT(0, "getxattr", MADE "/getxattr",
+           syscall(SYS_getxattr, MADE "/getxattr", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    EXPECT(ENOENT, "getxattr", OUT "/getxattr-missing",
+           syscall(SYS_getxattr, OUT "/getxattr-missing", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    make("getxattr-nodata");
+    EXPECT(ENODATA, "getxattr", MADE "/getxattr-nodata",
+           syscall(SYS_getxattr, MADE "/getxattr-nodata", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    make_with_attribute("getxattr-range");
+    EXPECT(ERANGE, "getxattr", MADE "/getxattr-range",
+           syscall(SYS_getxattr, MADE "/getxattr-range", ATTRIBUTE, attribute_buffer, 1));
+    EXPECT(0, "symlinkat", MADE_LINK "/getxattr-link",
+           syscall(SYS_symlinkat, "getxattr", AT_FDCWD, MADE_LINK "/getxattr-link"));
+    EXPECT(0, "getxattr", MADE "/getxattr-link",
+           syscall(SYS_getxattr, MADE "/getxattr-link", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+
+    make_with_attribute("lgetxattr");
+    EXPECT(0, "lgetxattr", MADE "/lgetxattr",
+           syscall(SYS_lgetxattr, MADE "/lgetxattr", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+    EXPECT(ENOENT, "lgetxattr", OUT "/lgetxattr-missing",
+           syscall(SYS_lgetxattr, OUT "/lgetxattr-missing", ATTRIBUTE, attribute_buffer,
+                   sizeof attribute_buffer));
+
+    fd = make_fd("fgetxattr");
+    set_attribute("fgetxattr");
+    EXPECT(0, "fgetxattr", MADE "/fgetxattr",
+           syscall(SYS_fgetxattr, fd, ATTRIBUTE, attribute_buffer, sizeof attribute_buffer));
+    close_fd(fd);
+
+    /* The group of getxattrat, only where it is available. */
+    if (gated_available[GATED_GETXATTRAT]) {
+        make_with_attribute("getxattrat");
+        EXPECT(0, "getxattrat", MADE "/getxattrat",
+               syscall(SYS_getxattrat, AT_FDCWD, MADE "/getxattrat", 0, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        make_with_attribute("getxattrat-at");
+        EXPECT(0, "getxattrat", "getxattrat-at",
+               syscall(SYS_getxattrat, made_fd, "getxattrat-at", 0, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        fd = make_fd("getxattrat-empty");
+        set_attribute("getxattrat-empty");
+        EXPECT(0, "getxattrat", MADE "/getxattrat-empty",
+               syscall(SYS_getxattrat, fd, "", AT_EMPTY_PATH, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        close_fd(fd);
+        EXPECT(ENOENT, "getxattrat", OUT "/getxattrat-missing",
+               syscall(SYS_getxattrat, AT_FDCWD, OUT "/getxattrat-missing", 0, ATTRIBUTE,
+                       &arguments, sizeof arguments));
+    }
+
+    make_with_attribute("listxattr");
+    EXPECT(0, "listxattr", MADE "/listxattr",
+           syscall(SYS_listxattr, MADE "/listxattr", attribute_buffer, sizeof attribute_buffer));
+    EXPECT(ENOENT, "listxattr", OUT "/listxattr-missing",
+           syscall(SYS_listxattr, OUT "/listxattr-missing", attribute_buffer,
+                   sizeof attribute_buffer));
+    make_with_attribute("llistxattr");
+    EXPECT(0, "llistxattr", MADE "/llistxattr",
+           syscall(SYS_llistxattr, MADE "/llistxattr", attribute_buffer,
+                   sizeof attribute_buffer));
+    EXPECT(ENOENT, "llistxattr", OUT "/llistxattr-missing",
+           syscall(SYS_llistxattr, OUT "/llistxattr-missing", attribute_buffer,
+                   sizeof attribute_buffer));
+    fd = make_fd("flistxattr");
+    set_attribute("flistxattr");
+    EXPECT(0, "flistxattr", MADE "/flistxattr",
+           syscall(SYS_flistxattr, fd, attribute_buffer, sizeof attribute_buffer));
+    close_fd(fd);
+    /* The group of listxattrat, only where it is available. */
+    if (gated_available[GATED_LISTXATTRAT]) {
+        make_with_attribute("listxattrat");
+        EXPECT(0, "listxattrat", MADE "/listxattrat",
+               syscall(SYS_listxattrat, AT_FDCWD, MADE "/listxattrat", 0, attribute_buffer,
+                       sizeof attribute_buffer));
+        EXPECT(ENOENT, "listxattrat", OUT "/listxattrat-missing",
+               syscall(SYS_listxattrat, AT_FDCWD, OUT "/listxattrat-missing", 0,
+                       attribute_buffer, sizeof attribute_buffer));
+    }
+}
+
+/*
+ * Changing extended attributes, the mode with fchmodat2, and the allocation with
+ * fallocate: setxattr, lsetxattr, fsetxattr and setxattrat set ATTRIBUTE on files
+ * made through out/linux/made-link, and removexattr, lremovexattr, fremovexattr and
+ * removexattrat remove it from files on which it was set through the link.
+ */
+static void linux_attribute_changes(void)
+{
+    size_t length = strlen(ATTRIBUTE_VALUE);
+    struct xattr_args_argument arguments = xattr_args(ATTRIBUTE_VALUE, length);
+    int fd;
+
+    make("setxattr");
+    EXPECT(0, "setxattr", MADE "/setxattr",
+           syscall(SYS_setxattr, MADE "/setxattr", ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    EXPECT(ENOENT, "setxattr", OUT "/setxattr-missing",
+           syscall(SYS_setxattr, OUT "/setxattr-missing", ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    make("lsetxattr");
+    EXPECT(0, "lsetxattr", MADE "/lsetxattr",
+           syscall(SYS_lsetxattr, MADE "/lsetxattr", ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    EXPECT(ENOENT, "lsetxattr", OUT "/lsetxattr-missing",
+           syscall(SYS_lsetxattr, OUT "/lsetxattr-missing", ATTRIBUTE, ATTRIBUTE_VALUE, length,
+                   0));
+    fd = make_fd("fsetxattr");
+    EXPECT(0, "fsetxattr", MADE "/fsetxattr",
+           syscall(SYS_fsetxattr, fd, ATTRIBUTE, ATTRIBUTE_VALUE, length, 0));
+    close_fd(fd);
+    /* The group of setxattrat, only where it is available. */
+    if (gated_available[GATED_SETXATTRAT]) {
+        make("setxattrat");
+        EXPECT(0, "setxattrat", MADE "/setxattrat",
+               syscall(SYS_setxattrat, AT_FDCWD, MADE "/setxattrat", 0, ATTRIBUTE, &arguments,
+                       sizeof arguments));
+        EXPECT(ENOENT, "setxattrat", OUT "/setxattrat-missing",
+               syscall(SYS_setxattrat, AT_FDCWD, OUT "/setxattrat-missing", 0, ATTRIBUTE,
+                       &arguments, sizeof arguments));
+    }
+
+    make_with_attribute("removexattr");
+    EXPECT(0, "removexattr", MADE "/removexattr",
+           syscall(SYS_removexattr, MADE "/removexattr", ATTRIBUTE));
+    EXPECT(ENOENT, "removexattr", OUT "/removexattr-missing",
+           syscall(SYS_removexattr, OUT "/removexattr-missing", ATTRIBUTE));
+    make_with_attribute("lremovexattr");
+    EXPECT(0, "lremovexattr", MADE "/lremovexattr",
+           syscall(SYS_lremovexattr, MADE "/lremovexattr", ATTRIBUTE));
+    EXPECT(ENOENT, "lremovexattr", OUT "/lremovexattr-missing",
+           syscall(SYS_lremovexattr, OUT "/lremovexattr-missing", ATTRIBUTE));
+    fd = make_fd("fremovexattr");
+    set_attribute("fremovexattr");
+    EXPECT(0, "fremovexattr", MADE "/fremovexattr", syscall(SYS_fremovexattr, fd, ATTRIBUTE));
+    close_fd(fd);
+    /* The group of removexattrat, only where it is available. */
+    if (gated_available[GATED_REMOVEXATTRAT]) {
+        make_with_attribute("removexattrat");
+        EXPECT(0, "removexattrat", MADE "/removexattrat",
+               syscall(SYS_removexattrat, AT_FDCWD, MADE "/removexattrat", 0, ATTRIBUTE));
+        EXPECT(ENOENT, "removexattrat", OUT "/removexattrat-missing",
+               syscall(SYS_removexattrat, AT_FDCWD, OUT "/removexattrat-missing", 0,
+                       ATTRIBUTE));
+    }
+
+    make("fchmodat2");
+    EXPECT(0, "fchmodat2", MADE "/fchmodat2",
+           syscall(SYS_fchmodat2, AT_FDCWD, MADE "/fchmodat2", 0600, 0));
+    fd = make_fd("fchmodat2-empty");
+    EXPECT(0, "fchmodat2", MADE "/fchmodat2-empty",
+           syscall(SYS_fchmodat2, fd, "", 0600, AT_EMPTY_PATH));
+    close_fd(fd);
+    EXPECT(ENOENT, "fchmodat2", OUT "/fchmodat2-missing",
+           syscall(SYS_fchmodat2, AT_FDCWD, OUT "/fchmodat2-missing", 0600, 0));
+
+    fd = make_fd("fallocate");
+    EXPECT(0, "fallocate", MADE "/fallocate", syscall(SYS_fallocate, fd, 0, 0, 4096));
+    close_fd(fd);
+}
+
+/*
+ * Calls that would mark the run with other arguments but leave it complete with
+ * these: unshare without CLONE_NEWNS, and setns with another namespace type on an
+ * invalid descriptor. Their results do not matter, because an environment may
+ * forbid them, so they are not checked.
+ */
+static void linux_namespaces(void)
+{
+    (void)syscall(SYS_unshare, CLONE_FILES);
+    (void)syscall(SYS_setns, -1, CLONE_NEWUTS);
+}
+
+/*
+ * Send the payload from the socket `fd` to `address`, `length` bytes long, named `what`, with the
+ * system call `call`, sendto, sendmsg or sendmmsg with one message, through syscall(), and check
+ * the result against `expected`.
+ */
+static void send_with(const char *call, int fd, const void *address, socklen_t length,
+                      const char *what, int expected)
+{
+    struct iovec vector = {payload, sizeof payload - 1};
+    struct mmsghdr messages[1];
+    memset(messages, 0, sizeof messages);
+    messages[0].msg_hdr.msg_name = (void *)address;
+    messages[0].msg_hdr.msg_namelen = length;
+    messages[0].msg_hdr.msg_iov = &vector;
+    messages[0].msg_hdr.msg_iovlen = 1;
+    if (strcmp(call, "sendto") == 0) {
+        EXPECT(expected, call, what,
+               syscall(SYS_sendto, fd, payload, sizeof payload - 1, 0, address, length));
+    } else if (strcmp(call, "sendmsg") == 0) {
+        EXPECT(expected, call, what, syscall(SYS_sendmsg, fd, &messages[0].msg_hdr, 0));
+    } else {
+        EXPECT(expected, call, what, syscall(SYS_sendmmsg, fd, messages, 1, 0));
+    }
+}
+
+/*
+ * Bind a datagram socket to OUT/CALL.sock and send to it with `call`, then send to the missing
+ * OUT/CALL-missing.sock, which fails with ENOENT.
+ */
+static void unix_datagrams(const char *call)
+{
+    char path[64];
+    char missing_path[64];
+    snprintf(path, sizeof path, OUT "/%s.sock", call);
+    snprintf(missing_path, sizeof missing_path, OUT "/%s-missing.sock", call);
+    socklen_t length;
+    struct sockaddr_un address = unix_address(path, &length);
+    int receiver = open_socket(path, AF_UNIX, SOCK_DGRAM);
+    EXPECT(0, "bind", path, syscall(SYS_bind, receiver, &address, length));
+    int sender = open_socket(path, AF_UNIX, SOCK_DGRAM);
+    send_with(call, sender, &address, length, path, 0);
+    socklen_t missing_length;
+    struct sockaddr_un missing = unix_address(missing_path, &missing_length);
+    send_with(call, sender, &missing, missing_length, missing_path, ENOENT);
+    close_fd(sender);
+    close_fd(receiver);
+}
+
+/*
+ * Sockets: bind, connect, sendto, sendmsg and sendmmsg, each through syscall(), on Unix sockets
+ * under OUT, with a missing path for each, and through UDP sockets to 127.0.0.21 through
+ * 127.0.0.25, one address for each call and port 47021 through 47025.
+ */
+static void linux_sockets(void)
+{
+    socklen_t length;
+    struct sockaddr_un bound = unix_address(OUT "/bound.sock", &length);
+    int listener = open_socket(OUT "/bound.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "bind", OUT "/bound.sock", syscall(SYS_bind, listener, &bound, length));
+    EXPECT(0, "listen", OUT "/bound.sock", listen(listener, 1));
+    int client = open_socket(OUT "/bound.sock", AF_UNIX, SOCK_STREAM);
+    EXPECT(0, "connect", OUT "/bound.sock", syscall(SYS_connect, client, &bound, length));
+    close_fd(client);
+    close_fd(listener);
+
+    client = open_socket(OUT "/no-dir/bind.sock", AF_UNIX, SOCK_STREAM);
+    struct sockaddr_un missing = unix_address(OUT "/no-dir/bind.sock", &length);
+    EXPECT(ENOENT, "bind", OUT "/no-dir/bind.sock", syscall(SYS_bind, client, &missing, length));
+    missing = unix_address(OUT "/connect-missing.sock", &length);
+    EXPECT(ENOENT, "connect", OUT "/connect-missing.sock",
+           syscall(SYS_connect, client, &missing, length));
+    close_fd(client);
+
+    unix_datagrams("sendto");
+    unix_datagrams("sendmsg");
+    unix_datagrams("sendmmsg");
+
+    struct sockaddr_in address = loopback(21, 47021);
+    int udp = open_socket("127.0.0.21:47021", AF_INET, SOCK_DGRAM);
+    EXPECT(0, "connect", "127.0.0.21:47021",
+           syscall(SYS_connect, udp, &address, sizeof address));
+    close_fd(udp);
+    address = loopback(22, 47022);
+    udp = open_socket("127.0.0.22:47022", AF_INET, SOCK_DGRAM);
+    send_with("sendto", udp, &address, sizeof address, "127.0.0.22:47022", 0);
+    close_fd(udp);
+    address = loopback(23, 47023);
+    udp = open_socket("127.0.0.23:47023", AF_INET, SOCK_DGRAM);
+    send_with("sendmsg", udp, &address, sizeof address, "127.0.0.23:47023", 0);
+    close_fd(udp);
+
+    /* sendmmsg sends two messages, to two addresses. */
+    struct sockaddr_in first = loopback(24, 47024);
+    struct sockaddr_in second = loopback(25, 47025);
+    struct iovec vector = {payload, sizeof payload - 1};
+    struct mmsghdr messages[2];
+    memset(messages, 0, sizeof messages);
+    messages[0].msg_hdr.msg_name = &first;
+    messages[0].msg_hdr.msg_namelen = sizeof first;
+    messages[1].msg_hdr.msg_name = &second;
+    messages[1].msg_hdr.msg_namelen = sizeof second;
+    for (int index = 0; index < 2; index++) {
+        messages[index].msg_hdr.msg_iov = &vector;
+        messages[index].msg_hdr.msg_iovlen = 1;
+    }
+    udp = open_socket("127.0.0.24:47024", AF_INET, SOCK_DGRAM);
+    long sent = EXPECT(0, "sendmmsg", "127.0.0.24:47024 and 127.0.0.25:47025",
+                       syscall(SYS_sendmmsg, udp, messages, 2, 0));
+    if (sent >= 0 && sent != 2) {
+        check("sendmmsg", "127.0.0.24:47024 and 127.0.0.25:47025", -1, 0, 0);
+    }
+    close_fd(udp);
+}
+
+/*
+ * The Linux section: every tracked system call, made through syscall(), after the
+ * check of the gated calls, whose groups it makes only where they are available.
+ */
 static void linux_section(void)
 {
+    check_availability();
     EXPECT(0, "mkdirat", OUT, syscall(SYS_mkdirat, AT_FDCWD, OUT, 0777));
     EXPECT(0, "mkdirat", MADE, syscall(SYS_mkdirat, AT_FDCWD, MADE, 0777));
     EXPECT(0, "symlinkat", MADE_LINK, syscall(SYS_symlinkat, "made", AT_FDCWD, MADE_LINK));
@@ -1016,6 +1892,11 @@ static void linux_section(void)
     linux_listings_and_processes();
     linux_names();
     linux_changes();
+    linux_file_systems_and_watches();
+    linux_attribute_reads();
+    linux_attribute_changes();
+    linux_namespaces();
+    linux_sockets();
 
 #ifdef SYS_io_uring_setup
     /* io_uring would bypass the tracer, so it is not available. */
@@ -1028,7 +1909,128 @@ static void linux_section(void)
     close_fd(made_fd);
 }
 
+/* Run the fixture script `path` with execveat from the working directory in a child. */
+static void run_script_at(const char *path)
+{
+    char *arguments[] = {(char *)path, NULL};
+    char *environment[] = {NULL};
+    pid_t pid = start_child(path);
+    if (pid == 0) {
+#ifdef SYS_execveat
+        EXPECT(0, "execveat", path,
+               syscall(SYS_execveat, AT_FDCWD, path, arguments, environment, 0));
+#else
+        check("execveat", path, -1, ENOSYS, 0);
 #endif
+        _exit(1);
+    }
+    wait_child(path, pid);
+}
+
+/*
+ * The Linux modes of the coverage-changes task: each first reads or runs its
+ * committed file under in/changes through one Linux call, then rewrites the file
+ * that it read or ran. Return whether `mode` is one of them.
+ */
+static int linux_change(const char *mode)
+{
+    int fd;
+    if (strcmp(mode, "open") == 0) {
+#ifdef SYS_open
+        fd = (int)EXPECT(0, "open", CHANGES "/open.txt",
+                         syscall(SYS_open, CHANGES "/open.txt", O_RDONLY | O_CLOEXEC));
+        read_some(CHANGES "/open.txt", fd);
+        close_fd(fd);
+#else
+        check("open", CHANGES "/open.txt", -1, ENOSYS, 0);
+#endif
+        write_stream(CHANGES "/open.txt");
+        return 1;
+    }
+    if (strcmp(mode, "openat") == 0) {
+        read_at(AT_FDCWD, CHANGES "/openat.txt");
+        write_stream(CHANGES "/openat.txt");
+        return 1;
+    }
+    if (strcmp(mode, "openat2") == 0) {
+#ifdef SYS_openat2
+        struct open_how_argument how = {O_RDONLY | O_CLOEXEC, 0, 0};
+        fd = (int)EXPECT(0, "openat2", CHANGES "/openat2.txt",
+                         syscall(SYS_openat2, AT_FDCWD, CHANGES "/openat2.txt", &how, sizeof how));
+        read_some(CHANGES "/openat2.txt", fd);
+        close_fd(fd);
+#else
+        check("openat2", CHANGES "/openat2.txt", -1, ENOSYS, 0);
+#endif
+        write_stream(CHANGES "/openat2.txt");
+        return 1;
+    }
+    if (strcmp(mode, "execve") == 0) {
+        run_script(CHANGES "/execve", 0);
+        write_stream(CHANGES "/execve");
+        return 1;
+    }
+    if (strcmp(mode, "execveat") == 0) {
+        run_script_at(CHANGES "/execveat");
+        write_stream(CHANGES "/execveat");
+        return 1;
+    }
+    if (strcmp(mode, "interpreter") == 0) {
+        /* The kernel runs the script through in/changes/interpreter, a script itself. */
+        run_script(CHANGES "/through-interpreter", 0);
+        write_stream(CHANGES "/interpreter");
+        return 1;
+    }
+    return 0;
+}
+
+#endif
+
+/* Run the fixture script `path` with the C library's execv in a child, and wait for it. */
+static void run_execv(const char *path)
+{
+    char *arguments[] = {(char *)path, NULL};
+    pid_t pid = start_child(path);
+    if (pid == 0) {
+        EXPECT(0, "execv", path, execv(path, arguments));
+        _exit(1);
+    }
+    wait_child(path, pid);
+}
+
+/*
+ * A step of the coverage-changes task in `mode`, without its prefix: the portable
+ * modes, which read or run their committed file through the C library and then
+ * rewrite it, the control, which writes its file before it reads it, and on Linux
+ * the modes of linux_change.
+ */
+static void change(const char *mode)
+{
+    if (strcmp(mode, "fopen") == 0) {
+        read_stream(CHANGES "/fopen.txt");
+        write_stream(CHANGES "/fopen.txt");
+        return;
+    }
+    if (strcmp(mode, "execv") == 0) {
+        run_execv(CHANGES "/execv");
+        write_stream(CHANGES "/execv");
+        return;
+    }
+    if (strcmp(mode, "control") == 0) {
+        EXPECT(0, "mkdir", "out", mkdir("out", 0777));
+        EXPECT(0, "mkdir", CHANGES_OUT, mkdir(CHANGES_OUT, 0777));
+        write_stream(CHANGES_OUT "/control");
+        read_stream(CHANGES_OUT "/control");
+        write_stream(CHANGES_OUT "/control");
+        return;
+    }
+#ifdef __linux__
+    if (linux_change(mode)) {
+        return;
+    }
+#endif
+    check("change", mode, -1, EINVAL, 0);
+}
 
 /* The calls of a child in `mode`, which an exec started. */
 static void child(const char *mode)
@@ -1047,15 +2049,256 @@ static void child(const char *mode)
 #endif
 }
 
+#ifdef __linux__
+
+/* A path that names nothing in the task directory, for the calls that take one. */
+#define MISSING "in/incomplete/missing"
+
+/* The numbers of the calls that older C library headers lack, as the kernel's
+ * x86_64 table and its generic table give them. */
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+#ifndef SYS_fsopen
+#define SYS_fsopen 430
+#endif
+#ifndef SYS_fsconfig
+#define SYS_fsconfig 431
+#endif
+#ifndef SYS_fsmount
+#define SYS_fsmount 432
+#endif
+#ifndef SYS_fspick
+#define SYS_fspick 433
+#endif
+#ifndef SYS_clone3
+#define SYS_clone3 435
+#endif
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+#ifndef SYS_quotactl_fd
+#define SYS_quotactl_fd 443
+#endif
+#ifndef SYS_open_tree_attr
+#define SYS_open_tree_attr 467
+#endif
+#ifndef SYS_fchroot
+#define SYS_fchroot 472
+#endif
+
+/* QCMD(Q_GETFMT, USRQUOTA): read the quota format of a file system. */
+#define QUOTA_GET_FORMAT 0x80000400
+
+/* `struct clone_args`, which clone3 takes: CLONE_ARGS_SIZE_VER0 bytes. */
+struct clone_args_argument {
+    uint64_t flags;
+    uint64_t pidfd;
+    uint64_t child_tid;
+    uint64_t parent_tid;
+    uint64_t exit_signal;
+    uint64_t stack;
+    uint64_t stack_size;
+    uint64_t tls;
+};
+
+/*
+ * Make the call `call` of the coverage-incomplete task in a way that changes
+ * nothing if it succeeds: on a missing path, an invalid descriptor or handle, or
+ * with flags that the kernel rejects before it acts. Set `*known` when `call` is one
+ * of them, and return the call's result.
+ */
+static long incomplete_call(const char *call, int *known)
+{
+    struct handle_argument handle;
+    struct clone_args_argument clone_args;
+    memset(&handle, 0, sizeof handle);
+    memset(&clone_args, 0, sizeof clone_args);
+    /* The kernel rejects a new mount namespace that shares its file system information. */
+    clone_args.flags = CLONE_NEWNS | CLONE_FS;
+    *known = 1;
+    if (strcmp(call, "open_by_handle_at") == 0) {
+        return syscall(SYS_open_by_handle_at, -1, &handle, O_RDONLY);
+    }
+    if (strcmp(call, "chroot") == 0) {
+        return syscall(SYS_chroot, MISSING);
+    }
+    if (strcmp(call, "fchroot") == 0) {
+        return syscall(SYS_fchroot, -1);
+    }
+    if (strcmp(call, "pivot_root") == 0) {
+        return syscall(SYS_pivot_root, MISSING, MISSING);
+    }
+    if (strcmp(call, "mount") == 0) {
+        return syscall(SYS_mount, MISSING, MISSING, "none", 0, NULL);
+    }
+    if (strcmp(call, "umount2") == 0) {
+        return syscall(SYS_umount2, MISSING, 0);
+    }
+    if (strcmp(call, "fsopen") == 0) {
+        return syscall(SYS_fsopen, "kizz-no-such-file-system", 0);
+    }
+    if (strcmp(call, "fsconfig") == 0) {
+        return syscall(SYS_fsconfig, -1, 0, "ro", NULL, 0);
+    }
+    if (strcmp(call, "fsmount") == 0) {
+        return syscall(SYS_fsmount, -1, 0, 0);
+    }
+    if (strcmp(call, "fspick") == 0) {
+        return syscall(SYS_fspick, AT_FDCWD, MISSING, 0);
+    }
+    if (strcmp(call, "move_mount") == 0) {
+        return syscall(SYS_move_mount, AT_FDCWD, MISSING, AT_FDCWD, MISSING, 0);
+    }
+    if (strcmp(call, "open_tree") == 0) {
+        return syscall(SYS_open_tree, AT_FDCWD, MISSING, 0);
+    }
+    if (strcmp(call, "open_tree_attr") == 0) {
+        return syscall(SYS_open_tree_attr, AT_FDCWD, MISSING, 0, NULL, 0);
+    }
+    if (strcmp(call, "mount_setattr") == 0) {
+        return syscall(SYS_mount_setattr, -1, "", AT_EMPTY_PATH, NULL, 0);
+    }
+    if (strcmp(call, "unshare") == 0) {
+        /* CLONE_VFORK is not a flag of unshare, so the kernel rejects the call. */
+        return syscall(SYS_unshare, CLONE_NEWNS | CLONE_VFORK);
+    }
+    if (strcmp(call, "setns") == 0) {
+        return syscall(SYS_setns, -1, CLONE_NEWNS);
+    }
+    if (strcmp(call, "clone") == 0) {
+        return syscall(SYS_clone, CLONE_NEWNS | CLONE_FS | SIGCHLD, 0, 0, 0, 0);
+    }
+    if (strcmp(call, "clone3") == 0) {
+        /* A size of 0 is smaller than any struct clone_args, which the kernel rejects. */
+        return syscall(SYS_clone3, &clone_args, 0);
+    }
+#ifdef SYS_uselib
+    if (strcmp(call, "uselib") == 0) {
+        return syscall(SYS_uselib, MISSING);
+    }
+#endif
+    if (strcmp(call, "acct") == 0) {
+        return syscall(SYS_acct, MISSING);
+    }
+    if (strcmp(call, "quotactl") == 0) {
+        return syscall(SYS_quotactl, QUOTA_GET_FORMAT, MISSING, 0, attribute_buffer);
+    }
+    if (strcmp(call, "quotactl_fd") == 0) {
+        return syscall(SYS_quotactl_fd, -1, QUOTA_GET_FORMAT, 0, attribute_buffer);
+    }
+    if (strcmp(call, "swapon") == 0) {
+        return syscall(SYS_swapon, MISSING, 0);
+    }
+    if (strcmp(call, "swapoff") == 0) {
+        return syscall(SYS_swapoff, MISSING);
+    }
+    *known = 0;
+    return -1;
+}
+
+/*
+ * A step of the coverage-incomplete task: make the one call `call`, which marks the
+ * run as incompletely traced, and exit with 0 whatever it returns. For
+ * open_tree_attr and fchroot, which a kernel may lack, also print whether the call
+ * is available: it is unavailable when it failed with ENOSYS, because the kernel
+ * lacks it or a seccomp filter installed before kizz's own refuses it.
+ */
+static int incomplete(const char *call)
+{
+    int known = 0;
+    errno = 0;
+    long result = incomplete_call(call, &known);
+    int error = errno;
+    if (!known) {
+        fprintf(stderr, "coverage: %s is not a call of the coverage-incomplete task\n", call);
+        return 2;
+    }
+    if (strcmp(call, "open_tree_attr") == 0 || strcmp(call, "fchroot") == 0) {
+        printf("coverage: %s: %s\n",
+               result < 0 && error == ENOSYS ? "unavailable" : "available", call);
+    }
+    printf("coverage: made %s: %s\n", call, result < 0 ? error_name(error) : "success");
+    return 0;
+}
+
+/*
+ * A step of the coverage-incomplete task: make the system call `number`, 400 or
+ * 1000000, which the tracer does not know, and exit with 0 whatever it returns. The
+ * numbers belong to the x86_64 table, so the mode exists only there.
+ */
+static int unknown(const char *number)
+{
+#ifdef __x86_64__
+    long call = 0;
+    if (strcmp(number, "400") == 0) {
+        call = 400;
+    } else if (strcmp(number, "1000000") == 0) {
+        call = 1000000;
+    } else {
+        fprintf(stderr, "coverage: %s is not a number of the coverage-incomplete task\n", number);
+        return 2;
+    }
+    errno = 0;
+    long result = syscall(call);
+    int error = errno;
+    printf("coverage: made system call %ld: %s\n", call, result < 0 ? error_name(error) : "success");
+    return 0;
+#else
+    fprintf(stderr, "coverage: system call %s belongs to the x86_64 table\n", number);
+    return 2;
+#endif
+}
+
+#else
+
+/* The coverage-incomplete task makes Linux calls only. */
+static int incomplete(const char *call)
+{
+    fprintf(stderr, "coverage: %s is a Linux call\n", call);
+    return 2;
+}
+
+/* The coverage-incomplete task makes Linux calls only. */
+static int unknown(const char *number)
+{
+    fprintf(stderr, "coverage: system call %s belongs to the x86_64 table of Linux\n", number);
+    return 2;
+}
+
+#endif
+
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && strcmp(argv[1], INTERPRETED) == 0) {
+        return 0;
+    }
     if (argc == 3) {
         snprintf(task_dir, sizeof task_dir, "%s", argv[2]);
         child(argv[1]);
         return mismatches == 0 ? 0 : 1;
     }
+    if (argc == 2 && strncmp(argv[1], INCOMPLETE_PREFIX, strlen(INCOMPLETE_PREFIX)) == 0) {
+        return incomplete(argv[1] + strlen(INCOMPLETE_PREFIX));
+    }
+    if (argc == 2 && strncmp(argv[1], UNKNOWN_PREFIX, strlen(UNKNOWN_PREFIX)) == 0) {
+        return unknown(argv[1] + strlen(UNKNOWN_PREFIX));
+    }
+    if (argc == 2 && strncmp(argv[1], CHANGE_PREFIX, strlen(CHANGE_PREFIX)) == 0) {
+        change(argv[1] + strlen(CHANGE_PREFIX));
+        if (mismatches != 0) {
+            printf("coverage: %ld of %ld checks failed\n", mismatches, checks);
+            return 1;
+        }
+        printf(SUCCESS_LINE ", %ld checks\n", checks);
+        return 0;
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: coverage, or coverage MODE TASK-DIRECTORY\n");
+        fprintf(stderr, "usage: coverage [change-MODE | incomplete-CALL | unknown-NUMBER | MODE "
+                        "TASK-DIRECTORY]\n");
         return 2;
     }
     if (getcwd(task_dir, sizeof task_dir) == NULL) {

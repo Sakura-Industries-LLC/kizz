@@ -134,13 +134,18 @@ pub struct Selected<'tasks> {
 
 /// Unit tests for target names, expressions, and selection.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::path::PathBuf;
 
     use kizz_store::TaskId;
 
     use super::{TargetExpr, TargetExprError, is_valid_target};
-    use crate::tasks::Task;
+    use crate::tasks::{Task, TaskOptions};
 
     /// A task in `kizz.md` at `index`, tagged with `targets`.
     fn task(
@@ -156,6 +161,7 @@ mod tests {
             line: 1,
             heading: None,
             targets: targets.iter().map(|&target| target.to_owned()).collect(),
+            options: TaskOptions::default(),
             source: String::new(),
         }
     }

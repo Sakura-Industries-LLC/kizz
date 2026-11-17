@@ -1,0 +1,367 @@
+//! Crash-consistency tests.
+//!
+//! These tests verify the on-disk write barrier: an SST's data (and metadata)
+//! must be durable BEFORE the manifest durably references it. Power loss is
+//! simulated at the filesystem-contract level: after a crash, a file that was
+//! never fsynced may legally come back empty (ext4/XFS delayed allocation),
+//! while fsynced files must survive intact. The `vfs::sync_tracker` ledger
+//! records which files were made durable via `vfs::fsync_file`.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use tempdir::TempDir;
+use test_log::test;
+
+use super::{sfs, tfs};
+use crate::batch::Batch;
+use crate::compaction::leveled::Strategy;
+use crate::ring::PipelineHook;
+use crate::vfs::sync_tracker;
+use crate::{Error, Options, Tree};
+
+/// Truncates a file to zero bytes, the way a power loss can when the file's
+/// data was never fsynced.
+fn simulate_data_loss(path: &std::path::Path) {
+	sfs::OpenOptions::new().write(true).open(path).unwrap().set_len(0).unwrap();
+}
+
+/// Test for https://github.com/surrealdb/surrealdb/issues/7426
+///
+/// Compaction writes its output SST, the (fsynced) manifest then references
+/// it, and the input tables are unlinked. If the output SST is not fsynced
+/// before the manifest commit, a power loss shortly after a compaction leaves
+/// a durable manifest referencing a 0-byte SST: the store refuses to open
+/// with `LoadManifestFail("...file size is too small: 0 bytes...")` and the
+/// merged data is unrecoverable (inputs deleted, covering WAL long gone).
+///
+/// A further batch is flushed after the compaction so the manifest also
+/// references a newer flush-created table, mirroring the on-disk state in
+/// the report: a 0-byte compaction output (table 5 there) alongside an
+/// intact flush output (the 1064-byte table 6 there).
+///
+/// NOTE: must stay on the default current-thread runtime (no `multi_thread`),
+/// and there must be no `.await` between `drop(tree)` and reopen, so that the
+/// best-effort async close spawned by `Drop` is never polled.
+#[test(tokio::test)]
+async fn power_loss_after_compaction_must_not_lose_synced_data() {
+	if tfs::skip_listed() {
+		return;
+	}
+	let temp_dir = TempDir::new("test").unwrap();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = Arc::new(Options {
+		path,
+		// Compact as soon as two L0 tables exist.
+		level0_max_files: 2,
+		// Crash semantics: nothing may be flushed on drop/close.
+		flush_on_close: false,
+		..Default::default()
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Two batches, two flushes -> two L0 tables (fsynced by the flush path).
+	for batch in 0..2u32 {
+		let mut txn = tree.begin().unwrap();
+		for i in 0..100u32 {
+			let key = format!("key_{batch:02}_{i:03}");
+			let value = format!("value_{batch:02}_{i:03}");
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+		}
+		txn.commit().await.unwrap();
+		tree.flush().unwrap();
+	}
+
+	let l0_ids: Vec<u64> = {
+		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		manifest.levels.get_levels()[0].tables.iter().map(|t| t.id).collect()
+	};
+	assert_eq!(l0_ids.len(), 2, "expected two L0 tables before compaction");
+
+	// Merge both L0 tables into one L1 table.
+	tree.compact(Arc::new(Strategy::from_options(Arc::clone(&opts)))).unwrap();
+
+	// Don't trust Ok(()) — a Skip decision also returns Ok. Assert post-state.
+	let output_id = {
+		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		let levels = manifest.levels.get_levels();
+		assert!(levels[0].tables.is_empty(), "L0 should be empty after compaction");
+		assert_eq!(levels[1].tables.len(), 1, "L1 should hold the compaction output");
+		levels[1].tables[0].id
+	};
+
+	// Blast radius: the pre-merge tables are already unlinked, so if the
+	// output is lost to a crash the data is unrecoverable.
+	for id in &l0_ids {
+		assert!(
+			!sfs::exists(opts.sstable_file_path(*id)),
+			"compaction input table {id} should be deleted"
+		);
+	}
+
+	// One more batch flushed AFTER the compaction, so the manifest
+	// references both the compaction output and a newer flush-created
+	// table — the issue's exact topology (0-byte table beside an intact
+	// sibling).
+	{
+		let batch = 2u32;
+		let mut txn = tree.begin().unwrap();
+		for i in 0..100u32 {
+			let key = format!("key_{batch:02}_{i:03}");
+			let value = format!("value_{batch:02}_{i:03}");
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+		}
+		txn.commit().await.unwrap();
+		tree.flush().unwrap();
+	}
+	let sibling_id = {
+		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		let levels = manifest.levels.get_levels();
+		assert_eq!(levels[0].tables.len(), 1, "post-compaction flush should land in L0");
+		levels[0].tables[0].id
+	};
+
+	// Simulate the crash: release the lock (so reopen works) and drop the
+	// tree without a clean close().
+	{
+		let mut lockfile = tree.core.inner.lockfile.lock().unwrap();
+		lockfile.release().unwrap();
+	}
+	drop(tree);
+
+	// Simulate power loss: any SST whose data was never fsynced may legally
+	// come back empty; fsynced files survive.
+	let mut truncated = Vec::new();
+	for entry in sfs::read_dir(opts.sstable_dir()).unwrap() {
+		let sst_path = entry.unwrap().path();
+		if sst_path.extension().is_some_and(|ext| ext == "sst")
+			&& !sync_tracker::was_synced(&sst_path)
+		{
+			simulate_data_loss(&sst_path);
+			truncated.push(sst_path);
+		}
+	}
+
+	// The flush-created sibling must have survived intact (it was fsynced)
+	// — the analogue of the intact 1064-byte table in the issue report.
+	let sibling_size = sfs::metadata(opts.sstable_file_path(sibling_id)).unwrap().len();
+	assert!(sibling_size > 0, "fsynced flush table {sibling_id} must survive the crash intact");
+
+	// Reopen: the store must come back with every key intact. Without the
+	// fsync barrier in the compaction path, the output table is truncated
+	// above and this fails with LoadManifestFail("...file size is too
+	// small: 0 bytes...") — exactly the failure in surrealdb#7426.
+	let tree = Tree::new(Arc::clone(&opts)).unwrap_or_else(|e| {
+		panic!(
+			"store failed to reopen after simulated power loss (compaction \
+			 output table {output_id} was not fsynced before the manifest \
+			 referenced it; truncated: {truncated:?}): {e}"
+		)
+	});
+
+	let txn = tree.begin().unwrap();
+	for batch in 0..3u32 {
+		for i in 0..100u32 {
+			let key = format!("key_{batch:02}_{i:03}");
+			let expected = format!("value_{batch:02}_{i:03}");
+			let got = txn.get(key.as_bytes()).unwrap();
+			assert_eq!(got, Some(expected.into_bytes()), "missing {key} after crash recovery");
+		}
+	}
+}
+
+/// A manifest that references a zero-byte SST must fail to open with a clear
+/// error rather than panicking. This is the startup failure signature from
+/// surrealdb/surrealdb#7426, and remains the expected behavior for disks
+/// corrupted by means other than a crash.
+#[test(tokio::test)]
+async fn manifest_referencing_zero_byte_sst_fails_cleanly() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = Arc::new(Options {
+		path,
+		..Default::default()
+	});
+
+	// Create one flushed table, then close cleanly.
+	let table_id = {
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"key", b"value").unwrap();
+		txn.commit().await.unwrap();
+		tree.flush().unwrap();
+
+		let table_id = {
+			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			manifest.levels.get_levels()[0].tables[0].id
+		};
+		tree.close().await.unwrap();
+		table_id
+	};
+
+	// Corrupt the referenced SST the way a crash does: 0 bytes on disk.
+	simulate_data_loss(&opts.sstable_file_path(table_id));
+
+	match Tree::new(Arc::clone(&opts)) {
+		Ok(_) => panic!("open should fail when the manifest references a zero-byte SST"),
+		Err(Error::LoadManifestFail(msg)) => {
+			assert!(
+				msg.contains("file size is too small"),
+				"unexpected LoadManifestFail message: {msg}"
+			);
+		}
+		Err(other) => panic!("expected LoadManifestFail, got: {other}"),
+	}
+}
+
+/// Drops `tree` the way a crash would: no close, no flush.
+fn crash(tree: Tree) {
+	{
+		let mut lockfile = tree.core.inner.lockfile.lock().unwrap();
+		lockfile.release().unwrap();
+	}
+	drop(tree);
+}
+
+/// Recovery splits a WAL segment over several memtables when it holds more than
+/// one memtable's worth, e.g. after `max_memtable_size` shrank between restarts.
+/// Flushing the first part must not advance `log_number` past the segment: the
+/// rest of it is still only in the WAL, and the next recovery would skip it.
+#[test(tokio::test)]
+async fn crash_after_recovery_splits_a_wal_segment_must_not_lose_its_tail() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let path = temp_dir.path().to_path_buf();
+	let opts_with = |max_memtable_size| {
+		Arc::new(Options {
+			path: path.clone(),
+			max_memtable_size,
+			flush_on_close: false,
+			..Default::default()
+		})
+	};
+	let key = |i: u32| format!("key_{i:04}");
+	const KEYS: u32 = 200;
+
+	// Fill one WAL segment with a large memtable, then crash.
+	let tree = Tree::new(opts_with(4 * 1024 * 1024)).unwrap();
+	for i in 0..KEYS {
+		let mut txn = tree.begin().unwrap();
+		txn.set(key(i).as_bytes(), &[0xAB; 100]).unwrap();
+		txn.commit().await.unwrap();
+	}
+	crash(tree);
+
+	// Recover with a memtable far too small for that segment, which splits it, and
+	// crash again before the last part (now the active memtable) is flushed.
+	let tree = Tree::new(opts_with(16 * 1024)).unwrap();
+	assert!(
+		tree.core.inner.l0_file_count() > 0,
+		"recovery should have flushed part of the split segment"
+	);
+	crash(tree);
+
+	let tree = Tree::new(opts_with(4 * 1024 * 1024)).unwrap();
+	let txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		assert!(txn.get(key(i).as_bytes()).unwrap().is_some(), "{} was lost", key(i));
+	}
+}
+
+/// A commit group is written to the WAL as a whole and then applied batch by batch.
+/// If the memtable filled up midway and rotated (rotating the WAL with it), the
+/// rest of the group landed in a memtable tagged with the *next* WAL segment, while
+/// its records sat in the previous one. Flushing the older memtable then advanced
+/// `log_number` past that segment, so a crash lost the rest of the group.
+#[test(tokio::test)]
+async fn crash_after_memtable_fills_mid_group_must_not_lose_the_rest_of_the_group() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		max_memtable_size: 16 * 1024,
+		flush_on_close: false,
+		..Default::default()
+	});
+	let key = |i: u64| format!("key_{i:04}");
+	const KEYS: u64 = 200;
+
+	// One group of single-entry batches, together far larger than one memtable.
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let first_seq = tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1;
+	let batches: Vec<Batch> = (0..KEYS)
+		.map(|i| {
+			let mut batch = Batch::new(first_seq + i);
+			batch.set(key(i).into_bytes(), vec![0xAB; 100], 0).unwrap();
+			batch
+		})
+		.collect();
+	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
+	assert!(
+		!tree.core.inner.immutable_memtables.read().unwrap().is_empty(),
+		"the group should have filled at least one memtable"
+	);
+
+	// Flush the filled memtables (but not the active one), then crash.
+	tree.core.inner.flush_all_immutables_sync().unwrap();
+	crash(tree);
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		assert!(txn.get(key(i).as_bytes()).unwrap().is_some(), "{} was lost", key(i));
+	}
+}
+
+/// A memtable rotation from outside the commit flusher (a checkpoint) can land while
+/// a run of batches is being appended to the WAL. The run's records then sit in the
+/// segment of the memtable that was just rotated out and flushed, which moved
+/// `log_number` past that segment, so the run must not just be applied to the new
+/// memtable: a crash before that one is flushed would lose it.
+#[test(tokio::test)]
+async fn crash_after_rotation_during_wal_append_must_not_lose_the_run() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		flush_on_close: false,
+		..Default::default()
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	// Something for the rotation to rotate out.
+	{
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"before", b"value").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Rotate the memtable and flush it right after the group's WAL append (and sync), the
+	// way a concurrent `create_checkpoint` can: the hook fires after the append and before
+	// anything is applied to a memtable.
+	let fired = Arc::new(AtomicBool::new(false));
+	{
+		let core = Arc::clone(&tree.core.inner);
+		let fired = Arc::clone(&fired);
+		tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+			if matches!(point, PipelineHook::AfterWalSync { .. })
+				&& !fired.swap(true, Ordering::SeqCst)
+			{
+				core.rotate_memtable().unwrap();
+				core.flush_all_immutables_sync().unwrap();
+			}
+		})));
+	}
+
+	let mut batch = Batch::new(tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1);
+	batch.set(b"run".to_vec(), b"value".to_vec(), 0).unwrap();
+	tree.core.commit_pipeline.flush_group(&[batch], true).await.unwrap();
+	assert!(fired.load(Ordering::SeqCst), "the rotation hook should have fired");
+	tree.core.commit_pipeline.set_hook(None);
+	crash(tree);
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let txn = tree.begin().unwrap();
+	assert!(txn.get(b"before").unwrap().is_some(), "before was lost");
+	assert!(txn.get(b"run").unwrap().is_some(), "run was lost");
+}

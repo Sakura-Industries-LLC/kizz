@@ -1,0 +1,1370 @@
+use std::collections::{HashMap, HashSet};
+use std::fs::File as SysFile;
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crc32fast::Hasher;
+use iter::LevelManifestIterator;
+pub(crate) use level::{Level, Levels};
+use rand::Rng;
+
+use crate::error::{EncryptionError, Error};
+use crate::sstable::table::{mask, Table};
+use crate::tde::{
+	is_cut_inside_manifest_magic,
+	is_sealed_manifest,
+	open_manifest,
+	seal_manifest,
+	EncryptionContext,
+};
+use crate::vfs::{default_fs, File, Fs, FsKind};
+use crate::wal::{parse_segment_name, should_include_file};
+use crate::{rt, Options, Result};
+
+/// Makes the key that the table `table_id`, whose file is `file`, was sealed under available from
+/// the key manager, which may wait on a provider, and which a database that has only ever used the
+/// key it is opened with does not ask for again: see `EncryptionContext::prepare`.
+///
+/// Only the start of the file is read, and nothing is decided here that the open of the table does
+/// not decide again, in its own order: a file that is not sealed, whose header does not decode or
+/// is not the header of this table of this database is left to `Table::new`, which names what is
+/// wrong with it. The answer here is only the manager's, for a key that the header names.
+fn prepare_key_of_table(
+	file: &Arc<dyn File>,
+	file_size: u64,
+	table_id: u64,
+	context: &EncryptionContext,
+) -> Result<()> {
+	use crate::tde::{CryptoHeader, FileKind, HEADER_LEN};
+
+	if file_size < HEADER_LEN as u64 {
+		return Ok(());
+	}
+	let mut head = [0u8; HEADER_LEN];
+	file.read_exact_at(0, &mut head)?;
+	let Ok(header) = CryptoHeader::decode(&head) else {
+		return Ok(());
+	};
+	let identity = header.identity;
+	if identity.db_id != context.db_id()
+		|| identity.file_kind != FileKind::Sst
+		|| identity.file_id != table_id
+	{
+		return Ok(());
+	}
+	Ok(context.prepare(&[identity.key_id])?)
+}
+
+/// The ids of the write-ahead log segments in `dir` that have the extension `allowed_extension`,
+/// sorted, as `wal::list_segment_ids` lists them but through `fs`. `None` where that is an
+/// error: a directory that cannot be listed, and a name that is not a segment's, which makes the
+/// whole listing an error there and so skips the check that asks for it.
+fn segment_ids_in(fs: &dyn Fs, dir: &Path, allowed_extension: &str) -> Option<Vec<u64>> {
+	let mut ids = Vec::new();
+	for entry in fs.read_dir(dir).ok()? {
+		// A link is followed, and one that points to nothing fails the listing: as the
+		// `wal::list_segment_ids` that this stands for did.
+		if entry.resolved_kind(fs, dir).ok()? != crate::vfs::EntryKind::File {
+			continue;
+		}
+		let (index, extension) = parse_segment_name(&entry.name.to_string_lossy()).ok()?;
+		if should_include_file(Some(allowed_extension), extension) {
+			ids.push(index);
+		}
+	}
+	ids.sort_unstable();
+	Some(ids)
+}
+
+/// Validates that the manifest's log_number doesn't exceed actual WAL segments on disk.
+/// This detects manifest corruption that could cause silent data loss.
+///
+/// On the file system that is `std`: only the tests of the check call this form, and every caller
+/// that has options calls [`validate_wal_log_number_in`] with theirs.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64) -> Result<()> {
+	validate_wal_log_number_in(&*default_fs(), wal_path, manifest_log_number)
+}
+
+/// [`validate_wal_log_number`] over `fs`.
+pub(crate) fn validate_wal_log_number_in(
+	fs: &dyn Fs,
+	wal_path: &Path,
+	manifest_log_number: u64,
+) -> Result<()> {
+	if let Some(segment_ids) = segment_ids_in(fs, wal_path, "wal") {
+		if !segment_ids.is_empty() {
+			let last_wal = *segment_ids.last().unwrap();
+			if manifest_log_number > last_wal + 1 {
+				return Err(Error::ManifestCorruption(format!(
+					"log_number {} exceeds WAL segments (max={}). \
+					 Possible manifest corruption or incomplete backup restoration.",
+					manifest_log_number, last_wal
+				)));
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Refuses to open a directory that holds database files but has no usable
+/// manifest.
+///
+/// An absent manifest otherwise means "create a new database": `LevelManifest::new`
+/// writes an empty one, WAL replay can overwrite table 1, and the startup orphan
+/// cleanup deletes every SSTable the new manifest does not list. A manifest that
+/// is present but cannot be decoded is reported here too, so that nothing (a
+/// directory, the lock file, a migration) has been created or moved by the time
+/// the open fails. Only a directory without any SSTable, WAL segment or value
+/// log file may be initialised.
+///
+/// Reads only. Must run before anything else in `Tree::new` touches the directory.
+pub(crate) fn check_manifest_before_open(opts: &Options) -> Result<()> {
+	check_manifest_before_open_in(&*opts.fs, opts)
+}
+
+/// [`check_manifest_before_open`] over `fs`, which is where the open path asks every question
+/// about the directory. Whether the manifest is there is the three-way answer of `try_exists`: a
+/// file system that cannot tell is an error, and never "no manifest".
+pub(crate) fn check_manifest_before_open_in(fs: &dyn Fs, opts: &Options) -> Result<()> {
+	let manifest_path = opts.manifest_file_path(0);
+
+	if fs.try_exists(&manifest_path)? {
+		let data = fs.read(&manifest_path)?;
+		let body = unseal_manifest(data, opts.encryption_context().map(Arc::as_ref));
+		return body.and_then(DecodedManifest::decode).map(drop).map_err(|e| match e {
+			// A key, a database or a manifest of the other kind is not damage, and is not
+			// reported as damage: the files are as they should be and the configuration is not.
+			Error::Encryption(_) => e,
+			// A pool that has no file for a read is not damage either: it is a moment away from
+			// having one, and the error stays the typed one that the tasks retry.
+			Error::FilePoolExhausted => e,
+			e => Error::ManifestCorruption(format!(
+				"{} cannot be decoded: {e}. Restore it from a backup; the data files have not been touched.",
+				manifest_path.display()
+			)),
+		});
+	}
+
+	let sstables = count_files_with_extension_in(fs, &opts.sstable_dir(), "sst")?;
+	let wal_segments = count_files_with_extension_in(fs, &opts.wal_dir(), "wal")?;
+	let vlog_files = count_files_with_extension_in(fs, &opts.vlog_dir(), "vlog")?;
+	if sstables + wal_segments + vlog_files == 0 {
+		return Ok(());
+	}
+
+	Err(Error::ManifestMissing(format!(
+		"there is no manifest at {} but {} holds database files ({sstables} SSTable(s), \
+		 {wal_segments} WAL segment(s), {vlog_files} value log file(s)). Refusing to open it as a \
+		 new database, which would discard them. Restore the manifest from a backup, or move the \
+		 data files away to start empty.",
+		manifest_path.display(),
+		opts.path.display()
+	)))
+}
+
+/// What the first bytes of a manifest file say it is, without a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestKind {
+	/// An encrypted manifest, see `tde::seal_manifest`.
+	Sealed,
+	/// Begins with a format version: a manifest that is not encrypted, as far as its first bytes
+	/// say. Whether it decodes is for its loader to say.
+	Plain,
+	/// Empty, or a part of the magic of an encrypted manifest and nothing more: a file that was
+	/// cut short. No plaintext manifest is that short.
+	CutShort,
+	/// Neither of them: what the first bytes of a plaintext or an encrypted manifest that has
+	/// rotted look like.
+	Unknown,
+}
+
+/// Tells what `prefix`, the first bytes of a manifest file, is. A plaintext manifest begins with
+/// its version as two bytes, a number that is small and not zero.
+pub(crate) fn manifest_kind(prefix: &[u8]) -> ManifestKind {
+	if is_sealed_manifest(prefix) {
+		return ManifestKind::Sealed;
+	}
+	if is_cut_inside_manifest_magic(prefix) {
+		return ManifestKind::CutShort;
+	}
+	match prefix.first_chunk::<2>().map(|version| u16::from_be_bytes(*version)) {
+		Some(1..=0xFF) => ManifestKind::Plain,
+		_ => ManifestKind::Unknown,
+	}
+}
+
+/// The body of the manifest file that holds `data`: the encoding that the manifest of a plaintext
+/// database has, which a sealed one is opened to give.
+///
+/// A manifest is read as the database is configured and never as what the file says it is, and
+/// a manifest of the other kind is refused, as a hard error: an encrypted one without a key is
+/// `NotConfigured`, and one that is not encrypted, where there is a key, is `NotEncrypted`. A
+/// plaintext manifest that is read without a key is returned as it is.
+pub(crate) fn unseal_manifest(
+	data: Vec<u8>,
+	context: Option<&EncryptionContext>,
+) -> Result<Vec<u8>> {
+	let Some(context) = context else {
+		return if is_sealed_manifest(&data) {
+			Err(EncryptionError::NotConfigured.into())
+		} else {
+			Ok(data)
+		};
+	};
+	match manifest_kind(&data) {
+		ManifestKind::Sealed => open_manifest(context, &data),
+		kind => Err(refuse_unsealed_manifest(kind)),
+	}
+}
+
+/// The error for a manifest that is not an encrypted one, where the database is encrypted: not
+/// being encrypted is a statement about the database, and a file that is not even a manifest is
+/// damage.
+pub(crate) fn refuse_unsealed_manifest(kind: ManifestKind) -> Error {
+	match kind {
+		ManifestKind::Plain => EncryptionError::NotEncrypted.into(),
+		// Not a reason to refuse a manifest, so never asked for one.
+		ManifestKind::Sealed => EncryptionError::InvalidInput("the manifest is encrypted").into(),
+		ManifestKind::CutShort => Error::ManifestCorruption(
+			"the manifest is cut short: it ends before its first header".to_string(),
+		),
+		ManifestKind::Unknown => Error::ManifestCorruption(
+			"the manifest begins with neither a version nor the magic of an encrypted manifest"
+				.to_string(),
+		),
+	}
+}
+
+/// Counts the entries in `dir` with the given extension, as the names say and whatever they are.
+/// A missing directory holds none.
+fn count_files_with_extension_in(fs: &dyn Fs, dir: &Path, extension: &str) -> Result<usize> {
+	let entries = match fs.read_dir(dir) {
+		Ok(entries) => entries,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+		Err(e) => return Err(e.into()),
+	};
+
+	Ok(entries
+		.iter()
+		.filter(|entry| Path::new(&entry.name).extension().is_some_and(|ext| ext == extension))
+		.count())
+}
+
+/// The manifest format written up to SurrealKV v0.21.x, and by development builds of the current
+/// engine until `MANIFEST_FORMAT_VERSION_V2`. The layout is identical to V2.
+pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
+
+/// The manifest format written since SurrealKV introduced `TableFormat::LSMV2`. The byte layout
+/// is the same as V1; the version exists so that a binary that only knows V1, which would
+/// misread the flat-key tables a V2 manifest lists, refuses the directory instead.
+pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
+
+/// The manifest format written since the WAL segments of SurrealKV may hold sync marks
+/// (`RecordType::SyncMark`). The byte layout is the same as V2; the version exists so that a binary
+/// that only knows V2, which would take a mark for damage and cut or refuse the segment, refuses
+/// the directory instead. An open (and a restore) makes the manifest of this version once the WAL
+/// is replayed and before the first segment of its own is started, see
+/// [`LevelManifest::upgrade_format_in`].
+pub const MANIFEST_FORMAT_VERSION_V3: u16 = 3;
+
+/// The manifest format version this code writes.
+pub const MANIFEST_FORMAT_VERSION: u16 = MANIFEST_FORMAT_VERSION_V3;
+
+/// Snapshot information stored in the manifest
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotInfo {
+	/// Snapshot sequence number
+	pub seq_num: u64,
+	/// Creation timestamp (system time in nanoseconds)
+	pub created_at: u128,
+}
+
+impl SnapshotInfo {
+	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+		let mut buf = Vec::new();
+		buf.extend_from_slice(&self.seq_num.to_be_bytes());
+		buf.extend_from_slice(&self.created_at.to_be_bytes());
+		Ok(buf)
+	}
+
+	pub(crate) fn decode(mut buf: &[u8]) -> Result<Self> {
+		let mut u64_buf = [0u8; 8];
+		buf.read_exact(&mut u64_buf)?;
+		let seq_num = u64::from_be_bytes(u64_buf);
+
+		let mut u128_buf = [0u8; 16];
+		buf.read_exact(&mut u128_buf)?;
+		let created_at = u128::from_be_bytes(u128_buf);
+
+		Ok(Self {
+			seq_num,
+			created_at,
+		})
+	}
+}
+
+/// Represents a set of changes to be applied to the manifest
+#[derive(Clone, Default)]
+pub(crate) struct ManifestChangeSet {
+	/// Manifest format version if changed
+	pub manifest_format_version: Option<u16>,
+
+	/// Tables to delete from manifest
+	pub deleted_tables: HashSet<(u8, u64)>, // (level, table_id)
+
+	/// Tables to add to manifest
+	pub new_tables: Vec<(u8, Arc<Table>)>, // (level, table)
+
+	/// Snapshots to add
+	pub new_snapshots: Vec<SnapshotInfo>,
+
+	/// Snapshots to delete (by sequence number)
+	pub deleted_snapshots: HashSet<u64>,
+
+	/// New log_number to set (if Some)
+	/// Indicates that WALs with number < log_number have been flushed
+	pub log_number: Option<u64>,
+}
+
+/// Data needed to revert an applied changeset. Only tests revert one: a writer applies a
+/// changeset to the manifest in memory once it is on disk (see
+/// [`LevelManifest::encode_with_changeset`]), so it has nothing to undo.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ChangeSetRollback {
+	/// Tables that were deleted (need to be re-added on revert)
+	pub deleted_tables: Vec<(u8, Arc<Table>)>,
+	/// Table IDs that were added (need to be removed on revert)
+	pub added_table_ids: Vec<(u8, u64)>,
+	/// Snapshots that were deleted
+	pub deleted_snapshots: Vec<SnapshotInfo>,
+	/// Snapshot seq_nums that were added
+	pub added_snapshot_seqs: Vec<u64>,
+	/// Previous manifest_format_version if changed
+	pub prev_version: Option<u16>,
+	/// Previous log_number if it was updated
+	pub prev_log_number: Option<u64>,
+	/// Previous last_sequence value
+	pub prev_last_sequence: u64,
+}
+
+mod iter;
+mod level;
+mod mode;
+mod orphans;
+
+// The `_in` forms are what the engine calls once its open path goes through the file system of its
+// options (M8): until then only tests and the forms without the suffix use them.
+#[allow(unused_imports)]
+pub(crate) use mode::{
+	check_manifest_mode,
+	check_manifest_mode_in,
+	resolve_encryption,
+	resolve_encryption_in,
+};
+#[allow(unused_imports)]
+pub(crate) use orphans::{
+	plan_cleanup as plan_orphan_cleanup,
+	plan_cleanup_in as plan_orphan_cleanup_in,
+};
+
+pub type HiddenSet = HashSet<u64>;
+
+/// Represents the levels of a log-structured merge tree.
+pub(crate) struct LevelManifest {
+	/// Path of level manifest file
+	pub path: PathBuf,
+
+	/// Levels of the LSM tree
+	pub levels: Levels,
+
+	/// Set of hidden tables that should not appear during compaction
+	pub(crate) hidden_set: HiddenSet,
+
+	/// Next table ID to use (persisted to disk for safe recovery)
+	pub(crate) next_table_id: Arc<AtomicU64>,
+
+	/// Manifest format version to allow schema evolution
+	pub manifest_format_version: u16,
+
+	/// A list of read snapshots that are currently open
+	pub snapshots: Vec<SnapshotInfo>,
+
+	/// Minimum WAL number that contains unflushed data.
+	/// All WAL files with number < log_number have been flushed to SST and can
+	/// be safely deleted.
+	pub(crate) log_number: u64,
+
+	/// Last sequence number persisted in the manifest.
+	/// Tracks the highest sequence number across all SSTables.
+	/// Updated when new tables are added during flush operations.
+	pub(crate) last_sequence: u64,
+
+	/// The encryption of the database, if it is encrypted: every write of the manifest seals it
+	/// with this, under a new salt, and it was opened with it. Only what a write needs is kept,
+	/// never a salt or a cipher of an earlier one.
+	pub(crate) encryption: Option<Arc<EncryptionContext>>,
+}
+
+pub(crate) const MANIFEST_TRAILER_MAGIC: [u8; 8] = *b"SKVMNFST";
+pub(crate) const MANIFEST_TRAILER_LEN: usize = 16;
+
+/// Computes the masked CRC-32 checksum of manifest body data.
+pub(crate) fn calculate_manifest_crc(data: &[u8]) -> u32 {
+	let mut hasher = Hasher::new();
+	hasher.update(data);
+	mask(hasher.finalize())
+}
+
+/// The contents of a manifest file, decoded without opening the tables it lists.
+#[derive(Debug)]
+pub(crate) struct DecodedManifest {
+	pub(crate) version: u16,
+	pub(crate) next_table_id: u64,
+	pub(crate) log_number: u64,
+	pub(crate) last_sequence: u64,
+	/// Table ids of each level
+	pub(crate) level_data: Vec<Vec<u64>>,
+	pub(crate) snapshots: Vec<SnapshotInfo>,
+}
+
+impl DecodedManifest {
+	/// Encodes the manifest in the layout `write_manifest_to_disk` writes and `decode` reads. Used
+	/// by the migration, which has to rewrite a manifest whose tables it cannot open.
+	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+		let mut buf = Vec::new();
+		buf.extend_from_slice(&self.version.to_be_bytes());
+		buf.extend_from_slice(&self.next_table_id.to_be_bytes());
+		buf.extend_from_slice(&self.log_number.to_be_bytes());
+		buf.extend_from_slice(&self.last_sequence.to_be_bytes());
+		buf.push(self.level_data.len() as u8);
+		for level in &self.level_data {
+			buf.extend_from_slice(&(level.len() as u32).to_be_bytes());
+			for id in level {
+				buf.extend_from_slice(&id.to_be_bytes());
+			}
+		}
+		buf.extend_from_slice(&(self.snapshots.len() as u32).to_be_bytes());
+		for snapshot in &self.snapshots {
+			let bytes = snapshot.encode()?;
+			buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+			buf.extend_from_slice(&bytes);
+		}
+		// Append the checksum trailer, as `write_manifest_to_disk` does
+		let body_len = buf.len() as u32;
+		let crc = calculate_manifest_crc(&buf);
+		buf.extend_from_slice(&body_len.to_be_bytes());
+		buf.extend_from_slice(&crc.to_be_bytes());
+		buf.extend_from_slice(&MANIFEST_TRAILER_MAGIC);
+		Ok(buf)
+	}
+
+	pub(crate) fn decode(data: Vec<u8>) -> Result<Self> {
+		let mut level_manifest = Cursor::new(&data);
+
+		// Read versioned manifest format
+		let mut u16_buf = [0u8; 2];
+		level_manifest.read_exact(&mut u16_buf)?;
+		let version = u16::from_be_bytes(u16_buf);
+		if !matches!(
+			version,
+			MANIFEST_FORMAT_VERSION_V1 | MANIFEST_FORMAT_VERSION_V2 | MANIFEST_FORMAT_VERSION_V3
+		) {
+			return Err(Error::LoadManifestFail(format!(
+				"Unsupported manifest format version: {version}. Expected: \
+				 {MANIFEST_FORMAT_VERSION_V1} to {MANIFEST_FORMAT_VERSION_V3}"
+			)));
+		}
+
+		let mut u64_buf = [0u8; 8];
+		level_manifest.read_exact(&mut u64_buf)?;
+		let next_table_id = u64::from_be_bytes(u64_buf);
+
+		level_manifest.read_exact(&mut u64_buf)?;
+		let log_number = u64::from_be_bytes(u64_buf);
+
+		level_manifest.read_exact(&mut u64_buf)?;
+		let last_sequence = u64::from_be_bytes(u64_buf);
+
+		tracing::debug!(
+			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
+			version,
+			next_table_id,
+			log_number,
+			last_sequence
+		);
+
+		// Read levels data
+		let level_data = Levels::decode(&mut level_manifest)?;
+
+		// Read snapshots
+		let mut u32_buf = [0u8; 4];
+		level_manifest.read_exact(&mut u32_buf)?;
+		let snapshot_count = u32::from_be_bytes(u32_buf);
+		let mut snapshots = Vec::new();
+		for _ in 0..snapshot_count {
+			level_manifest.read_exact(&mut u32_buf)?;
+			let snapshot_len = u32::from_be_bytes(u32_buf) as usize;
+			let mut snapshot_bytes = vec![0u8; snapshot_len];
+			level_manifest.read_exact(&mut snapshot_bytes)?;
+			let snapshot = SnapshotInfo::decode(&snapshot_bytes)?;
+			snapshots.push(snapshot);
+		}
+
+		let body_len = level_manifest.position() as usize;
+		let remaining = data.len().saturating_sub(body_len);
+
+		if remaining == 0 {
+			// Legacy manifest without checksum trailer: accept for backwards compatibility
+			tracing::info!("Legacy manifest without checksum trailer accepted");
+		} else if remaining == MANIFEST_TRAILER_LEN {
+			let trailer = &data[body_len..];
+			let trailer_body_len = u32::from_be_bytes(trailer[0..4].try_into().unwrap()) as usize;
+			let trailer_crc = u32::from_be_bytes(trailer[4..8].try_into().unwrap());
+			let magic: [u8; 8] = trailer[8..16].try_into().unwrap();
+
+			if magic != MANIFEST_TRAILER_MAGIC {
+				return Err(Error::ManifestCorruption(format!(
+					"Manifest trailer magic mismatch: expected {:?}, got {:?}",
+					MANIFEST_TRAILER_MAGIC, magic
+				)));
+			}
+			if trailer_body_len != body_len {
+				return Err(Error::ManifestCorruption(format!(
+					"Manifest trailer body length mismatch: recorded {}, actual {}",
+					trailer_body_len, body_len
+				)));
+			}
+			let actual_crc = calculate_manifest_crc(&data[..body_len]);
+			if trailer_crc != actual_crc {
+				return Err(Error::ManifestCorruption(format!(
+					"Manifest checksum mismatch: recorded 0x{:08x}, computed 0x{:08x}",
+					trailer_crc, actual_crc
+				)));
+			}
+		} else {
+			return Err(Error::ManifestCorruption(format!(
+				"Manifest corruption: trailing data of length {remaining} bytes (expected 0 or {MANIFEST_TRAILER_LEN})"
+			)));
+		}
+
+		Ok(Self {
+			version,
+			next_table_id,
+			log_number,
+			last_sequence,
+			level_data,
+			snapshots,
+		})
+	}
+}
+
+impl LevelManifest {
+	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		let fs = Arc::clone(&opts.fs);
+		Self::new_in(&*fs, opts)
+	}
+
+	/// [`Self::new`] over `fs`: the manifest is looked for, read and, if there is none, written
+	/// there.
+	pub(crate) fn new_in(fs: &dyn Fs, opts: Arc<Options>) -> Result<Self> {
+		assert!(opts.level_count > 0, "level_count should be >= 1");
+
+		let manifest_file_path = opts.manifest_file_path(0);
+
+		// Check if the manifest file already exists
+		if fs.exists(&manifest_file_path) {
+			// Load existing manifest from file
+			return Self::load_from_file_in(fs, &manifest_file_path, opts);
+		}
+
+		// If no manifest exists, create a new one
+
+		// Initialize levels with default values
+		let levels = Self::initialize_levels(opts.level_count);
+
+		// Start with next_table_id = 1 (0 is reserved)
+		let next_table_id = Arc::new(AtomicU64::new(1));
+
+		let manifest = Self {
+			path: manifest_file_path,
+			levels,
+			hidden_set: HashSet::with_capacity(10),
+			next_table_id,
+			manifest_format_version: MANIFEST_FORMAT_VERSION,
+			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
+			encryption: opts.encryption_context().cloned(),
+		};
+
+		// Write levels to disk with the counter
+		write_manifest_to_disk_in(fs, &manifest)?;
+
+		// The manifest of an encrypted database names the database and its suite, and nothing
+		// that is sealed under them may exist before it is on disk: the file and the directory
+		// that holds it are synced by the write, and the directory above it, which only now has
+		// the entry that names that one, is synced here.
+		if manifest.encryption.is_some() {
+			fs.sync_dir(&opts.path)?;
+		}
+
+		Ok(manifest)
+	}
+
+	/// Makes the manifest on disk of [`MANIFEST_FORMAT_VERSION`] if it is of an older one, so that
+	/// a binary that only knows the older one refuses the directory before anything of the newer
+	/// format is in it. Called by an open, and a restore, before it starts a WAL segment of its
+	/// own, which is the first one that can hold a mark.
+	pub(crate) fn upgrade_format_in(&mut self, fs: &dyn Fs) -> Result<()> {
+		if self.manifest_format_version >= MANIFEST_FORMAT_VERSION {
+			return Ok(());
+		}
+		let previous = self.manifest_format_version;
+		self.manifest_format_version = MANIFEST_FORMAT_VERSION;
+		if let Err(e) = write_manifest_to_disk_in(fs, self) {
+			self.manifest_format_version = previous;
+			return Err(e);
+		}
+		Ok(())
+	}
+
+	/// Returns the minimum WAL number that contains unflushed data
+	pub(crate) fn get_log_number(&self) -> u64 {
+		self.log_number
+	}
+
+	/// Returns the last sequence number persisted in the manifest
+	pub(crate) fn get_last_sequence(&self) -> u64 {
+		self.last_sequence
+	}
+
+	/// Initializes levels with default values
+	fn initialize_levels(level_count: u8) -> Levels {
+		let levels = (0..level_count).map(|_| Arc::new(Level::default())).collect::<Vec<_>>();
+
+		Levels(levels)
+	}
+
+	/// Load a manifest from file and return a complete LevelManifest instance
+	pub(crate) fn load_from_file<P: AsRef<Path>>(
+		manifest_path: P,
+		opts: Arc<Options>,
+	) -> Result<Self> {
+		let fs = Arc::clone(&opts.fs);
+		Self::load_from_file_in(&*fs, manifest_path, opts)
+	}
+
+	/// [`Self::load_from_file`] over `fs`: the manifest and every table it lists are read there.
+	pub(crate) fn load_from_file_in<P: AsRef<Path>>(
+		fs: &dyn Fs,
+		manifest_path: P,
+		opts: Arc<Options>,
+	) -> Result<Self> {
+		tracing::debug!("Loading manifest from {:?}", manifest_path.as_ref());
+
+		// Read and parse the manifest file, opening it first if the database is encrypted
+		let encryption = opts.encryption_context().cloned();
+		let data = fs.read(manifest_path.as_ref())?;
+		let data = unseal_manifest(data, encryption.as_deref())?;
+		let DecodedManifest {
+			version,
+			next_table_id,
+			log_number,
+			last_sequence,
+			level_data,
+			snapshots,
+		} = DecodedManifest::decode(data)?;
+
+		// Sweep stale temporary manifest files left behind by uncompleted writes. An encrypted
+		// database never deletes what it did not write: such a file may hold a sealed manifest. A
+		// pool replaces a manifest without a temporary name, so there is nothing for it to sweep.
+		if encryption.is_none() && fs.kind() == FsKind::Std {
+			if let Some(parent) = manifest_path.as_ref().parent() {
+				sweep_stale_manifest_temp_files_in(fs, parent);
+			}
+		}
+
+		// Validate log_number against actual WAL segments BEFORE proceeding
+		validate_wal_log_number_in(fs, &opts.wal_dir(), log_number)?;
+
+		// Now convert the level data into actual Level objects with Table instances
+		// Use the actual number of levels from the manifest, not the configured level
+		// count
+		let mut levels_vec = Vec::with_capacity(level_data.len());
+
+		// Load all levels that exist in the manifest
+		for table_ids in level_data.iter() {
+			let mut tables = Vec::with_capacity(table_ids.len());
+
+			for &table_id in table_ids {
+				// Load the actual table from disk
+				match Self::load_table_in(fs, table_id, Arc::clone(&opts)) {
+					Ok(table) => tables.push(table),
+					// A table that cannot be opened with the key is not a damaged manifest,
+					// and says so to the caller.
+					Err(err @ Error::Encryption(_)) => {
+						tracing::error!("Error loading table {table_id}: {err:?}");
+						return Err(err);
+					}
+					Err(err @ Error::LegacyFormat(_)) => return Err(err),
+					Err(err) => {
+						tracing::error!("Error loading table {table_id}: {err:?}");
+						return Err(Error::LoadManifestFail(err.to_string()));
+					}
+				}
+			}
+
+			// Validate sequence numbers for all tables in this level
+			if !tables.is_empty() {
+				Self::validate_table_sequence_numbers(&tables)?;
+			}
+
+			// Create the level with the loaded tables
+			let level = Level {
+				tables,
+			};
+			levels_vec.push(Arc::new(level));
+		}
+
+		// Create and return the complete manifest
+		let total_tables: usize = levels_vec.iter().map(|l| l.tables.len()).sum();
+
+		tracing::debug!(
+			"Manifest loaded successfully: version={}, log_number={}, last_sequence={}, tables={}, levels={}",
+			version,
+			log_number,
+			last_sequence,
+			total_tables,
+			levels_vec.len()
+		);
+
+		// Validate last_sequence watermark is not exceeded by any table in the manifest
+		let computed_max_seq = levels_vec
+			.iter()
+			.flat_map(|level| level.tables.iter())
+			.filter_map(|table| table.meta.largest_seq_num)
+			.max()
+			.unwrap_or(0);
+
+		if computed_max_seq > last_sequence {
+			return Err(Error::LoadManifestFail(format!(
+				"Manifest last_sequence violation: table seq {computed_max_seq} exceeds manifest watermark {last_sequence}"
+			)));
+		}
+
+		Ok(Self {
+			path: manifest_path.as_ref().to_path_buf(),
+			levels: Levels(levels_vec),
+			hidden_set: HashSet::with_capacity(10),
+			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
+			manifest_format_version: version,
+			snapshots,
+			log_number,
+			last_sequence,
+			encryption,
+		})
+	}
+
+	fn validate_table_sequence_numbers(tables: &[Arc<Table>]) -> Result<()> {
+		// Basic sanity check for all tables
+		for table in tables {
+			// Ensure both sequence numbers exist (they should always be set together)
+			// and that smallest_seq_num is not greater than largest_seq_num
+			let (smallest, largest) =
+				match (table.meta.smallest_seq_num, table.meta.largest_seq_num) {
+					(Some(s), Some(l)) => (s, l),
+					(None, None) => {
+						return Err(Error::LoadManifestFail(format!(
+							"Table {} has no sequence numbers (possibly corrupted or empty table)",
+							table.id
+						)));
+					}
+					(smallest, largest) => {
+						return Err(Error::LoadManifestFail(format!(
+							"Table {} has inconsistent sequence numbers: smallest={:?}, largest={:?}",
+							table.id, smallest, largest
+						)));
+					}
+				};
+
+			if smallest > largest {
+				return Err(Error::LoadManifestFail(format!(
+					"Table {} has invalid sequence numbers: smallest({}) > largest({})",
+					table.id, smallest, largest
+				)));
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Helper to load a single table by ID, from `fs`.
+	fn load_table_in(fs: &dyn Fs, table_id: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
+		let table_file_path = opts.sstable_file_path(table_id);
+
+		// Open the table file
+		let file: Arc<dyn File> = fs.open_read(&table_file_path)?;
+		let file_size = file.size()?;
+
+		// The key of a table written under an older key than the one that is active is made
+		// available here, while the database is opened or restored, and not when its first block
+		// is read.
+		if let Some(context) = opts.encryption_context() {
+			prepare_key_of_table(&file, file_size, table_id, context)?;
+		}
+
+		// Create and return the table
+		let mut table = Table::new(table_id, opts, file, file_size)?;
+		// A table of the current format has the property right, so naming no file means that it
+		// points into none. Only a table of an older engine, which may not have kept it, is
+		// unknown: it keeps the value log until a compaction writes it again.
+		table.vlog_pointers_unknown = table.meta.properties.oldest_vlog_file_id == 0
+			&& table.format != crate::sstable::table::TableFormat::LSMV2;
+		Ok(Arc::new(table))
+	}
+
+	fn depth(&self) -> u8 {
+		let len = self.levels.as_ref().len() as u8;
+
+		len
+	}
+
+	pub(crate) fn last_level_index(&self) -> u8 {
+		self.depth() - 1
+	}
+
+	pub(crate) fn iter(&self) -> impl Iterator<Item = Arc<Table>> + '_ {
+		LevelManifestIterator::new(self)
+	}
+
+	/// Returns the minimum oldest_vlog_file_id across all live SSTs.
+	/// Returns 0 if no SSTs reference VLog files.
+	pub(crate) fn min_oldest_vlog_file_id(&self) -> u32 {
+		self.iter()
+			.filter_map(|sst| {
+				let oldest = sst.meta.properties.oldest_vlog_file_id;
+				if oldest > 0 {
+					Some(oldest as u32)
+				} else {
+					None
+				}
+			})
+			.min()
+			.unwrap_or(0)
+	}
+
+	/// What the tables say about the value log, for [`crate::lsm::vlog_floor`]:
+	/// - 0, and nothing is deleted, when a table that was opened from disk names no file and may
+	///   point into the log all the same, see `Table::vlog_pointers_unknown`, whatever the other
+	///   tables say: its files are below theirs, or are theirs. The table of a database written by
+	///   an older engine is that, until a compaction rewrites it;
+	/// - otherwise the smallest file any table points into;
+	/// - if none does, `u32::MAX` when tables were written, as they then hold nothing back and the
+	///   files that nothing else points into can go, and 0 when no table was written yet (a fresh
+	///   database).
+	///
+	/// A table was written once `last_sequence` is above 0: it follows the tables that are
+	/// registered, and stays when they are compacted away. The ids of tables are no sign of it,
+	/// they are handed out when a memtable is rotated.
+	pub(crate) fn vlog_floor_of_tables(&self) -> u32 {
+		if self.iter().any(|table| table.vlog_pointers_unknown) {
+			return 0;
+		}
+		match self.min_oldest_vlog_file_id() {
+			0 if self.last_sequence > 0 => u32::MAX,
+			oldest => oldest,
+		}
+	}
+
+	pub(crate) fn get_all_tables(&self) -> HashMap<u64, Arc<Table>> {
+		let mut output = HashMap::new();
+
+		for table in self.iter() {
+			output.insert(table.meta.properties.id, table);
+		}
+
+		output
+	}
+
+	pub(crate) fn unhide_tables(&mut self, keys: &[u64]) {
+		for key in keys {
+			self.hidden_set.remove(key);
+		}
+	}
+
+	pub(crate) fn hide_tables(&mut self, keys: &[u64]) {
+		for key in keys {
+			self.hidden_set.insert(*key);
+		}
+	}
+
+	/// Finds a table by its table ID across all levels.
+	pub(crate) fn find_table_by_id(&self, table_id: u64) -> Option<Arc<Table>> {
+		for level in &self.levels {
+			if let Some(table) = level.tables.iter().find(|t| t.id == table_id) {
+				return Some(Arc::clone(table));
+			}
+		}
+		None
+	}
+
+	/// Apply a changeset to this manifest and return rollback data
+	pub(crate) fn apply_changeset(
+		&mut self,
+		changeset: &ManifestChangeSet,
+	) -> Result<ChangeSetRollback> {
+		let mut rollback = ChangeSetRollback {
+			deleted_tables: Vec::new(),
+			added_table_ids: Vec::new(),
+			deleted_snapshots: Vec::new(),
+			added_snapshot_seqs: Vec::new(),
+			prev_version: None,
+			prev_log_number: None,
+			prev_last_sequence: self.last_sequence,
+		};
+
+		// Capture and apply version change
+		if let Some(version) = changeset.manifest_format_version {
+			rollback.prev_version = Some(self.manifest_format_version);
+			self.manifest_format_version = version;
+		}
+
+		// Apply log_number if present, but only if it's higher
+		// This prevents race conditions where concurrent flushes could move log_number
+		// backward
+		if let Some(log_num) = changeset.log_number {
+			if log_num > self.log_number {
+				rollback.prev_log_number = Some(self.log_number);
+				self.log_number = log_num;
+			}
+		}
+
+		// Capture deleted tables BEFORE removing them, then remove
+		for (level, table_id) in &changeset.deleted_tables {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
+				// Find and capture the table before removing
+				if let Some(table) = level_ref.tables.iter().find(|t| t.id == *table_id) {
+					rollback.deleted_tables.push((*level, Arc::clone(table)));
+				}
+				Arc::make_mut(level_ref).remove(*table_id);
+			}
+		}
+
+		// Add new tables to levels and track their IDs
+		for (level, table) in &changeset.new_tables {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
+				let level_mut = Arc::make_mut(level_ref);
+				if *level == 0 {
+					// Level 0: sorted by sequence number (tables can overlap)
+					level_mut.insert(Arc::clone(table));
+				} else {
+					// Level 1+: sorted by smallest key (tables cannot overlap)
+					level_mut.insert_sorted_by_key(Arc::clone(table));
+				}
+				rollback.added_table_ids.push((*level, table.id));
+			}
+
+			// Update last_sequence if this table has a higher sequence number
+			let largest = table.meta.largest_seq_num.expect("table must have largest_seq_num");
+			if largest > self.last_sequence {
+				self.last_sequence = largest;
+			}
+		}
+
+		// Capture and delete snapshots
+		let deleted: Vec<_> = self
+			.snapshots
+			.iter()
+			.filter(|s| changeset.deleted_snapshots.contains(&s.seq_num))
+			.cloned()
+			.collect();
+		rollback.deleted_snapshots = deleted;
+		self.snapshots.retain(|snapshot| !changeset.deleted_snapshots.contains(&snapshot.seq_num));
+
+		// Add new snapshots and track their seq_nums
+		for snapshot in &changeset.new_snapshots {
+			self.snapshots.push(snapshot.clone());
+			rollback.added_snapshot_seqs.push(snapshot.seq_num);
+		}
+
+		Ok(rollback)
+	}
+
+	/// The bytes of this manifest with `changeset` applied, which [`write_encoded_manifest_in`]
+	/// writes, leaving this manifest as it is.
+	///
+	/// A writer makes a change durable before anything can read it: it encodes the change here
+	/// under the read lock, writes it with no lock of the manifest held, and applies the same
+	/// changeset to this manifest only once the write succeeded. The manifest in memory then never
+	/// lists a table, or a `log_number`, that the one on disk does not, and readers are not held
+	/// up by the fsync. Every writer holds the tree's `manifest_io` from this call until it has
+	/// applied the changeset, so no other change lands in between.
+	pub(crate) fn encode_with_changeset(&self, changeset: &ManifestChangeSet) -> Result<Vec<u8>> {
+		let mut staged = Self {
+			path: self.path.clone(),
+			levels: self.levels.clone(),
+			hidden_set: HiddenSet::new(),
+			next_table_id: Arc::clone(&self.next_table_id),
+			manifest_format_version: self.manifest_format_version,
+			snapshots: self.snapshots.clone(),
+			log_number: self.log_number,
+			last_sequence: self.last_sequence,
+			encryption: self.encryption.clone(),
+		};
+		staged.apply_changeset(changeset)?;
+		encode_manifest(&staged)
+	}
+
+	/// Revert a previously applied changeset using rollback data
+	#[cfg(test)]
+	pub(crate) fn revert_changeset(&mut self, rollback: ChangeSetRollback) {
+		// Restore last_sequence
+		self.last_sequence = rollback.prev_last_sequence;
+
+		// Restore version if it was changed
+		if let Some(prev_version) = rollback.prev_version {
+			self.manifest_format_version = prev_version;
+		}
+
+		// Restore log_number if it was changed
+		if let Some(prev_log_number) = rollback.prev_log_number {
+			self.log_number = prev_log_number;
+		}
+
+		// Remove tables that were added
+		for (level, table_id) in rollback.added_table_ids {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(level as usize) {
+				Arc::make_mut(level_ref).remove(table_id);
+			}
+		}
+
+		// Re-add tables that were deleted
+		for (level, table) in rollback.deleted_tables {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(level as usize) {
+				let level_mut = Arc::make_mut(level_ref);
+				if level == 0 {
+					// Level 0: sorted by sequence number (tables can overlap)
+					level_mut.insert(table);
+				} else {
+					// Level 1+: sorted by smallest key (tables cannot overlap)
+					level_mut.insert_sorted_by_key(table);
+				}
+			}
+		}
+
+		// Remove snapshots that were added
+		self.snapshots.retain(|s| !rollback.added_snapshot_seqs.contains(&s.seq_num));
+
+		// Re-add snapshots that were deleted
+		for snapshot in rollback.deleted_snapshots {
+			self.snapshots.push(snapshot);
+		}
+	}
+
+	/// Generates the next unique table ID for a new SSTable
+	/// This is the single source of truth for table ID generation
+	pub(crate) fn next_table_id(&self) -> u64 {
+		self.next_table_id.fetch_add(1, std::sync::atomic::Ordering::Release)
+	}
+}
+
+/// Test-only: the step of `replace_file_content` that an injected failure stops at.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplaceFailure {
+	/// Before the rename: the old file is untouched.
+	BeforeRename,
+	/// After the rename, as a failed fsync of the file or its directory does: the new file is in
+	/// place and may not be durable.
+	AfterRename,
+}
+
+#[cfg(test)]
+struct Failpoint {
+	path: PathBuf,
+	at: ReplaceFailure,
+	/// Replacements of `path` that succeed first.
+	skip: usize,
+	/// Replacements that fail after those, `usize::MAX` for every one.
+	times: usize,
+	/// Where each replacement fails, in order, after `skip`; the failpoint ends with the last one.
+	/// Empty for one that fails `times` replacements at `at`.
+	sequence: std::collections::VecDeque<ReplaceFailure>,
+}
+
+#[cfg(test)]
+static FAILPOINTS: parking_lot::Mutex<Vec<Failpoint>> = parking_lot::Mutex::new(Vec::new());
+
+/// Test-only: after `skip` more replacements of `path` succeed, the next `times` fail at `at`
+/// (`usize::MAX` for all of them). The failpoint belongs to `path`, so tests running side by side
+/// do not meet each other's.
+#[cfg(test)]
+pub(crate) fn fail_replacements(path: &Path, at: ReplaceFailure, skip: usize, times: usize) {
+	let mut failpoints = FAILPOINTS.lock();
+	failpoints.retain(|f| f.path != path);
+	failpoints.push(Failpoint {
+		path: path.to_path_buf(),
+		at,
+		skip,
+		times,
+		sequence: std::collections::VecDeque::new(),
+	});
+}
+
+/// Test-only: the replacements of `path` fail one after the other at the steps in `steps`, and
+/// those after them succeed. Unlike `fail_replacements` it lets one replacement land (fail after
+/// the rename) and the next fail before it.
+#[cfg(test)]
+pub(crate) fn fail_replacements_sequence(path: &Path, steps: &[ReplaceFailure]) {
+	let mut failpoints = FAILPOINTS.lock();
+	failpoints.retain(|f| f.path != path);
+	if let Some(&at) = steps.first() {
+		failpoints.push(Failpoint {
+			path: path.to_path_buf(),
+			at,
+			skip: 0,
+			times: 0,
+			sequence: steps.iter().copied().collect(),
+		});
+	}
+}
+
+/// Test-only: whether `path` has a failpoint that has not failed all its replacements yet.
+#[cfg(test)]
+pub(crate) fn replacements_pending(path: &Path) -> bool {
+	FAILPOINTS.lock().iter().any(|f| f.path == path)
+}
+
+/// Test-only: removes the failpoint of `path`.
+#[cfg(test)]
+pub(crate) fn heal_replacements(path: &Path) {
+	FAILPOINTS.lock().retain(|f| f.path != path);
+}
+
+/// Test-only: counts this replacement of `path` against its failpoint and says where it fails.
+#[cfg(test)]
+fn injected_failure(path: &Path) -> Option<ReplaceFailure> {
+	let mut failpoints = FAILPOINTS.lock();
+	let failpoint = failpoints.iter_mut().find(|f| f.path == path)?;
+	if failpoint.skip > 0 {
+		failpoint.skip -= 1;
+		return None;
+	}
+	if let Some(at) = failpoint.sequence.pop_front() {
+		if failpoint.sequence.is_empty() {
+			failpoints.retain(|f| f.path != path);
+		}
+		return Some(at);
+	}
+	let at = failpoint.at;
+	if failpoint.times != usize::MAX {
+		failpoint.times -= 1;
+		if failpoint.times == 0 {
+			failpoints.retain(|f| f.path != path);
+		}
+	}
+	Some(at)
+}
+
+/// Writes `content` to the temporary file `path`, syncs it and gives it `permissions`.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "called only by replace_file_content, which only StdFs and the std-only migrators call"
+)]
+fn write_temp_file(
+	path: &Path,
+	content: &[u8],
+	permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+	{
+		let mut temp_file = SysFile::create(path)?;
+		temp_file.write_all(content)?;
+		temp_file.sync_all()?;
+	}
+
+	// Apply original permissions to temp file if they exist
+	if let Some(permissions) = permissions {
+		std::fs::set_permissions(path, permissions)?;
+	}
+	Ok(())
+}
+
+/// Safely updates a file's content.
+///
+/// A failure before the rename is an `Error::Io` and leaves the file as it was. A failure from
+/// the rename on is an `Error::ManifestWriteUncertain`: the new content may be in place, and
+/// until the directory is synced a crash may bring the old content back.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "this is the body of StdFs::replace and of the std-only migrators; no other file system calls it"
+)]
+pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[u8]) -> Result<()> {
+	let target_path = file_path.as_ref();
+	#[cfg(test)]
+	let injected = injected_failure(target_path);
+	let directory = target_path
+		.parent()
+		.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
+
+	// Generate a unique temporary filename
+	let timestamp = rt::now_unix_ns();
+	let temp_filename = format!(".tmp_{}_{}", timestamp, rand::rng().random::<u64>());
+	let temp_path = directory.join(temp_filename);
+
+	// Get original file permissions if the file exists
+	let original_permissions = std::fs::metadata(target_path).ok().map(|m| m.permissions());
+
+	let staged = write_temp_file(&temp_path, new_content, original_permissions);
+	#[cfg(test)]
+	let staged = staged.and_then(|()| match injected {
+		Some(ReplaceFailure::BeforeRename) => {
+			Err(std::io::Error::other("injected failure before the rename"))
+		}
+		_ => Ok(()),
+	});
+	if let Err(e) = staged {
+		// Clean up temp file: the target was not touched
+		let _ = std::fs::remove_file(&temp_path);
+		return Err(e.into());
+	}
+
+	let uncertain = |e: std::io::Error| {
+		Error::ManifestWriteUncertain(format!("replacing {}: {e}", target_path.display()))
+	};
+
+	// Atomically replace the target file with the temporary file
+	if let Err(e) = std::fs::rename(&temp_path, target_path) {
+		// Clean up temp file on rename failure
+		let _ = std::fs::remove_file(&temp_path);
+		return Err(uncertain(e));
+	}
+
+	#[cfg(test)]
+	if injected == Some(ReplaceFailure::AfterRename) {
+		return Err(uncertain(std::io::Error::other("injected failure after the rename")));
+	}
+
+	let updated_file = crate::vfs::open_for_sync(target_path).map_err(uncertain)?;
+	updated_file.sync_all().map_err(uncertain)?;
+
+	// Make the rename itself durable: without a parent-directory fsync, a
+	// crash can revert the directory entry to the old file even though the
+	// new content was synced.
+	crate::lsm::fsync_directory(directory).map_err(uncertain)?;
+
+	Ok(())
+}
+
+/// Write the full versioned manifest to disk, sealed if the database is encrypted.
+///
+/// On the file system that is `std`: this is the form that has no options to take a file system
+/// from, and every caller that has them calls [`write_manifest_to_disk_in`] with theirs.
+pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
+	write_manifest_to_disk_in(&*default_fs(), manifest)
+}
+
+/// [`write_manifest_to_disk`] through `fs`, which replaces the manifest all or nothing
+/// ([`Fs::replace_atomic`]; on `std` that is `replace_file_content`, failpoints included).
+pub(crate) fn write_manifest_to_disk_in(fs: &dyn Fs, manifest: &LevelManifest) -> Result<()> {
+	let content = encode_manifest(manifest)?;
+	write_encoded_manifest_in(fs, &manifest.path, &content)
+}
+
+/// Replaces the manifest at `path` with `content`, which [`encode_manifest`] made, all or nothing
+/// ([`Fs::replace_atomic`]). It takes no lock: a writer holds the tree's `manifest_io` across the
+/// encode and this write, and only the bytes and the path, so that readers of the manifest in
+/// memory are not held up by the write and its fsync.
+pub(crate) fn write_encoded_manifest_in(fs: &dyn Fs, path: &Path, content: &[u8]) -> Result<()> {
+	fs.replace_atomic(path, content)?;
+	tracing::debug!("Manifest written successfully to {:?}", path);
+	Ok(())
+}
+
+/// The bytes [`write_manifest_to_disk_in`] writes for `manifest`, sealed if the database is
+/// encrypted.
+pub(crate) fn encode_manifest(manifest: &LevelManifest) -> Result<Vec<u8>> {
+	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
+	let total_tables: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
+
+	tracing::debug!(
+		"Writing manifest: version={}, log_number={}, last_sequence={}, next_table_id={}, total_tables={}",
+		manifest.manifest_format_version,
+		manifest.log_number,
+		manifest.last_sequence,
+		next_table_id,
+		total_tables
+	);
+
+	let mut buf = Vec::new();
+
+	// Write header. Every manifest this code writes is of the current version, including one
+	// that was loaded as V1: its tables are all in a layout V1 binaries cannot read in place.
+	let version = manifest.manifest_format_version.max(MANIFEST_FORMAT_VERSION);
+	buf.extend_from_slice(&version.to_be_bytes());
+	buf.extend_from_slice(&next_table_id.to_be_bytes());
+	buf.extend_from_slice(&manifest.log_number.to_be_bytes());
+	buf.extend_from_slice(&manifest.last_sequence.to_be_bytes());
+
+	// Write levels data
+	manifest.levels.encode(&mut buf)?;
+
+	// Write snapshots
+	buf.extend_from_slice(&(manifest.snapshots.len() as u32).to_be_bytes());
+	for snapshot in &manifest.snapshots {
+		let snapshot_bytes = snapshot.encode()?;
+		buf.extend_from_slice(&(snapshot_bytes.len() as u32).to_be_bytes());
+		buf.extend_from_slice(&snapshot_bytes);
+	}
+
+	// Append checksum trailer
+	let body_len = buf.len() as u32;
+	let crc = calculate_manifest_crc(&buf);
+	buf.extend_from_slice(&body_len.to_be_bytes());
+	buf.extend_from_slice(&crc.to_be_bytes());
+	buf.extend_from_slice(&MANIFEST_TRAILER_MAGIC);
+
+	// An encrypted database's manifest is sealed here, on every write and under a salt drawn
+	// by this write: a failed write that is tried again seals again, and never reuses a key.
+	// Failing to seal writes nothing.
+	match &manifest.encryption {
+		Some(context) => seal_manifest(context, &buf),
+		None => Ok(buf),
+	}
+}
+
+/// Sweeps any temporary manifest files (`.tmp_*`) left behind in the manifest directory of `fs`.
+pub(crate) fn sweep_stale_manifest_temp_files_in(fs: &dyn Fs, dir: &Path) {
+	if let Ok(entries) = fs.read_dir(dir) {
+		for entry in entries {
+			if entry.name.to_string_lossy().starts_with(".tmp_") {
+				let _ = fs.remove_file(&dir.join(&entry.name));
+			}
+		}
+	}
+}
+
+/// Helper to handle manifest write errors. If the error is `ManifestWriteUncertain`,
+/// records the uncertainty in `manifest_uncertain` and preserves the error variant.
+/// Otherwise wraps it in `Error::Other` with context.
+pub(crate) fn manifest_write_error(
+	manifest_uncertain: &AtomicBool,
+	error: Error,
+	context: &str,
+) -> Error {
+	match error {
+		Error::ManifestWriteUncertain(_) => {
+			manifest_uncertain.store(true, Ordering::Release);
+			error
+		}
+		// A pool that had no file for the manifest, which is the typed error that the tasks retry
+		// once the pool is refilled, and not a failure of the disk.
+		Error::FilePoolExhausted => error,
+		// A manifest that could not be sealed was not written: the key was not to be had, and
+		// whether it may be asked for again is what its type says, which text does not.
+		Error::Encryption(_) => error,
+		error => Error::Other(format!("{context}: {error}")),
+	}
+}

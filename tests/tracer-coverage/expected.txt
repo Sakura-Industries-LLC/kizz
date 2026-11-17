@@ -7,7 +7,7 @@
 # PATH is relative to the task directory, as the tracer reports it: `.` components and repeated
 # separators are removed, and `..` components are kept.
 #
-# KINDS joins with `+` the access kinds that "What is recorded" names: read, probe, list, write and exec.
+# KINDS joins with `+` the access kinds that "What is recorded" names: read, probe, list, write, exec and xattr.
 #
 # STATE is the type of the path's state when the step ended, as "Path states" names it:
 #
@@ -20,26 +20,57 @@
 # * symlink:TARGET:POINTEE, a symbolic link with its target and the state of what it points to,
 #   which is recorded with the kinds of the link's own entry.
 #
+# A path whose extended attributes were read or listed, the xattr kind, also records them with its state, and
+# STATE then ends with `@` and the names of the recorded attributes in the `user.` namespace, which the program
+# sets, joined with `,`; names in other namespaces depend on the machine and are left out.
+# For a symbolic link, `/` and the names of the attributes of what it points to follow, such as
+# symlink:t:file@/user.kizz.
+#
 # PLATFORM is where the path is touched: all, every platform, for the portable core; linux, for the Linux
 # section; or linux-x86_64, for the code that the Linux section compiles only where a call exists that
 # aarch64 lacks, such as open, stat or getdents.
 #
+# A platform may carry a mark: a `/` and the gated calls that the entry's group needs, joined with `+`, each
+# once, such as linux/getxattrat or linux/file_getattr+file_setattr.
+# The gated calls are file_getattr, getxattrat, listxattrat, setxattrat, removexattrat and file_setattr, which
+# Linux 6.13 and 6.17 added, so a kernel that runs the test may lack them.
+# coverage.c first makes each with arguments that cannot succeed, prints whether it is available, and makes a
+# group's calls only where every call that its mark names is available.
+# An entry is expected where its platform is current and every call that its mark names is available; where a
+# call is unavailable, nothing may be recorded at the paths of the entries that name it.
+# Only the entries of the gated calls' groups carry a mark, and each entry with a source of a gated call names it.
+#
 # Each SOURCE is a call that touches the path in the run, as ORIGIN:NAME:OUTCOME:KINDS.
 # ORIGIN is sys, for a tracked system call that coverage.c makes through syscall(); libc, for a function of
-# the C library; or kizz, for kizz's own start of the program with a traced execve.
+# the C library; kizz, for kizz's own start of the program with a traced execve; or kernel, for a file that the
+# kernel loads to run a program without a system call of its own: interpreter, the interpreter that the #! line
+# of a script that a process runs names, and interpreter_of_interpreter, the interpreter of an interpreter that
+# is a script itself, at any depth.
 # OUTCOME is ok, or the error the call failed with; KINDS are the kinds the call adds.
 # A call that succeeds adds the kinds of "What is recorded", as the Linux tracer decodes them since Step 4:
 # opening for reading reads, opening for writing, creating or truncating writes, and O_DIRECTORY or O_PATH
 # only probes.
 # A call that fails, with ENOENT or another error, adds a probe of each of its paths, because its lookup
-# happened.
+# happened; a call that reads or lists extended attributes and fails with ENODATA, ERANGE or EOPNOTSUPP adds
+# the xattr kind instead, because each of those answers depends on the attributes.
 #
 # The paths that the Linux section creates under out/linux/made-link, a symbolic link to out/linux/made, are
 # recorded under the link's name; the call that a group tests then works on the path under out/linux/made,
 # or on a descriptor that names it, so it is that path's only source.
+#
+# The connections that the step must record follow the paths, one on each line, and no others:
+#
+#     connection PLATFORM DESTINATION SOURCE
+#
+# DESTINATION is an IPv4 or IPv6 address and port, such as 127.0.0.1:47011 or [::1]:80; unix:PATH, a Unix
+# socket by its path relative to the task directory; or abstract:NAME, an abstract Unix socket by its name.
+# PLATFORM is as for the paths, without a mark, and SOURCE is ORIGIN:NAME, the call that made the connection:
+# connect, sendto, sendmsg or sendmmsg, through syscall() or the C library.
+# A destination is recorded once, however many calls connect or send to it.
 
-# The program, which kizz starts with execve and the portable core's child runs again with execv.
-coverage exec file+hash all kizz:execve:ok:exec libc:execv:ok:exec
+# The program, which kizz starts with execve, the portable core's child runs again with execv, and the kernel
+# runs as the interpreter of the script in/linux/interp/inner.
+coverage exec file+hash all kizz:execve:ok:exec libc:execv:ok:exec kernel:interpreter_of_interpreter:ok:exec
 
 # Portable core: the output directories; out must not exist, and a second mkdir of out/core fails with EEXIST.
 out write dir all libc:mkdir:ok:write
@@ -237,6 +268,16 @@ out/linux/execveat-copy probe+write+exec file+hash linux sys:openat:ok:write sys
 in/linux/child-execveat-empty.txt read file+hash linux sys:openat:ok:read
 in/linux/execveat-missing probe absent linux sys:execveat:ENOENT:probe
 
+# #! scripts: a child runs in/linux/interp/outer with execve, and the kernel runs it through its interpreter
+# in/linux/interp/middle, a script whose interpreter in/linux/interp/inner is a script whose interpreter is the
+# program; another child runs in/linux/interp/broken, whose interpreter in/linux/interp/missing does not exist,
+# so execve fails with ENOENT.
+in/linux/interp/outer exec file+hash linux sys:execve:ok:exec
+in/linux/interp/middle exec file+hash linux kernel:interpreter:ok:exec
+in/linux/interp/inner exec file+hash linux kernel:interpreter_of_interpreter:ok:exec
+in/linux/interp/broken probe file linux sys:execve:ENOENT:probe
+in/linux/interp/missing probe absent linux kernel:interpreter:ENOENT:probe
+
 # chdir and fchdir: children enter a directory, by name or by a descriptor that openat opened through a link
 # to it, and read a relative path there; a missing directory fails with ENOENT.
 in/linux/chdir probe dir linux sys:chdir:ok:probe
@@ -366,3 +407,156 @@ out/linux/made-link/fchmod write file linux sys:openat:ok:write
 out/linux/made/fchmod write file linux sys:fchmod:ok:write
 out/linux/made-link/fchown write file linux sys:openat:ok:write
 out/linux/made/fchown write file linux sys:fchown:ok:write
+
+# statfs and fstatfs: the file system of a file made through out/linux/made-link, by path and through a
+# descriptor; a missing name fails with ENOENT.
+out/linux/made-link/statfs write file linux sys:openat:ok:write
+out/linux/made/statfs probe file linux sys:statfs:ok:probe
+out/linux/statfs-missing probe absent linux sys:statfs:ENOENT:probe
+out/linux/made-link/fstatfs write file linux sys:openat:ok:write
+out/linux/made/fstatfs probe file linux sys:fstatfs:ok:probe
+
+# file_getattr and file_setattr: the file attributes of files made through out/linux/made-link, by path and on
+# the empty path with AT_EMPTY_PATH; file_setattr sets the attributes that file_getattr read through the link;
+# missing names fail with ENOENT.
+# Both calls are gated: the group of file_getattr needs it, and that of file_setattr needs both.
+out/linux/made-link/file_getattr write file linux/file_getattr sys:openat:ok:write
+out/linux/made/file_getattr probe file linux/file_getattr sys:file_getattr:ok:probe
+out/linux/made-link/file_getattr-empty write file linux/file_getattr sys:openat:ok:write
+out/linux/made/file_getattr-empty probe file linux/file_getattr sys:file_getattr:ok:probe
+out/linux/file_getattr-missing probe absent linux/file_getattr sys:file_getattr:ENOENT:probe
+out/linux/made-link/file_setattr probe+write file linux/file_getattr+file_setattr sys:openat:ok:write sys:file_getattr:ok:probe
+out/linux/made/file_setattr write file linux/file_getattr+file_setattr sys:file_setattr:ok:write
+out/linux/file_setattr-missing probe absent linux/file_getattr+file_setattr sys:file_setattr:ENOENT:probe
+
+# name_to_handle_at: the handle of a file made through out/linux/made-link; a missing name fails with ENOENT.
+out/linux/made-link/name_to_handle_at write file linux sys:openat:ok:write
+out/linux/made/name_to_handle_at probe file linux sys:name_to_handle_at:ok:probe
+out/linux/name_to_handle_at-missing probe absent linux sys:name_to_handle_at:ENOENT:probe
+
+# inotify_add_watch and fanotify_mark: watches of files made through out/linux/made-link, through an inotify
+# instance and a fanotify group of the program's own; missing names fail with ENOENT.
+out/linux/made-link/inotify write file linux sys:openat:ok:write
+out/linux/made/inotify probe file linux sys:inotify_add_watch:ok:probe
+out/linux/inotify-missing probe absent linux sys:inotify_add_watch:ENOENT:probe
+out/linux/made-link/fanotify write file linux sys:openat:ok:write
+out/linux/made/fanotify probe file linux sys:fanotify_mark:ok:probe
+out/linux/fanotify-missing probe absent linux sys:fanotify_mark:ENOENT:probe
+
+# getxattr, lgetxattr, fgetxattr and getxattrat: reads of user.kizz, which setxattr set through
+# out/linux/made-link, by path, through a descriptor, from a descriptor and on the empty path with
+# AT_EMPTY_PATH; getxattr also through a link to such a file, whose attributes are recorded with those of what
+# it points to, and with ENODATA for a missing attribute and ERANGE for a buffer too small, which record the
+# xattr kind; missing names fail with ENOENT. The group of getxattrat is gated on it.
+out/linux/made-link/getxattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/getxattr xattr file@user.kizz linux sys:getxattr:ok:xattr
+out/linux/getxattr-missing probe absent linux sys:getxattr:ENOENT:probe
+out/linux/made-link/getxattr-nodata write file linux sys:openat:ok:write
+out/linux/made/getxattr-nodata xattr file@ linux sys:getxattr:ENODATA:xattr
+out/linux/made-link/getxattr-range write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/getxattr-range xattr file@user.kizz linux sys:getxattr:ERANGE:xattr
+out/linux/made-link/getxattr-link write symlink:getxattr:file linux sys:symlinkat:ok:write
+out/linux/made/getxattr-link xattr symlink:getxattr:file@/user.kizz linux sys:getxattr:ok:xattr
+out/linux/made-link/lgetxattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/lgetxattr xattr file@user.kizz linux sys:lgetxattr:ok:xattr
+out/linux/lgetxattr-missing probe absent linux sys:lgetxattr:ENOENT:probe
+out/linux/made-link/fgetxattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/fgetxattr xattr file@user.kizz linux sys:fgetxattr:ok:xattr
+out/linux/made-link/getxattrat write file linux/getxattrat sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/getxattrat xattr file@user.kizz linux/getxattrat sys:getxattrat:ok:xattr
+out/linux/made-link/getxattrat-at write file linux/getxattrat sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/getxattrat-at xattr file@user.kizz linux/getxattrat sys:getxattrat:ok:xattr
+out/linux/made-link/getxattrat-empty write file linux/getxattrat sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/getxattrat-empty xattr file@user.kizz linux/getxattrat sys:getxattrat:ok:xattr
+out/linux/getxattrat-missing probe absent linux/getxattrat sys:getxattrat:ENOENT:probe
+
+# listxattr, llistxattr, flistxattr and listxattrat: lists of the attributes of files on which setxattr set
+# user.kizz through out/linux/made-link, by path and through a descriptor; missing names fail with ENOENT.
+# The group of listxattrat is gated on it.
+out/linux/made-link/listxattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/listxattr xattr file@user.kizz linux sys:listxattr:ok:xattr
+out/linux/listxattr-missing probe absent linux sys:listxattr:ENOENT:probe
+out/linux/made-link/llistxattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/llistxattr xattr file@user.kizz linux sys:llistxattr:ok:xattr
+out/linux/llistxattr-missing probe absent linux sys:llistxattr:ENOENT:probe
+out/linux/made-link/flistxattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/flistxattr xattr file@user.kizz linux sys:flistxattr:ok:xattr
+out/linux/made-link/listxattrat write file linux/listxattrat sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/listxattrat xattr file@user.kizz linux/listxattrat sys:listxattrat:ok:xattr
+out/linux/listxattrat-missing probe absent linux/listxattrat sys:listxattrat:ENOENT:probe
+
+# setxattr, lsetxattr, fsetxattr and setxattrat: writes of user.kizz on files made through out/linux/made-link,
+# by path and through a descriptor; missing names fail with ENOENT. The group of setxattrat is gated on it.
+out/linux/made-link/setxattr write file linux sys:openat:ok:write
+out/linux/made/setxattr write file linux sys:setxattr:ok:write
+out/linux/setxattr-missing probe absent linux sys:setxattr:ENOENT:probe
+out/linux/made-link/lsetxattr write file linux sys:openat:ok:write
+out/linux/made/lsetxattr write file linux sys:lsetxattr:ok:write
+out/linux/lsetxattr-missing probe absent linux sys:lsetxattr:ENOENT:probe
+out/linux/made-link/fsetxattr write file linux sys:openat:ok:write
+out/linux/made/fsetxattr write file linux sys:fsetxattr:ok:write
+out/linux/made-link/setxattrat write file linux/setxattrat sys:openat:ok:write
+out/linux/made/setxattrat write file linux/setxattrat sys:setxattrat:ok:write
+out/linux/setxattrat-missing probe absent linux/setxattrat sys:setxattrat:ENOENT:probe
+
+# removexattr, lremovexattr, fremovexattr and removexattrat: removals of user.kizz, which setxattr set through
+# out/linux/made-link, by path and through a descriptor; missing names fail with ENOENT.
+# The group of removexattrat is gated on it.
+out/linux/made-link/removexattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/removexattr write file linux sys:removexattr:ok:write
+out/linux/removexattr-missing probe absent linux sys:removexattr:ENOENT:probe
+out/linux/made-link/lremovexattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/lremovexattr write file linux sys:lremovexattr:ok:write
+out/linux/lremovexattr-missing probe absent linux sys:lremovexattr:ENOENT:probe
+out/linux/made-link/fremovexattr write file linux sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/fremovexattr write file linux sys:fremovexattr:ok:write
+out/linux/made-link/removexattrat write file linux/removexattrat sys:openat:ok:write sys:setxattr:ok:write
+out/linux/made/removexattrat write file linux/removexattrat sys:removexattrat:ok:write
+out/linux/removexattrat-missing probe absent linux/removexattrat sys:removexattrat:ENOENT:probe
+
+# fchmodat2 and fallocate: changes of files made through out/linux/made-link, fchmodat2 by path and on the empty
+# path with AT_EMPTY_PATH, and fallocate through a descriptor; a missing name fails with ENOENT.
+out/linux/made-link/fchmodat2 write file linux sys:openat:ok:write
+out/linux/made/fchmodat2 write file linux sys:fchmodat2:ok:write
+out/linux/made-link/fchmodat2-empty write file linux sys:openat:ok:write
+out/linux/made/fchmodat2-empty write file linux sys:fchmodat2:ok:write
+out/linux/fchmodat2-missing probe absent linux sys:fchmodat2:ENOENT:probe
+out/linux/made-link/fallocate write file linux sys:openat:ok:write
+out/linux/made/fallocate write file linux sys:fallocate:ok:write
+
+# Portable core: a Unix stream socket that bind creates and connect probes, through the C library, and a
+# missing Unix socket, which connect probes and fails on with ENOENT.
+out/core/stream.sock probe+write socket all libc:bind:ok:write libc:connect:ok:probe
+out/core/missing.sock probe absent all libc:connect:ENOENT:probe
+
+# bind and connect: a Unix stream socket that bind creates and connect probes, and missing paths, on which
+# each fails with ENOENT.
+out/linux/bound.sock probe+write socket linux sys:bind:ok:write sys:connect:ok:probe
+out/linux/no-dir/bind.sock probe absent linux sys:bind:ENOENT:probe
+out/linux/connect-missing.sock probe absent linux sys:connect:ENOENT:probe
+
+# sendto, sendmsg and sendmmsg: a datagram socket for each, which bind creates and the call probes when it
+# sends to it, and a missing path for each, on which the call fails with ENOENT.
+out/linux/sendto.sock probe+write socket linux sys:bind:ok:write sys:sendto:ok:probe
+out/linux/sendto-missing.sock probe absent linux sys:sendto:ENOENT:probe
+out/linux/sendmsg.sock probe+write socket linux sys:bind:ok:write sys:sendmsg:ok:probe
+out/linux/sendmsg-missing.sock probe absent linux sys:sendmsg:ENOENT:probe
+out/linux/sendmmsg.sock probe+write socket linux sys:bind:ok:write sys:sendmmsg:ok:probe
+out/linux/sendmmsg-missing.sock probe absent linux sys:sendmmsg:ENOENT:probe
+
+# The connections. The portable core connects to its Unix stream socket and, through UDP sockets, connects
+# and sends to 127.0.0.1 on two ports. The Linux section connects and sends to its Unix sockets, and through
+# UDP sockets connects, sends with sendto and with sendmsg to one loopback address each, and sends with
+# sendmmsg to two. The missing paths, and bind, record no connection.
+connection all unix:out/core/stream.sock libc:connect
+connection all 127.0.0.1:47011 libc:connect
+connection all 127.0.0.1:47012 libc:sendto
+connection linux unix:out/linux/bound.sock sys:connect
+connection linux unix:out/linux/sendto.sock sys:sendto
+connection linux unix:out/linux/sendmsg.sock sys:sendmsg
+connection linux unix:out/linux/sendmmsg.sock sys:sendmmsg
+connection linux 127.0.0.21:47021 sys:connect
+connection linux 127.0.0.22:47022 sys:sendto
+connection linux 127.0.0.23:47023 sys:sendmsg
+connection linux 127.0.0.24:47024 sys:sendmmsg
+connection linux 127.0.0.25:47025 sys:sendmmsg

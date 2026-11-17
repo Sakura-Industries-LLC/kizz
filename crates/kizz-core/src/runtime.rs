@@ -17,45 +17,83 @@
 //! them, and calling `run()` while a module is being loaded, outside any task, is
 //! an error.
 //!
+//! Each positional argument of `run()` is a string, or a list or tuple of strings,
+//! lists or tuples, which expands in place, in order and at any depth, into the
+//! step's command. The expansion walks the values with its own stack, fails on a
+//! list or tuple that contains itself, and stops past a million values, so it never
+//! recurses without bound and always ends.
+//!
 //! The task environment starts empty, and only the `env` functions change it;
 //! `env.caller` and `env.inherit` read the caller environment that
 //! [`TaskProgram::run`] is given, never the process environment. The task
 //! environment and the caller environment exist only while the task runs, so while
 //! a module is being loaded, the `env` functions other than `env.read` are errors,
 //! like `run()`. The `fs` functions and `env.read` work there too, and every file
-//! access they make, like each module read, is recorded against the task.
+//! access they make, like each module read, is recorded against the task, as is
+//! every file that `fs.write` or `fs.write_json` changes.
+//!
+//! `run()` returns a value of the runtime's own Starlark type, `run_result`, with
+//! the attributes `rc`, `signal`, `stdout` and `stderr` or `output`, and `cached`.
+//! The value notes when the program reads `rc` or `signal`, or encodes the value
+//! with `json.encode` or `fs.write_json`, which encode it as an object of its
+//! attributes, as they encoded the struct that `run()` returned before. So when the
+//! program ends, [`TaskRun::unchecked`] lists every step that exited with a
+//! non-zero code or was killed by a signal, whose `run()` had no `expect`, and
+//! whose result the program never checked ("Exit codes and failure").
+//!
+//! The runtime never panics ("Kizz never panics"): the state of the running task
+//! and of a module being loaded lives in `Cell`s, which the private `cells` module
+//! takes out, changes and puts back, where `RefCell` borrows would panic while the
+//! cell is borrowed; and the blank lines that put the block at its line of the
+//! `kizz.md` are pushed into space reserved with `String::try_reserve_exact`, where
+//! `str::repeat` would panic on a length that overflows.
 
 use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    cell::Cell,
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
+use allocative::Allocative;
+use kizz_store::MachinePart;
 use kizz_trace::{
     AbsolutePath, AccessKind, Accesses, CaptureMode, CapturedOutput, NotAbsoluteError, Termination,
 };
 use starlark::{
     PrintHandler,
     any::ProvidesStaticType,
+    collections::SmallMap,
+    docs::{DocFunction, DocItem, DocMember},
     environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module},
     eval::{Evaluator, FileLoader},
+    pagable::{
+        StarlarkDeserialize, StarlarkDeserializeContext, StarlarkSerialize,
+        StarlarkSerializeContext,
+    },
     starlark_module,
     syntax::{AstModule, Dialect},
     values::{
-        Heap, Value,
-        dict::{AllocDict, UnpackDictEntries},
+        AllocValue, Heap, StarlarkValue, Value, ValueIdentity, ValueLike,
+        dict::{Dict, UnpackDictEntries},
+        list::ListRef,
         list_or_tuple::UnpackListOrTuple,
         none::{NoneOr, NoneType},
+        starlark_value,
         structs::AllocStruct,
-        tuple::UnpackTuple,
+        tuple::{TupleRef, UnpackTuple},
     },
 };
 
 use crate::{
+    cells,
     dotenv::{self, DotenvError},
-    files::{FileError, Files},
+    files::{AccessOutcomes, FileChanges, FileError, Files},
     step::{StepError, StepExecutor, StepOutcome, StepSpec},
     tasks::Task,
 };
@@ -79,18 +117,27 @@ pub struct TaskInfo {
     pub line: usize,
     /// The index of the task block in its `kizz.md`, counting from zero.
     pub index: u32,
-    /// The nearest heading above the block, which names the task, if there is one.
+    /// The name that the block's `name=` option gives the task, if it has one.
     pub name: Option<String>,
+    /// The nearest heading above the block, the task's heading, if there is one.
+    pub heading: Option<String>,
     /// The targets on the block, in the order written.
     pub targets: Vec<String>,
     /// The requested targets that selected the task.
     pub selected: Vec<String>,
+    /// The task's arguments, which programs read as `task.args`: empty under
+    /// `kizz build`. They are not part of the task program hash.
+    pub args: Vec<String>,
+    /// Whether the block's `cache=never` option marks the task, so every command of
+    /// the task runs as if it were marked `always`.
+    pub cache_never: bool,
     /// The block's Starlark source.
     pub source: String,
 }
 
 impl TaskInfo {
-    /// The information of `task`, selected by the requested targets `selected`.
+    /// The information of `task`, selected by the requested targets `selected`, with
+    /// no arguments, as `kizz build` runs it.
     ///
     /// # Errors
     ///
@@ -107,26 +154,48 @@ impl TaskInfo {
             relative_file: task.relative_file.clone(),
             line: task.line,
             index: task.id.index,
-            name: task.heading.clone(),
+            name: task.options.name.clone(),
+            heading: task.heading.clone(),
             targets: task.targets.clone(),
             selected: selected.to_vec(),
+            args: Vec::new(),
+            cache_never: task.options.cache_never,
             source: task.source.clone(),
         })
     }
 
-    /// The name that prefixes the task's `print` output: its heading, or
-    /// `path/kizz.md:LINE` when the block has no heading above it.
+    /// The information of `task` as `kizz run` runs it: with the arguments `args`,
+    /// which its program reads as `task.args`, and an empty `task.selected`,
+    /// because no target selected the task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotAbsoluteError`] when the task's `kizz.md` path is not absolute.
+    pub fn for_run(
+        task: &Task,
+        args: Vec<String>,
+    ) -> Result<Self, NotAbsoluteError> {
+        Ok(Self {
+            args,
+            ..Self::new(task, &[])?
+        })
+    }
+
+    /// The name that prefixes the task's `print` output: its name, else its heading,
+    /// else `path/kizz.md:LINE`.
     #[must_use]
     pub fn display_name(&self) -> String {
         self.name
             .clone()
+            .or_else(|| self.heading.clone())
             .unwrap_or_else(|| format!("{}:{}", self.relative_file.display(), self.line))
     }
 }
 
 /// Where the lines that task programs `print` go.
 pub trait PrintSink {
-    /// Show one line of `print` output, already prefixed with the task name.
+    /// Show one line of `print` output, already prefixed with the task's
+    /// [`TaskInfo::display_name`]: its name, else its heading, else its location.
     fn print_line(
         &self,
         line: &str,
@@ -193,14 +262,88 @@ impl fmt::Display for UnexpectedExit {
                 expected.join(" or ")
             },
         )?;
-        match &self.output {
-            CapturedOutput::Split { stdout, stderr } => {
-                write_output(f, "stdout", stdout)?;
-                write_output(f, "stderr", stderr)
-            },
-            CapturedOutput::Merged { output } => write_output(f, "output", output),
-        }
+        write_captured(f, &self.output)
     }
+}
+
+/// Write the captured output `output` under a header for each stream.
+fn write_captured(
+    f: &mut fmt::Formatter<'_>,
+    output: &CapturedOutput,
+) -> fmt::Result {
+    match output {
+        CapturedOutput::Split { stdout, stderr } => {
+            write_output(f, "stdout", stdout)?;
+            write_output(f, "stderr", stderr)
+        },
+        CapturedOutput::Merged { output } => write_output(f, "output", output),
+    }
+}
+
+/// A step whose command exited with a non-zero code or was killed by a signal,
+/// whose `run()` had no `expect`, and whose result the task program never checked:
+/// it never read the result's `rc` or `signal` and never encoded the result
+/// ("Exit codes and failure"). A result from the cache counts like any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncheckedExit {
+    /// The position of the step in the task's run, counting from zero: the number
+    /// of `run()` calls that reached the executor before it.
+    pub position: u32,
+    /// The step's argument vector.
+    pub argv: Vec<String>,
+    /// How the command ended: never with exit code 0.
+    pub termination: Termination,
+    /// The command's raw captured output.
+    pub output: CapturedOutput,
+    /// Whether the result came from the cache.
+    pub cached: bool,
+}
+
+impl UncheckedExit {
+    /// The command as messages name it: its arguments joined with spaces.
+    #[must_use]
+    pub fn command(&self) -> String {
+        self.argv.join(" ")
+    }
+}
+
+impl fmt::Display for UncheckedExit {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        writeln!(
+            f,
+            "command `{}`: {}, which the task program never checked: its `run()` has no \
+             `expect`, and the program never read the result's `rc` or `signal`",
+            self.command(),
+            self.termination,
+        )?;
+        write_captured(f, &self.output)
+    }
+}
+
+/// The message of a task that `--fail-unchecked` fails because its program left
+/// the steps `exits` unchecked, under the command `invoked`, such as `kizz build`
+/// or `kizz run`: a line that says so and names the command with the option, then
+/// each command with its exit status and its captured output.
+fn unchecked_message(
+    exits: &[UncheckedExit],
+    invoked: &str,
+) -> String {
+    let mut message = format!(
+        "the task program left {} unchecked, and `{invoked} --fail-unchecked` makes that fail \
+         the task\n",
+        if exits.len() == 1 {
+            "a non-zero exit".to_owned()
+        } else {
+            format!("{} non-zero exits", exits.len())
+        }
+    );
+    for exit in exits {
+        message.push_str(&exit.to_string());
+    }
+    message
 }
 
 /// Write one captured stream under a header, decoded as UTF-8 with invalid bytes
@@ -238,6 +381,20 @@ pub enum TaskFailure {
         /// The Starlark error message with the stack of the `run()` call.
         message: String,
     },
+    /// The program ended, and left steps unchecked, which fails the task with
+    /// `kizz build --fail-unchecked` or `kizz run --fail-unchecked` ("Exit codes and
+    /// failure").
+    #[error("{}", unchecked_message(.exits, .invoked))]
+    Unchecked {
+        /// Each unchecked step, in the order the program ran them, with its command,
+        /// its exit status, and its captured output.
+        exits: Vec<UncheckedExit>,
+        /// The command that was given `--fail-unchecked`, as the message names it:
+        /// `kizz build` or `kizz run` (see [`Engine::command_name`]).
+        ///
+        /// [`Engine::command_name`]: crate::Engine::command_name
+        invoked: &'static str,
+    },
 }
 
 impl TaskFailure {
@@ -247,6 +404,137 @@ impl TaskFailure {
             message: message.to_string(),
         }
     }
+}
+
+/// The most values that the expansion of `run()`'s positional arguments visits:
+/// the positional arguments, and every string, list and tuple inside them, alike.
+/// The bound keeps the expansion of lists that share lists, which can double at each
+/// level, under a million steps, and it refuses no command that Linux could start.
+const MAX_ARGUMENT_VALUES: usize = 1_000_000;
+
+/// Where a value among `run()`'s positional arguments is: the positional argument,
+/// counted from 1, and the index path within it, as Starlark indexing writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArgumentPlace {
+    /// The positional argument, counted from 1.
+    argument: usize,
+    /// The index into each list or tuple on the way to the value, outermost first;
+    /// empty for the positional argument itself.
+    path: Vec<usize>,
+}
+
+impl fmt::Display for ArgumentPlace {
+    /// `3` for a positional argument itself, and `2 at [1][0]` for `x[1][0]` where
+    /// `x` is the second positional argument.
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "{}", self.argument)?;
+        if !self.path.is_empty() {
+            f.write_str(" at ")?;
+            for index in &self.path {
+                write!(f, "[{index}]")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A list or tuple that the expansion of `run()`'s positional arguments is inside.
+struct ArgumentFrame<'v> {
+    /// The elements of the list or tuple.
+    items: &'v [Value<'v>],
+    /// The index of the next element to visit.
+    next: usize,
+    /// The identity of the list or tuple, which the cycle check holds while the
+    /// expansion is inside it.
+    identity: ValueIdentity<'v>,
+}
+
+/// The elements of `value` and its type, `list` or `tuple`, when it is a list or a
+/// tuple, frozen or not.
+fn list_or_tuple_items(value: Value<'_>) -> Option<(&[Value<'_>], &'static str)> {
+    if let Some(list) = ListRef::from_value(value) {
+        return Some((list.content(), value.get_type()));
+    }
+    TupleRef::from_value(value).map(|tuple| (tuple.content(), value.get_type()))
+}
+
+/// The command that `run()`'s positional arguments `arguments` give: each string as
+/// one argument, unchanged, and each list or tuple expanded in place, in order and at
+/// any depth.
+///
+/// The walk uses an explicit stack of frames, never recursion, so no depth of nesting
+/// can overflow the thread's stack. The identities of the lists and tuples on the
+/// current path are held in a set, so a list or tuple met again inside itself is an
+/// error, while the same list used twice side by side is not. Every visited value
+/// counts towards [`MAX_ARGUMENT_VALUES`], so lists that share lists end promptly.
+/// Errors come in the order of the walk.
+///
+/// # Errors
+///
+/// Returns [`RunError::ArgumentType`] for a value that is neither a string nor a list
+/// or tuple, [`RunError::SelfContaining`] for a list or tuple met again inside
+/// itself, and [`RunError::TooManyValues`] past the bound.
+fn expand_arguments(arguments: &[Value<'_>]) -> Result<Vec<String>, RunError> {
+    let mut argv = Vec::new();
+    let mut visited: usize = 0;
+    for (position, &argument) in arguments.iter().enumerate() {
+        let number = position.saturating_add(1);
+        let mut stack: Vec<ArgumentFrame<'_>> = Vec::new();
+        let mut on_path: HashSet<ValueIdentity<'_>> = HashSet::new();
+        let mut pending = Some(argument);
+        loop {
+            if let Some(value) = pending.take() {
+                if visited >= MAX_ARGUMENT_VALUES {
+                    return Err(RunError::TooManyValues);
+                }
+                visited = visited.saturating_add(1);
+                let place = || {
+                    ArgumentPlace {
+                        argument: number,
+                        path: stack
+                            .iter()
+                            .map(|frame| frame.next.saturating_sub(1))
+                            .collect(),
+                    }
+                };
+                if let Some(text) = value.unpack_str() {
+                    argv.push(text.to_owned());
+                } else if let Some((items, kind)) = list_or_tuple_items(value) {
+                    let identity = value.identity();
+                    if !on_path.insert(identity) {
+                        return Err(RunError::SelfContaining {
+                            place: place(),
+                            kind,
+                        });
+                    }
+                    stack.push(ArgumentFrame {
+                        items,
+                        next: 0,
+                        identity,
+                    });
+                } else {
+                    return Err(RunError::ArgumentType {
+                        place: place(),
+                        kind: value.get_type(),
+                    });
+                }
+            }
+            let Some(frame) = stack.last_mut() else {
+                break;
+            };
+            if let Some(&item) = frame.items.get(frame.next) {
+                frame.next = frame.next.saturating_add(1);
+                pending = Some(item);
+            } else {
+                on_path.remove(&frame.identity);
+                stack.pop();
+            }
+        }
+    }
+    Ok(argv)
 }
 
 /// Errors that `run()`, the `env` and `fs` functions, and module loading raise
@@ -265,9 +553,40 @@ enum RunError {
     /// `run()` was called with no program.
     #[error("run() needs a program: run(\"program\", \"argument\", ...)")]
     NoProgram,
+    /// A positional argument of `run()`, or a value inside one, is neither a string
+    /// nor a list or tuple.
+    #[error("run(): argument {place} is of type {kind}, not a string, list or tuple")]
+    ArgumentType {
+        /// Where the value is.
+        place: ArgumentPlace,
+        /// The value's type, as Starlark's `type()` names it.
+        kind: &'static str,
+    },
+    /// A list or tuple among the positional arguments of `run()` contains itself,
+    /// directly or through other lists or tuples.
+    #[error("run(): argument {place} is a {kind} that contains itself")]
+    SelfContaining {
+        /// Where the list or tuple is met again inside itself.
+        place: ArgumentPlace,
+        /// `list` or `tuple`.
+        kind: &'static str,
+    },
+    /// The positional arguments of `run()` would expand to more values than
+    /// [`MAX_ARGUMENT_VALUES`].
+    #[error(
+        "run(): the arguments expand to more than {max} strings, lists and tuples",
+        max = MAX_ARGUMENT_VALUES
+    )]
+    TooManyValues,
     /// `capture` was neither `"split"` nor `"merged"`.
     #[error("run(): capture must be \"split\" or \"merged\", not \"{0}\"")]
     Capture(String),
+    /// `machine` named a part that the machine state does not have.
+    #[error(
+        "run(): machine has no part \"{0}\"; the parts are {parts}",
+        parts = MachinePart::names_text()
+    )]
+    MachinePart(String),
     /// The executor could not run the step.
     #[error("run(): {0}")]
     Step(#[from] StepError),
@@ -319,6 +638,13 @@ enum RunError {
     /// A JSON number has no Starlark value.
     #[error("fs.read_json(): the number {0} is out of range")]
     NumberRange(String),
+    /// A JSON key has no Starlark dict key.
+    #[error("fs.read_json(): the key {0:?} cannot be a dict key")]
+    JsonKey(String),
+    /// A `run()` result was to be stored as a frozen value, which never happens,
+    /// because a result exists only while its task runs.
+    #[error("a run() result exists only while its task runs, so it cannot be stored")]
+    NotStored,
 }
 
 /// The state of the task whose program is being evaluated, reached by `run()`
@@ -332,11 +658,33 @@ struct TaskState<'a> {
     /// The caller environment, which `env.caller` and `env.inherit` read.
     caller: &'a BTreeMap<String, String>,
     /// The task environment, which starts empty.
-    env: RefCell<BTreeMap<String, String>>,
+    env: Cell<BTreeMap<String, String>>,
     /// Every file access the program makes.
-    accesses: RefCell<Accesses>,
+    accesses: Cell<Accesses>,
+    /// Every file the program changes.
+    changes: Cell<FileChanges>,
+    /// How each file access of the program ended, when the run notes it for the
+    /// report of `kizz run --output`, and otherwise `None`.
+    outcomes: Cell<Option<AccessOutcomes>>,
     /// The step whose exit status `expect` did not accept, if any.
-    unexpected: RefCell<Option<UnexpectedExit>>,
+    unexpected: Cell<Option<UnexpectedExit>>,
+    /// The number of `run()` calls that reached the executor so far, which is the
+    /// position of the next step in the task's run.
+    started: Cell<u32>,
+    /// The steps that exited with a non-zero code or were killed by a signal and
+    /// had no `expect`, in the order they ran, each with whether the program
+    /// checked its result.
+    watched: Cell<Vec<Watched>>,
+}
+
+/// A step that is unchecked unless the program checks its result before it ends:
+/// reads its `rc` or `signal`, or encodes it.
+struct Watched {
+    /// The step, as it is reported when it stays unchecked.
+    exit: UncheckedExit,
+    /// Set when the program reads the result's `rc` or `signal`, or encodes the
+    /// result; shared with the [`RunResult`] that `run()` returned for the step.
+    checked: Arc<AtomicBool>,
 }
 
 /// Marks an evaluator that loads a module, outside any task.
@@ -347,7 +695,12 @@ struct LoadingModule {
     /// The directory of the task that loads it, against which `fs` paths resolve.
     dir: AbsolutePath,
     /// Every file access the module's top-level code makes.
-    accesses: RefCell<Accesses>,
+    accesses: Cell<Accesses>,
+    /// Every file the module's top-level code changes.
+    changes: Cell<FileChanges>,
+    /// How each file access of the module's top-level code ended, when the run
+    /// notes it, and otherwise `None`.
+    outcomes: Cell<Option<AccessOutcomes>>,
 }
 
 /// The error for `call`, a function that needs the running task, when `eval`
@@ -384,7 +737,12 @@ fn with_task<R>(
 }
 
 /// Call `f` with the file operations of the task that `eval` evaluates or loads a
-/// module for, so every access is recorded against that task.
+/// module for, so every access and every change is recorded against that task, and
+/// the outcome of every access is noted when the run notes outcomes.
+///
+/// The accesses, the changes and the outcomes are taken out of their cells for the
+/// length of `f`, which only does file operations and reaches none of the cells,
+/// and put back after it.
 ///
 /// # Errors
 ///
@@ -395,19 +753,32 @@ fn with_files<R>(
     f: impl FnOnce(&mut Files<'_>) -> Result<R, RunError>,
 ) -> starlark::Result<R> {
     let extra = eval.extra;
-    let result = if let Some(state) = extra.and_then(|extra| extra.downcast_ref::<TaskState>()) {
-        f(&mut Files::new(
+    let (dir, accesses, changes, outcomes) = if let Some(state) =
+        extra.and_then(|extra| extra.downcast_ref::<TaskState>())
+    {
+        (
             &state.task.dir,
-            &mut state.accesses.borrow_mut(),
-        ))
+            &state.accesses,
+            &state.changes,
+            &state.outcomes,
+        )
     } else if let Some(loading) = extra.and_then(|extra| extra.downcast_ref::<LoadingModule>()) {
-        f(&mut Files::new(
+        (
             &loading.dir,
-            &mut loading.accesses.borrow_mut(),
-        ))
+            &loading.accesses,
+            &loading.changes,
+            &loading.outcomes,
+        )
     } else {
         return Err(outside_task(eval, call));
     };
+    let result = cells::update(accesses, |accesses| {
+        cells::update(changes, |changes| {
+            cells::update(outcomes, |outcomes| {
+                f(&mut Files::new(dir, accesses, changes).noting(outcomes.as_mut()))
+            })
+        })
+    });
     result.map_err(starlark::Error::new_other)
 }
 
@@ -490,9 +861,10 @@ impl FileLoader for ModuleMap {
     }
 }
 
-/// Prefixes each line a program prints with the task name.
+/// Prefixes each line a program prints with the task's
+/// [`TaskInfo::display_name`]: its name, else its heading, else its location.
 struct TaskPrinter<'a> {
-    /// The task name.
+    /// The prefix: the task's name, else its heading, else `path/kizz.md:LINE`.
     name: String,
     /// Where the lines go.
     sink: &'a dyn PrintSink,
@@ -515,16 +887,20 @@ impl PrintHandler for TaskPrinter<'_> {
 fn kizz_globals(builder: &mut GlobalsBuilder) {
     /// Run a command and return its result.
     ///
-    /// The positional arguments are the program, then its arguments. With
+    /// The positional arguments are the program, then its arguments. Each is a
+    /// string, or a list or tuple of strings, lists or tuples, which expands in
+    /// place, in order and at any depth, so `[]` adds nothing. With
     /// `expect = None`, `run()` always returns; with a list of exit codes, the task
-    /// fails when the exit code is not in it or a signal killed the command.
+    /// fails when the exit code is not in it or a signal killed the command. A
+    /// non-zero exit or a signal without `expect` is unchecked unless the program
+    /// reads the result's `rc` or `signal`, or encodes the result, before it ends.
     #[expect(
         clippy::too_many_arguments,
         reason = "run() takes every parameter that \"Running commands\" lists, as Starlark \
                   keywords"
     )]
     fn run<'v>(
-        #[starlark(args)] argv: UnpackTuple<&str>,
+        #[starlark(args)] argv: UnpackTuple<Value<'v>>,
         #[starlark(require = named, default = NoneOr::None)] stdin: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] env: NoneOr<
             UnpackDictEntries<&str, NoneOr<&str>>,
@@ -537,6 +913,9 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
         ignore: UnpackListOrTuple<String>,
         #[starlark(require = named, default = UnpackListOrTuple::default())]
         track: UnpackListOrTuple<String>,
+        #[starlark(require = named, default = false)] timestamps: bool,
+        #[starlark(require = named, default = UnpackListOrTuple::default())]
+        machine: UnpackListOrTuple<String>,
         #[starlark(require = named, default = NoneOr::None)] expect: NoneOr<UnpackListOrTuple<i32>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
@@ -546,7 +925,8 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
         else {
             return Err(outside_task(eval, "run()"));
         };
-        if argv.items.is_empty() {
+        let argv = expand_arguments(&argv.items).map_err(starlark::Error::new_other)?;
+        if argv.is_empty() {
             return Err(starlark::Error::new_other(RunError::NoProgram));
         }
         let capture = match capture {
@@ -558,7 +938,18 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
                 )));
             },
         };
-        let mut step_env = state.env.borrow().clone();
+        let mut machine = machine.items;
+        if let Some(unknown) = machine
+            .iter()
+            .find(|name| MachinePart::from_name(name).is_none())
+        {
+            return Err(starlark::Error::new_other(RunError::MachinePart(
+                unknown.clone(),
+            )));
+        }
+        machine.sort();
+        machine.dedup();
+        let mut step_env = cells::cloned(&state.env);
         if let NoneOr::Other(entries) = env {
             for (name, value) in entries.entries {
                 match value {
@@ -572,7 +963,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             }
         }
         let step = StepSpec {
-            argv: argv.items.iter().map(|&arg| arg.to_owned()).collect(),
+            argv,
             stdin: stdin.into_option().map(str::to_owned),
             env: step_env,
             cwd: cwd
@@ -583,8 +974,12 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             always,
             ignore: ignore.items,
             track: track.items,
+            timestamps,
+            machine,
             expect: expect.into_option().map(|codes| codes.items),
         };
+        let position = state.started.get();
+        state.started.set(position.saturating_add(1));
         let outcome = state
             .executor
             .execute(&step)
@@ -596,40 +991,289 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
                 command: step.command(),
                 termination: outcome.termination,
             };
-            *state.unexpected.borrow_mut() = Some(UnexpectedExit {
+            state.unexpected.set(Some(UnexpectedExit {
                 argv: step.argv,
                 termination: outcome.termination,
                 expect: expect.clone(),
                 output: outcome.output,
-            });
+            }));
             return Err(starlark::Error::new_other(error));
         }
-        Ok(result_value(eval.heap(), &outcome))
+        let result = RunResult::new(&outcome);
+        if step.expect.is_none() && outcome.termination != Termination::Exited(0) {
+            let watched = Watched {
+                exit: UncheckedExit {
+                    position,
+                    argv: step.argv,
+                    termination: outcome.termination,
+                    output: outcome.output,
+                    cached: outcome.cached,
+                },
+                checked: Arc::clone(&result.checked),
+            };
+            cells::update(&state.watched, |steps| steps.push(watched));
+        }
+        Ok(eval.heap().alloc(result))
     }
 }
 
-/// The value `run()` returns: `rc`, `signal`, `stdout` and `stderr` or `output`
-/// for the capture mode, and `cached`.
-fn result_value<'v>(
-    heap: Heap<'v>,
-    outcome: &StepOutcome,
-) -> Value<'v> {
-    let int_or_none =
-        |value: Option<i32>| value.map_or_else(Value::new_none, |value| heap.alloc(value));
-    let text = |bytes: &[u8]| heap.alloc(String::from_utf8_lossy(bytes).as_ref());
-    let mut fields: Vec<(&str, Value<'v>)> = vec![
-        ("rc", int_or_none(outcome.termination.code())),
-        ("signal", int_or_none(outcome.termination.signal())),
-    ];
-    match &outcome.output {
-        CapturedOutput::Split { stdout, stderr } => {
-            fields.push(("stdout", text(stdout)));
-            fields.push(("stderr", text(stderr)));
-        },
-        CapturedOutput::Merged { output } => fields.push(("output", text(output))),
+/// The output of a `run()` result in the shape of its capture mode, decoded as
+/// UTF-8 with invalid bytes replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+enum ResultOutput {
+    /// With `capture = "split"`: standard output and standard error apart.
+    Split {
+        /// Standard output.
+        stdout: String,
+        /// Standard error.
+        stderr: String,
+    },
+    /// With `capture = "merged"`: both streams in the order they were written.
+    Merged {
+        /// Both streams.
+        output: String,
+    },
+}
+
+/// The value `run()` returns, of the Starlark type `run_result`: the attributes
+/// `rc`, `signal`, `stdout` and `stderr` or `output` for the capture mode, and
+/// `cached`, with the values a struct of them had, so `dir()`, `hasattr` and
+/// `getattr` work as for that struct.
+///
+/// The value notes when the program checks it: reads `rc` or `signal`, as an
+/// attribute or with `getattr`, or encodes the value with `json.encode` or
+/// `fs.write_json`, also inside an encoded list or dict ("Exit codes and
+/// failure"); `hasattr`, `dir()`, printing the value, and reading the output or
+/// `cached` do not.
+#[derive(Debug, ProvidesStaticType, Allocative)]
+struct RunResult {
+    /// The exit code, or `None` when a signal killed the command.
+    rc: Option<i32>,
+    /// The signal that killed the command, or `None` when it exited.
+    signal: Option<i32>,
+    /// The captured output.
+    output: ResultOutput,
+    /// Whether the result came from the cache.
+    cached: bool,
+    /// Set once the program reads `rc` or `signal` or encodes the value; shared with
+    /// the runtime's [`Watched`] entry of the step, when it has one.
+    checked: Arc<AtomicBool>,
+}
+
+impl RunResult {
+    /// The result of a step that ended as `outcome`, not checked yet.
+    fn new(outcome: &StepOutcome) -> Self {
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        Self {
+            rc: outcome.termination.code(),
+            signal: outcome.termination.signal(),
+            output: match &outcome.output {
+                CapturedOutput::Split { stdout, stderr } => {
+                    ResultOutput::Split {
+                        stdout: text(stdout),
+                        stderr: text(stderr),
+                    }
+                },
+                CapturedOutput::Merged { output } => {
+                    ResultOutput::Merged {
+                        output: text(output),
+                    }
+                },
+            },
+            cached: outcome.cached,
+            checked: Arc::new(AtomicBool::new(false)),
+        }
     }
-    fields.push(("cached", Value::new_bool(outcome.cached)));
-    heap.alloc(AllocStruct(fields))
+
+    /// The names of the attributes, in the order the struct had them:
+    /// [`SPLIT_RESULT_ATTRIBUTES`] or [`MERGED_RESULT_ATTRIBUTES`], for the capture
+    /// mode.
+    const fn attributes(&self) -> &'static [&'static str] {
+        match self.output {
+            ResultOutput::Split { .. } => SPLIT_RESULT_ATTRIBUTES,
+            ResultOutput::Merged { .. } => MERGED_RESULT_ATTRIBUTES,
+        }
+    }
+
+    /// The value of the attribute `name`, or `None` for a name that
+    /// [`Self::attributes`] lacks: the constants decide which attributes a result
+    /// has, for `get_attr` and for the JSON encoding alike. Reading `rc` or `signal`
+    /// checks the result.
+    fn attribute(
+        &self,
+        name: &str,
+    ) -> Option<AttributeValue<'_>> {
+        if !self.attributes().contains(&name) {
+            return None;
+        }
+        match (name, &self.output) {
+            ("rc", _) => {
+                self.checked.store(true, Ordering::Relaxed);
+                Some(AttributeValue::Int(self.rc))
+            },
+            ("signal", _) => {
+                self.checked.store(true, Ordering::Relaxed);
+                Some(AttributeValue::Int(self.signal))
+            },
+            ("stdout", ResultOutput::Split { stdout, .. }) => Some(AttributeValue::Text(stdout)),
+            ("stderr", ResultOutput::Split { stderr, .. }) => Some(AttributeValue::Text(stderr)),
+            ("output", ResultOutput::Merged { output }) => Some(AttributeValue::Text(output)),
+            ("cached", _) => Some(AttributeValue::Bool(self.cached)),
+            _ => None,
+        }
+    }
+
+    /// Whether `other` has the same exit status, output and `cached`, whether or
+    /// not either was checked.
+    fn same_values(
+        &self,
+        other: &Self,
+    ) -> bool {
+        self.rc == other.rc
+            && self.signal == other.signal
+            && self.output == other.output
+            && self.cached == other.cached
+    }
+}
+
+impl fmt::Display for RunResult {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        /// An optional integer as Starlark shows it.
+        fn int(value: Option<i32>) -> String {
+            value.map_or_else(|| "None".to_owned(), |value| value.to_string())
+        }
+        write!(
+            f,
+            "run_result(rc={}, signal={}, ",
+            int(self.rc),
+            int(self.signal)
+        )?;
+        match &self.output {
+            ResultOutput::Split { stdout, stderr } => {
+                write!(f, "stdout={stdout:?}, stderr={stderr:?}, ")?;
+            },
+            ResultOutput::Merged { output } => write!(f, "output={output:?}, ")?,
+        }
+        write!(f, "cached={})", if self.cached { "True" } else { "False" })
+    }
+}
+
+impl<'v> AllocValue<'v> for RunResult {
+    fn alloc_value(
+        self,
+        heap: Heap<'v>,
+    ) -> Value<'v> {
+        heap.alloc_simple(self)
+    }
+}
+
+/// The value of one attribute of a `run()` result, which `get_attr` turns into a
+/// Starlark value and the JSON encoding writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributeValue<'a> {
+    /// An integer or `None`, such as `rc` and `signal`.
+    Int(Option<i32>),
+    /// A string, such as `stdout`.
+    Text(&'a str),
+    /// A boolean, such as `cached`.
+    Bool(bool),
+}
+
+/// The JSON encoding of `json.encode` and `fs.write_json`: an object of the
+/// attributes of [`RunResult::attributes`], in their order, `rc`, `signal`,
+/// `stdout` and `stderr` or `output`, and `cached`, with the same values, as the
+/// struct that `run()` returned before encoded. Encoding the value checks it,
+/// because its exit status then leaves the program on purpose ("Exit codes and
+/// failure"). A listed name without a value is an error, never a panic.
+impl serde::Serialize for RunResult {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error as _, SerializeMap as _};
+
+        self.checked.store(true, Ordering::Relaxed);
+        let mut map = serializer.serialize_map(Some(self.attributes().len()))?;
+        for &name in self.attributes() {
+            match self.attribute(name) {
+                Some(AttributeValue::Int(value)) => map.serialize_entry(name, &value)?,
+                Some(AttributeValue::Text(value)) => map.serialize_entry(name, value)?,
+                Some(AttributeValue::Bool(value)) => map.serialize_entry(name, &value)?,
+                None => {
+                    return Err(S::Error::custom(format!(
+                        "the run() result has no value for its attribute {name}"
+                    )));
+                },
+            }
+        }
+        map.end()
+    }
+}
+
+/// A `run()` result exists only while its task runs and is never stored as a
+/// frozen value, so this storage, which is not JSON, refuses it.
+impl StarlarkSerialize for RunResult {
+    fn starlark_serialize(
+        &self,
+        _ctx: &mut dyn StarlarkSerializeContext,
+    ) -> starlark::Result<()> {
+        Err(starlark::Error::new_other(RunError::NotStored))
+    }
+}
+
+/// A `run()` result is never stored, so it is never read back from storage either.
+impl StarlarkDeserialize for RunResult {
+    fn starlark_deserialize(
+        _ctx: &mut dyn StarlarkDeserializeContext<'_>
+    ) -> starlark::Result<Self> {
+        Err(starlark::Error::new_other(RunError::NotStored))
+    }
+}
+
+#[starlark_value(type = "run_result")]
+impl<'v> StarlarkValue<'v> for RunResult {
+    fn get_attr(
+        &self,
+        attribute: &str,
+        heap: Heap<'v>,
+    ) -> Option<Value<'v>> {
+        self.attribute(attribute).map(|value| {
+            match value {
+                AttributeValue::Int(value) => {
+                    value.map_or_else(Value::new_none, |value| heap.alloc(value))
+                },
+                AttributeValue::Text(value) => heap.alloc(value),
+                AttributeValue::Bool(value) => Value::new_bool(value),
+            }
+        })
+    }
+
+    fn has_attr(
+        &self,
+        attribute: &str,
+        _heap: Heap<'v>,
+    ) -> bool {
+        self.attributes().contains(&attribute)
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        self.attributes()
+            .iter()
+            .map(|&name| name.to_owned())
+            .collect()
+    }
+
+    fn equals(
+        &self,
+        other: Value<'v>,
+    ) -> starlark::Result<bool> {
+        Ok(other
+            .downcast_ref::<Self>()
+            .is_some_and(|other| self.same_values(other)))
+    }
 }
 
 /// The `env` functions, which read the caller environment and dotenv files and
@@ -659,12 +1303,13 @@ fn env_functions(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'_, '_, '_>,
     ) -> starlark::Result<NoneType> {
         with_task(eval, "env.inherit()", |state| {
-            let mut env = state.env.borrow_mut();
-            for name in names.items {
-                if let Some(value) = state.caller.get(name) {
-                    env.insert(name.to_owned(), value.clone());
+            cells::update(&state.env, |env| {
+                for name in names.items {
+                    if let Some(value) = state.caller.get(name) {
+                        env.insert(name.to_owned(), value.clone());
+                    }
                 }
-            }
+            });
             Ok(NoneType)
         })
     }
@@ -686,15 +1331,21 @@ fn env_functions(builder: &mut GlobalsBuilder) {
                 check_variable(call, name, value)?;
                 vars.insert(name.to_owned(), value.to_owned());
             }
-            let mut accesses = state.accesses.borrow_mut();
-            let mut files = Files::new(&state.task.dir, &mut accesses);
-            let file = if required {
-                Some(require_dotenv(&mut files, call, path)?)
-            } else {
-                read_dotenv(&mut files, call, path)?
-            };
+            let file = cells::update(&state.accesses, |accesses| {
+                cells::update(&state.changes, |changes| {
+                    cells::update(&state.outcomes, |outcomes| {
+                        let mut files = Files::new(&state.task.dir, accesses, changes)
+                            .noting(outcomes.as_mut());
+                        if required {
+                            require_dotenv(&mut files, call, path).map(Some)
+                        } else {
+                            read_dotenv(&mut files, call, path)
+                        }
+                    })
+                })
+            })?;
             vars.extend(file.unwrap_or_default());
-            state.env.borrow_mut().extend(vars.clone());
+            cells::update(&state.env, |env| env.extend(vars.clone()));
             Ok(vars)
         })?;
         Ok(eval.heap().alloc(vars))
@@ -720,10 +1371,9 @@ fn env_functions(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<NoneType> {
         with_task(eval, "env.set()", |state| {
             check_variable("env.set()", name, value)?;
-            state
-                .env
-                .borrow_mut()
-                .insert(name.to_owned(), value.to_owned());
+            cells::update(&state.env, |env| {
+                env.insert(name.to_owned(), value.to_owned());
+            });
             Ok(NoneType)
         })
     }
@@ -737,12 +1387,14 @@ fn env_functions(builder: &mut GlobalsBuilder) {
             for (name, value) in &values.entries {
                 check_variable("env.update()", name, value)?;
             }
-            state.env.borrow_mut().extend(
-                values
-                    .entries
-                    .iter()
-                    .map(|&(name, value)| (name.to_owned(), value.to_owned())),
-            );
+            cells::update(&state.env, |env| {
+                env.extend(
+                    values
+                        .entries
+                        .iter()
+                        .map(|&(name, value)| (name.to_owned(), value.to_owned())),
+                );
+            });
             Ok(NoneType)
         })
     }
@@ -753,7 +1405,9 @@ fn env_functions(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'_, '_, '_>,
     ) -> starlark::Result<NoneType> {
         with_task(eval, "env.unset()", |state| {
-            state.env.borrow_mut().remove(name);
+            cells::update(&state.env, |env| {
+                env.remove(name);
+            });
             Ok(NoneType)
         })
     }
@@ -766,7 +1420,7 @@ fn env_functions(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         let value = with_task(eval, "env.get()", |state| {
-            Ok(state.env.borrow().get(name).cloned())
+            Ok(cells::update(&state.env, |env| env.get(name).cloned()))
         })?;
         Ok(value.map_or_else(
             || default.unwrap_or_else(Value::new_none),
@@ -776,14 +1430,14 @@ fn env_functions(builder: &mut GlobalsBuilder) {
 
     /// The task environment as a new dict.
     fn dict<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<Value<'v>> {
-        let env = with_task(eval, "env.dict()", |state| Ok(state.env.borrow().clone()))?;
+        let env = with_task(eval, "env.dict()", |state| Ok(cells::cloned(&state.env)))?;
         Ok(eval.heap().alloc(env))
     }
 
     /// Empty the task environment.
     fn clear(eval: &mut Evaluator<'_, '_, '_>) -> starlark::Result<NoneType> {
         with_task(eval, "env.clear()", |state| {
-            state.env.borrow_mut().clear();
+            cells::update(&state.env, BTreeMap::clear);
             Ok(NoneType)
         })
     }
@@ -940,11 +1594,17 @@ fn json_value<'v>(
             heap.alloc(items)
         },
         serde_json::Value::Object(members) => {
-            let members = members
-                .iter()
-                .map(|(key, member)| Ok((key.as_str(), json_value(heap, member)?)))
-                .collect::<Result<Vec<_>, RunError>>()?;
-            heap.alloc(AllocDict(members))
+            // Each key is hashed with `get_hashed`, whose error is returned, where
+            // `AllocDict` "panics if a key is not hashable" (its documentation).
+            let mut map = SmallMap::new();
+            for (key, member) in members {
+                let hashed = heap
+                    .alloc(key.as_str())
+                    .get_hashed()
+                    .map_err(|_not_hashed| RunError::JsonKey(key.clone()))?;
+                map.insert_hashed(hashed, json_value(heap, member)?);
+            }
+            heap.alloc(Dict::new(map))
         },
     })
 }
@@ -958,25 +1618,179 @@ fn globals() -> Globals {
         .build()
 }
 
-/// Set `task` in `module` to the values that describe `task`.
+/// The name of the value that describes the running task, which every task
+/// program's module holds besides the globals.
+pub const TASK_VALUE: &str = "task";
+
+/// The members of [`TASK_VALUE`], in the order the value holds them, under which
+/// the runtime sets the values that describe the running task.
+pub const TASK_MEMBERS: [&str; 8] = [
+    "dir", "file", "line", "name", "heading", "targets", "selected", "args",
+];
+
+/// The attributes of a `run()` result with `capture = "split"`, in the order the
+/// struct that `run()` returned before had them.
+pub const SPLIT_RESULT_ATTRIBUTES: &[&str] = &["rc", "signal", "stdout", "stderr", "cached"];
+
+/// The attributes of a `run()` result with `capture = "merged"`, in the order the
+/// struct that `run()` returned before had them.
+pub const MERGED_RESULT_ATTRIBUTES: &[&str] = &["rc", "signal", "output", "cached"];
+
+/// What a name that task programs use is, which decides how documentation writes
+/// it: a function with `()`, such as `run()`, and a module or a value without, such
+/// as `env` or `task.args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NameKind {
+    /// A function, such as `run` or `env.inherit`.
+    Function,
+    /// A module of members, such as `env` or `task`.
+    Module,
+    /// A value, such as `task.args`.
+    Value,
+}
+
+/// A name that task programs use beyond Starlark's standard globals.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProgramName {
+    /// The name, after its module and a `.` for a member, such as `run`, `env` or
+    /// `env.inherit`.
+    pub name: String,
+    /// What the name is.
+    pub kind: NameKind,
+}
+
+impl ProgramName {
+    /// The name as documentation writes it: `run()` or `env.inherit()` for a
+    /// function, and `env` or `task.args` for a module or a value.
+    #[must_use]
+    pub fn written(&self) -> String {
+        match self.kind {
+            NameKind::Function => format!("{}()", self.name),
+            NameKind::Module | NameKind::Value => self.name.clone(),
+        }
+    }
+}
+
+/// Everything that task programs use beyond Starlark's standard globals, read from
+/// the runtime itself, so that the documentation can be checked against it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProgramNames {
+    /// The globals that kizz adds to Starlark's standard ones, [`TASK_VALUE`]
+    /// included, sorted.
+    pub globals: Vec<ProgramName>,
+    /// The members of the modules among the globals, `task`'s included, sorted.
+    pub members: Vec<ProgramName>,
+    /// The parameters of `run()`, in the order of its signature, the positional
+    /// arguments first.
+    pub run_parameters: Vec<String>,
+    /// The attributes of a `run()` result in either capture mode, each once.
+    pub result_attributes: Vec<String>,
+}
+
+/// What `item`, the documentation of a global or a member, says the name is.
+const fn name_kind(item: &DocItem) -> NameKind {
+    match item {
+        DocItem::Module(_) => NameKind::Module,
+        DocItem::Member(DocMember::Function(_)) => NameKind::Function,
+        DocItem::Type(_) | DocItem::Member(DocMember::Property(_)) => NameKind::Value,
+    }
+}
+
+/// The names of the parameters of `function`, in the order of its signature.
+fn parameter_names(function: &DocFunction) -> Vec<String> {
+    let params = &function.params;
+    params
+        .pos_only
+        .iter()
+        .chain(&params.pos_or_named)
+        .chain(&params.args)
+        .chain(&params.named_only)
+        .chain(&params.kwargs)
+        .map(|param| param.name.clone())
+        .collect()
+}
+
+/// Everything that task programs use beyond Starlark's standard globals: the
+/// globals of task programs that the standard ones lack, with the members of each
+/// module, `run()`'s parameters from its signature, `task` with [`TASK_MEMBERS`],
+/// and the result's attributes from [`SPLIT_RESULT_ATTRIBUTES`] and
+/// [`MERGED_RESULT_ATTRIBUTES`].
+#[must_use]
+pub fn program_names() -> ProgramNames {
+    let standard = GlobalsBuilder::standard().build();
+    let standard: Vec<&str> = standard.iter().map(|(name, _value)| name).collect();
+    let mut names = ProgramNames::default();
+    for (name, item) in globals().documentation().members {
+        if standard.contains(&name.as_str()) {
+            continue;
+        }
+        if let DocItem::Module(module) = &item {
+            for (member, member_item) in &module.members {
+                names.members.push(ProgramName {
+                    name: format!("{name}.{member}"),
+                    kind: name_kind(member_item),
+                });
+            }
+        }
+        if let DocItem::Member(DocMember::Function(function)) = &item
+            && name == "run"
+        {
+            names.run_parameters = parameter_names(function);
+        }
+        names.globals.push(ProgramName {
+            kind: name_kind(&item),
+            name,
+        });
+    }
+    names.globals.push(ProgramName {
+        name: TASK_VALUE.to_owned(),
+        kind: NameKind::Module,
+    });
+    names.members.extend(TASK_MEMBERS.iter().map(|member| {
+        ProgramName {
+            name: format!("{TASK_VALUE}.{member}"),
+            kind: NameKind::Value,
+        }
+    }));
+    names.globals.sort();
+    names.members.sort();
+    for attribute in SPLIT_RESULT_ATTRIBUTES
+        .iter()
+        .chain(MERGED_RESULT_ATTRIBUTES)
+    {
+        if !names
+            .result_attributes
+            .iter()
+            .any(|known| known == attribute)
+        {
+            names.result_attributes.push((*attribute).to_owned());
+        }
+    }
+    names
+}
+
+/// Set [`TASK_VALUE`] in `module` to the values that describe `task`, under the
+/// names of [`TASK_MEMBERS`]: `task.name` is the name that its `name=` option
+/// gives, or `None`, `task.heading` its heading, or `None`, and `task.args` its
+/// arguments.
 fn set_task_value(
     module: &Module<'_>,
     task: &TaskInfo,
 ) {
     let heap = module.heap();
-    let name = task
-        .name
-        .as_deref()
-        .map_or_else(Value::new_none, |name| heap.alloc(name));
-    let value = heap.alloc(AllocStruct([
-        ("dir", heap.alloc(task.dir.to_string())),
-        ("file", heap.alloc(task.file.to_string())),
-        ("line", heap.alloc(task.line)),
-        ("name", name),
-        ("targets", heap.alloc(task.targets.clone())),
-        ("selected", heap.alloc(task.selected.clone())),
-    ]));
-    module.set("task", value);
+    let optional = |text: Option<&str>| text.map_or_else(Value::new_none, |text| heap.alloc(text));
+    let values = [
+        heap.alloc(task.dir.to_string()),
+        heap.alloc(task.file.to_string()),
+        heap.alloc(task.line),
+        optional(task.name.as_deref()),
+        optional(task.heading.as_deref()),
+        heap.alloc(task.targets.clone()),
+        heap.alloc(task.selected.clone()),
+        heap.alloc(task.args.clone()),
+    ];
+    let value = heap.alloc(AllocStruct(TASK_MEMBERS.into_iter().zip(values)));
+    module.set(TASK_VALUE, value);
 }
 
 /// The directory that holds `path`, or `path` itself for the root.
@@ -997,6 +1811,11 @@ struct ModuleLoader<'a> {
     printer: &'a TaskPrinter<'a>,
     /// Every module read, and every module path found missing.
     accesses: Accesses,
+    /// Every file the modules' top-level code changed.
+    changes: FileChanges,
+    /// How each module read and each file access of the modules' top-level code
+    /// ended, when the run notes it, and otherwise `None`.
+    outcomes: Option<AccessOutcomes>,
     /// The modules loaded so far, by absolute path.
     loaded: HashMap<AbsolutePath, FrozenModule>,
     /// The modules being loaded, outermost first, to find load cycles.
@@ -1043,7 +1862,7 @@ impl ModuleLoader<'_> {
         }
         let source = match fs::read_to_string(path) {
             Ok(source) => {
-                self.accesses.record(path.clone(), AccessKind::Read);
+                self.record(path, AccessKind::Read, None);
                 source
             },
             Err(error) => {
@@ -1052,7 +1871,7 @@ impl ModuleLoader<'_> {
                 } else {
                     AccessKind::Read
                 };
-                self.accesses.record(path.clone(), kind);
+                self.record(path, kind, Some(&error));
                 return Err(TaskFailure::program(format!(
                     "{from}: load(\"{id}\"): cannot read {path}: {error}"
                 )));
@@ -1073,15 +1892,37 @@ impl ModuleLoader<'_> {
             self.globals,
             self.printer,
             &mut self.accesses,
+            &mut self.changes,
+            self.outcomes.as_mut(),
         )?;
         self.sources.push((path.clone(), source));
         self.loaded.insert(path.clone(), module.clone());
         Ok(module)
     }
+
+    /// Record that loading touched the module at `path` in the way `kind` names,
+    /// and note that the read failed with `error`, or succeeded when it is `None`,
+    /// when the run notes outcomes.
+    fn record(
+        &mut self,
+        path: &AbsolutePath,
+        kind: AccessKind,
+        error: Option<&io::Error>,
+    ) {
+        if let Some(outcomes) = &mut self.outcomes {
+            outcomes.note(path.clone(), kind, error);
+        }
+        self.accesses.record(path.clone(), kind);
+    }
 }
 
 /// Evaluate and freeze one module, outside any task, recording the file accesses
-/// of its top-level code in `accesses`.
+/// of its top-level code in `accesses`, the files it changed in `changes`, and,
+/// when `outcomes` is `Some`, how each access ended in it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate part of the loading context"
+)]
 fn evaluate_module(
     ast: AstModule,
     path: &AbsolutePath,
@@ -1090,11 +1931,15 @@ fn evaluate_module(
     globals: &Globals,
     printer: &TaskPrinter<'_>,
     accesses: &mut Accesses,
+    changes: &mut FileChanges,
+    outcomes: Option<&mut AccessOutcomes>,
 ) -> Result<FrozenModule, TaskFailure> {
     let marker = LoadingModule {
         path: path.clone(),
         dir: task.dir.clone(),
-        accesses: RefCell::new(Accesses::new()),
+        accesses: Cell::new(Accesses::new()),
+        changes: Cell::new(FileChanges::new()),
+        outcomes: Cell::new(outcomes.is_some().then(AccessOutcomes::new)),
     };
     let result = Module::with_temp_heap(|module| {
         set_task_value(&module, task);
@@ -1114,6 +1959,10 @@ fn evaluate_module(
         })
     });
     accesses.merge(marker.accesses.into_inner());
+    changes.merge(marker.changes.into_inner());
+    if let (Some(outcomes), Some(noted)) = (outcomes, marker.outcomes.into_inner()) {
+        outcomes.merge(noted);
+    }
     result
 }
 
@@ -1138,12 +1987,18 @@ pub struct ProgramParts {
     pub modules: Vec<(PathBuf, [u8; 32])>,
 }
 
-/// The result of [`TaskProgram::load`].
+/// The result of [`TaskProgram::load`] and [`TaskProgram::load_noting`].
 #[derive(Debug)]
 pub struct ProgramLoad {
     /// Every module the task read and every module path it found missing, with the
     /// file accesses of the modules' top-level code.
     pub accesses: Accesses,
+    /// Every file the modules' top-level code changed through `fs.write` and
+    /// `fs.write_json`, in the order it first changed each.
+    pub changes: FileChanges,
+    /// How each of those accesses ended, when the load noted it, and otherwise
+    /// `None`.
+    pub outcomes: Option<AccessOutcomes>,
     /// The loaded program, or why it could not be loaded.
     pub program: Result<TaskProgram, TaskFailure>,
 }
@@ -1160,6 +2015,8 @@ pub struct TaskProgram {
     hash: ProgramHash,
     /// The hashes of the block and of each module.
     parts: ProgramParts,
+    /// Whether its run notes how each file access ended, as the load did.
+    noting: bool,
 }
 
 impl fmt::Debug for TaskProgram {
@@ -1175,6 +2032,35 @@ impl fmt::Debug for TaskProgram {
     }
 }
 
+/// `source` after `lines` blank lines, so Starlark's line numbers are those of
+/// the `kizz.md`.
+///
+/// The space is reserved first with `String::try_reserve_exact`, which returns an
+/// error where `str::repeat` panics on a length that overflows, so the pushes that
+/// follow fit.
+///
+/// # Errors
+///
+/// A [`TaskFailure::Program`] when the padded source cannot be allocated.
+fn padded_source(
+    lines: usize,
+    source: &str,
+) -> Result<String, TaskFailure> {
+    let mut padded = String::new();
+    padded
+        .try_reserve_exact(lines.saturating_add(source.len()))
+        .map_err(|error| {
+            TaskFailure::program(format_args!(
+                "cannot place the task's source after {lines} blank lines: {error}"
+            ))
+        })?;
+    for _ in 0..lines {
+        padded.push('\n');
+    }
+    padded.push_str(source);
+    Ok(padded)
+}
+
 impl TaskProgram {
     /// Parse the task block and load every module it loads, directly or
     /// indirectly.
@@ -1187,6 +2073,19 @@ impl TaskProgram {
         task: TaskInfo,
         print: &dyn PrintSink,
     ) -> ProgramLoad {
+        Self::load_noting(task, print, false)
+    }
+
+    /// Load the task program as [`TaskProgram::load`] does; when `noting` is set,
+    /// also note how each module read and each file access ended, in
+    /// [`ProgramLoad::outcomes`] and then in [`TaskRun::outcomes`] of its run, for
+    /// the observation report of `kizz run --output`.
+    #[must_use]
+    pub fn load_noting(
+        task: TaskInfo,
+        print: &dyn PrintSink,
+        noting: bool,
+    ) -> ProgramLoad {
         let globals = globals();
         let printer = TaskPrinter {
             name: task.display_name(),
@@ -1197,6 +2096,8 @@ impl TaskProgram {
             globals: &globals,
             printer: &printer,
             accesses: Accesses::new(),
+            changes: FileChanges::new(),
+            outcomes: noting.then(AccessOutcomes::new),
             loaded: HashMap::new(),
             loading: Vec::new(),
             sources: Vec::new(),
@@ -1204,15 +2105,21 @@ impl TaskProgram {
         let file_name = task.relative_file.display().to_string();
         // Blank lines before the source make Starlark's line numbers those of the
         // `kizz.md`.
-        let padded = format!("{}{}", "\n".repeat(task.line), task.source);
-        let parsed = AstModule::parse(&file_name, padded, &Dialect::Extended)
-            .map_err(TaskFailure::program)
+        let parsed = padded_source(task.line, &task.source)
+            .and_then(|padded| {
+                AstModule::parse(&file_name, padded, &Dialect::Extended)
+                    .map_err(TaskFailure::program)
+            })
             .and_then(|ast| {
                 let imports = loader.load_imports(&ast, &task.dir, &file_name)?;
                 Ok((ast, imports))
             });
         let ModuleLoader {
-            accesses, sources, ..
+            accesses,
+            changes,
+            outcomes,
+            sources,
+            ..
         } = loader;
         let program = parsed.map(|(ast, imports)| {
             let mut hasher = blake3::Hasher::new_derive_key(PROGRAM_HASH_CONTEXT);
@@ -1242,9 +2149,15 @@ impl TaskProgram {
                 imports,
                 hash,
                 parts,
+                noting,
             }
         });
-        ProgramLoad { accesses, program }
+        ProgramLoad {
+            accesses,
+            changes,
+            outcomes,
+            program,
+        }
     }
 
     /// The hash of the block and every module it loads.
@@ -1271,7 +2184,11 @@ impl TaskProgram {
     ///
     /// The task environment starts empty. `caller` is the caller environment, the
     /// only one that `env.caller` and `env.inherit` read. The result holds every
-    /// file access the program made while it ran, whether or not it failed.
+    /// file access the program made while it ran, and every file it changed,
+    /// whether or not it failed, and every step it left unchecked: when the
+    /// program ends, whether it succeeded or failed, each step that exited with a
+    /// non-zero code or was killed by a signal, whose `run()` had no `expect`, and
+    /// whose result's `rc` and `signal` the program never read.
     #[must_use]
     pub fn run(
         self,
@@ -1280,7 +2197,11 @@ impl TaskProgram {
         print: &dyn PrintSink,
     ) -> TaskRun {
         let Self {
-            task, ast, imports, ..
+            task,
+            ast,
+            imports,
+            noting,
+            ..
         } = self;
         let globals = globals();
         let printer = TaskPrinter {
@@ -1291,9 +2212,13 @@ impl TaskProgram {
             task: &task,
             executor,
             caller,
-            env: RefCell::new(BTreeMap::new()),
-            accesses: RefCell::new(Accesses::new()),
-            unexpected: RefCell::new(None),
+            env: Cell::new(BTreeMap::new()),
+            accesses: Cell::new(Accesses::new()),
+            changes: Cell::new(FileChanges::new()),
+            outcomes: Cell::new(noting.then(AccessOutcomes::new)),
+            unexpected: Cell::new(None),
+            started: Cell::new(0),
+            watched: Cell::new(Vec::new()),
         };
         let result = Module::with_temp_heap(|module| {
             set_task_value(&module, &task);
@@ -1315,9 +2240,19 @@ impl TaskProgram {
                 None => TaskFailure::Program { message },
             }
         });
+        let unchecked = state
+            .watched
+            .take()
+            .into_iter()
+            .filter(|watched| !watched.checked.load(Ordering::Relaxed))
+            .map(|watched| watched.exit)
+            .collect();
         TaskRun {
             accesses: state.accesses.into_inner(),
+            changes: state.changes.into_inner(),
+            outcomes: state.outcomes.into_inner(),
             result,
+            unchecked,
         }
     }
 }
@@ -1329,18 +2264,33 @@ pub struct TaskRun {
     /// functions, `env.load_file`, and `env.read`, missing files and directory
     /// listings included.
     pub accesses: Accesses,
-    /// Whether the program succeeded, or why it failed.
+    /// Every file the program changed through `fs.write` and `fs.write_json` while
+    /// it ran, in the order it first changed each, without repeats.
+    pub changes: FileChanges,
+    /// How each of those accesses ended, when the program was loaded with
+    /// [`TaskProgram::load_noting`], and otherwise `None`.
+    pub outcomes: Option<AccessOutcomes>,
+    /// Whether the program succeeded, or why it failed. Unchecked steps never fail
+    /// the run here; `kizz build --fail-unchecked` turns them into a failure.
     pub result: Result<(), TaskFailure>,
+    /// Every step the program left unchecked, in the order they ran, with its
+    /// command, how it ended, and its output; results from the cache included.
+    pub unchecked: Vec<UncheckedExit>,
 }
 
 /// Unit tests for the runtime's own logic.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert, borrow cells and lock"
+)]
 mod tests {
     use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
 
     use kizz_trace::{AbsolutePath, CapturedOutput, Termination};
 
-    use super::{PrintSink, TaskInfo, TaskProgram, UnexpectedExit};
+    use super::{PrintSink, TaskFailure, TaskInfo, TaskProgram, UnexpectedExit, padded_source};
     use crate::step::{StepError, StepExecutor, StepOutcome, StepSpec};
 
     /// Records each step and answers with exit status 0 and no output.
@@ -1384,8 +2334,11 @@ mod tests {
             line: 1,
             index: 0,
             name: None,
+            heading: None,
             targets: vec!["ci".to_owned()],
             selected: vec!["ci".to_owned()],
+            args: Vec::new(),
+            cache_never: false,
             source: source.to_owned(),
         }
     }
@@ -1444,5 +2397,455 @@ mod tests {
             "command `make all`: killed by signal 9, but `expect` accepts exit code 0\n--- \
              output ---\npartial\n"
         );
+    }
+
+    /// A task's source after blank lines whose total length cannot be reserved is a
+    /// program failure, where `str::repeat` would panic: `usize::MAX` lines saturate
+    /// the length, which overflows the largest length a `String` can reserve, so the
+    /// reservation fails at once, without allocating; a length that fits is built in
+    /// full.
+    #[test]
+    fn padding_that_cannot_be_reserved_is_a_program_failure() {
+        let Err(TaskFailure::Program { message }) = padded_source(usize::MAX, "run(\"a\")\n")
+        else {
+            panic!("the padding was reserved");
+        };
+        assert!(
+            message.starts_with(&format!(
+                "cannot place the task's source after {} blank lines: ",
+                usize::MAX
+            )),
+            "{message}"
+        );
+        assert_eq!(padded_source(2, "x").unwrap(), "\n\nx");
+        assert_eq!(padded_source(0, "x").unwrap(), "x");
+    }
+}
+
+/// Unit tests of `expand_arguments`, the expansion of `run()`'s positional
+/// arguments, on Starlark values that small programs build, or that a test
+/// allocates directly: each form of the expansion, the errors with their exact
+/// messages, the cycle check, the bound, and a nesting deep enough that a recursive
+/// walk would overflow the stack.
+#[cfg(test)]
+#[allow(clippy::disallowed_macros, reason = "test code: the tests assert")]
+mod argument_tests {
+    use starlark::{
+        environment::{Globals, Module},
+        eval::Evaluator,
+        syntax::{AstModule, Dialect},
+        values::{Heap, tuple::TupleRef},
+    };
+
+    use super::{MAX_ARGUMENT_VALUES, expand_arguments};
+
+    /// The expansion of the positional arguments that `source` gives, a Starlark
+    /// program whose last statement is the tuple of the arguments, or the message of
+    /// the expansion's error.
+    fn expand(source: &str) -> Result<Vec<String>, String> {
+        Module::with_temp_heap(|module| {
+            let ast =
+                AstModule::parse("arguments.star", source.to_owned(), &Dialect::Extended).unwrap();
+            let globals = Globals::standard();
+            let mut eval = Evaluator::new(&module);
+            let value = eval.eval_module(ast, &globals).unwrap();
+            let arguments = TupleRef::from_value(value).unwrap();
+            expand_arguments(arguments.content()).map_err(|error| error.to_string())
+        })
+    }
+
+    /// `items` as owned strings.
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|&item| item.to_owned()).collect()
+    }
+
+    /// Lists and tuples expand in place, in order and at any depth, wherever they
+    /// stand: first, last, in the middle, nested, or as the whole command; empty ones
+    /// add nothing; each string, one with spaces and an empty one included, stays one
+    /// argument; and the same list used twice, side by side, adds its strings twice.
+    #[test]
+    fn lists_and_tuples_expand_in_place_and_strings_stay_whole() {
+        let this_is_test = strings(&["echo", "this", "is", "test"]);
+        for source in [
+            "(\"echo\", \"this\", \"is\", \"test\")",
+            "(\"echo\", [\"this\", \"is\", \"test\"])",
+            "([\"echo\", \"this\"], \"is\", \"test\")",
+            "(\"echo\", [\"this\"], \"is\", (\"test\",))",
+            "(\"echo\", [[\"this\"], (\"is\", [])], \"test\")",
+            "((\"echo\",), [[\"this\"], (\"is\", [])], \"test\")",
+            "([\"echo\", \"this\", \"is\", \"test\"],)",
+            "(((\"echo\", [[[\"this\"]]]), \"is\"), [], (), [[]], \"test\")",
+        ] {
+            assert_eq!(expand(source), Ok(this_is_test.clone()), "{source}");
+        }
+        assert_eq!(
+            expand("(\"printf\", [\"%s|\", \"a b\"], \"\", [\"\"])"),
+            Ok(strings(&["printf", "%s|", "a b", "", ""]))
+        );
+        assert_eq!(
+            expand("opt = [\"-v\"]\n(\"tool\", opt, \"x\", [opt, opt])"),
+            Ok(strings(&["tool", "-v", "x", "-v", "-v"]))
+        );
+        assert_eq!(
+            expand("flags = []\n(\"tool\", flags, \"x\")"),
+            Ok(strings(&["tool", "x"]))
+        );
+    }
+
+    /// Arguments of nothing but empty lists and tuples, and no arguments at all,
+    /// expand to no string, which `run()` then refuses as a call without a program.
+    #[test]
+    fn empty_lists_and_tuples_expand_to_nothing() {
+        for source in ["()", "([],)", "([], ())", "([[]],)", "(([(), [[]]],),)"] {
+            assert_eq!(expand(source), Ok(Vec::new()), "{source}");
+        }
+    }
+
+    /// A value that is neither a string nor a list or tuple fails with its argument,
+    /// its index path within the lists, and its type, as Starlark's `type()` names
+    /// it, and the first such value in the order of the walk is the one named.
+    #[test]
+    fn other_values_fail_with_their_place_and_type() {
+        for (source, message) in [
+            (
+                "(\"p\", \"a\", 5)",
+                "run(): argument 3 is of type int, not a string, list or tuple",
+            ),
+            (
+                "(\"p\", True)",
+                "run(): argument 2 is of type bool, not a string, list or tuple",
+            ),
+            (
+                "(\"p\", [\"a\", [None]])",
+                "run(): argument 2 at [1][0] is of type NoneType, not a string, list or tuple",
+            ),
+            (
+                "([{\"a\": 1}],)",
+                "run(): argument 1 at [0] is of type dict, not a string, list or tuple",
+            ),
+            (
+                "(\"p\", (\"a\", range(3)))",
+                "run(): argument 2 at [1] is of type range, not a string, list or tuple",
+            ),
+            (
+                "([], 5)",
+                "run(): argument 2 is of type int, not a string, list or tuple",
+            ),
+            (
+                "a = [\"x\"]\na.append(a)\n(\"p\", [1], a)",
+                "run(): argument 2 at [0] is of type int, not a string, list or tuple",
+            ),
+        ] {
+            assert_eq!(expand(source), Err(message.to_owned()), "{source}");
+        }
+    }
+
+    /// A list or tuple that contains itself, directly, through another list, or
+    /// through a list inside a tuple, fails where it is met again, with its own
+    /// type, and the walk ends.
+    #[test]
+    fn a_list_or_tuple_that_contains_itself_fails() {
+        for (source, message) in [
+            (
+                "a = [\"x\"]\na.append(a)\n(\"p\", a)",
+                "run(): argument 2 at [1] is a list that contains itself",
+            ),
+            (
+                "a = []\nb = [a]\na.append(b)\n(\"p\", a)",
+                "run(): argument 2 at [0][0] is a list that contains itself",
+            ),
+            (
+                "l = []\nt = (\"a\", l)\nl.append(t)\n(\"p\", t)",
+                "run(): argument 2 at [1][0] is a tuple that contains itself",
+            ),
+        ] {
+            assert_eq!(expand(source), Err(message.to_owned()), "{source}");
+        }
+    }
+
+    /// The expansion visits at most [`MAX_ARGUMENT_VALUES`] values: a list of
+    /// 999,999 strings is 1,000,000 values and expands, one more string fails, and so
+    /// do twenty-one doublings of a shared list, which would expand to 2,097,152
+    /// strings, before the walk goes further.
+    #[test]
+    fn the_expansion_stops_past_a_million_values() {
+        let limit = "run(): the arguments expand to more than 1000000 strings, lists and tuples";
+        assert_eq!(MAX_ARGUMENT_VALUES, 1_000_000);
+        assert_eq!(
+            expand("([\"x\"] * 999999,)").as_ref().map(Vec::len),
+            Ok(999_999)
+        );
+        assert_eq!(expand("([\"x\"] * 1000000,)"), Err(limit.to_owned()));
+        assert_eq!(
+            expand("a = [\"x\"]\nfor _ in range(21):\n    a = [a, a]\n(a,)"),
+            Err(limit.to_owned())
+        );
+    }
+
+    /// A string inside 100,000 nested lists, passed inside a tuple, expands to that
+    /// string, because the walk keeps its own stack rather than recursing. The lists
+    /// are allocated directly on a heap, where no garbage collection runs: Starlark's
+    /// collector, which the evaluator runs between a module's top-level statements,
+    /// copies nested values recursively, so building this nesting in a program can
+    /// overflow the stack in the collector, before any `run()` call.
+    #[test]
+    fn a_deep_nesting_expands_without_recursion() {
+        Heap::temp(|heap| {
+            let mut nested = heap.alloc("deep");
+            for _ in 0..100_000 {
+                nested = heap.alloc(vec![nested]);
+            }
+            let arguments = [heap.alloc("p"), heap.alloc((nested,))];
+            assert_eq!(
+                expand_arguments(&arguments).map_err(|error| error.to_string()),
+                Ok(strings(&["p", "deep"]))
+            );
+        });
+    }
+}
+
+/// Unit tests of `program_names`, which the documentation coverage test reads, and
+/// of the result-attribute constants that it lists.
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and borrow cells"
+)]
+mod names_tests {
+    use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
+
+    use kizz_trace::{AbsolutePath, CapturedOutput, Termination};
+    use starlark::values::{Heap, StarlarkValue as _};
+
+    use super::{
+        MERGED_RESULT_ATTRIBUTES, PrintSink, ProgramName, ProgramNames, RunResult,
+        SPLIT_RESULT_ATTRIBUTES, TaskInfo, TaskProgram, program_names,
+    };
+    use crate::step::{StepError, StepExecutor, StepOutcome, StepSpec};
+
+    /// Answers every step with exit status 0 and no output.
+    struct Succeed;
+
+    impl StepExecutor for Succeed {
+        fn execute(
+            &self,
+            step: &StepSpec,
+        ) -> Result<StepOutcome, StepError> {
+            Ok(StepOutcome {
+                termination: Termination::Exited(0),
+                output: CapturedOutput::empty(step.capture),
+                cached: false,
+            })
+        }
+    }
+
+    /// Keeps the lines that programs print.
+    #[derive(Default)]
+    struct Lines {
+        /// The printed lines, in order, each with its prefix.
+        lines: RefCell<Vec<String>>,
+    }
+
+    impl PrintSink for Lines {
+        fn print_line(
+            &self,
+            line: &str,
+        ) {
+            self.lines.borrow_mut().push(line.to_owned());
+        }
+    }
+
+    /// The members of `module` among `names`, without the module's name, sorted.
+    fn members_of(
+        names: &ProgramNames,
+        module: &str,
+    ) -> Vec<String> {
+        let prefix = format!("{module}.");
+        let mut members: Vec<String> = names
+            .members
+            .iter()
+            .filter_map(|name| name.name.strip_prefix(&prefix).map(str::to_owned))
+            .collect();
+        members.sort();
+        members
+    }
+
+    /// `names` as owned strings, sorted.
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|&name| name.to_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// What a task program in `/work` sees, as `dir()` lists it, of `env`, `fs`,
+    /// `json`, `task`, and a `run()` result in each capture mode, each sorted.
+    fn seen_by_a_program() -> Vec<Vec<String>> {
+        let task = TaskInfo {
+            dir: AbsolutePath::new("/work").unwrap(),
+            file: AbsolutePath::new("/work/kizz.md").unwrap(),
+            relative_file: PathBuf::from("kizz.md"),
+            line: 1,
+            index: 0,
+            name: None,
+            heading: None,
+            targets: vec!["ci".to_owned()],
+            selected: vec!["ci".to_owned()],
+            args: Vec::new(),
+            cache_never: false,
+            source: "print(json.encode([dir(env), dir(fs), dir(json), dir(task), \
+                     dir(run(\"a\")), dir(run(\"a\", capture = \"merged\"))]))\n"
+                .to_owned(),
+        };
+        let lines = Lines::default();
+        let program = TaskProgram::load(task, &lines).program.unwrap();
+        program
+            .run(&BTreeMap::new(), &Succeed, &lines)
+            .result
+            .unwrap();
+        let printed = lines.lines.borrow();
+        let [line] = printed.as_slice() else {
+            panic!("the program printed {printed:?}");
+        };
+        let (_task, text) = line.split_once(": ").unwrap();
+        let seen: Vec<Vec<String>> = serde_json::from_str(text).unwrap();
+        seen.into_iter()
+            .map(|mut names| {
+                names.sort();
+                names
+            })
+            .collect()
+    }
+
+    /// The members, result attributes and `task` members that `program_names` lists
+    /// are those that a task program sees with `dir()`; the globals are those that
+    /// kizz adds to Starlark's standard ones, `task` included, and `run()`'s
+    /// parameters come from its signature, the positional arguments first.
+    #[test]
+    fn program_names_are_what_programs_see() {
+        let names = program_names();
+        assert_eq!(seen_by_a_program(), [
+            members_of(&names, "env"),
+            members_of(&names, "fs"),
+            members_of(&names, "json"),
+            members_of(&names, "task"),
+            sorted(SPLIT_RESULT_ATTRIBUTES),
+            sorted(MERGED_RESULT_ATTRIBUTES),
+        ]);
+        let globals: Vec<String> = names.globals.iter().map(ProgramName::written).collect();
+        assert_eq!(globals, ["env", "fs", "json", "print()", "run()", "task"]);
+        let members: Vec<String> = names.members.iter().map(ProgramName::written).collect();
+        assert!(members.contains(&"env.inherit()".to_owned()), "{members:?}");
+        assert!(members.contains(&"task.args".to_owned()), "{members:?}");
+        assert_eq!(names.run_parameters, [
+            "argv",
+            "stdin",
+            "env",
+            "cwd",
+            "capture",
+            "stream",
+            "always",
+            "ignore",
+            "track",
+            "timestamps",
+            "machine",
+            "expect",
+        ]);
+        assert_eq!(names.result_attributes, [
+            "rc", "signal", "stdout", "stderr", "cached", "output"
+        ]);
+    }
+
+    /// The keys of a JSON object, in the order its text has them.
+    struct Keys {
+        /// The keys, in order.
+        keys: Vec<String>,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Keys {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            /// Collects the keys of an object and skips its values.
+            struct KeysVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for KeysVisitor {
+                type Value = Keys;
+
+                fn expecting(
+                    &self,
+                    formatter: &mut std::fmt::Formatter<'_>,
+                ) -> std::fmt::Result {
+                    formatter.write_str("a JSON object")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Keys, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some((key, serde::de::IgnoredAny)) =
+                        map.next_entry::<String, serde::de::IgnoredAny>()?
+                    {
+                        keys.push(key);
+                    }
+                    Ok(Keys { keys })
+                }
+            }
+
+            deserializer.deserialize_map(KeysVisitor)
+        }
+    }
+
+    /// The attribute constants decide which attributes a `run()` result has: in
+    /// each capture mode, `get_attr` and `has_attr` answer every name of the mode's
+    /// constant and no other, the other mode's names and unknown names included, and
+    /// the JSON encoding writes exactly the constant's names, in its order.
+    #[test]
+    fn the_attribute_constants_decide_what_a_result_has() {
+        let modes = [
+            (
+                CapturedOutput::Split {
+                    stdout: b"out".to_vec(),
+                    stderr: b"err".to_vec(),
+                },
+                SPLIT_RESULT_ATTRIBUTES,
+            ),
+            (
+                CapturedOutput::Merged {
+                    output: b"both".to_vec(),
+                },
+                MERGED_RESULT_ATTRIBUTES,
+            ),
+        ];
+        let mut names: Vec<&str> = SPLIT_RESULT_ATTRIBUTES
+            .iter()
+            .chain(MERGED_RESULT_ATTRIBUTES)
+            .copied()
+            .collect();
+        names.extend(["duration", "checked", "RC", ""]);
+        for (output, attributes) in modes {
+            let result = RunResult::new(&StepOutcome {
+                termination: Termination::Exited(3),
+                output,
+                cached: true,
+            });
+            Heap::temp(|heap| {
+                for &name in &names {
+                    let listed = attributes.contains(&name);
+                    assert_eq!(
+                        result.get_attr(name, heap).is_some(),
+                        listed,
+                        "get_attr of {name:?} with {attributes:?}"
+                    );
+                    assert_eq!(
+                        result.has_attr(name, heap),
+                        listed,
+                        "has_attr of {name:?} with {attributes:?}"
+                    );
+                }
+            });
+            let encoded = serde_json::to_string(&result).unwrap();
+            let keys: Keys = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(keys.keys, attributes, "{encoded}");
+        }
     }
 }

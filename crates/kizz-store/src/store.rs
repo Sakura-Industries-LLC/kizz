@@ -13,10 +13,34 @@
 //! store hands the write-ahead log to the operating system, so a committed record
 //! survives a crash of the process.
 //!
-//! When the store creates the database it writes [`SCHEMA_VERSION`] into it, and it
-//! refuses to open a database with another version. It never wipes a cache by
-//! itself: `kizz cache reset --all` does, after asking, through [`Store::inventory`],
-//! which counts the entries of a cache of any schema version, and [`Store::wipe`].
+//! The store starts no thread of its own ("Kizz never panics"), so it cannot fail
+//! when the system cannot start one. Its runtime is a current-thread runtime, which
+//! runs `SurrealKV`'s tasks on the threads that call the store, while they wait for a
+//! commit or the close. Kizz builds `SurrealKV` from a patched copy in
+//! `vendor/surrealkv`, and the store opens it with the copy's direct clock,
+//! [`ClockMode::Direct`], which reads the system clock on every reading instead of
+//! keeping a thread that brings it up to date. Its stall thresholds, [`STALL_THRESHOLD`],
+//! are so high that `SurrealKV` never paces or stalls a write, which a cache of small
+//! records does not need. When it replays several log segments after a crash,
+//! the copy starts a thread when it can and otherwise replays them on the thread
+//! that opens the store.
+//!
+//! The store waits for `SurrealKV` with `Runtime::block_on` only after it checks,
+//! with `Handle::try_current`, that the calling thread is in no runtime, because
+//! `block_on` panics when it is called within an asynchronous execution context
+//! ("Kizz never panics"); a call from inside a runtime is
+//! [`StoreError::InsideRuntime`] instead. Its runtime never panics when it is
+//! dropped either: inside an asynchronous context, where dropping a Tokio runtime
+//! panics, it shuts down in the background instead.
+//!
+//! When the store creates the database it writes [`SCHEMA_VERSION`] and the current
+//! [`CacheIdentity`] into it. It refuses to open a database with another version,
+//! and then one whose identity differs from the current one or that has none,
+//! because the cache is not portable between machines and users. It never wipes a
+//! cache by itself:
+//! `kizz cache reset --all` does, after asking, through [`Store::inventory`], which
+//! counts the entries of a cache of any schema version and reads its identity, and
+//! [`Store::wipe`].
 
 use std::{
     collections::BTreeSet,
@@ -24,10 +48,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use surrealkv::{Durability, LSMIterator as _, Mode, ReadOptions, Transaction, Tree, TreeBuilder};
+use surrealkv::{
+    ClockMode, Durability, LSMIterator as _, Mode, Options, ReadOptions, Transaction, Tree,
+    TreeBuilder,
+};
 
-use crate::records::{
-    Family, PositionKey, Record, RecordKey, SchemaKey, SchemaVersion, TaskId, database_key,
+use crate::{
+    identity::{CacheIdentity, IdentityDifference, IdentityKey, identity_differences_text},
+    records::{
+        Family, PositionKey, Record, RecordKey, SchemaKey, SchemaVersion, TaskId, database_key,
+    },
 };
 
 /// The name of the database directory in the cache directory.
@@ -35,6 +65,25 @@ pub const DATABASE_DIR: &str = "db";
 
 /// The name a wiped database directory has while [`Store::wipe`] removes it.
 const WIPED_DIR: &str = "db.wiped";
+
+/// The number of immutable memory tables, and of level-0 files, at which `SurrealKV`
+/// would stall writes, as the store sets it: the largest number there is.
+///
+/// `SurrealKV` paces writes once a count passes 2 below its memory-table threshold
+/// or 4 below its level-0 threshold, and stalls them at the threshold, so with this
+/// value it would take more than `usize::MAX - 4` memory tables or files in one
+/// database, which no process can hold: write pacing, which waited on a thread in
+/// published `SurrealKV`, never runs, and no write stalls.
+pub const STALL_THRESHOLD: usize = usize::MAX;
+
+/// The options the store opens the database in `path` with: the direct clock, which
+/// starts no thread, and stall thresholds that keep write pacing from running.
+fn tree_options(path: PathBuf) -> Options {
+    Options::new_with_clock(ClockMode::Direct)
+        .with_path(path)
+        .with_memtable_stall_threshold(STALL_THRESHOLD)
+        .with_l0_stall_threshold(STALL_THRESHOLD)
+}
 
 /// The version of the record encoding that this build of kizz reads and writes.
 ///
@@ -51,8 +100,44 @@ const WIPED_DIR: &str = "db.wiped";
 /// exited with a code of its own after the build was interrupted, which, like a
 /// command that a signal stopped then, is never a cache hit. Version 7 added the
 /// owners of step records: the tasks that produced or used each record, which path
-/// resets and `kizz cache clean` use.
-pub const SCHEMA_VERSION: u32 = 7;
+/// resets and `kizz cache clean` use. Version 8 added task programs as last
+/// writers: each last writer names its task and either the step that wrote the path,
+/// with its position, or the task program, and explanations name a task program
+/// that last wrote a changed input. Version 9 added the owner, as user and group
+/// numbers, to every regular-file state, the mode and owner to every directory
+/// state, and the permission and owner changes that a cache check finds. Version 10
+/// added the `timestamps` option to the step specification, the modification and
+/// change times to every directory state, and the timestamp change that a cache
+/// check finds. Version 11 keeps directory listings in the order the file system
+/// returned their entries, with a hash of that order and a hash of the same entries
+/// sorted, and adds the names of the entries that changed and the order change to
+/// what a cache check finds. Version 12 adds the reason for a run in which files
+/// changed after the command first read them or ran them, which lists each such
+/// file and whether the command wrote it, and, like the other reasons a run's
+/// result is not cached, marks a record that is never a cache hit. Version 13 adds
+/// the xattr access bit, the extended attributes recorded with a path whose
+/// attributes the command read or listed, each name with a hash of its value, for
+/// the path and, for a symbolic link, for what it points to, and the change that
+/// lists the attributes that appeared, disappeared, or changed. Version 14 adds the
+/// numbers of the system calls that a command made and that the tracer does not
+/// know to every step record, whether or not its result was cached, and the reason
+/// for a run that made such calls, which, like the other reasons a run's result is
+/// not cached, marks a record that is never a cache hit. Version 15 adds the
+/// connections that a command made to IPv4 and IPv6 addresses and to Unix sockets,
+/// by path or abstract name, to every step record, whether or not its result was
+/// cached; they never keep a result out of the cache. Version 16 adds the cache
+/// identity, in the `meta/` family: the host name, the effective user and group, the
+/// supplementary groups, the umask, the machine architecture, and the CPU model of
+/// the process that created the database, which every later open compares with the
+/// current values. Version 17 adds the machine state that a command started with to
+/// every step record, the `machine` names to the step specification, the machine
+/// state values that a cache check finds changed, and the reasons that name a change
+/// of the `machine` names or of the machine state. Version 18 adds the reason of a
+/// command that runs because its task is marked `cache=never`, to step records and
+/// to the explanations of step positions. Version 19 adds the reason of a command
+/// that runs because `kizz run --no-cache` was given, to step records and to the
+/// explanations of step positions.
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +161,10 @@ pub enum StoreError {
     /// one changed nothing.
     #[error("a concurrent transaction changed the same cache records; nothing was written")]
     Conflict,
+    /// The store was called from inside an asynchronous execution context, where
+    /// waiting for the database would panic, so it did not wait.
+    #[error("the cache database cannot be waited for from inside an asynchronous task")]
+    InsideRuntime,
     /// A record could not be encoded.
     #[error("cannot encode a {family}: {message}")]
     Encode {
@@ -112,6 +201,35 @@ pub enum StoreError {
         found: u32,
         /// The version this build uses, [`SCHEMA_VERSION`].
         expected: u32,
+    },
+    /// The database was stamped with another cache identity: another machine or user
+    /// created it.
+    #[error(
+        "the cache database at `{}` belongs to another machine or user, so kizz refuses to \
+         use it: {}; the cache is not portable between machines and users; run `kizz cache \
+         reset --all` to wipe the cache, or set `KIZZ_CACHE_DIR` to use another cache",
+        path.display(),
+        identity_differences_text(differences)
+    )]
+    IdentityMismatch {
+        /// The database directory.
+        path: PathBuf,
+        /// Each value that differs, stored and current, in the order of the fields of
+        /// [`CacheIdentity`].
+        differences: Vec<IdentityDifference>,
+    },
+    /// The database has this schema version but no cache identity, so kizz cannot
+    /// tell which machine and user it belongs to.
+    #[error(
+        "the cache database at `{}` has no cache identity, so kizz cannot tell which machine \
+         and user it belongs to and refuses to use it; the cache is not portable between \
+         machines and users; run `kizz cache reset --all` to wipe the cache, or set \
+         `KIZZ_CACHE_DIR` to use another cache",
+        path.display()
+    )]
+    IdentityMissing {
+        /// The database directory.
+        path: PathBuf,
     },
     /// The database directory could not be removed.
     #[error("cannot remove the cache database `{}`", path.display())]
@@ -160,13 +278,17 @@ impl EntryCounts {
 }
 
 /// What a whole cache holds, as [`Store::inventory`] counts it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inventory {
-    /// The entries of every family but the schema version.
+    /// The entries of every family but the database facts: the schema version and the
+    /// cache identity.
     pub entries: EntryCounts,
     /// The schema version stored in the database, or `None` when there is no
     /// database or it holds no readable version.
     pub schema_version: Option<u32>,
+    /// The cache identity stored in the database, or `None` when there is no
+    /// database or it holds no readable identity.
+    pub identity: Option<CacheIdentity>,
 }
 
 /// The cache database, shared by the threads of one process.
@@ -174,7 +296,7 @@ pub struct Store {
     /// The `SurrealKV` tree. Declared before the runtime so that it is dropped first.
     tree: Tree,
     /// The runtime that drives the tree's commits and background work.
-    runtime: tokio::runtime::Runtime,
+    runtime: StoreRuntime,
     /// The database directory.
     path: PathBuf,
     /// Whether the tree has been closed.
@@ -194,21 +316,27 @@ impl std::fmt::Debug for Store {
 
 impl Store {
     /// Opens the database in the `db` directory of `cache_dir`, creating it, with the
-    /// current schema version, if it does not exist.
+    /// current schema version and the current [`CacheIdentity`], if it does not exist.
+    ///
+    /// An existing database's schema version is checked first, then its identity.
     ///
     /// # Errors
     ///
     /// [`StoreError::SchemaMismatch`] when the database has another schema version,
-    /// and another [`StoreError`] when the database cannot be created or opened.
+    /// [`StoreError::IdentityMismatch`] when it has another identity,
+    /// [`StoreError::IdentityMissing`] when it has this schema version but no
+    /// identity, and another [`StoreError`] when the database cannot be created or
+    /// opened.
     pub fn open(cache_dir: &Path) -> Result<Self, StoreError> {
         let store = Self::open_tree(cache_dir)?;
-        store.check_schema()?;
+        store.check_stamp(&CacheIdentity::current())?;
         Ok(store)
     }
 
     /// Counts the entries of the database in the `db` directory of `cache_dir`,
-    /// whatever its schema version, by their keys alone, without decoding a record
-    /// or changing anything. A cache without a database has no entries.
+    /// whatever its schema version, by their keys alone, and reads its schema version
+    /// and its identity when it can, without decoding another record or changing
+    /// anything. A cache without a database has no entries.
     ///
     /// # Errors
     ///
@@ -225,6 +353,10 @@ impl Store {
                 .get(database_key::<SchemaVersion>(&SchemaKey))?
                 .and_then(|bytes| decode::<SchemaVersion>(&bytes).ok())
                 .map(|schema| schema.version);
+            let identity = txn
+                .inner
+                .get(database_key::<CacheIdentity>(&IdentityKey))?
+                .and_then(|bytes| decode::<CacheIdentity>(&bytes).ok());
             let task_keys = txn.raw_keys(Family::Task)?;
             let position_keys = txn.raw_keys(Family::Position)?;
             let order_keys = txn.raw_keys(Family::Order)?;
@@ -250,6 +382,7 @@ impl Store {
                     writers: txn.raw_keys(Family::Writer)?.len(),
                 },
                 schema_version,
+                identity,
             }
         };
         store.close()?;
@@ -257,8 +390,9 @@ impl Store {
     }
 
     /// Wipes the whole cache database in the `db` directory of `cache_dir`, whatever
-    /// its schema version; the next [`Store::open`] creates an empty one. The caller
-    /// holds the cache lock, so no process has the database open.
+    /// its schema version and identity; the next [`Store::open`] creates an empty one,
+    /// stamped with the current identity. The caller holds the cache lock, so no
+    /// process has the database open.
     ///
     /// The directory is first renamed, in one step, so a crash during the removal
     /// leaves no partial database behind, only a directory that the next wipe
@@ -304,20 +438,20 @@ impl Store {
                 source,
             }
         })?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("kizz-store")
+        // A current-thread runtime starts no thread: the tree's tasks run on the
+        // threads that wait in `block_on`.
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(StoreError::Runtime)?;
         let tree = {
             // The tree starts its background tasks on the runtime it is opened in.
             let _entered = runtime.enter();
-            TreeBuilder::new().with_path(path.clone()).build()?
+            TreeBuilder::with_options(tree_options(path.clone())).build()?
         };
         Ok(Self {
             tree,
-            runtime,
+            runtime: StoreRuntime(Some(runtime)),
             path,
             closed: false,
         })
@@ -368,31 +502,54 @@ impl Store {
             return Ok(());
         }
         self.closed = true;
-        self.runtime.block_on(self.tree.close())?;
+        wait_for(&self.runtime, self.tree.close())??;
         Ok(())
     }
 
-    /// Writes the schema version into a new database, or checks the version of an
-    /// existing one.
-    fn check_schema(&self) -> Result<(), StoreError> {
+    /// Writes the schema version and `current`, the identity of this process, into a
+    /// new database, in one transaction, or checks the version of an existing one
+    /// first and then its identity against `current`.
+    ///
+    /// A database of this schema version always gets its identity in the transaction
+    /// that creates it, so one that has none is refused: kizz cannot tell whose
+    /// cache it is, and only `kizz cache reset --all` makes it usable again.
+    fn check_stamp(
+        &self,
+        current: &CacheIdentity,
+    ) -> Result<(), StoreError> {
         let mut txn = self.write()?;
         match txn.get::<SchemaVersion>(&SchemaKey)? {
             Some(SchemaVersion {
                 version: SCHEMA_VERSION,
-            }) => Ok(()),
+            }) => {},
             Some(SchemaVersion { version }) => {
-                Err(StoreError::SchemaMismatch {
+                return Err(StoreError::SchemaMismatch {
                     path: self.path.clone(),
                     found: version,
                     expected: SCHEMA_VERSION,
-                })
+                });
             },
             None => {
                 txn.put(&SchemaKey, &SchemaVersion {
                     version: SCHEMA_VERSION,
                 })?;
-                txn.commit()
+                txn.put(&IdentityKey, current)?;
+                return txn.commit();
             },
+        }
+        let Some(stored) = txn.get::<CacheIdentity>(&IdentityKey)? else {
+            return Err(StoreError::IdentityMissing {
+                path: self.path.clone(),
+            });
+        };
+        let differences = stored.differences(current);
+        if differences.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::IdentityMismatch {
+                path: self.path.clone(),
+                differences,
+            })
         }
     }
 }
@@ -543,7 +700,7 @@ impl Txn<'_> {
     /// both cases nothing was written.
     pub fn commit(mut self) -> Result<(), StoreError> {
         self.inner.set_durability(Durability::Eventual);
-        match self.store.runtime.block_on(self.inner.commit()) {
+        match wait_for(&self.store.runtime, self.inner.commit())? {
             Ok(()) => {},
             Err(surrealkv::Error::TransactionWriteConflict) => return Err(StoreError::Conflict),
             Err(error) => return Err(error.into()),
@@ -553,6 +710,57 @@ impl Txn<'_> {
         self.store.tree.flush_wal(false)?;
         Ok(())
     }
+}
+
+/// The store's runtime, which never panics when it is dropped ("Kizz never
+/// panics").
+///
+/// Dropping a Tokio runtime waits for its blocking pool, which panics with "Cannot
+/// drop a runtime in a context where blocking is not allowed" inside an
+/// asynchronous context. Kizz drops no store there, but should one be dropped
+/// there, its runtime shuts down in the background, with
+/// `Runtime::shutdown_background`, which does not wait, instead; elsewhere it shuts
+/// down as usual. The runtime is `None` only while it is dropped.
+struct StoreRuntime(Option<tokio::runtime::Runtime>);
+
+impl StoreRuntime {
+    /// The runtime, until it is dropped.
+    const fn get(&self) -> Option<&tokio::runtime::Runtime> {
+        self.0.as_ref()
+    }
+}
+
+impl Drop for StoreRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// Runs `future` to its end on `runtime` with `Runtime::block_on`, after checking
+/// that the calling thread is in no runtime, where `block_on` would panic.
+///
+/// # Errors
+///
+/// [`StoreError::InsideRuntime`] when the calling thread is in a runtime; the
+/// future is dropped without running. [`StoreError::Runtime`] for a runtime that
+/// is already gone, which only a store being dropped has.
+fn wait_for<F: Future>(
+    runtime: &StoreRuntime,
+    future: F,
+) -> Result<F::Output, StoreError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(StoreError::InsideRuntime);
+    }
+    let Some(runtime) = runtime.get() else {
+        return Err(StoreError::Runtime(io::Error::other(
+            "the cache database runtime has shut down",
+        )));
+    };
+    Ok(runtime.block_on(future))
 }
 
 /// Decodes a stored record of type `R`.
@@ -580,8 +788,69 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 
 /// Unit tests for the parts of the store that need no database.
 #[cfg(test)]
+#[allow(clippy::disallowed_macros, reason = "test code: the tests assert")]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// The store's runtime, dropped inside an asynchronous context, where dropping a
+    /// Tokio runtime panics with "Cannot drop a runtime in a context where blocking
+    /// is not allowed", shuts down in the background instead, and the context goes
+    /// on; dropped outside one, it shuts down as usual.
+    #[test]
+    fn the_runtime_drops_without_a_panic_inside_an_asynchronous_context() {
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let inside = StoreRuntime(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        ));
+        assert!(inside.get().is_some());
+        outer.block_on(async move { drop(inside) });
+        let outside = StoreRuntime(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        ));
+        drop(outside);
+        let gone = StoreRuntime(None);
+        assert!(matches!(
+            wait_for(&gone, async { 5 }),
+            Err(StoreError::Runtime(_))
+        ));
+    }
+
+    /// Waiting for the database from inside a runtime is
+    /// [`StoreError::InsideRuntime`], where `Runtime::block_on` would panic, and
+    /// the future never runs; outside a runtime, it runs to its end.
+    #[test]
+    fn waiting_inside_a_runtime_is_an_error() {
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let runtime = StoreRuntime(Some(
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        ));
+        let ran = Cell::new(false);
+        let entered = outer.enter();
+        let inside = wait_for(&runtime, async { ran.set(true) });
+        assert!(
+            matches!(inside, Err(StoreError::InsideRuntime)),
+            "{inside:?}"
+        );
+        assert!(!ran.get());
+        assert_eq!(
+            StoreError::InsideRuntime.to_string(),
+            "the cache database cannot be waited for from inside an asynchronous task"
+        );
+        drop(entered);
+        assert_eq!(wait_for(&runtime, async { 5 }).unwrap(), 5);
+    }
 
     #[test]
     fn prefix_end_is_the_first_key_after_the_prefix() {
@@ -606,5 +875,124 @@ mod tests {
         );
         assert!(message.contains("`kizz cache reset --all`"), "{message}");
         assert!(message.contains("/cache/db"), "{message}");
+    }
+
+    /// The identity mismatch names each difference, stored and current, says that the
+    /// cache is not portable, and gives both ways on.
+    #[test]
+    fn identity_mismatch_names_each_difference_and_both_ways_on() {
+        let message = StoreError::IdentityMismatch {
+            path: PathBuf::from("/cache/db"),
+            differences: vec![
+                IdentityDifference {
+                    part: crate::IdentityPart::Host,
+                    stored: String::from(r#""old-host""#),
+                    current: String::from(r#""new-host""#),
+                },
+                IdentityDifference {
+                    part: crate::IdentityPart::Umask,
+                    stored: String::from("0022"),
+                    current: String::from("0077"),
+                },
+            ],
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "the cache database at `/cache/db` belongs to another machine or user, so kizz \
+             refuses to use it: host name: \"old-host\" in the cache, \"new-host\" now; umask: \
+             0022 in the cache, 0077 now; the cache is not portable between machines and users; \
+             run `kizz cache reset --all` to wipe the cache, or set `KIZZ_CACHE_DIR` to use \
+             another cache"
+        );
+    }
+
+    /// The missing-identity error says that the identity is missing, that the cache
+    /// is not portable, and gives both ways on.
+    #[test]
+    fn identity_missing_says_so_and_gives_both_ways_on() {
+        let message = StoreError::IdentityMissing {
+            path: PathBuf::from("/cache/db"),
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "the cache database at `/cache/db` has no cache identity, so kizz cannot tell \
+             which machine and user it belongs to and refuses to use it; the cache is not \
+             portable between machines and users; run `kizz cache reset --all` to wipe the \
+             cache, or set `KIZZ_CACHE_DIR` to use another cache"
+        );
+    }
+
+    /// The check that every open makes refuses a stored identity whose CPU models
+    /// differ from the current ones, also for the lists that the joined text of earlier
+    /// versions showed alike, naming the CPU model alone; its error text shows the
+    /// stored and the current list differently; and it accepts the stored models
+    /// themselves.
+    #[test]
+    fn the_open_check_refuses_and_tells_apart_cpu_models_that_once_showed_alike() {
+        let base = CacheIdentity::current();
+        for collision in crate::identity::colliding_cpu_models() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            let stored = CacheIdentity {
+                cpu_models: collision.stored,
+                ..base.clone()
+            };
+            let current = CacheIdentity {
+                cpu_models: collision.current,
+                ..base.clone()
+            };
+            let mut txn = store.write().unwrap();
+            txn.put(&IdentityKey, &stored).unwrap();
+            txn.commit().unwrap();
+            store.check_stamp(&stored).unwrap();
+            let error = store.check_stamp(&current).unwrap_err();
+            let message = error.to_string();
+            match error {
+                StoreError::IdentityMismatch { path, differences } => {
+                    assert_eq!(path, dir.path().join(DATABASE_DIR));
+                    assert_eq!(differences, vec![IdentityDifference {
+                        part: crate::IdentityPart::CpuModel,
+                        stored: String::from(collision.stored_text),
+                        current: String::from(collision.current_text),
+                    }]);
+                },
+                other => panic!("expected an identity mismatch, got {other:?}"),
+            }
+            assert_ne!(collision.stored_text, collision.current_text);
+            let shown = format!(
+                "refuses to use it: CPU model: {} in the cache, {} now; the cache is not",
+                collision.stored_text, collision.current_text
+            );
+            assert!(message.contains(&shown), "{message}");
+            store.close().unwrap();
+        }
+    }
+
+    /// Version 19 adds the reason of a command that runs because `kizz run
+    /// --no-cache` was given, one more than version 18, which added the reason of a
+    /// command whose task is marked `cache=never`.
+    #[test]
+    fn schema_version_19_records_the_run_no_cache_reason() {
+        assert_eq!(SCHEMA_VERSION, 19);
+    }
+
+    /// The store's thresholds keep write pacing from running: `SurrealKV` paces a
+    /// write only while a count of immutable memory tables passes its threshold less
+    /// 2, or a count of level-0 files its threshold less 4 (`StallThresholds::new`
+    /// and `WriteStallController::check` in `vendor/surrealkv/src/stall.rs`), and
+    /// both counts are lengths of collections in memory, which never pass
+    /// `isize::MAX`.
+    #[test]
+    fn write_pacing_cannot_run_under_the_store_thresholds() {
+        let options = tree_options(PathBuf::from("/cache/db"));
+        assert_eq!(options.memtable_stall_threshold, STALL_THRESHOLD);
+        assert_eq!(options.l0_stall_threshold, STALL_THRESHOLD);
+        let memtable_soft_limit = options.memtable_stall_threshold.saturating_sub(2).max(1);
+        let l0_soft_limit = options.l0_stall_threshold.saturating_sub(4).max(1);
+        let longest = usize::try_from(isize::MAX).unwrap();
+        assert!(memtable_soft_limit > longest);
+        assert!(l0_soft_limit > longest);
     }
 }

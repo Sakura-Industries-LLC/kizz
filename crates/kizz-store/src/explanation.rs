@@ -14,10 +14,13 @@
 //! * the arguments changed: old and new, word by word;
 //! * the environment changed: the variables added, removed, or changed, with their
 //!   values, which only `--verbose` shows;
-//! * the working directory, `stdin`, capture mode, ignore patterns, or `track` patterns
-//!   changed;
+//! * the working directory, `stdin`, capture mode, ignore patterns, `track` patterns,
+//!   `timestamps`, or `machine` changed;
 //! * inputs changed: every changed path, what changed about it, and who last wrote it;
+//! * the machine state that the step names changed: each changed value, old and new;
 //! * the command is marked `always`;
+//! * its task is marked `cache=never`;
+//! * `kizz run --no-cache` was given;
 //! * the previous run could not be cached, and why.
 //!
 //! Every type here is encoded by the rules of "Step keys": definite lengths, fields
@@ -28,6 +31,7 @@ use std::path::PathBuf;
 use minicbor::{Decode, Encode};
 
 use crate::{
+    machine::MachineChange,
     records::TaskId,
     step::{Capture, Change, NotCachedReason, path_bytes, path_list},
 };
@@ -81,10 +85,25 @@ pub enum Writer {
         #[n(1)]
         position: u32,
     },
-    /// Something outside kizz: no step recorded a write to the path after the
-    /// recorded state was taken.
+    /// Something outside kizz: no step or task program recorded a write to the path
+    /// after the recorded state was taken.
     #[n(3)]
     Outside,
+    /// The program of a task, through `fs.write` or `fs.write_json`, in this build.
+    #[n(4)]
+    ProgramThisBuild {
+        /// The task.
+        #[n(0)]
+        task: TaskLabel,
+    },
+    /// The program of a task, through `fs.write` or `fs.write_json`, in an earlier
+    /// build.
+    #[n(5)]
+    ProgramEarlierBuild {
+        /// The task.
+        #[n(0)]
+        task: TaskLabel,
+    },
 }
 
 /// Why a changed input is a self-inflicted reason to run: kizz's own build changes
@@ -94,8 +113,9 @@ pub enum SelfInflicted {
     /// This command writes the file and also reads it.
     #[n(0)]
     WritesAndReads,
-    /// Another step that runs on every build, because it is marked `always` or
-    /// re-runs for a self-inflicted reason itself, wrote the file in this build.
+    /// Another step that runs on every build, because it is marked `always`, its
+    /// task is marked `cache=never`, or it re-runs for a self-inflicted reason
+    /// itself, wrote the file in this build.
     #[n(1)]
     WrittenEveryBuild {
         /// The task of the writing step.
@@ -252,12 +272,39 @@ pub enum Reason {
         #[n(1)]
         new: Vec<String>,
     },
+    /// The `timestamps` option changed.
+    #[n(12)]
+    TimestampsChanged {
+        /// The old value.
+        #[n(0)]
+        old: bool,
+        /// The new value.
+        #[n(1)]
+        new: bool,
+    },
+    /// The `machine` names changed.
+    #[n(13)]
+    MachineNamesChanged {
+        /// The old names.
+        #[n(0)]
+        old: Vec<String>,
+        /// The new names.
+        #[n(1)]
+        new: Vec<String>,
+    },
     /// Recorded inputs changed.
     #[n(9)]
     InputsChanged {
         /// Every changed input, sorted by path.
         #[n(0)]
         inputs: Vec<ChangedInput>,
+    },
+    /// Values of the machine state that the step names changed.
+    #[n(14)]
+    MachineChanged {
+        /// Each changed value, old and new, in the order of the step's names.
+        #[n(0)]
+        changes: Vec<MachineChange>,
     },
     /// The command is marked `always`.
     #[n(10)]
@@ -272,6 +319,16 @@ pub enum Reason {
         #[n(1)]
         inputs: Vec<ChangedInput>,
     },
+    /// The command's task is marked `cache=never`, so the command runs as if it were
+    /// marked `always`.
+    #[n(15)]
+    TaskCacheNever,
+    /// `kizz run --no-cache` was given, so the command ran although its record may
+    /// have been a cache hit. Unlike [`Reason::Always`] and
+    /// [`Reason::TaskCacheNever`], it does not make the step one that runs on every
+    /// build.
+    #[n(16)]
+    RunNoCache,
 }
 
 impl Reason {
@@ -315,12 +372,12 @@ impl Explanation {
         paths
     }
 
-    /// Whether the step runs on every build: it is marked `always`, or one of its
-    /// changed inputs is self-inflicted.
+    /// Whether the step runs on every build: it is marked `always`, its task is
+    /// marked `cache=never`, or one of its changed inputs is self-inflicted.
     #[must_use]
     pub fn runs_every_build(&self) -> bool {
         self.reasons.iter().any(|reason| {
-            matches!(reason, Reason::Always)
+            matches!(reason, Reason::Always | Reason::TaskCacheNever)
                 || reason
                     .inputs()
                     .iter()
@@ -343,6 +400,11 @@ pub enum Verdict {
 
 /// Unit tests for the encoding of explanations.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
 
@@ -408,6 +470,14 @@ mod tests {
                 old: vec!["/proc/x".to_owned()],
                 new: Vec::new(),
             },
+            Reason::TimestampsChanged {
+                old: false,
+                new: true,
+            },
+            Reason::MachineNamesChanged {
+                old: Vec::new(),
+                new: vec!["kernel".to_owned()],
+            },
             Reason::InputsChanged {
                 inputs: vec![
                     input(Writer::ThisCommand, Some(SelfInflicted::WritesAndReads)),
@@ -429,9 +499,20 @@ mod tests {
                         None,
                     ),
                     input(Writer::Outside, None),
+                    input(Writer::ProgramThisBuild { task: label() }, None),
+                    input(Writer::ProgramEarlierBuild { task: label() }, None),
                 ],
             },
+            Reason::MachineChanged {
+                changes: vec![MachineChange {
+                    value: "kernel release".to_owned(),
+                    old: "6.12.0".to_owned(),
+                    new: "6.13.0".to_owned(),
+                }],
+            },
             Reason::Always,
+            Reason::TaskCacheNever,
+            Reason::RunNoCache,
             Reason::NotCached {
                 why: NotCachedReason::Signaled { signal: 9 },
                 inputs: Vec::new(),
@@ -474,5 +555,55 @@ mod tests {
             repeated: Vec::new(),
         };
         assert!(always.runs_every_build());
+        let never = Explanation {
+            reasons: vec![Reason::TaskCacheNever],
+            repeated: Vec::new(),
+        };
+        assert!(never.runs_every_build());
+        assert_eq!(never.self_inflicted(), Vec::<PathBuf>::new());
+        let no_cache = Explanation {
+            reasons: vec![Reason::RunNoCache],
+            repeated: Vec::new(),
+        };
+        assert!(!no_cache.runs_every_build());
+        assert_eq!(no_cache.self_inflicted(), Vec::<PathBuf>::new());
+    }
+
+    /// The reason of a command whose task is marked `cache=never` encodes
+    /// differently from `always`, and an explanation that holds it round-trips.
+    #[test]
+    fn the_task_cache_never_reason_encodes_and_round_trips() {
+        let never = minicbor::to_vec(&Reason::TaskCacheNever).unwrap();
+        assert_ne!(never, minicbor::to_vec(&Reason::Always).unwrap());
+        assert_eq!(
+            minicbor::decode::<Reason>(&never).unwrap(),
+            Reason::TaskCacheNever
+        );
+        let verdict = Verdict::Ran(Explanation {
+            reasons: vec![Reason::TaskCacheNever],
+            repeated: Vec::new(),
+        });
+        let bytes = minicbor::to_vec(&verdict).unwrap();
+        assert_eq!(minicbor::decode::<Verdict>(&bytes).unwrap(), verdict);
+    }
+
+    /// The reason of a command that ran because `kizz run --no-cache` was given
+    /// encodes differently from `always` and from `cache=never`, and an explanation
+    /// that holds it round-trips.
+    #[test]
+    fn the_run_no_cache_reason_encodes_and_round_trips() {
+        let no_cache = minicbor::to_vec(&Reason::RunNoCache).unwrap();
+        assert_ne!(no_cache, minicbor::to_vec(&Reason::Always).unwrap());
+        assert_ne!(no_cache, minicbor::to_vec(&Reason::TaskCacheNever).unwrap());
+        assert_eq!(
+            minicbor::decode::<Reason>(&no_cache).unwrap(),
+            Reason::RunNoCache
+        );
+        let verdict = Verdict::Ran(Explanation {
+            reasons: vec![Reason::RunNoCache],
+            repeated: Vec::new(),
+        });
+        let bytes = minicbor::to_vec(&verdict).unwrap();
+        assert_eq!(minicbor::decode::<Verdict>(&bytes).unwrap(), verdict);
     }
 }

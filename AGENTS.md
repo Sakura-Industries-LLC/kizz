@@ -11,13 +11,16 @@ The Justfile holds the commands, written out directly; kizz does not use Moon.
 * `just sort-dictionary` sorts `.config/dictionaries/project.dic` case-insensitively and removes duplicate words.
 * `just fix` runs every automated fixer: it sorts the dictionary, then runs the formatters and anything else
   that can be fixed automatically.
-* `just check` checks formatting, lints, tests, docs, Markdown and spelling, and changes nothing.
+* `just check` checks formatting, lints, tests, docs, Markdown, spelling and the documentation site, and changes no tracked file.
 * `just check-ci` checks and builds: it sorts the dictionary, runs the checks, checks licenses, and builds the release binaries.
   No recipe makes Cargo enforce an up-to-date lock file, so Cargo creates and refreshes `Cargo.lock` as needed,
   and `Cargo.lock` is committed.
 * `just fix-ci` runs `fix` and then `check-ci`.
 
 `just fix-ci` is the quality gate: run it from the worktree after your last edit, and it must pass.
+
+The Justfile loads a `.env` file beside it if there is one; it holds one machine's settings, so never commit it.
+If a seccomp filter refuses calls before kizz's tracer sees them, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` there skips their checks.
 
 ## Rules
 
@@ -27,3 +30,5 @@ The Justfile holds the commands, written out directly; kizz does not use Moon.
   Never sort or rewrite the file by hand; the recipes sort it and remove duplicates.
 * Tests never use the real cache: every test that runs the engine or the `kizz` binary sets `KIZZ_CACHE_DIR`
   to a temporary directory and gives each child process an explicit environment.
+* The documentation site in `docs/` is a Zola site, whose pages link to each other with `@/` links.
+  Its build output, `docs/public/`, is ignored by Git.

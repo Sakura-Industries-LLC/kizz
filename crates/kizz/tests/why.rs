@@ -10,8 +10,16 @@
 //! reports the accesses that a step's arguments name. Every run of the binary gets
 //! an explicit environment that holds only `KIZZ_CACHE_DIR`, set to that cache.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     ffi::OsString,
     fs,
@@ -21,11 +29,14 @@ use std::{
     process::{Command, Stdio},
 };
 
-use kizz_core::{Engine, ProgramHash, ProgramParts, StepExecutor as _, StepSpec, TaskIdentity};
+use kizz_core::{
+    Engine, ProgramHash, ProgramParts, StepExecutor as _, StepSpec, TaskIdentity, WorkerPool,
+};
 use kizz_store::{CacheLock, LockDetails, Store, TaskId};
 use kizz_trace::{
-    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Disk, EchoSink,
+    FileSystem, FirstReads, Kernel, MachineState, Memory, OutputStream, ProcessTree, ResourceLimit,
+    RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -52,6 +63,7 @@ kizz.md:3 (Build) [ci]
     ran because:
       never run: there is no record for this step
     untracked /proc and /sys accesses: `/proc/cpuinfo` (read), `/sys/kernel` (probe)
+    connections: none
     ignored accesses: 1
 ";
 
@@ -65,7 +77,8 @@ fn tracer_failure(error: &dyn Error) -> TraceError {
 
 /// A tracer that runs nothing and reports, for each argument `read:PATH`,
 /// `kernel:PATH`, or `probe:PATH`, a read, a read, or a check of the path, relative
-/// to the working directory.
+/// to the working directory, noting the metadata of each file read as its first
+/// read, as the Linux tracer does; its machine query answers with a fixed state.
 struct FakeTracer;
 
 impl Tracer for FakeTracer {
@@ -76,6 +89,8 @@ impl Tracer for FakeTracer {
         _cancel: &Cancellation,
     ) -> Result<RunResult, TraceError> {
         let mut accesses = Accesses::new();
+        let mut first_reads = FirstReads::new();
+        first_reads.note_at(&request.program, &accesses);
         accesses.record(request.program.clone(), AccessKind::Exec);
         for arg in request.args.iter().skip(1) {
             let arg = arg.to_str().unwrap_or_default();
@@ -89,14 +104,63 @@ impl Tracer for FakeTracer {
             };
             let path = AbsolutePath::new(request.cwd.as_path().join(path))
                 .map_err(|error| tracer_failure(&error))?;
+            if kind == AccessKind::Read {
+                first_reads.note_at(&path, &accesses);
+            }
             accesses.record(path, kind);
         }
         Ok(RunResult {
             termination: Termination::Exited(0),
             output: CapturedOutput::empty(request.capture),
+            tree: request
+                .tree
+                .then(|| ProcessTree::of_request(request, &accesses, Some(Termination::Exited(0)))),
             accesses,
             incomplete: None,
+            first_reads,
+            unknown_system_calls: BTreeSet::new(),
+            connections: BTreeSet::new(),
         })
+    }
+
+    /// These tests read no extended attributes, so there are none.
+    fn extended_attributes(
+        &self,
+        _path: &std::path::Path,
+        _follow: bool,
+    ) -> std::io::Result<kizz_trace::ExtendedAttributes> {
+        Ok(kizz_trace::ExtendedAttributes::new())
+    }
+
+    /// The same state with every part, whatever the working directory.
+    fn machine_state(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> MachineState {
+        MachineState {
+            kernel: Some(Kernel {
+                release: "6.12.0".to_owned(),
+                version: "#1 SMP".to_owned(),
+            }),
+            limits: Some(vec![ResourceLimit {
+                resource: "nofile".to_owned(),
+                soft: Some(1_024),
+                hard: None,
+            }]),
+            affinity: Some(vec![0, 1, 2, 3]),
+            memory: Some(Memory {
+                total: 8_000,
+                available: 4_000,
+            }),
+            filesystem: Some(FileSystem {
+                kind: 0xEF53,
+                flags: 0x1020,
+            }),
+            disk: Some(Disk {
+                size: 100_000,
+                free: 40_000,
+            }),
+        }
     }
 }
 
@@ -194,6 +258,8 @@ impl Fixture {
             always: false,
             ignore: vec!["*.tmp".to_owned()],
             track: Vec::new(),
+            timestamps: false,
+            machine: Vec::new(),
             expect: None,
         })
     }
@@ -217,7 +283,14 @@ impl Fixture {
             dir: AbsolutePath::new(&self.root)?,
         };
         let store = Store::open(self.cache.path())?;
-        let engine = Engine::new(&FakeTracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            &FakeTracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let steps = engine.task_for(identity);
         steps.execute(&self.step(env)?)?;
         steps.finish(true)?;
@@ -295,13 +368,14 @@ fn why_prints_the_reasons_untracked_accesses_and_ignored_counts() -> TestResult 
 }
 
 /// `kizz why` names the environment variables that changed and shows their values
-/// only with `--verbose`.
+/// only with `--verbose`, which also shows every part of the machine state that the
+/// step started with, one line for each.
 #[test]
 fn why_shows_environment_values_only_with_verbose() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.build(&[("TOKEN", "secret-one")])?;
     fixture.build(&[("TOKEN", "secret-two")])?;
-    let expected = |change: &str| {
+    let expected = |change: &str, machine: &str| {
         format!(
             "The most recent build ran 1 task under `.`.
 
@@ -311,14 +385,22 @@ kizz.md:3 (Build) [ci]
       the environment changed:
         {change}
     untracked /proc and /sys accesses: `/proc/cpuinfo` (read), `/sys/kernel` (probe)
-    ignored accesses: 1
+    connections: none
+{machine}    ignored accesses: 1
 "
         )
     };
+    let machine = "    machine kernel: kernel release 6.12.0, kernel version #1 SMP
+    machine limits: soft limit of nofile 1024, hard limit of nofile unlimited
+    machine affinity: CPUs 0-3
+    machine memory: total memory 8000 bytes, available memory 4000 bytes
+    machine filesystem: file system type 0xef53, mount flags 0x1020
+    machine disk: file system size 100000 bytes, free space 40000 bytes
+";
 
     let plain = fixture.why(&[], &[])?;
     assert_eq!(plain.status, Some(0), "{plain:?}");
-    assert_eq!(plain.stdout, expected("changed TOKEN"), "{plain:?}");
+    assert_eq!(plain.stdout, expected("changed TOKEN", ""), "{plain:?}");
     assert!(!plain.stdout.contains("secret"), "{plain:?}");
 
     for verbose in ["-v", "--verbose"] {
@@ -326,7 +408,7 @@ kizz.md:3 (Build) [ci]
         assert_eq!(shown.status, Some(0), "{shown:?}");
         assert_eq!(
             shown.stdout,
-            expected("changed TOKEN from `secret-one` to `secret-two`"),
+            expected("changed TOKEN from `secret-one` to `secret-two`", machine),
             "{shown:?}"
         );
     }

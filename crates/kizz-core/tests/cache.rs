@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Cache checks, replay, `always` steps, and results that are not cached, with a fake
-//! tracer and real files.
+//! Cache checks, replay, `always` steps, results that are not cached, runs that
+//! made system calls that the tracer does not know, and runs that made connections,
+//! with a fake tracer and real files.
 //!
 //! Each test builds a project directory and a cache in temporary directories and
 //! opens the store in that cache. A build is one [`Engine`]: a test runs a build,
@@ -15,11 +16,20 @@
 //! Files that a test does not mean to be racily clean get a modification time an
 //! hour in the past, so the two-second rule does not hash them.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs::{self, File, FileTimes},
     io,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
@@ -28,16 +38,18 @@ use std::{
 };
 
 use kizz_core::{
-    Engine, PrintSink, ProgramHash, StepExecutor, StepOutcome, StepSpec, TaskInfo, TaskProgram,
-    parse_tasks, step_key,
+    Engine, PrintSink, ProgramHash, StepConnections, StepExecutor, StepOutcome, StepSpec, TaskInfo,
+    TaskProgram, UnknownCalls, WorkerPool, observe::listing, parse_tasks, step_key,
 };
 use kizz_store::{
-    AccessBits, Change, ContentHash, Difference, FileMeta, NotCachedReason, Observation, PathState,
-    RunReason, StepExit, StepKey, StepRecord, Store,
+    AccessBits, Attribute, Attributes, Change, Connection as StoredConnection, ContentHash,
+    Difference, DirEntry, EntryKind, FileMeta, Listing, NotCachedReason, Observation, Owner,
+    PathState, RunReason, StepExit, StepKey, StepRecord, Store, Times,
 };
 use kizz_trace::{
-    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    IncompleteReason, OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Connection,
+    EchoSink, ExtendedAttributes, FirstReads, IncompleteReason, OutputStream, ProcessTree,
+    RunRequest, RunResult, Termination, TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -48,12 +60,16 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type Script = dyn Fn(&RunRequest) -> Result<RunResult, TraceError> + Send + Sync;
 
 /// A tracer that runs nothing and follows a script that performs file operations
-/// on real files and reports them.
+/// on real files and reports them, and whose attribute query answers with the
+/// extended attributes that a test sets.
 struct FakeTracer {
     /// What each run does.
     script: Box<Script>,
     /// Every request received, in order.
     requests: Mutex<Vec<RunRequest>>,
+    /// The extended attributes of each path, by the path and whether a final link
+    /// is followed; the query finds none for any other path that exists.
+    attributes: Mutex<BTreeMap<(PathBuf, bool), ExtendedAttributes>>,
 }
 
 impl FakeTracer {
@@ -64,7 +80,26 @@ impl FakeTracer {
         Self {
             script: Box::new(script),
             requests: Mutex::new(Vec::new()),
+            attributes: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Set the extended attributes of `path`, with or without following a final
+    /// link, to `pairs` of a name and a value.
+    fn set_attributes(
+        &self,
+        path: &Path,
+        follow: bool,
+        pairs: &[(&str, &str)],
+    ) {
+        let attributes = pairs
+            .iter()
+            .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+            .collect();
+        self.attributes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((path.to_path_buf(), follow), attributes);
     }
 
     /// A tracer whose runs exit with status 0 and report reading `paths`.
@@ -108,6 +143,31 @@ impl Tracer for FakeTracer {
             .push(request.clone());
         (self.script)(request)
     }
+
+    fn extended_attributes(
+        &self,
+        path: &Path,
+        follow: bool,
+    ) -> io::Result<ExtendedAttributes> {
+        let set = self
+            .attributes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(path.to_path_buf(), follow))
+            .cloned();
+        match set {
+            Some(attributes) => Ok(attributes),
+            None => fs::symlink_metadata(path).map(|_| ExtendedAttributes::new()),
+        }
+    }
+
+    /// These tests name no machine state, so the fake knows no part.
+    fn machine_state(
+        &self,
+        _cwd: &Path,
+    ) -> kizz_trace::MachineState {
+        kizz_trace::MachineState::default()
+    }
 }
 
 /// A tracer failure from `error`.
@@ -127,13 +187,33 @@ fn reported(
     request: &RunRequest,
     accesses: &[(PathBuf, AccessKind)],
 ) -> Result<Accesses, TraceError> {
+    traced(request, accesses).map(|(reported, _)| reported)
+}
+
+/// The accesses of a run of `request`, the program as run, then `accesses`, with
+/// the first reads of the run: the metadata of each file read or run before it was
+/// written, noted now, when the script has done its file operations, under the
+/// rules of the Linux tracer.
+///
+/// # Errors
+///
+/// A tracer failure when a path in `accesses` is not absolute.
+fn traced(
+    request: &RunRequest,
+    accesses: &[(PathBuf, AccessKind)],
+) -> Result<(Accesses, FirstReads), TraceError> {
     let mut reported = Accesses::new();
+    let mut first_reads = FirstReads::new();
+    first_reads.note_at(&request.program, &reported);
     reported.record(request.program.clone(), AccessKind::Exec);
     for (path, kind) in accesses {
         let path = AbsolutePath::new(path).map_err(|error| tracer_failure(&error))?;
+        if matches!(kind, AccessKind::Read | AccessKind::Exec) {
+            first_reads.note_at(&path, &reported);
+        }
         reported.record(path, *kind);
     }
-    Ok(reported)
+    Ok((reported, first_reads))
 }
 
 /// A result that reports the program as run, then `accesses`, with no output.
@@ -146,11 +226,18 @@ fn finished(
     accesses: &[(PathBuf, AccessKind)],
     termination: Termination,
 ) -> Result<RunResult, TraceError> {
+    let (accesses, first_reads) = traced(request, accesses)?;
     Ok(RunResult {
         termination,
         output: CapturedOutput::empty(request.capture),
-        accesses: reported(request, accesses)?,
+        tree: request
+            .tree
+            .then(|| ProcessTree::of_request(request, &accesses, Some(termination))),
+        accesses,
         incomplete: None,
+        first_reads,
+        unknown_system_calls: BTreeSet::new(),
+        connections: BTreeSet::new(),
     })
 }
 
@@ -300,6 +387,8 @@ impl Fixture {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
+            machine: Vec::new(),
             expect: None,
         })
     }
@@ -312,14 +401,41 @@ impl Fixture {
         cancel: Cancellation,
         steps: &[&StepSpec],
     ) -> TestResult<Built> {
+        self.build_engine(tracer, cancel, false, steps)
+    }
+
+    /// Run `steps` in one build with `tracer`, whose engine caches the results of
+    /// runs that made system calls that the tracer does not know, as
+    /// `kizz build --cache-unknown-syscalls` asks.
+    fn build_caching_unknown(
+        &self,
+        tracer: &FakeTracer,
+        steps: &[&StepSpec],
+    ) -> TestResult<Built> {
+        self.build_engine(tracer, Cancellation::new(), true, steps)
+    }
+
+    /// Run `steps` in one build, a new engine with `tracer` and `cancel` that
+    /// caches the results of runs with unknown system calls when `cache_unknown` is
+    /// set, as one run of a task, and return what the build returned.
+    fn build_engine(
+        &self,
+        tracer: &FakeTracer,
+        cancel: Cancellation,
+        cache_unknown: bool,
+        steps: &[&StepSpec],
+    ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None);
+        let engine = Engine::new(tracer, &store, &NoEcho, cancel, None, &WorkerPool::new()?)
+            .with_cache_unknown_system_calls(cache_unknown);
         let task = engine.task(PROGRAM, self.dir()?);
         let results = steps.iter().map(|step| task.execute(step)).collect();
         let built = Built {
             results,
             hashed: engine.files_hashed(),
-            not_cached: engine.not_cached(),
+            not_cached: engine.not_cached()?,
+            unknown: engine.unknown_system_calls()?,
+            connections: engine.connections()?,
         };
         drop(task);
         drop(engine);
@@ -366,6 +482,10 @@ struct Built {
     hashed: u64,
     /// The steps whose results were not cached.
     not_cached: Vec<(StepKey, NotCachedReason)>,
+    /// The runs that made system calls that the tracer does not know.
+    unknown: Vec<UnknownCalls>,
+    /// The runs that made connections.
+    connections: Vec<StepConnections>,
 }
 
 impl Built {
@@ -396,10 +516,13 @@ const PROGRAM: ProgramHash = ProgramHash::from_bytes([7; 32]);
 /// The why of a record's reason, with its differences.
 fn differences(record: &StepRecord) -> Vec<Difference> {
     match &record.reason {
-        RunReason::InputsChanged { differences } | RunReason::NotCached { differences, .. } => {
+        RunReason::InputsChanged { differences, .. } | RunReason::NotCached { differences, .. } => {
             differences.clone()
         },
-        RunReason::NeverRun | RunReason::Always => Vec::new(),
+        RunReason::NeverRun
+        | RunReason::Always
+        | RunReason::TaskCacheNever
+        | RunReason::RunNoCache => Vec::new(),
     }
 }
 
@@ -440,6 +563,10 @@ fn read_state(path: &Path) -> TestResult<PathState> {
             inode: metadata.ino(),
             device: metadata.dev(),
             mode: metadata.mode(),
+            owner: Owner {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            },
         },
         hash: Some(ContentHash(*blake3::hash(&fs::read(path)?).as_bytes())),
     })
@@ -597,7 +724,17 @@ fn a_new_entry_or_a_program_appearing_on_path_reruns_the_step() -> TestResult {
     fixture.write_old("src/b.c", "b")?;
     assert!(!fixture.build(&tracer, &[&step])?.cached(0)?);
     let record = fixture.record(&step)?.ok_or("no record")?;
-    assert_eq!(differences(&record), [difference(listed, Change::Entries)]);
+    assert_eq!(differences(&record), [difference(
+        listed,
+        Change::Entries {
+            appeared: vec![DirEntry {
+                name: b"b.c".to_vec(),
+                kind: EntryKind::File,
+            }],
+            disappeared: Vec::new(),
+            retyped: Vec::new(),
+        }
+    )]);
 
     fixture.write_old("first/tool", "#!/bin/sh\n")?;
     fs::set_permissions(
@@ -630,7 +767,14 @@ fn build_task(
     let task = TaskInfo::new(parsed.tasks.first().ok_or("no task")?, &["ci".to_owned()])?;
     let program = TaskProgram::load(task, &Lines::default()).program?;
     let store = fixture.store()?;
-    let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     let steps = engine.task(program.hash(), fixture.dir()?);
     let lines = Lines::default();
     program
@@ -733,7 +877,14 @@ fn always_steps_with_identical_output_leave_dependents_cached() -> TestResult {
     // The second build runs the `always` step once, even when a later pass checks
     // the task again, and the step that reads its output stays cached.
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        &tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     for pass in 0..2 {
         let task = engine.task(PROGRAM, fixture.dir()?);
         assert_eq!(task.execute(&generate)?.cached, pass == 1, "pass {pass}");
@@ -765,11 +916,12 @@ fn always_steps_with_identical_output_leave_dependents_cached() -> TestResult {
 }
 
 /// A file that was only checked is never hashed, and a change to its metadata
-/// re-runs the step.
+/// re-runs the step; a change of its permission bits is named as such.
 #[test]
 fn a_checked_file_is_never_hashed_and_its_metadata_change_reruns() -> TestResult {
     let fixture = Fixture::new()?;
     let config = fixture.write_old("config.toml", "checked = true")?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644))?;
     let reported = config.clone();
     let tracer = FakeTracer::new(move |request| {
         finished(
@@ -785,7 +937,7 @@ fn a_checked_file_is_never_hashed_and_its_metadata_change_reruns() -> TestResult
     assert!(unchanged.cached(0)?);
     assert_eq!(unchanged.hashed, 0);
 
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    age(&config, 7_200)?;
     let changed = fixture.build(&tracer, &[&step])?;
     assert!(!changed.cached(0)?);
     assert_eq!(changed.hashed, 1);
@@ -798,6 +950,18 @@ fn a_checked_file_is_never_hashed_and_its_metadata_change_reruns() -> TestResult
         return Err("the checked file is not recorded as a file".into());
     };
     assert_eq!(*hash, None);
+
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    let changed = fixture.build(&tracer, &[&step])?;
+    assert!(!changed.cached(0)?);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(differences(&record), [difference(
+        config.clone(),
+        Change::Permissions {
+            old: 0o644,
+            new: 0o600,
+        }
+    )]);
     Ok(())
 }
 
@@ -1102,7 +1266,14 @@ fn show(
     let lines = Lines::default();
     let program = TaskProgram::load(task, &lines).program?;
     let store = fixture.store()?;
-    let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     let steps = engine.task(program.hash(), fixture.dir()?);
     program
         .run(&BTreeMap::new(), &steps, &lines)
@@ -1116,8 +1287,11 @@ fn show(
 
 /// A tracer whose runs read `outcome` in the project and end as it says: `signal`,
 /// `interrupt` (a signal stops the command), `handled` (the command handles the
-/// interrupt and exits with code 130), `incomplete`, `start`, or anything else for
-/// exit status 0.
+/// interrupt and exits with code 130), `incomplete`, `start`, `unknown` (the command
+/// makes the system calls 1,000,000 and 400, which the tracer does not know, and
+/// 400 again), `incomplete-unknown` (both), `connect` (the command makes the
+/// connections of [`connections_made`], one of them twice), `incomplete-connect`
+/// (both), or anything else for exit status 0.
 fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
     FakeTracer::new(move |request| {
         let text = fs::read_to_string(&outcome).map_err(|error| tracer_failure(&error))?;
@@ -1129,17 +1303,27 @@ fn outcome_tracer(outcome: PathBuf) -> FakeTracer {
             _ => Termination::Exited(0),
         };
         if text == "start" {
+            let touched = reported(request, &accesses)?;
             return Err(TraceError::StartFailed {
                 program: request.program.clone(),
                 source: io::Error::from(io::ErrorKind::OutOfMemory),
-                accesses: reported(request, &accesses)?,
+                tree: request
+                    .tree
+                    .then(|| ProcessTree::of_request(request, &touched, None)),
+                accesses: touched,
             });
         }
         let mut result = finished(request, &accesses, termination)?;
-        if text == "incomplete" {
+        if text.starts_with("incomplete") {
             result.incomplete = Some(IncompleteReason::NonNativeSystemCall {
                 detail: "int 0x80".to_owned(),
             });
+        }
+        if text.ends_with("unknown") {
+            result.unknown_system_calls = [1_000_000, 400, 400].into_iter().collect();
+        }
+        if text.ends_with("connect") {
+            result.connections = connections_made(&request.cwd);
         }
         Ok(result)
     })
@@ -1161,9 +1345,14 @@ fn not_cached_reason(
         "signal" => NotCachedReason::Signaled { signal: 9 },
         "interrupt" => NotCachedReason::Interrupted { signal: 2 },
         "handled" => NotCachedReason::InterruptedExited { code: 130 },
-        "incomplete" => {
+        "incomplete" | "incomplete-unknown" | "incomplete-connect" => {
             NotCachedReason::Incomplete {
                 detail: "a system call used a non-native interface: int 0x80".to_owned(),
+            }
+        },
+        "unknown" => {
+            NotCachedReason::UnknownSystemCalls {
+                numbers: UNKNOWN.to_vec(),
             }
         },
         _ => {
@@ -1186,7 +1375,14 @@ fn not_cached_reason(
 /// one that a signal stopped.
 #[test]
 fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
-    for kind in ["signal", "interrupt", "handled", "incomplete", "start"] {
+    for kind in [
+        "signal",
+        "interrupt",
+        "handled",
+        "incomplete",
+        "start",
+        "unknown",
+    ] {
         let fixture = Fixture::new()?;
         let why = not_cached_reason(kind, &fixture.path("bin/tool"));
         let outcome = fixture.write_old("outcome", kind)?;
@@ -1197,12 +1393,12 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
             cancel.cancel();
         }
         let store = fixture.store()?;
-        let engine = Engine::new(&tracer, &store, &NoEcho, cancel, None);
+        let engine = Engine::new(&tracer, &store, &NoEcho, cancel, None, &WorkerPool::new()?);
         let first = engine.task(PROGRAM, fixture.dir()?).execute(&step);
         let again = engine.task(PROGRAM, fixture.dir()?).execute(&step);
         assert_eq!(tracer.runs(), 1, "{kind}");
         let key = step_key(PROGRAM, &step, 0)?;
-        assert_eq!(engine.not_cached(), [(key, why.clone())], "{kind}");
+        assert_eq!(engine.not_cached()?, [(key, why.clone())], "{kind}");
         let stored = store.read()?.scan::<StepRecord>(b"")?;
         assert_eq!(stored.len(), 1, "{kind}");
         let (stored_key, marker) = stored.first().ok_or("no marker")?;
@@ -1230,7 +1426,7 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
         assert!(!rerun.cached, "{kind}");
         assert_eq!(tracer.runs(), 2, "{kind}");
         let rerun_not_cached: Vec<_> = rerun_why.iter().map(|why| (key, why.clone())).collect();
-        assert_eq!(engine.not_cached(), rerun_not_cached, "{kind}");
+        assert_eq!(engine.not_cached()?, rerun_not_cached, "{kind}");
         drop(engine);
         store.close()?;
         let record = fixture.record(&step)?.ok_or("no record")?;
@@ -1274,7 +1470,14 @@ fn results_that_are_not_cached_leave_only_a_marker() -> TestResult {
 /// and only the build after that is a cache hit.
 #[test]
 fn an_older_record_is_never_replayed_after_a_result_that_is_not_cached() -> TestResult {
-    for kind in ["signal", "interrupt", "handled", "incomplete", "start"] {
+    for kind in [
+        "signal",
+        "interrupt",
+        "handled",
+        "incomplete",
+        "start",
+        "unknown",
+    ] {
         let fixture = Fixture::new()?;
         let why = not_cached_reason(kind, &fixture.path("bin/tool"));
         let outcome = fixture.write_old("outcome", "ok")?;
@@ -1322,6 +1525,237 @@ fn an_older_record_is_never_replayed_after_a_result_that_is_not_cached() -> Test
     Ok(())
 }
 
+/// The system calls that the outcome tracer's `unknown` runs make, sorted and
+/// without repeats, as the tracer reports them.
+const UNKNOWN: [u32; 2] = [400, 1_000_000];
+
+/// Without the option, a run that made system calls that the tracer does not know
+/// is not cached: its marker gives the reason that names each number and lists
+/// them, the engine keeps the run for the warning as not cached, and the next build
+/// runs the step again with that reason. A cache hit keeps nothing for a warning.
+#[test]
+fn a_run_with_unknown_system_calls_is_not_cached_without_the_option() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "unknown")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+    let why = NotCachedReason::UnknownSystemCalls {
+        numbers: UNKNOWN.to_vec(),
+    };
+
+    let first = fixture.build(&tracer, &[&step])?;
+    assert!(!first.cached(0)?);
+    assert_eq!(first.not_cached, [(key, why.clone())]);
+    assert_eq!(first.unknown, [UnknownCalls {
+        key,
+        numbers: UNKNOWN.to_vec(),
+        cached: false,
+    }]);
+    let marker = fixture.record(&step)?.ok_or("no marker")?;
+    assert_eq!(marker.not_cached, Some(why.clone()));
+    assert_eq!(marker.unknown_system_calls, UNKNOWN);
+
+    let second = fixture.build(&tracer, &[&step])?;
+    assert!(!second.cached(0)?);
+    assert_eq!(tracer.runs(), 2);
+    let marker = fixture.record(&step)?.ok_or("no marker")?;
+    assert_eq!(marker.reason, RunReason::NotCached {
+        why: why.clone(),
+        differences: Vec::new(),
+    });
+    assert_eq!(
+        why.to_string(),
+        "the command made system calls 400 and 1000000, which the tracer does not know"
+    );
+    Ok(())
+}
+
+/// With the option, a run that made system calls that the tracer does not know is
+/// cached as if it had made none: its record lists the numbers and has no marker,
+/// and the engine keeps the run for the warning as cached. A later build without
+/// the option finds the record a cache hit, and keeps nothing for a warning.
+#[test]
+fn with_the_option_a_run_with_unknown_system_calls_is_cached() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "unknown")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+
+    let first = fixture.build_caching_unknown(&tracer, &[&step])?;
+    assert!(!first.cached(0)?);
+    assert_eq!(first.not_cached, Vec::new());
+    assert_eq!(first.unknown, [UnknownCalls {
+        key,
+        numbers: UNKNOWN.to_vec(),
+        cached: true,
+    }]);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.not_cached, None);
+    assert_eq!(record.unknown_system_calls, UNKNOWN);
+
+    for later in [
+        fixture.build(&tracer, &[&step])?,
+        fixture.build_caching_unknown(&tracer, &[&step])?,
+    ] {
+        assert!(later.cached(0)?);
+        assert_eq!(later.unknown, Vec::new());
+        assert_eq!(later.not_cached, Vec::new());
+    }
+    assert_eq!(tracer.runs(), 1);
+    Ok(())
+}
+
+/// A run that is also incompletely traced keeps that reason, with or without the
+/// option, and its marker still lists the numbers; the engine keeps the run for the
+/// warning as not cached.
+#[test]
+fn an_incomplete_run_with_unknown_system_calls_keeps_its_reason() -> TestResult {
+    for cache_unknown in [false, true] {
+        let fixture = Fixture::new()?;
+        let outcome = fixture.write_old("outcome", "incomplete-unknown")?;
+        let tracer = outcome_tracer(outcome);
+        let step = fixture.step(&["tool"])?;
+        let key = step_key(PROGRAM, &step, 0)?;
+        let why = not_cached_reason("incomplete-unknown", &fixture.path("bin/tool"));
+
+        let built = if cache_unknown {
+            fixture.build_caching_unknown(&tracer, &[&step])?
+        } else {
+            fixture.build(&tracer, &[&step])?
+        };
+        assert_eq!(built.not_cached, [(key, why.clone())], "{cache_unknown}");
+        assert_eq!(
+            built.unknown,
+            [UnknownCalls {
+                key,
+                numbers: UNKNOWN.to_vec(),
+                cached: false,
+            }],
+            "{cache_unknown}"
+        );
+        let marker = fixture.record(&step)?.ok_or("no marker")?;
+        assert_eq!(marker.not_cached, Some(why), "{cache_unknown}");
+        assert_eq!(marker.unknown_system_calls, UNKNOWN, "{cache_unknown}");
+    }
+    Ok(())
+}
+
+/// The connections that the outcome tracer's `connect` runs make in the task
+/// directory `dir`: the IPv4 address 127.0.0.1 on port 8080, twice, the IPv6
+/// address `::1` on port 443, the Unix socket `run/s.sock` in `dir`, and the
+/// abstract Unix socket `kizz` followed by a zero byte.
+fn connections_made(dir: &AbsolutePath) -> BTreeSet<Connection> {
+    [
+        Connection::Ip(SocketAddr::from(([127, 0, 0, 1], 8080))),
+        Connection::UnixAbstract(b"kizz\0".to_vec()),
+        Connection::UnixPath(dir.join("run/s.sock")),
+        Connection::Ip(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            443,
+            0,
+            0,
+        ))),
+        Connection::Ip(SocketAddr::from(([127, 0, 0, 1], 8080))),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// The connections of [`connections_made`] in the project of `fixture`, as a record
+/// keeps them: sorted and without repeats.
+fn connections_recorded(fixture: &Fixture) -> Vec<StoredConnection> {
+    vec![
+        StoredConnection::Ipv4 {
+            address: [127, 0, 0, 1],
+            port: 8080,
+        },
+        StoredConnection::Ipv6 {
+            address: Ipv6Addr::LOCALHOST.octets(),
+            port: 443,
+            scope: 0,
+        },
+        StoredConnection::UnixPath {
+            path: fixture.path("run/s.sock"),
+        },
+        StoredConnection::UnixAbstract {
+            name: b"kizz\0".to_vec(),
+        },
+    ]
+}
+
+/// A run that made connections is cached: its record lists each connection once,
+/// sorted, and has no marker, and the engine keeps the run for the warning as
+/// cached. The next build finds the record a cache hit and keeps nothing for a
+/// warning, so a cache hit does not warn.
+#[test]
+fn a_run_with_connections_is_cached_and_warns_only_when_it_runs() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "connect")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+
+    let first = fixture.build(&tracer, &[&step])?;
+    assert!(!first.cached(0)?);
+    assert_eq!(first.not_cached, Vec::new());
+    assert_eq!(first.unknown, Vec::new());
+    assert_eq!(first.connections, [StepConnections {
+        key,
+        connections: connections_recorded(&fixture),
+        cached: true,
+    }]);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.not_cached, None);
+    assert_eq!(record.connections, connections_recorded(&fixture));
+
+    let second = fixture.build(&tracer, &[&step])?;
+    assert!(second.cached(0)?);
+    assert_eq!(second.connections, Vec::new());
+    assert_eq!(tracer.runs(), 1);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.connections, connections_recorded(&fixture));
+    Ok(())
+}
+
+/// A run that made connections and is also incompletely traced keeps that reason,
+/// and its marker still lists the connections; the engine keeps the run for the
+/// warning as not cached, and the next build runs it again and warns again.
+#[test]
+fn an_incomplete_run_with_connections_keeps_its_reason() -> TestResult {
+    let fixture = Fixture::new()?;
+    let outcome = fixture.write_old("outcome", "incomplete-connect")?;
+    let tracer = outcome_tracer(outcome);
+    let step = fixture.step(&["tool"])?;
+    let key = step_key(PROGRAM, &step, 0)?;
+    let why = not_cached_reason("incomplete-connect", &fixture.path("bin/tool"));
+
+    for build in 1..=2 {
+        let built = fixture.build(&tracer, &[&step])?;
+        assert!(!built.cached(0)?, "{build}");
+        assert_eq!(built.not_cached, [(key, why.clone())], "{build}");
+        assert_eq!(
+            built.connections,
+            [StepConnections {
+                key,
+                connections: connections_recorded(&fixture),
+                cached: false,
+            }],
+            "{build}"
+        );
+        let marker = fixture.record(&step)?.ok_or("no marker")?;
+        assert_eq!(marker.not_cached, Some(why.clone()), "{build}");
+        assert_eq!(
+            marker.connections,
+            connections_recorded(&fixture),
+            "{build}"
+        );
+    }
+    assert_eq!(tracer.runs(), 2);
+    Ok(())
+}
+
 /// An `always` step runs at most once per build, when a pass first reaches it: every
 /// later pass of the same build reuses its result without running it, even after a
 /// path it touched changed, whether that result was cached or not; the next build
@@ -1342,7 +1776,14 @@ fn an_always_step_runs_once_per_build_whatever_changes() -> TestResult {
 
         for build in 1..=2 {
             let store = fixture.store()?;
-            let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+            let engine = Engine::new(
+                &tracer,
+                &store,
+                &NoEcho,
+                Cancellation::new(),
+                None,
+                &WorkerPool::new()?,
+            );
             for pass in 0..3 {
                 let result = engine.task(PROGRAM, fixture.dir()?).execute(&step)?;
                 assert_eq!(
@@ -1356,7 +1797,7 @@ fn an_always_step_runs_once_per_build_whatever_changes() -> TestResult {
                 assert_eq!(tracer.runs(), build, "{kind}, build {build}, pass {pass}");
             }
             assert_eq!(
-                engine.not_cached().len(),
+                engine.not_cached()?.len(),
                 usize::from(kind == "signal"),
                 "{kind}"
             );
@@ -1399,7 +1840,14 @@ fn a_shared_file_is_hashed_once_per_build_and_again_after_a_write() -> TestResul
     let after = fixture.step(&["tool", "d"])?;
 
     let store = fixture.store()?;
-    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+    let engine = Engine::new(
+        &tracer,
+        &store,
+        &NoEcho,
+        Cancellation::new(),
+        None,
+        &WorkerPool::new()?,
+    );
     let steps = engine.task(PROGRAM, fixture.dir()?);
     for reader in &readers {
         steps.execute(reader)?;
@@ -1424,5 +1872,606 @@ fn a_shared_file_is_hashed_once_per_build_and_again_after_a_write() -> TestResul
     assert_eq!(checked.hashed, 1);
     assert_eq!(tracer.runs(), 5);
     assert_eq!(checked.not_cached, Vec::new());
+    Ok(())
+}
+
+/// A step that read a file is a cache hit until `chmod` changes the file's mode
+/// from 0644 to 0600 with identical bytes: the step runs again, and its reason
+/// names the permission change. When the times change with the mode, the mode is
+/// still what is reported, and nothing refreshes it away.
+#[test]
+fn a_permission_change_with_identical_bytes_runs_a_step_that_read_the_file() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "same bytes")?;
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o644))?;
+    let tracer = FakeTracer::reading(vec![input.clone()]);
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o600))?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(input.clone(), Change::Permissions {
+            old: 0o644,
+            new: 0o600,
+        })]),
+    )?;
+
+    // A new modification time and a new mode: the mode is reported, not refreshed.
+    age(&input, 7_200)?;
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o640))?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(input.clone(), Change::Permissions {
+            old: 0o600,
+            new: 0o640,
+        })]),
+    )?;
+    assert_eq!(tracer.runs(), 3);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    Ok(())
+}
+
+/// A step that ran a program runs again after the program loses its execute bits,
+/// the review's first example: its reason names the permission change of the
+/// program, and the step fails because the program is not executable.
+#[test]
+fn a_program_that_loses_its_execute_bits_runs_its_step_again() -> TestResult {
+    let fixture = Fixture::new()?;
+    let tracer = FakeTracer::reading(Vec::new());
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+
+    let program = fixture.path("bin/tool");
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o644))?;
+    let built = fixture.build(&tracer, &[&step])?;
+    let Some(Err(error)) = built.results.first() else {
+        return Err("the step did not fail".into());
+    };
+    assert!(error.message.contains("not executable"), "{error:?}");
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(record.exit, StepExit::ProgramNotExecutable);
+    assert_eq!(differences(&record), [difference(
+        program,
+        Change::Permissions {
+            old: 0o755,
+            new: 0o644,
+        }
+    )]);
+    // The lookup found no executable program, so nothing was traced.
+    assert_eq!(tracer.runs(), 1);
+    Ok(())
+}
+
+/// Replace the owner that `state` records, a regular file's or a directory's, with
+/// `owner`.
+fn set_owner(
+    state: &mut PathState,
+    owner: Owner,
+) -> TestResult {
+    match state {
+        PathState::File { meta, .. } => meta.owner = owner,
+        PathState::Directory {
+            owner: recorded, ..
+        } => *recorded = owner,
+        other => return Err(format!("no owner in {other:?}").into()),
+    }
+    Ok(())
+}
+
+/// A recorded owner that differs from the file's or the directory's current one is
+/// a change, for a file that was read and for a directory that was only checked.
+/// Tests cannot change owners, so the test writes the other owner into the stored
+/// record.
+#[test]
+fn a_recorded_owner_that_differs_runs_the_step_again() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "content")?;
+    let dir = fixture.path("inputs");
+    fs::create_dir(&dir)?;
+    let (read, probed) = (input.clone(), dir.clone());
+    let tracer = FakeTracer::new(move |request| {
+        finished(
+            request,
+            &[
+                (read.clone(), AccessKind::Read),
+                (probed.clone(), AccessKind::Probe),
+            ],
+            Termination::Exited(0),
+        )
+    });
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+
+    let metadata = fs::metadata(&input)?;
+    let current = Owner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    };
+    let other = Owner {
+        uid: current.uid.wrapping_add(1),
+        gid: current.gid.wrapping_add(1),
+    };
+    let key = step_key(PROGRAM, &step, 0)?;
+    let mut record = fixture.record(&step)?.ok_or("no record")?;
+    for observation in &mut record.observations {
+        if observation.path == input || observation.path == dir {
+            set_owner(&mut observation.state, other)?;
+        }
+    }
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    txn.put(&key, &record)?;
+    txn.commit()?;
+    store.close()?;
+
+    let owner = Change::Owner {
+        old: other,
+        new: current,
+    };
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[
+            difference(input.clone(), owner.clone()),
+            difference(dir.clone(), owner),
+        ]),
+    )?;
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    let PathState::Directory { owner, mode, .. } = observation(&record, &dir)?.state else {
+        return Err("the directory is not recorded as a directory".into());
+    };
+    assert_eq!(owner, current);
+    assert_eq!(mode, fs::metadata(&dir)?.mode());
+    Ok(())
+}
+
+/// Replace the listing that `state`, a listed directory, records with `new`.
+fn set_listing(
+    state: &mut PathState,
+    new: Listing,
+) -> TestResult {
+    match state {
+        PathState::Directory {
+            listing: Some(recorded),
+            ..
+        } => {
+            *recorded = new;
+            Ok(())
+        },
+        other => Err(format!("no listing in {other:?}").into()),
+    }
+}
+
+/// Replace the listing of `dir` in the stored record of `step` with the listing of
+/// `entries`, in their order, with the hashes of that order.
+fn store_listing(
+    fixture: &Fixture,
+    step: &StepSpec,
+    dir: &Path,
+    entries: &[DirEntry],
+) -> TestResult {
+    let key = step_key(PROGRAM, step, 0)?;
+    let mut record = fixture.record(step)?.ok_or("no record")?;
+    for observation in &mut record.observations {
+        if observation.path == dir {
+            set_listing(&mut observation.state, listing(entries.to_vec()))?;
+        }
+    }
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    txn.put(&key, &record)?;
+    txn.commit()?;
+    store.close()?;
+    Ok(())
+}
+
+/// A recorded listing with the directory's current entries in reverse order runs
+/// the step with an order change, and one that lacks a current entry runs it with
+/// an entries change that names the entry. The test writes each listing, with the
+/// hashes of its order, into the stored record.
+#[test]
+fn a_listing_in_another_order_or_without_an_entry_runs_the_step_again() -> TestResult {
+    let fixture = Fixture::new()?;
+    let listed = fixture.path("listed");
+    for name in ["one", "two", "three", "four"] {
+        fixture.write_old(&format!("listed/{name}"), name)?;
+    }
+    let reported = listed.clone();
+    let tracer = FakeTracer::new(move |request| {
+        finished(
+            request,
+            &[(reported.clone(), AccessKind::List)],
+            Termination::Exited(0),
+        )
+    });
+    let step = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&step])?;
+    assert!(fixture.build(&tracer, &[&step])?.cached(0)?);
+    let record = fixture.record(&step)?.ok_or("no record")?;
+    let PathState::Directory {
+        listing: Some(recorded),
+        ..
+    } = &observation(&record, &listed)?.state
+    else {
+        return Err("the directory is not recorded as listed".into());
+    };
+    let current = recorded.entries.clone().ok_or("no entries")?;
+    assert_eq!(current.len(), 4);
+
+    let reversed: Vec<DirEntry> = current.iter().rev().cloned().collect();
+    store_listing(&fixture, &step, &listed, &reversed)?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(listed.clone(), Change::Order)]),
+    )?;
+
+    let without_two: Vec<DirEntry> = current
+        .iter()
+        .filter(|entry| entry.name != b"two")
+        .cloned()
+        .collect();
+    store_listing(&fixture, &step, &listed, &without_two)?;
+    reruns_then_hits(
+        &fixture,
+        &tracer,
+        &step,
+        Some(&[difference(listed, Change::Entries {
+            appeared: vec![DirEntry {
+                name: b"two".to_vec(),
+                kind: EntryKind::File,
+            }],
+            disappeared: Vec::new(),
+            retyped: Vec::new(),
+        })]),
+    )?;
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// A listed directory and a directory that was only checked each run their step
+/// again after `chmod`, with the permission change as the reason.
+#[test]
+fn a_listed_or_checked_directory_runs_its_step_again_after_chmod() -> TestResult {
+    let fixture = Fixture::new()?;
+    let listed = fixture.path("listed");
+    let checked = fixture.path("checked");
+    for dir in [&listed, &checked] {
+        fs::create_dir(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    }
+    let (list, probe) = (listed.clone(), checked.clone());
+    let tracer = FakeTracer::new(move |request| {
+        let accesses = match verb(request) {
+            "list" => [(list.clone(), AccessKind::List)],
+            _ => [(probe.clone(), AccessKind::Probe)],
+        };
+        finished(request, &accesses, Termination::Exited(0))
+    });
+    let lists = fixture.step(&["tool", "list"])?;
+    let checks = fixture.step(&["tool", "check"])?;
+    fixture.build(&tracer, &[&lists, &checks])?;
+    let hit = fixture.build(&tracer, &[&lists, &checks])?;
+    assert!(hit.cached(0)? && hit.cached(1)?);
+
+    let change = Change::Permissions {
+        old: 0o755,
+        new: 0o700,
+    };
+    for (dir, step, other) in [(&listed, &lists, &checks), (&checked, &checks, &lists)] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        let built = fixture.build(&tracer, &[step, other])?;
+        assert!(!built.cached(0)?, "{}", dir.display());
+        assert!(built.cached(1)?, "{}", dir.display());
+        let record = fixture.record(step)?.ok_or("no record")?;
+        assert_eq!(differences(&record), [difference(
+            dir.clone(),
+            change.clone()
+        )]);
+        let again = fixture.build(&tracer, &[step, other])?;
+        assert!(again.cached(0)? && again.cached(1)?);
+    }
+    assert_eq!(tracer.runs(), 4);
+    Ok(())
+}
+
+/// Set the modification time of `path`, a file or a directory, to `seconds` seconds
+/// ago, which also gives it a new change time.
+fn set_modified(
+    path: &Path,
+    seconds: u64,
+) -> TestResult {
+    let then = SystemTime::now()
+        .checked_sub(Duration::from_secs(seconds))
+        .ok_or("time out of range")?;
+    File::open(path)?.set_times(FileTimes::new().set_modified(then))?;
+    Ok(())
+}
+
+/// The modification and change times that `state`, a regular file's or a
+/// directory's, records.
+fn recorded_times(state: &PathState) -> TestResult<Times> {
+    match state {
+        PathState::File { meta, .. } => Ok(meta.times()),
+        PathState::Directory { times, .. } => Ok(*times),
+        other => Err(format!("no times in {other:?}").into()),
+    }
+}
+
+/// The current modification and change times of `path`.
+fn current_times(path: &Path) -> TestResult<Times> {
+    let metadata = fs::metadata(path)?;
+    let nanos = |seconds: i64, nanoseconds: i64| {
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanoseconds))
+            .ok_or("time out of range")
+    };
+    Ok(Times {
+        mtime_nanos: nanos(metadata.mtime(), metadata.mtime_nsec())?,
+        ctime_nanos: nanos(metadata.ctime(), metadata.ctime_nsec())?,
+    })
+}
+
+/// `step` with the `timestamps` option set.
+fn stamped(step: &StepSpec) -> StepSpec {
+    StepSpec {
+        timestamps: true,
+        ..step.clone()
+    }
+}
+
+/// With `timestamps = True`, a read file whose modification time changes while its
+/// bytes stay the same runs the step, without hashing, with a reason that names the
+/// old and new times. The same step without the option is a hit that stores the new
+/// metadata, and the two have different step keys.
+#[test]
+fn with_timestamps_a_new_modification_time_with_the_same_bytes_runs_the_step() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "same bytes")?;
+    let tracer = FakeTracer::reading(vec![input.clone()]);
+    let plain = fixture.step(&["tool"])?;
+    let stamped = stamped(&plain);
+    assert_ne!(
+        step_key(PROGRAM, &plain, 0)?,
+        step_key(PROGRAM, &stamped, 0)?
+    );
+    fixture.build(&tracer, &[&plain, &stamped])?;
+    let hit = fixture.build(&tracer, &[&plain, &stamped])?;
+    assert!(hit.cached(0)? && hit.cached(1)?);
+    assert_eq!(tracer.runs(), 2);
+
+    let record = fixture.record(&stamped)?.ok_or("no record")?;
+    let old = recorded_times(&observation(&record, &input)?.state)?;
+    set_modified(&input, 7_200)?;
+    let new = current_times(&input)?;
+    assert_ne!(old.mtime_nanos, new.mtime_nanos);
+
+    // The step with the option checks first, finds the times changed without
+    // hashing, and runs; the step without it hashes the file and is a hit.
+    let built = fixture.build(&tracer, &[&stamped, &plain])?;
+    assert!(!built.cached(0)?);
+    assert!(built.cached(1)?);
+    assert_eq!(tracer.runs(), 3);
+    let record = fixture.record(&stamped)?.ok_or("no record")?;
+    assert_eq!(differences(&record), [difference(
+        input.clone(),
+        Change::Timestamps { old, new }
+    )]);
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    let record = fixture.record(&plain)?.ok_or("no record")?;
+    assert_eq!(observation(&record, &input)?.state, read_state(&input)?);
+    assert_eq!(record.reason, RunReason::NeverRun);
+
+    let again = fixture.build(&tracer, &[&plain, &stamped])?;
+    assert!(again.cached(0)? && again.cached(1)?);
+    assert_eq!(again.hashed, 0);
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// With `timestamps = True`, a listed directory and a directory that was only
+/// checked each run their step when their modification time changes, with the
+/// times as the reason; without the option, both are hits.
+#[test]
+fn with_timestamps_a_listed_or_checked_directory_runs_when_its_time_changes() -> TestResult {
+    let fixture = Fixture::new()?;
+    let listed = fixture.path("listed");
+    let checked = fixture.path("checked");
+    for dir in [&listed, &checked] {
+        fs::create_dir(dir)?;
+    }
+    let (list, probe) = (listed.clone(), checked.clone());
+    let tracer = FakeTracer::new(move |request| {
+        let accesses = match verb(request) {
+            "list" => [(list.clone(), AccessKind::List)],
+            _ => [(probe.clone(), AccessKind::Probe)],
+        };
+        finished(request, &accesses, Termination::Exited(0))
+    });
+    let lists = fixture.step(&["tool", "list"])?;
+    let checks = fixture.step(&["tool", "check"])?;
+    let (stamped_lists, stamped_checks) = (stamped(&lists), stamped(&checks));
+    let all = [&lists, &checks, &stamped_lists, &stamped_checks];
+    fixture.build(&tracer, &all)?;
+    let hit = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(hit.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 4);
+
+    for (dir, step, index) in [(&listed, &stamped_lists, 2), (&checked, &stamped_checks, 3)] {
+        let record = fixture.record(step)?.ok_or("no record")?;
+        let old = recorded_times(&observation(&record, dir)?.state)?;
+        set_modified(dir, 7_200)?;
+        let new = current_times(dir)?;
+        assert_ne!(old.mtime_nanos, new.mtime_nanos);
+        let built = fixture.build(&tracer, &all)?;
+        for other in 0..all.len() {
+            assert_eq!(
+                built.cached(other)?,
+                other != index,
+                "{} step {other}",
+                dir.display()
+            );
+        }
+        let record = fixture.record(step)?.ok_or("no record")?;
+        assert_eq!(differences(&record), [difference(
+            dir.clone(),
+            Change::Timestamps { old, new }
+        )]);
+        assert_eq!(recorded_times(&observation(&record, dir)?.state)?, new);
+        let again = fixture.build(&tracer, &all)?;
+        for other in 0..all.len() {
+            assert!(again.cached(other)?, "{} step {other}", dir.display());
+        }
+    }
+    assert_eq!(tracer.runs(), 6);
+    Ok(())
+}
+
+/// A step without the option refreshes a touched file's metadata on a hit; the same
+/// step switched to the option does not reuse that record, under its own key, and
+/// runs, and switching back is a hit on the first record.
+#[test]
+fn switching_the_timestamps_option_does_not_reuse_a_refreshed_record() -> TestResult {
+    let fixture = Fixture::new()?;
+    let input = fixture.write_old("input.txt", "same bytes")?;
+    let tracer = FakeTracer::reading(vec![input.clone()]);
+    let plain = fixture.step(&["tool"])?;
+    fixture.build(&tracer, &[&plain])?;
+    set_modified(&input, 7_200)?;
+    let touched = fixture.build(&tracer, &[&plain])?;
+    assert!(touched.cached(0)?);
+    assert_eq!(touched.hashed, 1);
+    let refreshed = fixture.record(&plain)?.ok_or("no record")?;
+    assert_eq!(observation(&refreshed, &input)?.state, read_state(&input)?);
+
+    let stamped = stamped(&plain);
+    let switched = fixture.build(&tracer, &[&stamped])?;
+    assert!(!switched.cached(0)?);
+    assert_eq!(tracer.runs(), 2);
+    let record = fixture.record(&stamped)?.ok_or("no record")?;
+    assert!(record.spec.timestamps);
+    assert_eq!(record.reason, RunReason::NeverRun);
+    assert_eq!(fixture.records()?.len(), 2);
+    assert!(!refreshed.spec.timestamps);
+
+    let back = fixture.build(&tracer, &[&plain])?;
+    assert!(back.cached(0)?);
+    assert_eq!(tracer.runs(), 2);
+    Ok(())
+}
+
+/// The attribute `name` with the hash of `value`, as a record holds it.
+fn attribute(
+    name: &str,
+    value: &str,
+) -> Attribute {
+    Attribute {
+        name: name.as_bytes().to_vec(),
+        hash: ContentHash(*blake3::hash(value.as_bytes()).as_bytes()),
+    }
+}
+
+/// A step whose command read the extended attributes of a file, of a directory, or
+/// of what a link points to records them, through the fake attribute query, and
+/// stays cached while they do not change; when one appears, disappears, or
+/// changes value, the step runs again, and the reason names the attribute.
+#[test]
+fn a_step_runs_again_when_an_extended_attribute_it_read_changes() -> TestResult {
+    let fixture = Fixture::new()?;
+    let file = fixture.write_old("file.txt", "content")?;
+    let dir = fixture.path("dir");
+    fs::create_dir(&dir)?;
+    fixture.write_old("target.txt", "pointee")?;
+    let link = fixture.path("link");
+    symlink("target.txt", &link)?;
+    let (read_file, read_dir, read_link) = (file.clone(), dir.clone(), link.clone());
+    let tracer = FakeTracer::new(move |request| {
+        let path = match verb(request) {
+            "file" => read_file.clone(),
+            "dir" => read_dir.clone(),
+            _ => read_link.clone(),
+        };
+        finished(
+            request,
+            &[(path, AccessKind::Xattr)],
+            Termination::Exited(0),
+        )
+    });
+    tracer.set_attributes(&file, false, &[("user.a", "1")]);
+    tracer.set_attributes(&dir, false, &[("user.kept", "k"), ("user.gone", "g")]);
+    tracer.set_attributes(&link, false, &[]);
+    tracer.set_attributes(&link, true, &[("user.origin", "x")]);
+    let steps = [
+        fixture.step(&["tool", "file"])?,
+        fixture.step(&["tool", "dir"])?,
+        fixture.step(&["tool", "link"])?,
+    ];
+    let all: Vec<&StepSpec> = steps.iter().collect();
+    fixture.build(&tracer, &all)?;
+    let record = fixture.record(&steps[2])?.ok_or("no record")?;
+    let observed = observation(&record, &link)?;
+    assert!(observed.access.contains(AccessBits::XATTR));
+    assert_eq!(
+        observed.attributes,
+        Some(Attributes {
+            own: Some(Vec::new()),
+            pointee: Some(vec![attribute("user.origin", "x")]),
+        })
+    );
+    let hit = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(hit.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 3);
+
+    tracer.set_attributes(&file, false, &[("user.a", "1"), ("user.new", "n")]);
+    tracer.set_attributes(&dir, false, &[("user.kept", "k")]);
+    tracer.set_attributes(&link, true, &[("user.origin", "y")]);
+    let built = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(!built.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 6);
+    let expected = [
+        (&file, Change::Attributes {
+            appeared: vec![attribute("user.new", "n")],
+            disappeared: Vec::new(),
+            changed: Vec::new(),
+        }),
+        (&dir, Change::Attributes {
+            appeared: Vec::new(),
+            disappeared: vec![attribute("user.gone", "g")],
+            changed: Vec::new(),
+        }),
+        (&link, Change::Attributes {
+            appeared: Vec::new(),
+            disappeared: Vec::new(),
+            changed: vec![attribute("user.origin", "y")],
+        }),
+    ];
+    for (step, (path, change)) in steps.iter().zip(expected) {
+        let record = fixture.record(step)?.ok_or("no record")?;
+        assert_eq!(differences(&record), [difference(path.clone(), change)]);
+    }
+    let again = fixture.build(&tracer, &all)?;
+    for index in 0..all.len() {
+        assert!(again.cached(index)?, "step {index}");
+    }
+    assert_eq!(tracer.runs(), 6);
     Ok(())
 }

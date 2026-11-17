@@ -1,0 +1,461 @@
+//! Tests for the atomic `MemTable::add` contract and arena-size accounting.
+//!
+//! These tests verify three properties of the preflight reservation:
+//!
+//! 1. **Formula correctness**: `max_entry_bytes(key_len, value_len)` returns artmap's worst-case
+//!    per-insert arena cost (`ArenaVersionedArtMap::max_insert_bytes(key_len)`) plus `value_len`.
+//! 2. **Upper-bound invariant**: actual arena allocation for any batch is always `≤` the estimate
+//!    computed from `max_entry_bytes`. This is what makes `try_reserve` safe: if a reservation
+//!    succeeds, the subsequent inserts cannot run out of arena space.
+//! 3. **Utilization gap**: the estimate is pessimistic — actual allocation uses less arena than the
+//!    estimate. These tests quantify the gap for common record shapes so changes in artmap's node
+//!    layout or in the estimator are caught loudly.
+//!
+//! They also cover the atomicity properties of `MemTable::add`:
+//! batch-on-arena-full leaves the memtable unchanged; concurrent `try_reserve`
+//! calls correctly serialize via CAS.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+
+use artmap::arena::ArenaVersionedArtMap;
+use test_log::test;
+
+use crate::batch::Batch;
+use crate::memtable::{max_entry_bytes, MemTable};
+use crate::{Error, Key, Value};
+
+/// Bytes artmap reserves at the start of every arena as its null region, so
+/// a freshly constructed memtable reports this as its size.
+const ARENA_BASE_OVERHEAD: usize = 64;
+
+/// Worst-case arena bytes one insert of a `key_len`-byte key can consume.
+fn insert_overhead(key_len: usize) -> u64 {
+	ArenaVersionedArtMap::<Key, Value>::max_insert_bytes(key_len) as u64
+}
+
+// ============================================================================
+// 1. Formula correctness
+// ============================================================================
+
+#[test]
+fn max_entry_bytes_basic_inputs() {
+	// Zero-length key and value: just artmap's worst-case insert.
+	assert_eq!(max_entry_bytes(0, 0), insert_overhead(0));
+	// Small entry.
+	assert_eq!(max_entry_bytes(10, 100), insert_overhead(10) + 100);
+	// Larger entry.
+	assert_eq!(max_entry_bytes(100, 1000), insert_overhead(100) + 1000);
+}
+
+#[test]
+fn max_entry_bytes_is_monotonic_in_key_len() {
+	// Longer keys can need longer prefix chains, so the bound never shrinks.
+	let mut prev = max_entry_bytes(0, 64);
+	for k in [1usize, 10, 64, 256, 4096] {
+		let cur = max_entry_bytes(k, 64);
+		assert!(cur >= prev, "estimate shrank from {} to {} at key_len={}", prev, cur, k);
+		prev = cur;
+	}
+}
+
+#[test]
+fn fresh_memtable_size_is_arena_base_overhead() {
+	assert_eq!(MemTable::new(64 * 1024).size(), ARENA_BASE_OVERHEAD);
+}
+
+#[test]
+fn max_entry_bytes_is_linear_in_value_len() {
+	let base = max_entry_bytes(16, 0);
+	for v in [1usize, 10, 64, 256, 4096] {
+		assert_eq!(max_entry_bytes(16, v), base + v as u64);
+	}
+}
+
+#[test]
+fn batch_memtable_size_estimate_sums_per_entry() {
+	let mut batch = Batch::new(1);
+	batch.set(vec![0u8; 5], vec![0u8; 10], 0).unwrap();
+	batch.set(vec![0u8; 10], vec![0u8; 20], 0).unwrap();
+	batch.set(vec![0u8; 15], vec![0u8; 30], 0).unwrap();
+
+	let expected = max_entry_bytes(5, 10) + max_entry_bytes(10, 20) + max_entry_bytes(15, 30);
+	assert_eq!(batch.memtable_size_estimate(), expected);
+}
+
+#[test]
+fn batch_memtable_size_estimate_treats_delete_as_zero_value() {
+	let mut batch = Batch::new(1);
+	batch.set(vec![0u8; 10], vec![0u8; 50], 0).unwrap();
+	batch.delete(vec![0u8; 8], 0).unwrap();
+
+	let expected = max_entry_bytes(10, 50) + max_entry_bytes(8, 0);
+	assert_eq!(batch.memtable_size_estimate(), expected);
+}
+
+// ============================================================================
+// 2. Upper-bound invariant: actual allocation ≤ estimate, always
+// ============================================================================
+
+/// Insert N entries of fixed shape into a fresh memtable and return
+/// (estimate_bytes, actual_arena_bytes_consumed).
+fn measure(key_len: usize, value_len: usize, n_entries: usize) -> (u64, usize) {
+	let estimate = max_entry_bytes(key_len, value_len) * (n_entries as u64);
+	// Provision plenty of headroom so the reservation succeeds regardless of
+	// how unrealistically pessimistic the estimate is for this shape.
+	let arena_size = estimate as usize + ARENA_BASE_OVERHEAD + 64 * 1024;
+
+	let memtable = MemTable::new(arena_size);
+	let initial = memtable.size();
+
+	let mut batch = Batch::new(1);
+	for i in 0..n_entries {
+		let mut key = vec![0u8; key_len];
+		// Stamp the index into the first few bytes of the key so entries
+		// are distinct (otherwise the map stores them as versions of one key).
+		for (j, b) in (i as u64).to_le_bytes().iter().enumerate() {
+			if j < key.len() {
+				key[j] = *b;
+			}
+		}
+		batch.set(key, vec![0u8; value_len], 0).unwrap();
+	}
+	memtable.add(&batch).unwrap();
+	let actual = memtable.size() - initial;
+	(estimate, actual)
+}
+
+#[test]
+fn estimate_is_upper_bound_on_actual_tiny_entries() {
+	for n in [1, 10, 100, 1000] {
+		let (estimate, actual) = measure(8, 16, n);
+		assert!(
+			(actual as u64) <= estimate,
+			"upper bound violated: tiny entries (k=8,v=16), n={}, estimate={}, actual={}",
+			n,
+			estimate,
+			actual
+		);
+	}
+}
+
+#[test]
+fn estimate_is_upper_bound_on_actual_medium_entries() {
+	for n in [1, 10, 100, 500] {
+		let (estimate, actual) = measure(16, 256, n);
+		assert!(
+			(actual as u64) <= estimate,
+			"upper bound violated: medium entries (k=16,v=256), n={}, estimate={}, actual={}",
+			n,
+			estimate,
+			actual
+		);
+	}
+}
+
+#[test]
+fn estimate_is_upper_bound_on_actual_large_values() {
+	for n in [1, 10, 100] {
+		let (estimate, actual) = measure(32, 8192, n);
+		assert!(
+			(actual as u64) <= estimate,
+			"upper bound violated: large values (k=32,v=8192), n={}, estimate={}, actual={}",
+			n,
+			estimate,
+			actual
+		);
+	}
+}
+
+#[test]
+fn estimate_is_upper_bound_under_varied_shapes() {
+	// A grid of shapes. The invariant must hold for every combination — if
+	// any cell fails, `max_entry_bytes` no longer covers what artmap
+	// actually allocates.
+	let key_lens = [1usize, 8, 32, 128, 512];
+	let value_lens = [0usize, 1, 16, 256, 4096];
+	for &k in &key_lens {
+		for &v in &value_lens {
+			let (estimate, actual) = measure(k, v, 200);
+			assert!(
+				(actual as u64) <= estimate,
+				"upper bound violated: k={}, v={}, estimate={}, actual={}",
+				k,
+				v,
+				estimate,
+				actual
+			);
+		}
+	}
+}
+
+// ============================================================================
+// 3. Utilization gap: actual vs estimate, by record shape
+// ============================================================================
+//
+// These tests measure (actual / estimate) and assert it falls in a documented
+// range for each record shape. ArenaVersionedArtMap puts inner nodes, leaves
+// and version nodes in the arena, but the key and value bytes (`Vec<u8>`) live
+// on the heap. The estimate is artmap's worst case for one insert (a prefix
+// chain, a split and one grown node of every size) plus the value length, so
+// utilization is low and falls further as values grow.
+//
+// If these ever fail, either the estimator or artmap's node layout has
+// changed — both require manual review.
+
+fn assert_utilization_in_range(
+	label: &str,
+	key_len: usize,
+	value_len: usize,
+	n_entries: usize,
+	min_ratio: f64,
+	max_ratio: f64,
+) {
+	let (estimate, actual) = measure(key_len, value_len, n_entries);
+	let ratio = (actual as f64) / (estimate as f64);
+	tracing::info!(
+		"utilization[{}] k={} v={} n={}: estimate={} actual={} ratio={:.3}",
+		label,
+		key_len,
+		value_len,
+		n_entries,
+		estimate,
+		actual,
+		ratio
+	);
+	assert!(
+		ratio >= min_ratio && ratio <= max_ratio,
+		"utilization for {} (k={},v={},n={}) out of expected range [{:.2}, {:.2}]: \
+		 estimate={} actual={} ratio={:.3}",
+		label,
+		key_len,
+		value_len,
+		n_entries,
+		min_ratio,
+		max_ratio,
+		estimate,
+		actual,
+		ratio
+	);
+}
+
+#[test]
+fn utilization_tiny_kv() {
+	// 8B key + 16B value: per-entry estimate 2001, actual ≈ 96 ⇒ ~5%.
+	assert_utilization_in_range("tiny", 8, 16, 2000, 0.03, 0.10);
+}
+
+#[test]
+fn utilization_small_kv() {
+	// 16B key + 100B value: per-entry estimate 2085, actual ≈ 90 ⇒ ~4%.
+	assert_utilization_in_range("small", 16, 100, 1000, 0.03, 0.10);
+}
+
+#[test]
+fn utilization_medium_kv() {
+	// 32B key + 512B value: per-entry estimate 2568, actual ≈ 107 ⇒ ~4%.
+	assert_utilization_in_range("medium", 32, 512, 500, 0.03, 0.10);
+}
+
+#[test]
+fn utilization_large_value() {
+	// 16B key + 4096B value: per-entry estimate 6081, actual ≈ 81 ⇒ ~1%.
+	assert_utilization_in_range("large", 16, 4096, 200, 0.005, 0.04);
+}
+
+// ============================================================================
+// 4. Atomicity of `MemTable::add` on overflow
+// ============================================================================
+
+#[test]
+fn add_atomic_on_arena_full_leaves_memtable_unchanged() {
+	// Pick an arena that can't fit even one of these huge entries.
+	let memtable = MemTable::new(2 * 1024);
+	let pre_size = memtable.size();
+	assert!(memtable.is_empty());
+
+	let mut batch = Batch::new(1);
+	batch.set(vec![0u8; 8], vec![0u8; 4 * 1024], 0).unwrap();
+	let result = memtable.add(&batch);
+
+	assert!(matches!(result, Err(Error::ArenaFull)), "expected ArenaFull, got {:?}", result);
+	assert_eq!(
+		memtable.size(),
+		pre_size,
+		"memtable size changed after ArenaFull — partial application leaked"
+	);
+	assert!(memtable.is_empty(), "memtable contains entries after a failed add");
+}
+
+#[test]
+fn add_atomic_after_partial_prefill_preserves_prior_entries() {
+	// Arena big enough for the prefill, too small for the second batch.
+	let arena_size = 64 * 1024;
+	let memtable = MemTable::new(arena_size);
+
+	// Prefill with 8 entries of ~2 KiB estimate each (≈ 16 KiB total).
+	let mut prefill = Batch::new(1);
+	for i in 0..8u8 {
+		prefill.set(vec![i; 8], vec![0u8; 50], 0).unwrap();
+	}
+	memtable.add(&prefill).unwrap();
+	let post_prefill_size = memtable.size();
+
+	// Second batch sized to overflow remaining capacity but fit a fresh memtable.
+	let mut big = Batch::new(100);
+	for i in 0..200u16 {
+		big.set(i.to_le_bytes().to_vec(), vec![0u8; 200], 0).unwrap();
+	}
+	let result = memtable.add(&big);
+
+	assert!(matches!(result, Err(Error::ArenaFull)));
+	assert_eq!(
+		memtable.size(),
+		post_prefill_size,
+		"memtable grew despite ArenaFull — partial application leaked"
+	);
+
+	// Prefill entries must still be readable.
+	for i in 0..8u8 {
+		let key = vec![i; 8];
+		let got = memtable.get(&key, None);
+		assert!(got.is_some(), "prefill entry {} missing after failed add", i);
+	}
+
+	// No entry from the second batch should be visible.
+	for i in 0..200u16 {
+		let key = i.to_le_bytes().to_vec();
+		assert!(
+			memtable.get(&key, None).is_none(),
+			"entry from failed batch leaked into memtable: i={}",
+			i
+		);
+	}
+}
+
+#[test]
+fn add_releases_reservation_after_success() {
+	// After a successful add returns, the reservation must be released — so a
+	// subsequent reservation of the entire remaining capacity must succeed.
+	let memtable = MemTable::new(64 * 1024);
+
+	let mut batch = Batch::new(1);
+	for i in 0..10u8 {
+		batch.set(vec![i; 8], vec![0u8; 100], 0).unwrap();
+	}
+	memtable.add(&batch).unwrap();
+
+	// Reserve every byte still available. If the previous reservation leaked,
+	// this would falsely report ArenaFull.
+	let still_available = memtable.room();
+	memtable.try_reserve(still_available).expect("reservation leak after successful add");
+	memtable.release_reservation(still_available);
+}
+
+#[test]
+fn add_releases_reservation_after_failure() {
+	// Same property after a failed add: reservation must be released so a
+	// later (fitting) batch can claim the space.
+	let memtable = MemTable::new(8 * 1024);
+
+	// First batch too large to fit — should fail cleanly.
+	let mut huge = Batch::new(1);
+	huge.set(vec![0u8; 8], vec![0u8; 16 * 1024], 0).unwrap();
+	assert!(matches!(memtable.add(&huge), Err(Error::ArenaFull)));
+
+	// A small batch must still work.
+	let mut small = Batch::new(10);
+	small.set(vec![1u8; 8], vec![0u8; 100], 0).unwrap();
+	memtable.add(&small).expect("small batch failed after a prior ArenaFull");
+}
+
+// ============================================================================
+// 5. CAS-correctness of `try_reserve` under concurrent contention
+// ============================================================================
+
+#[test]
+fn try_reserve_serializes_concurrent_callers() {
+	// Capacity sized for exactly 8 reservations of RESERVE_BYTES each, plus
+	// the arena's null region and a small slack. Spawn many more threads than slots
+	// and assert the count of Ok results doesn't exceed what's actually available.
+	const RESERVE_BYTES: u64 = 1024;
+	const SLOTS: u64 = 8;
+	let capacity = ARENA_BASE_OVERHEAD + (RESERVE_BYTES * SLOTS) as usize + 256;
+	let memtable = Arc::new(MemTable::new(capacity));
+
+	let success_count = Arc::new(AtomicUsize::new(0));
+	let fail_count = Arc::new(AtomicUsize::new(0));
+
+	let mut handles = Vec::new();
+	for _ in 0..32 {
+		let mt = Arc::clone(&memtable);
+		let succ = Arc::clone(&success_count);
+		let fail = Arc::clone(&fail_count);
+		handles.push(thread::spawn(move || match mt.try_reserve(RESERVE_BYTES) {
+			Ok(()) => {
+				succ.fetch_add(1, Ordering::Relaxed);
+			}
+			Err(_) => {
+				fail.fetch_add(1, Ordering::Relaxed);
+			}
+		}));
+	}
+	for h in handles {
+		h.join().unwrap();
+	}
+
+	let succ = success_count.load(Ordering::Relaxed);
+	let fail = fail_count.load(Ordering::Relaxed);
+	assert_eq!(succ + fail, 32, "every thread should report a single outcome");
+	assert!(
+		(succ as u64) <= SLOTS,
+		"more reservations succeeded ({}) than the arena had slots for ({})",
+		succ,
+		SLOTS
+	);
+
+	// Total reserved must equal succ * RESERVE_BYTES. Release everything and
+	// verify a fresh reservation of the entire reserved budget succeeds.
+	let released = (succ as u64) * RESERVE_BYTES;
+	for _ in 0..succ {
+		memtable.release_reservation(RESERVE_BYTES);
+	}
+	// After release, the original budget must again be reservable.
+	memtable.try_reserve(released).expect("budget didn't return after releases");
+}
+
+#[test]
+fn try_reserve_zero_always_succeeds() {
+	// Edge case: reserving zero bytes is a no-op and must always succeed.
+	let memtable = MemTable::new(1024);
+	memtable.try_reserve(0).expect("try_reserve(0) failed on empty memtable");
+	// And after the arena is full.
+	let mut batch = Batch::new(1);
+	batch.set(vec![0u8; 8], vec![0u8; 4096], 0).unwrap();
+	let _ = memtable.add(&batch); // expected to fail
+	memtable.try_reserve(0).expect("try_reserve(0) failed on full memtable");
+}
+
+#[test]
+fn values_count_towards_the_bound() {
+	// Values live on the heap, not in the arena: a memtable whose arena has room is still full
+	// once its arena and its values reach its size.
+	let memtable = MemTable::new(256 * 1024);
+	let value = vec![7u8; 16 * 1024];
+	let mut added = 0usize;
+	loop {
+		let mut batch = Batch::new(added as u64 + 1);
+		batch.set(format!("k{added:06}").into_bytes(), value.clone(), 0).unwrap();
+		match memtable.add(&batch) {
+			Ok(()) => added += 1,
+			Err(Error::ArenaFull) => break,
+			Err(e) => panic!("unexpected error: {e:?}"),
+		}
+		assert!(added < 64, "the values never filled the memtable");
+	}
+	assert_eq!(added, 15, "fifteen values of 16 KiB and their entries fit 256 KiB");
+	assert!(memtable.used() >= (added * value.len()) as u64);
+	assert!(memtable.used() <= memtable.arena_capacity() as u64);
+	assert!(memtable.size() < 16 * 1024, "the arena itself is mostly unused");
+}

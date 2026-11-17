@@ -11,6 +11,7 @@
 //! | Family | Prefix | Rest of the key | Record |
 //! | --- | --- | --- | --- |
 //! | schema version | `meta/` | `schema-version` | [`SchemaVersion`] |
+//! | cache identity | `meta/` | `identity` | [`CacheIdentity`](crate::identity::CacheIdentity) |
 //! | step records | `step/` | the 32 bytes of the [`StepKey`] | [`StepRecord`](crate::step::StepRecord) |
 //! | step positions | `position/` | the [`TaskId`], then the position | [`StepPosition`] |
 //! | task records | `task/` | the [`TaskId`] | [`TaskRecord`] |
@@ -49,7 +50,7 @@ use crate::{
 /// The record families of the cache database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Family {
-    /// Facts about the database itself: the schema version.
+    /// Facts about the database itself: the schema version and the cache identity.
     Meta,
     /// Step records, by step key.
     Step,
@@ -91,7 +92,7 @@ impl Family {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Meta => "schema version",
+            Self::Meta => "database fact",
             Self::Step => "step record",
             Self::Position => "step position",
             Self::Task => "task record",
@@ -301,7 +302,8 @@ impl RecordKey for PathKey {
     }
 }
 
-/// The key of the schema version, the only record of its family.
+/// The key of the schema version, one of the two records of its family with the
+/// cache identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SchemaKey;
 
@@ -415,24 +417,41 @@ impl Record for TaskRecord {
     const FAMILY: Family = Family::Task;
 }
 
-/// The step that most recently wrote a path.
+/// What in a task wrote a path: one of its steps, or its program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub enum WrittenBy {
+    /// A step of the task.
+    #[n(0)]
+    Step {
+        /// The step key.
+        #[n(0)]
+        step: StepKey,
+        /// The position of the step in its task's run, counting from zero.
+        #[n(1)]
+        position: u32,
+    },
+    /// The task program, through `fs.write` or `fs.write_json`.
+    #[n(1)]
+    Program,
+}
+
+/// The step or the task program that most recently wrote a path.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct LastWriter {
-    /// The task of the step.
+    /// The task of the step or the program.
     #[n(0)]
     pub task: TaskId,
-    /// The step key.
+    /// Whether a step of the task or its program wrote the path.
     #[n(1)]
-    pub step: StepKey,
-    /// The position of the step in its task's run, counting from zero.
+    pub by: WrittenBy,
+    /// The build in which the path was written.
     #[n(2)]
-    pub position: u32,
-    /// The build in which the step wrote the path.
-    #[n(3)]
     pub build: BuildId,
-    /// When kizz recorded the state the step left, after the write, in nanoseconds
-    /// since the Unix epoch: the `recorded_at_nanos` of the step's record.
-    #[n(4)]
+    /// When the write happened, in nanoseconds since the Unix epoch: for a step,
+    /// when kizz recorded the state the step left, after the write, which is the
+    /// `recorded_at_nanos` of the step's record; for a program, when it wrote the
+    /// file.
+    #[n(3)]
     pub written_at_nanos: u64,
 }
 
@@ -458,6 +477,11 @@ impl Record for LearnedOrder {
 
 /// Unit tests for the key layout and the record encoding.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
 
@@ -601,13 +625,34 @@ mod tests {
                 hash: ContentHash([5; 32]),
             }],
         });
-        encode_stably(&LastWriter {
+        let step_writer = encode_stably(&LastWriter {
             task: task("a", 0),
-            step: StepKey([3; 32]),
-            position: 1,
+            by: WrittenBy::Step {
+                step: StepKey([3; 32]),
+                position: 1,
+            },
             build: BuildId(5),
             written_at_nanos: 6,
         });
+        let program_writer = encode_stably(&LastWriter {
+            task: task("a", 0),
+            by: WrittenBy::Program,
+            build: BuildId(5),
+            written_at_nanos: 6,
+        });
+        // A definite-length array of four items, then the task; the two records
+        // differ only in who wrote the path.
+        assert_eq!(step_writer.first(), Some(&0x84));
+        assert_eq!(program_writer.first(), Some(&0x84));
+        assert_ne!(step_writer, program_writer);
+        assert_ne!(
+            minicbor::decode::<LastWriter>(&step_writer).unwrap().by,
+            WrittenBy::Program
+        );
+        assert_eq!(
+            minicbor::decode::<LastWriter>(&program_writer).unwrap().by,
+            WrittenBy::Program
+        );
     }
 
     #[test]

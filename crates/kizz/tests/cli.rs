@@ -8,6 +8,14 @@
 //! a temporary directory, and runs in another temporary directory, so no run can
 //! reach the real cache or a real project.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
+
 use std::{io, process::Command};
 
 /// A line of the banner that no other output contains.
@@ -48,21 +56,20 @@ fn kizz(args: &[&str]) -> io::Result<Run> {
 }
 
 /// Every scaffolded command, with the name its scaffold message shows. `kizz build`,
-/// `kizz list`, `kizz why`, and `kizz cache` are implemented, and `tests/build.rs`,
-/// `tests/list.rs`, `tests/why.rs`, and `tests/cache.rs` cover them.
-const STUBS: [(&[&str], &str); 3] = [
-    (&["graph"], "graph"),
-    (&["run"], "run"),
-    (&["image"], "image"),
-];
+/// `kizz list`, `kizz why`, `kizz cache`, `kizz execute` and `kizz run` are
+/// implemented, and their own test files cover them.
+const STUBS: [(&[&str], &str); 2] = [(&["graph"], "graph"), (&["image"], "image")];
 
 /// `kizz --help` lists every command and exits with status 0, and the help of the
-/// commands with options lists them.
+/// commands with options lists and describes them, `kizz build --fail-unchecked`,
+/// every option of `kizz execute` and every option of `kizz run` included.
 #[test]
 fn help_lists_every_subcommand() {
     let run = kizz(&["--help"]).unwrap();
     assert_eq!(run.status, Some(0), "{run:?}");
-    for command in ["build", "why", "list", "cache", "graph", "run", "image"] {
+    for command in [
+        "build", "why", "list", "cache", "execute", "graph", "run", "image",
+    ] {
         assert!(
             run.stdout
                 .lines()
@@ -92,12 +99,27 @@ fn help_lists_every_subcommand() {
 
     let build = kizz(&["build", "--help"]).unwrap();
     assert_eq!(build.status, Some(0), "{build:?}");
-    for option in ["--explain", "--sequential", "--parallel", "TARGETS"] {
+    for option in [
+        "--explain",
+        "--cache-unknown-syscalls",
+        "--fail-unchecked",
+        "--sequential",
+        "--parallel",
+        "TARGETS",
+    ] {
         assert!(
             build.stdout.contains(option),
             "build --help lacks {option}: {build:?}"
         );
     }
+    assert!(
+        build.stdout.contains("does not know"),
+        "build --help does not describe --cache-unknown-syscalls: {build:?}"
+    );
+    assert!(
+        build.stdout.contains("leaves a non-zero exit unchecked"),
+        "build --help does not describe --fail-unchecked: {build:?}"
+    );
 
     let reset = kizz(&["cache", "reset", "--help"]).unwrap();
     assert_eq!(reset.status, Some(0), "{reset:?}");
@@ -107,6 +129,47 @@ fn help_lists_every_subcommand() {
             "cache reset --help lacks {option}: {reset:?}"
         );
     }
+
+    let execute = kizz(&["execute", "--help"]).unwrap();
+    assert_eq!(execute.status, Some(0), "{execute:?}");
+    for (option, description) in [
+        ("--output", "Write the observation report to this file"),
+        ("--compact", "Combine the observations of every process"),
+        ("--json", "Write JSON instead of readable text"),
+        ("PROGRAM", "The program to run, after `--`"),
+    ] {
+        assert!(
+            execute.stdout.contains(option) && execute.stdout.contains(description),
+            "execute --help does not describe {option}: {execute:?}"
+        );
+    }
+
+    let run_help = kizz(&["run", "--help"]).unwrap();
+    assert_eq!(run_help.status, Some(0), "{run_help:?}");
+    for (option, description) in [
+        ("--no-cache", "Run every command of the task"),
+        ("--explain", "Print the full reason for every command"),
+        ("--fail-unchecked", "leaves a non-zero exit unchecked"),
+        ("--cache-unknown-syscalls", "does not know"),
+        ("--output", "Write an observation report"),
+        ("--compact", "Combine the observations of every process"),
+        ("--json", "Write the report as JSON"),
+        ("NAME", "The name of the task"),
+        ("ARGUMENTS", "The task's arguments, after `--`"),
+    ] {
+        assert!(
+            run_help.stdout.contains(option) && run_help.stdout.contains(description),
+            "run --help does not describe {option}: {run_help:?}"
+        );
+    }
+    assert!(
+        run_help.stdout.contains("Run one task by its name"),
+        "run --help does not describe the command: {run_help:?}"
+    );
+    assert!(
+        run.stdout.contains("Run one task by its name"),
+        "--help does not describe run: {run:?}"
+    );
 }
 
 /// `kizz --version` prints the version and exits with status 0.

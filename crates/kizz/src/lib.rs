@@ -7,11 +7,15 @@
 //! The `kizz` binary is a thin wrapper over this library's [`cli`] entry point,
 //! which parses the command line and prints through the terminal helpers of the
 //! `ui` module. The binary is the only crate that wires the engine of `kizz_core`
-//! to the Linux tracer of `kizz_trace_linux`.
+//! to the Linux tracer of `kizz_trace_linux`. The [`environment`] module lists the
+//! environment variables that kizz reads.
 
 mod build;
 mod cache;
 pub mod cli;
+pub mod environment;
+mod execute;
 mod list;
+mod run;
 mod ui;
 mod why;

@@ -5,7 +5,9 @@
 //! Golden-output tests of explanations: every reason kind, every kind of last
 //! writer, environment values hidden without `--verbose` and shown with it, a step
 //! that writes a file and also reads it, the warning for consecutive builds, the
-//! one-line reasons, and the report of `kizz why`.
+//! one-line reasons, permission and owner changes, timestamp changes and the
+//! `timestamps` option, order and entries changes of listed directories, system
+//! calls that the tracer does not know, connections, and the report of `kizz why`.
 //!
 //! Each test builds a project directory and a cache in temporary directories. A
 //! build is one [`Engine`] on a store opened in the cache, and each task runs through
@@ -19,30 +21,53 @@
 //! * `bump:PATH` reads a file and writes it back with one more `+`;
 //! * `kernel:PATH` reads an absolute path, such as one under `/proc`;
 //! * `probe:PATH` checks an absolute path;
+//! * `list:PATH` lists a directory;
 //! * `signal` makes a signal kill the command;
+//! * `unknown:NUMBER` reports the system call `NUMBER` as one that the tracer does not
+//!   know;
+//! * `tcp:ADDRESS` reports a connection to the IP address and port `ADDRESS`, such as
+//!   `127.0.0.1:80` or `[::1]:80`;
+//! * `unix:PATH` reports a connection to the Unix socket `PATH`;
+//! * `abstract:NAME` reports a connection to the abstract Unix socket `NAME`;
 //!
 //! and any other argument does nothing. Relative paths are relative to the step's
-//! working directory.
+//! working directory. As the Linux tracer does, the fake notes the metadata of each
+//! file that a step reads or runs before it writes it, at the moment of the read,
+//! so `rw` and `bump` leave a result that is not cached.
+
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
-    fs, io,
-    os::unix::fs::PermissionsExt as _,
+    fs::{self, File, FileTimes},
+    io,
+    net::SocketAddr,
+    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use kizz_core::{
     Engine, PrintSink, ProgramHash, ProgramParts, Render, RepeatedWarning, StepDecision,
-    StepExecutor as _, StepSpec, TaskIdentity, TaskInfo, TaskProgram, TaskSteps, parse_tasks, why,
+    StepExecutor as _, StepSpec, TaskIdentity, TaskInfo, TaskProgram, TaskSteps, WorkerPool,
+    observe, parse_tasks, why,
 };
 use kizz_store::{
-    Explanation, Reason, SelfInflicted, StepPosition, Store, TaskId, TaskRecord, Verdict, Writer,
+    Explanation, Owner, PathState, Reason, SelfInflicted, StepPosition, StepRecord, Store, TaskId,
+    TaskRecord, Verdict, Writer,
 };
 use kizz_trace::{
-    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, EchoSink,
-    OutputStream, RunRequest, RunResult, Termination, TraceError, Tracer,
+    AbsolutePath, AccessKind, Accesses, Cancellation, CaptureMode, CapturedOutput, Connection,
+    EchoSink, FirstReads, OutputStream, ProcessTree, RunRequest, RunResult, Termination,
+    TraceError, Tracer,
 };
 use tempfile::TempDir;
 
@@ -51,6 +76,11 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// The program hash of the tasks that run steps directly.
 const PROGRAM: [u8; 32] = [7; 32];
+
+/// The full reason line of a step whose previous run read `state.txt` and then
+/// rewrote it, so its result was not cached.
+const REWROTE_STATE: &str = "  the previous run could not be cached: a file changed after the \
+                             command read it: `state.txt` (the command wrote it)";
 
 /// A tracer failure from `error`.
 fn tracer_failure(error: &dyn Error) -> TraceError {
@@ -65,10 +95,17 @@ fn tracer_failure(error: &dyn Error) -> TraceError {
 fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
     let cwd = request.cwd.as_path();
     let mut accesses = Accesses::new();
+    let mut first_reads = FirstReads::new();
+    first_reads.note_at(&request.program, &accesses);
     accesses.record(request.program.clone(), AccessKind::Exec);
     let mut termination = Termination::Exited(0);
-    let mut record = |path: PathBuf, kind| -> Result<(), TraceError> {
+    let mut unknown = BTreeSet::new();
+    let mut connections = BTreeSet::new();
+    let mut record = |path: PathBuf, kind: AccessKind| -> Result<(), TraceError> {
         let path = AbsolutePath::new(path).map_err(|error| tracer_failure(&error))?;
+        if matches!(kind, AccessKind::Read | AccessKind::Exec) {
+            first_reads.note_at(&path, &accesses);
+        }
         accesses.record(path, kind);
         Ok(())
     };
@@ -89,28 +126,55 @@ fn script(request: &RunRequest) -> Result<RunResult, TraceError> {
             },
             "rw" => {
                 let _content: Vec<u8> = fs::read(&path).unwrap_or_default();
-                fs::write(&path, text).map_err(failed)?;
                 record(path.clone(), AccessKind::Read)?;
+                fs::write(&path, text).map_err(failed)?;
                 record(path, AccessKind::Write)?;
             },
             "bump" => {
                 let mut content = fs::read_to_string(&path).unwrap_or_default();
+                record(path.clone(), AccessKind::Read)?;
                 content.push('+');
                 fs::write(&path, content).map_err(failed)?;
-                record(path.clone(), AccessKind::Read)?;
                 record(path, AccessKind::Write)?;
             },
             "kernel" => record(path, AccessKind::Read)?,
             "probe" => record(path, AccessKind::Probe)?,
+            "list" => record(path, AccessKind::List)?,
             "signal" => termination = Termination::Signaled(9),
+            "unknown" => {
+                unknown.insert(
+                    rest.parse::<u32>()
+                        .map_err(|error| tracer_failure(&error))?,
+                );
+            },
+            "tcp" => {
+                connections.insert(Connection::Ip(
+                    rest.parse::<SocketAddr>()
+                        .map_err(|error| tracer_failure(&error))?,
+                ));
+            },
+            "unix" => {
+                connections.insert(Connection::UnixPath(
+                    AbsolutePath::new(&path).map_err(|error| tracer_failure(&error))?,
+                ));
+            },
+            "abstract" => {
+                connections.insert(Connection::UnixAbstract(rest.as_bytes().to_vec()));
+            },
             _ => {},
         }
     }
     Ok(RunResult {
         termination,
         output: CapturedOutput::empty(request.capture),
+        tree: request
+            .tree
+            .then(|| ProcessTree::of_request(request, &accesses, Some(termination))),
         accesses,
         incomplete: None,
+        first_reads,
+        unknown_system_calls: unknown,
+        connections,
     })
 }
 
@@ -138,6 +202,23 @@ impl Tracer for FakeTracer {
         let mut runs = self.runs.lock().unwrap_or_else(PoisonError::into_inner);
         *runs = runs.saturating_add(1);
         script(request)
+    }
+
+    /// These tests read no extended attributes, so there are none.
+    fn extended_attributes(
+        &self,
+        _path: &std::path::Path,
+        _follow: bool,
+    ) -> std::io::Result<kizz_trace::ExtendedAttributes> {
+        Ok(kizz_trace::ExtendedAttributes::new())
+    }
+
+    /// These tests name no machine state, so the fake knows no part.
+    fn machine_state(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> kizz_trace::MachineState {
+        kizz_trace::MachineState::default()
     }
 }
 
@@ -252,6 +333,8 @@ impl Fixture {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
+            machine: Vec::new(),
             expect: None,
         })
     }
@@ -284,15 +367,25 @@ impl Fixture {
     }
 
     /// Run one build with `tracer`: each task with its steps, in order, in
-    /// `passes` passes, finishing each task run as succeeded.
+    /// `passes` passes, finishing each task run as succeeded; the engine caches the
+    /// results of runs that made unknown system calls when `cache_unknown` is set.
     fn build_passes(
         &self,
         tracer: &FakeTracer,
         tasks: &[(&TaskIdentity, &[&StepSpec])],
         passes: usize,
+        cache_unknown: bool,
     ) -> TestResult<Built> {
         let store = self.store()?;
-        let engine = Engine::new(tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        )
+        .with_cache_unknown_system_calls(cache_unknown);
         let mut decisions = Vec::new();
         for _ in 0..passes {
             for (identity, steps) in tasks {
@@ -307,7 +400,7 @@ impl Fixture {
         }
         let built = Built {
             decisions,
-            warnings: engine.warnings(),
+            warnings: engine.warnings()?,
         };
         drop(engine);
         store.close()?;
@@ -320,7 +413,7 @@ impl Fixture {
         tracer: &FakeTracer,
         tasks: &[(&TaskIdentity, &[&StepSpec])],
     ) -> TestResult<Built> {
-        self.build_passes(tracer, tasks, 1)
+        self.build_passes(tracer, tasks, 1, false)
     }
 
     /// The renderer of the project, verbose or not.
@@ -545,7 +638,14 @@ fn a_changed_program_names_its_block_or_the_loaded_module() -> TestResult {
         let task = TaskInfo::new(parsed.tasks.first().ok_or("no task")?, &["ci".to_owned()])?;
         let program = TaskProgram::load(task, &NoPrint).program?;
         let store = fixture.store()?;
-        let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None);
+        let engine = Engine::new(
+            &tracer,
+            &store,
+            &NoEcho,
+            Cancellation::new(),
+            None,
+            &WorkerPool::new()?,
+        );
         let steps = engine.task_for(TaskIdentity::of(&program));
         let run = program.run(&caller, &steps, &NoPrint);
         run.result.map_err(|failure| failure.to_string())?;
@@ -665,6 +765,308 @@ fn changed_inputs_name_who_last_wrote_them() -> TestResult {
     Ok(())
 }
 
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// `tool read:mode.txt` once because `input` changed.
+fn why_for_one_changed_input(input: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool read:mode.txt`
+    ran because:
+      1 input changed:
+        {input}
+    untracked /proc and /sys accesses: none
+    connections: none
+    ignored accesses: 0
+"
+    )
+}
+
+/// A permission change and an owner change name their old and new values in the
+/// full reasons, in the one-line reason of `kizz build`, and in `kizz why`. Tests
+/// cannot change owners, so the test writes another owner into the stored record.
+#[test]
+fn permission_and_owner_changes_name_their_old_and_new_values() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("mode.txt", "same")?;
+    let path = fixture.path("mode.txt");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let read = fixture.step(&["tool", "read:mode.txt"])?;
+    fixture.build(&tracer, &[(&task, &[&read])])?;
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let built = fixture.build(&tracer, &[(&task, &[&read])])?;
+    let input = "`mode.txt`: permissions changed from 0644 to 0600; last written by something \
+                 outside kizz";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        "`mode.txt` changed (permissions changed from 0644 to 0600)"
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_input(input));
+
+    let metadata = fs::metadata(&path)?;
+    let current = Owner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    };
+    let other = Owner {
+        uid: current.uid.wrapping_add(1),
+        gid: current.gid.wrapping_add(1),
+    };
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    for (key, mut record) in txn.scan::<StepRecord>(&[])? {
+        for observation in &mut record.observations {
+            if observation.path == path
+                && let PathState::File { meta, .. } = &mut observation.state
+            {
+                meta.owner = other;
+            }
+        }
+        txn.put(&key, &record)?;
+    }
+    txn.commit()?;
+    store.close()?;
+
+    let built = fixture.build(&tracer, &[(&task, &[&read])])?;
+    let input = format!(
+        "`mode.txt`: owner changed from {other} to {current}; last written by something \
+         outside kizz"
+    );
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        format!("`mode.txt` changed (owner changed from {other} to {current})")
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_input(&input));
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// Set the modification time of `path` to `millis` milliseconds after the Unix
+/// epoch, which also gives it a new change time, and return its change time in
+/// nanoseconds since the epoch.
+fn set_modified(
+    path: &Path,
+    millis: u64,
+) -> TestResult<i64> {
+    let then = UNIX_EPOCH
+        .checked_add(Duration::from_millis(millis))
+        .ok_or("time out of range")?;
+    File::open(path)?.set_times(FileTimes::new().set_modified(then))?;
+    let metadata = fs::metadata(path)?;
+    Ok(metadata
+        .ctime()
+        .checked_mul(1_000_000_000)
+        .and_then(|nanos| nanos.checked_add(metadata.ctime_nsec()))
+        .ok_or("change time out of range")?)
+}
+
+/// A time in nanoseconds since the Unix epoch as explanations show it: seconds with
+/// nine decimals.
+fn seconds(nanos: i64) -> String {
+    format!(
+        "{}.{:09}",
+        nanos.div_euclid(1_000_000_000),
+        nanos.rem_euclid(1_000_000_000)
+    )
+}
+
+/// With `timestamps = True`, a new modification time with the same bytes names the
+/// old and new times, and the change time when it changed too, in the full reasons,
+/// in the one-line reason of `kizz build`, and in `kizz why`; switching the option
+/// off names the option, with its old and new values, in all three.
+#[test]
+fn timestamp_changes_and_the_timestamps_option_are_explained() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("mode.txt", "same")?;
+    let path = fixture.path("mode.txt");
+    let old_ctime = set_modified(&path, 1_700_000_000_000)?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let mut stamped = fixture.step(&["tool", "read:mode.txt"])?;
+    stamped.timestamps = true;
+    fixture.build(&tracer, &[(&task, &[&stamped])])?;
+    assert_eq!(
+        fixture
+            .build(&tracer, &[(&task, &[&stamped])])?
+            .verdict(0, 0)?,
+        &Verdict::Cached
+    );
+
+    let new_ctime = set_modified(&path, 1_700_000_001_500)?;
+    let built = fixture.build(&tracer, &[(&task, &[&stamped])])?;
+    let modification = "timestamps changed: modification time from 1700000000.000000000 to \
+                        1700000001.500000000";
+    let change = if new_ctime == old_ctime {
+        modification.to_owned()
+    } else {
+        format!(
+            "{modification}, change time from {} to {}",
+            seconds(old_ctime),
+            seconds(new_ctime)
+        )
+    };
+    let input = format!("`mode.txt`: {change}; last written by something outside kizz");
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        format!("`mode.txt` changed ({change})")
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_input(&input));
+
+    let plain = fixture.step(&["tool", "read:mode.txt"])?;
+    let built = fixture.build(&tracer, &[(&task, &[&plain])])?;
+    let option = "the `timestamps` option changed from True to False";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {option}")])
+    );
+    assert_eq!(fixture.render(false).one_line(built.verdict(0, 0)?), option);
+    assert_eq!(
+        fixture.why(false)?,
+        format!(
+            "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool read:mode.txt`
+    ran because:
+      {option}
+    untracked /proc and /sys accesses: none
+    connections: none
+    ignored accesses: 0
+"
+        )
+    );
+
+    // Switching back finds the record of the step key with the option, which
+    // nothing changed since.
+    let built = fixture.build(&tracer, &[(&task, &[&stamped])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// `tool list:listed` once because `input` changed.
+fn why_for_one_changed_listing(input: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool list:listed`
+    ran because:
+      1 input changed:
+        {input}
+    untracked /proc and /sys accesses: none
+    connections: none
+    ignored accesses: 0
+"
+    )
+}
+
+/// A listed directory whose recorded entries are its current entries in reverse
+/// order runs its step with an order change, and one with a new entry runs it with
+/// an entries change that names the entry, in the full reasons, in the one-line
+/// reason of `kizz build`, and in `kizz why`. The test writes the reversed listing,
+/// with the hashes of its order, into the stored record.
+#[test]
+fn order_and_entries_changes_of_a_listed_directory_are_explained() -> TestResult {
+    let fixture = Fixture::new()?;
+    for name in ["a", "b", "c"] {
+        fixture.write(&format!("listed/{name}"), name)?;
+    }
+    let path = fixture.path("listed");
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let list = fixture.step(&["tool", "list:listed"])?;
+    fixture.build(&tracer, &[(&task, &[&list])])?;
+
+    let store = fixture.store()?;
+    let mut txn = store.write()?;
+    for (key, mut record) in txn.scan::<StepRecord>(&[])? {
+        for observation in &mut record.observations {
+            if observation.path == path
+                && let PathState::Directory {
+                    listing: Some(listing),
+                    ..
+                } = &mut observation.state
+            {
+                let entries = listing.entries.clone().ok_or("no entries")?;
+                *listing = observe::listing(entries.into_iter().rev().collect());
+            }
+        }
+        txn.put(&key, &record)?;
+    }
+    txn.commit()?;
+    store.close()?;
+
+    let built = fixture.build(&tracer, &[(&task, &[&list])])?;
+    let input = "`listed`: the order of its entries changed; last written by something outside \
+                 kizz";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        "`listed` changed (the order of its entries changed)"
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_listing(input));
+
+    fixture.write("listed/d", "d")?;
+    let built = fixture.build(&tracer, &[(&task, &[&list])])?;
+    let input = "`listed`: directory entries changed: `d` appeared; last written by something \
+                 outside kizz";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&[
+            "ran because:",
+            "  1 input changed:",
+            &format!("    {input}")
+        ])
+    );
+    assert_eq!(
+        fixture.render(false).one_line(built.verdict(0, 0)?),
+        "`listed` changed (directory entries changed: `d` appeared)"
+    );
+    assert_eq!(fixture.why(false)?, why_for_one_changed_listing(input));
+
+    let built = fixture.build(&tracer, &[(&task, &[&list])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
 /// A step that writes a file and also reads it: when the file changed because this
 /// command wrote it on its previous run, the explanation says so directly.
 #[test]
@@ -737,11 +1139,14 @@ fn consecutive_external_edits_of_a_file_a_step_writes_and_reads_are_not_self_inf
 
     fixture.write("state.txt", "xyz")?;
     let second = fixture.build(&tracer, &[(&task, &[&bump])])?;
+    // The step reads the file and then rewrites it, so its result is never cached,
+    // and each explanation starts with that reason.
     assert_eq!(
         fixture.full(second.verdict(0, 0)?, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 2 to 3 bytes; last written by something \
              outside kizz",
         ])
@@ -756,14 +1161,17 @@ fn consecutive_external_edits_of_a_file_a_step_writes_and_reads_are_not_self_inf
         fixture.full(verdict, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 4 to 7 bytes; last written by something \
              outside kizz",
         ])
     );
     assert_eq!(
         fixture.render(false).one_line(verdict),
-        "`state.txt` changed (size changed from 4 to 7 bytes)"
+        "the previous run could not be cached: a file changed after the command read it: \
+         `state.txt` (the command wrote it); `state.txt` changed (size changed from 4 to 7 \
+         bytes)"
     );
     assert_eq!(self_inflicted(verdict)?, [None]);
     assert_eq!(third.warnings, Vec::<RepeatedWarning>::new());
@@ -794,7 +1202,8 @@ fn another_writer_of_a_file_a_step_writes_and_reads_is_not_self_inflicted() -> T
         fixture.full(second.verdict(1, 0)?, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 2 to 4 bytes; last written by step 1 of \
              kizz.md:3 (Other) in this build",
         ])
@@ -811,29 +1220,38 @@ fn another_writer_of_a_file_a_step_writes_and_reads_is_not_self_inflicted() -> T
         fixture.full(verdict, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
+            REWROTE_STATE,
+            "  1 input changed since:",
             "    `state.txt`: size changed from 5 to 8 bytes; last written by step 1 of \
              kizz.md:3 (Other) in this build",
         ])
     );
     assert_eq!(
         fixture.render(false).one_line(verdict),
-        "`state.txt` changed (size changed from 5 to 8 bytes)"
+        "the previous run could not be cached: a file changed after the command read it: \
+         `state.txt` (the command wrote it); `state.txt` changed (size changed from 5 to 8 \
+         bytes)"
     );
     assert_eq!(self_inflicted(verdict)?, [None]);
     assert_eq!(third.warnings, Vec::<RepeatedWarning>::new());
 
-    // Rewritten in an earlier build, the file names that build's writer instead.
+    // With nothing changed since, the step runs again only because its previous
+    // run was not cached, and it rewrites the file once more.
     let fourth = fixture.build(&tracer, &[(&state, &[&bump])])?;
-    assert_eq!(fourth.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(
+        fixture.full(fourth.verdict(0, 0)?, false),
+        lines(&["ran because:", REWROTE_STATE])
+    );
+    // Rewritten in an earlier build, the file names that build's writer instead.
     fixture.build(&tracer, &[(&other, &[&write("dd")?])])?;
     let sixth = fixture.build(&tracer, &[(&state, &[&bump])])?;
     assert_eq!(
         fixture.full(sixth.verdict(0, 0)?, false),
         lines(&[
             "ran because:",
-            "  1 input changed:",
-            "    `state.txt`: size changed from 9 to 2 bytes; last written by step 1 of \
+            REWROTE_STATE,
+            "  1 input changed since:",
+            "    `state.txt`: size changed from 10 to 2 bytes; last written by step 1 of \
              kizz.md:3 (Other) in an earlier build",
         ])
     );
@@ -964,7 +1382,7 @@ fn why_reports_the_most_recent_build_of_each_step() -> TestResult {
     first.ignore = vec!["*.tmp".to_owned()];
     let second = fixture.step(&["tool", "second"])?;
 
-    let built = fixture.build_passes(&tracer, &[(&task, &[&first, &second])], 2)?;
+    let built = fixture.build_passes(&tracer, &[(&task, &[&first, &second])], 2, false)?;
     assert_eq!(built.verdict(1, 0)?, &Verdict::Cached);
     assert_eq!(
         fixture.why(false)?,
@@ -975,11 +1393,13 @@ kizz.md:3 (Build) [ci]
     ran because:
       never run: there is no record for this step
     untracked /proc and /sys accesses: `/proc/cpuinfo` (read), `/sys/kernel` (probe)
+    connections: none
     ignored accesses: 1
   step 2: `tool second`
     ran because:
       never run: there is no record for this step
     untracked /proc and /sys accesses: none
+    connections: none
     ignored accesses: 0
 "
     );
@@ -1062,4 +1482,120 @@ fn explanations_render_every_reason_in_order() {
     assert_eq!(render.full(&Verdict::Ran(Explanation::default())), [
         "ran because:"
     ]);
+}
+
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// `tool unknown:1000000 unknown:400` once, with the lines `reasons` and the line of
+/// the two system calls that the tracer does not know.
+fn why_for_unknown_system_calls(reasons: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool unknown:1000000 unknown:400`
+{reasons}
+    untracked /proc and /sys accesses: none
+    connections: none
+    system calls that the tracer does not know: 400, 1000000
+    ignored accesses: 0
+"
+    )
+}
+
+/// A run that made system calls that the tracer does not know is not cached
+/// without the option: the next build runs the step again, and its full reasons,
+/// its one-line reason and `kizz why` name each number, and `kizz why` lists them on
+/// a line of their own. With the option, the result is cached: `kizz why` still
+/// lists the numbers, and a later build without the option is a cache hit.
+#[test]
+fn unknown_system_calls_are_explained() -> TestResult {
+    let fixture = Fixture::new()?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let step = fixture.step(&["tool", "unknown:1000000", "unknown:400"])?;
+    fixture.build(&tracer, &[(&task, &[&step])])?;
+
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    let reason = "the previous run could not be cached: the command made system calls 400 and \
+                  1000000, which the tracer does not know";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {reason}")])
+    );
+    assert_eq!(fixture.render(false).one_line(built.verdict(0, 0)?), reason);
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_unknown_system_calls(&format!("    ran because:\n      {reason}"))
+    );
+    assert_eq!(tracer.runs(), 2);
+
+    // With the option, the run is cached, and its record still lists the numbers.
+    let built = fixture.build_passes(&tracer, &[(&task, &[&step])], 1, true)?;
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {reason}")])
+    );
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_unknown_system_calls("    cached: no recorded input changed")
+    );
+    assert_eq!(tracer.runs(), 3);
+    Ok(())
+}
+
+/// The report of `kizz why` for a project whose one task, `kizz.md:3 (Build)`, ran
+/// its connecting command once, with the lines `reasons` and the line of its
+/// connections.
+fn why_for_connections(reasons: &str) -> String {
+    format!(
+        "The most recent build ran 1 task under `.`.
+
+kizz.md:3 (Build) [ci]
+  step 1: `tool abstract:kizz unix:run/s.sock tcp:[::1]:443 tcp:127.0.0.1:80 tcp:127.0.0.1:80`
+{reasons}
+    untracked /proc and /sys accesses: none
+    connections: 127.0.0.1:80, [::1]:443, Unix socket `run/s.sock`, abstract Unix socket @kizz
+    ignored accesses: 0
+"
+    )
+}
+
+/// A run that made connections is cached, and its explanations say nothing of
+/// them: `kizz why` lists them, sorted and once each, on a line of their own, with
+/// a Unix socket path relative to the base, after the run and after a later cache
+/// hit alike.
+#[test]
+fn connections_are_listed_by_why() -> TestResult {
+    let fixture = Fixture::new()?;
+    let tracer = FakeTracer::default();
+    let task = fixture.task(0, 3, "Build")?;
+    let step = fixture.step(&[
+        "tool",
+        "abstract:kizz",
+        "unix:run/s.sock",
+        "tcp:[::1]:443",
+        "tcp:127.0.0.1:80",
+        "tcp:127.0.0.1:80",
+    ])?;
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    let reason = "never run: there is no record for this step";
+    assert_eq!(
+        fixture.full(built.verdict(0, 0)?, false),
+        lines(&["ran because:", &format!("  {reason}")])
+    );
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_connections(&format!("    ran because:\n      {reason}"))
+    );
+
+    let built = fixture.build(&tracer, &[(&task, &[&step])])?;
+    assert_eq!(built.verdict(0, 0)?, &Verdict::Cached);
+    assert_eq!(
+        fixture.why(false)?,
+        why_for_connections("    cached: no recorded input changed")
+    );
+    assert_eq!(tracer.runs(), 1);
+    Ok(())
 }

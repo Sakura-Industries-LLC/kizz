@@ -1,5 +1,6 @@
 [global]
 disable = ["MD060", "MD041"]
+exclude = ["vendor/"]
 
 [MD003]
 style = "atx"

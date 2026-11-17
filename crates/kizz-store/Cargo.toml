@@ -13,11 +13,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+kizz-threads = { path = "../kizz-threads", version = "0.0.1" }
 libc = "0.2.191"
 minicbor = { version = "2.3.1", features = ["alloc", "derive"] }
-surrealkv = "1.0.0"
+surrealkv = "1.4.0"
 thiserror = "2.0.21"
-tokio = { version = "1.36", features = ["rt-multi-thread"] }
+tokio = { version = "1.54.1", features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

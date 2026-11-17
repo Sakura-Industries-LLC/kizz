@@ -6,7 +6,17 @@
 //!
 //! Each test writes its `kizz.md` and modules into a temporary directory, parses
 //! the task block, loads and runs its program, and checks the step specifications
-//! the fake executor received, the lines the program printed, and the failure.
+//! the fake executor received, the lines the program printed, and the failure;
+//! for equivalent forms of `run()`'s list and tuple arguments, it also checks the
+//! step keys that `kizz_core::step_key` derives from the specifications.
+
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, borrow cells, lock and print"
+)]
 
 use std::{
     cell::RefCell,
@@ -18,7 +28,7 @@ use std::{
 
 use kizz_core::{
     PrintSink, ProgramHash, StepError, StepExecutor, StepOutcome, StepSpec, TaskFailure, TaskInfo,
-    TaskProgram, parse_tasks,
+    TaskProgram, TaskRun, UncheckedExit, parse_tasks,
 };
 use kizz_trace::{AbsolutePath, AccessKind, Accesses, CaptureMode, CapturedOutput, Termination};
 use tempfile::TempDir;
@@ -179,7 +189,8 @@ impl Fixture {
         Ok(TaskInfo::new(task, &["ci".to_owned()])?)
     }
 
-    /// A task named `Build it`, tagged `ci check`, whose block is `source`.
+    /// A task with the heading `Build it` and no name, tagged `ci check`, whose block
+    /// is `source`.
     fn block(
         &self,
         source: &str,
@@ -347,8 +358,9 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
     let task = fixture.block(
         "run(\"prog\")\nrun(\"prog\", \"a b\", \"c\", stdin = \"input\", env = {\"A\": \"1\", \
          \"B\": None}, cwd = \"sub/dir\", capture = \"merged\", stream = True, always = True, \
-         ignore = [\"*.log\", \"tmp/**\"], track = [\"/proc/cpuinfo\"], expect = [0, 2])\nrun(\"prog\", \
-         cwd = \"/elsewhere\")\n",
+         ignore = [\"*.log\", \"tmp/**\"], track = [\"/proc/cpuinfo\"], timestamps = True, machine \
+         = [\"memory\", \"kernel\", \"memory\"], expect = [0, 2])\nrun(\"prog\", cwd = \
+         \"/elsewhere\")\n",
     )?;
     let dir = AbsolutePath::new(fixture.path())?;
     let (result, _) = run(task, &executor)?;
@@ -364,6 +376,8 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             always: false,
             ignore: vec![],
             track: vec![],
+            timestamps: false,
+            machine: vec![],
             expect: None,
         },
         StepSpec {
@@ -376,6 +390,8 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             always: true,
             ignore: vec!["*.log".to_owned(), "tmp/**".to_owned()],
             track: vec!["/proc/cpuinfo".to_owned()],
+            timestamps: true,
+            machine: vec!["kernel".to_owned(), "memory".to_owned()],
             expect: Some(vec![0, 2]),
         },
         StepSpec {
@@ -388,6 +404,8 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
             always: false,
             ignore: vec![],
             track: vec![],
+            timestamps: false,
+            machine: vec![],
             expect: None,
         },
     ]);
@@ -395,7 +413,8 @@ fn the_step_specification_carries_every_parameter() -> TestResult {
 }
 
 /// Invalid `run()` calls fail the task: no program, an unknown capture mode, an
-/// unknown parameter, and a step the executor cannot run.
+/// unknown parameter, a `timestamps` value that is not a boolean, an unknown
+/// `machine` part, and a step the executor cannot run.
 #[test]
 fn invalid_run_calls_fail_the_task() -> TestResult {
     let fixture = Fixture::new()?;
@@ -406,6 +425,15 @@ fn invalid_run_calls_fail_the_task() -> TestResult {
             "capture must be \"split\" or \"merged\"",
         ),
         ("run(\"p\", shell = True)\n", "shell"),
+        (
+            "run(\"p\", timestamps = \"yes\")\n",
+            "Type of parameter `timestamps` doesn't match, expected `bool`",
+        ),
+        (
+            "run(\"p\", machine = [\"kernel\", \"cpu\"])\n",
+            "run(): machine has no part \"cpu\"; the parts are kernel, limits, affinity, \
+             memory, filesystem and disk",
+        ),
         ("run(\"missing\")\n", "run(): no such program: missing"),
     ] {
         let executor = FakeExecutor::scripted(|step| {
@@ -416,6 +444,46 @@ fn invalid_run_calls_fail_the_task() -> TestResult {
         });
         let message = program_message(run(fixture.block(source)?, &executor)?.0)?;
         assert!(message.contains(expected), "{expected:?} in {message}");
+    }
+    Ok(())
+}
+
+/// `timestamps = "yes"` fails the task with Starlark's argument check, which names
+/// the parameter, before any step runs.
+#[test]
+fn a_timestamps_value_that_is_not_a_boolean_fails_the_task() -> TestResult {
+    let fixture = Fixture::new()?;
+    let executor = FakeExecutor::new();
+    let task = fixture.block("run(\"p\", timestamps = \"yes\")\n")?;
+    let message = program_message(run(task, &executor)?.0)?;
+    assert!(
+        message.contains("Type of parameter `timestamps` doesn't match, expected `bool`"),
+        "{message}"
+    );
+    assert_eq!(executor.steps(), []);
+    Ok(())
+}
+
+/// An unknown `machine` part fails the task with an error that lists every part,
+/// before any step runs, and so does a value that is not a list of strings.
+#[test]
+fn an_unknown_machine_part_fails_the_task() -> TestResult {
+    let fixture = Fixture::new()?;
+    for (source, expected) in [
+        (
+            "run(\"p\", machine = [\"Kernel\"])\n",
+            "run(): machine has no part \"Kernel\"; the parts are kernel, limits, affinity, \
+             memory, filesystem and disk",
+        ),
+        (
+            "run(\"p\", machine = \"kernel\")\n",
+            "Type of parameter `machine` doesn't match",
+        ),
+    ] {
+        let executor = FakeExecutor::new();
+        let message = program_message(run(fixture.block(source)?, &executor)?.0)?;
+        assert!(message.contains(expected), "{expected:?} in {message}");
+        assert_eq!(executor.steps(), []);
     }
     Ok(())
 }
@@ -455,7 +523,8 @@ fn result_attributes_follow_the_capture_mode() -> TestResult {
 }
 
 /// Top-level `if` and `for` work, `json.encode` and `json.decode` are available,
-/// and `print` output is prefixed with the task name, one line at a time.
+/// and `print` output is prefixed with the task's heading when it has no name, or
+/// with its location when it has neither, one line at a time.
 #[test]
 fn extended_dialect_json_and_prefixed_print() -> TestResult {
     let fixture = Fixture::new()?;
@@ -516,14 +585,16 @@ fn starlark_errors_fail_the_task_with_message_and_stack() -> TestResult {
     Ok(())
 }
 
-/// `task` describes the running task, in the block and in module functions.
+/// `task` describes the running task, in the block and in module functions: a task
+/// without `name=` has the name `None` and its heading as `task.heading`, and
+/// `task.args` is an empty list under a build.
 #[test]
 fn task_values_match_the_task() -> TestResult {
     let fixture = Fixture::new()?;
-    fixture.write("lib/info.star", "def heading():\n    return task.name\n")?;
+    fixture.write("lib/info.star", "def heading():\n    return task.heading\n")?;
     let task = fixture.block(
         "load(\"lib/info.star\", \"heading\")\nprint(task.dir)\nprint(task.file)\nprint(task.line, \
-         task.name, heading())\nprint(task.targets, task.selected)\n",
+         task.name, task.heading, heading())\nprint(task.targets, task.selected, task.args)\n",
     )?;
     let (result, printed) = run(task, &FakeExecutor::new())?;
     result?;
@@ -531,14 +602,82 @@ fn task_values_match_the_task() -> TestResult {
     assert_eq!(printed, [
         format!("Build it: {dir}"),
         format!("Build it: {dir}/kizz.md"),
-        "Build it: 3 Build it Build it".to_owned(),
-        "Build it: [\"ci\", \"check\"] [\"ci\"]".to_owned(),
+        "Build it: 3 None Build it Build it".to_owned(),
+        "Build it: [\"ci\", \"check\"] [\"ci\"] []".to_owned(),
     ]);
 
-    let task = fixture.task("```starlark ci\nprint(task.name)\n```\n")?;
+    let task = fixture.task("```starlark ci\nprint(task.name, task.heading)\n```\n")?;
     let (result, printed) = run(task, &FakeExecutor::new())?;
     result?;
-    assert_eq!(printed, ["kizz.md:1: None"]);
+    assert_eq!(printed, ["kizz.md:1: None None"]);
+    Ok(())
+}
+
+/// `task.name` is the name that `name=` gives, in the block and in module
+/// functions, and `print` output is prefixed with the name, not the heading; a
+/// named task without a heading has the heading `None`.
+#[test]
+fn task_names_come_from_the_name_option() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("lib/info.star", "def name():\n    return task.name\n")?;
+    let task = fixture.task(
+        "# Lint everything\n\n```starlark ci name=lint cache=never\nload(\"lib/info.star\", \
+         \"name\")\nprint(task.name, name(), task.heading)\nprint(task.targets, task.args)\n```\n",
+    )?;
+    assert_eq!(task.name.as_deref(), Some("lint"));
+    assert_eq!(task.heading.as_deref(), Some("Lint everything"));
+    assert!(task.cache_never);
+    assert_eq!(task.args, Vec::<String>::new());
+    let (result, printed) = run(task, &FakeExecutor::new())?;
+    result?;
+    assert_eq!(printed, [
+        "lint: lint lint Lint everything",
+        "lint: [\"ci\"] []",
+    ]);
+
+    let task = fixture.task("```starlark name=deploy\nprint(task.name, task.heading)\n```\n")?;
+    let (result, printed) = run(task, &FakeExecutor::new())?;
+    result?;
+    assert_eq!(printed, ["deploy: deploy None"]);
+    Ok(())
+}
+
+/// `task.args` is a list of strings that a program can read like any list, and
+/// is empty under a build, which runs a task with no arguments.
+#[test]
+fn task_args_are_an_empty_list_under_a_build() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task =
+        fixture.block("print(type(task.args), len(task.args))\nrun(\"tool\", *task.args)\n")?;
+    assert_eq!(task.args, Vec::<String>::new());
+    let executor = FakeExecutor::new();
+    let (result, printed) = run(task, &executor)?;
+    result?;
+    assert_eq!(printed, ["Build it: list 0"]);
+    let argv: Vec<Vec<String>> = executor.steps().into_iter().map(|step| step.argv).collect();
+    assert_eq!(argv, [vec!["tool".to_owned()]]);
+    Ok(())
+}
+
+/// Task options and arguments are not part of the task program, so adding `name=`
+/// or `cache=never` to a block, or giving it arguments, keeps its program hash.
+#[test]
+fn task_options_and_arguments_keep_the_program_hash() -> TestResult {
+    let fixture = Fixture::new()?;
+    let source = "run(\"tool\")\n";
+    let plain = hash(fixture.task(&format!("# T\n\n```starlark ci\n{source}```\n")))?;
+    for info in [
+        "ci name=tool",
+        "ci cache=never",
+        "name=tool cache=never",
+        "cache=never ci name=x",
+    ] {
+        let options = hash(fixture.task(&format!("# T\n\n```starlark {info}\n{source}```\n")))?;
+        assert_eq!(options, plain, "{info}");
+    }
+    let mut task = fixture.task(&format!("# T\n\n```starlark ci\n{source}```\n"))?;
+    task.args = vec!["a".to_owned(), "b".to_owned()];
+    assert_eq!(hash(Ok(task))?, plain);
     Ok(())
 }
 
@@ -688,5 +827,538 @@ fn run_while_a_module_loads_is_an_error() -> TestResult {
         AbsolutePath::new(fixture.path().join("out"))?,
         "cwd resolves against the task directory, not the module's"
     );
+    Ok(())
+}
+
+/// An executor whose steps end by their program: `fails` exits with code 3,
+/// `killed` is killed by signal 9, `cached` exits with code 2 from the cache, and
+/// every other program exits with code 0. Each step writes `out` to standard
+/// output and `err` to standard error.
+fn exits() -> FakeExecutor {
+    FakeExecutor::scripted(|step| {
+        let program = step.argv.first().map_or("", String::as_str);
+        let termination = match program {
+            "fails" => Termination::Exited(3),
+            "killed" => Termination::Signaled(9),
+            "cached" => Termination::Exited(2),
+            _ => Termination::Exited(0),
+        };
+        let mut outcome = outcome(termination, step.capture, b"out\n", b"err\n");
+        outcome.cached = program == "cached";
+        Ok(outcome)
+    })
+}
+
+/// Load and run the program of `task`, which must load, returning the whole run
+/// and the printed lines.
+fn run_whole(
+    task: TaskInfo,
+    executor: &FakeExecutor,
+) -> TestResult<(TaskRun, Vec<String>)> {
+    let printed = Printed::default();
+    let program = TaskProgram::load(task, &printed).program?;
+    let run = program.run(&BTreeMap::new(), executor, &printed);
+    Ok((run, printed.lines()))
+}
+
+/// The position, command, and termination of each unchecked step of `run`.
+fn unchecked(run: &TaskRun) -> Vec<(u32, String, Termination)> {
+    run.unchecked
+        .iter()
+        .map(|exit| (exit.position, exit.command(), exit.termination))
+        .collect()
+}
+
+/// A non-zero exit whose result the program ignores is unchecked, and so is a
+/// command killed by a signal; a zero exit never is. Each unchecked step keeps its
+/// position, command, termination, and raw output, and the run still succeeds.
+#[test]
+fn ignored_non_zero_exits_and_signals_are_unchecked() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block(
+        "a = run(\"fails\", \"one\")\nb = run(\"killed\", capture = \"merged\")\nc = \
+         run(\"ok\")\n",
+    )?;
+    let (run, _) = run_whole(task, &exits())?;
+    run.result?;
+    assert_eq!(run.unchecked, [
+        UncheckedExit {
+            position: 0,
+            argv: vec!["fails".to_owned(), "one".to_owned()],
+            termination: Termination::Exited(3),
+            output: CapturedOutput::Split {
+                stdout: b"out\n".to_vec(),
+                stderr: b"err\n".to_vec(),
+            },
+            cached: false,
+        },
+        UncheckedExit {
+            position: 1,
+            argv: vec!["killed".to_owned()],
+            termination: Termination::Signaled(9),
+            output: CapturedOutput::Merged {
+                output: b"out\nerr\n".to_vec(),
+            },
+            cached: false,
+        },
+    ]);
+    Ok(())
+}
+
+/// Reading `rc`, `signal`, `getattr(result, "rc")` or `getattr(result, "signal")`
+/// checks a result; reading only `stdout`, `stderr`, `output` or `cached`, asking
+/// `hasattr`, listing `dir()`, or printing the result does not.
+#[test]
+fn reading_rc_or_signal_checks_and_reading_output_does_not() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block(
+        "a = run(\"fails\", \"rc\")\nb = run(\"killed\", \"signal\")\nc = run(\"fails\", \
+         \"getattr\")\nd = run(\"killed\", \"getattr-signal\")\nread = [a.rc, b.signal, \
+         getattr(c, \"rc\"), getattr(d, \"signal\")]\nprint(read)\ne = run(\"fails\", \
+         \"stdout\")\nprint(e.stdout.strip(), e.stderr.strip(), e.cached, hasattr(e, \"rc\"), \
+         hasattr(e, \"signal\"), dir(e))\nprint(str(e).startswith(\"run_result(\"))\nf = \
+         run(\"fails\", \"merged\", capture = \"merged\")\nprint(f.output.strip())\n",
+    )?;
+    let (run, printed) = run_whole(task, &exits())?;
+    run.result.clone()?;
+    assert_eq!(printed, [
+        "Build it: [3, 9, 3, 9]",
+        "Build it: out err False True True [\"cached\", \"rc\", \"signal\", \"stderr\", \
+         \"stdout\"]",
+        "Build it: True",
+        "Build it: out",
+        "Build it: err",
+    ]);
+    assert_eq!(unchecked(&run), [
+        (4, "fails stdout".to_owned(), Termination::Exited(3)),
+        (5, "fails merged".to_owned(), Termination::Exited(3)),
+    ]);
+    Ok(())
+}
+
+/// With `expect = [0, 1]`, nothing is unchecked, whatever the exit: an accepted
+/// code returns, and any other code or a signal fails the task as an unexpected
+/// exit, never as an unchecked one.
+#[test]
+fn expect_leaves_nothing_unchecked() -> TestResult {
+    let fixture = Fixture::new()?;
+    let executor = FakeExecutor::scripted(|step| {
+        let termination = match first_argument(step) {
+            "one" => Termination::Exited(1),
+            "three" => Termination::Exited(3),
+            "killed" => Termination::Signaled(15),
+            _ => Termination::Exited(0),
+        };
+        Ok(outcome(termination, step.capture, b"", b""))
+    });
+    let accepted = fixture.block(
+        "run(\"tool\", \"zero\", expect = [0, 1])\nrun(\"tool\", \"one\", expect = [0, 1])\n",
+    )?;
+    let (run, _) = run_whole(accepted, &executor)?;
+    run.result?;
+    assert!(run.unchecked.is_empty(), "{:?}", run.unchecked);
+    for argument in ["three", "killed"] {
+        let task = fixture.block(&format!("run(\"tool\", \"{argument}\", expect = [0, 1])\n"))?;
+        let (run, _) = run_whole(task, &executor)?;
+        assert!(
+            matches!(run.result, Err(TaskFailure::UnexpectedExit { .. })),
+            "{argument}: {:?}",
+            run.result
+        );
+        assert!(run.unchecked.is_empty(), "{argument}: {:?}", run.unchecked);
+    }
+    Ok(())
+}
+
+/// A module function that returns a result to its caller, which reads `rc`,
+/// checks it; the same function whose caller reads only the output leaves it
+/// unchecked.
+#[test]
+fn a_result_returned_by_a_module_function_is_checked_where_it_is_read() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write(
+        "lib/tools.star",
+        "def tool(name):\n    return run(\"fails\", name)\n",
+    )?;
+    let task = fixture.block(
+        "load(\"lib/tools.star\", \"tool\")\nif tool(\"checked\").rc != 3:\n    fail(\"rc\")\nprint(tool(\"ignored\").stdout.strip())\n",
+    )?;
+    let (run, printed) = run_whole(task, &exits())?;
+    run.result.clone()?;
+    assert_eq!(printed, ["Build it: out"]);
+    assert_eq!(unchecked(&run), [(
+        1,
+        "fails ignored".to_owned(),
+        Termination::Exited(3)
+    )]);
+    Ok(())
+}
+
+/// A result from the cache counts like any other, and a program that fails still
+/// reports what it left unchecked before it failed.
+#[test]
+fn cached_results_and_failed_programs_report_unchecked_steps() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block("a = run(\"cached\")\nfail(\"stop\")\n")?;
+    let (run, _) = run_whole(task, &exits())?;
+    let message = program_message(run.result.clone())?;
+    assert!(message.contains("stop"), "{message}");
+    assert_eq!(run.unchecked.len(), 1, "{:?}", run.unchecked);
+    let exit = &run.unchecked[0];
+    assert_eq!(exit.termination, Termination::Exited(2));
+    assert!(exit.cached);
+    Ok(())
+}
+
+/// An unchecked step and the failure of `kizz build --fail-unchecked` show each
+/// command, its exit status, and its captured output, as an unexpected exit does;
+/// the failure's first line names the command that was given `--fail-unchecked`,
+/// `kizz build` or `kizz run`, and only its first line depends on it.
+#[test]
+fn unchecked_failures_show_each_command_status_and_output() {
+    let exits = vec![
+        UncheckedExit {
+            position: 0,
+            argv: vec!["false".to_owned()],
+            termination: Termination::Exited(1),
+            output: CapturedOutput::Split {
+                stdout: b"out".to_vec(),
+                stderr: Vec::new(),
+            },
+            cached: false,
+        },
+        UncheckedExit {
+            position: 2,
+            argv: vec!["sleep".to_owned(), "9".to_owned()],
+            termination: Termination::Signaled(9),
+            output: CapturedOutput::Merged {
+                output: b"partial\n".to_vec(),
+            },
+            cached: true,
+        },
+    ];
+    let steps = "command `false`: exit code 1, which the task program never checked: its `run()` \
+                 has no `expect`, and the program never read the result's `rc` or \
+                 `signal`\n--- stdout ---\nout\n--- stderr ---\ncommand `sleep 9`: killed by \
+                 signal 9, which the task program never checked: its `run()` has no `expect`, \
+                 and the program never read the result's `rc` or `signal`\n--- output \
+                 ---\npartial\n";
+    let shown = TaskFailure::Unchecked {
+        exits: exits.clone(),
+        invoked: "kizz build",
+    }
+    .to_string();
+    assert_eq!(
+        shown,
+        format!(
+            "the task program left 2 non-zero exits unchecked, and `kizz build --fail-unchecked` \
+             makes that fail the task\n{steps}"
+        )
+    );
+    let shown = TaskFailure::Unchecked {
+        exits,
+        invoked: "kizz run",
+    }
+    .to_string();
+    assert_eq!(
+        shown,
+        format!(
+            "the task program left 2 non-zero exits unchecked, and `kizz run --fail-unchecked` \
+             makes that fail the task\n{steps}"
+        )
+    );
+}
+
+/// An executor for the encoding tests, by the step's first argument: `one` exits
+/// with code 1 and writes `out` to standard output, `killed` is killed by signal 9
+/// after writing `out` and `err`, and `hit` exits with code 0 from the cache after
+/// writing `hit` and `warn`.
+fn encoded() -> FakeExecutor {
+    FakeExecutor::scripted(|step| {
+        let (termination, stdout, stderr): (Termination, &[u8], &[u8]) = match first_argument(step)
+        {
+            "one" => (Termination::Exited(1), b"out\n", b""),
+            "killed" => (Termination::Signaled(9), b"out\n", b"err\n"),
+            _ => (Termination::Exited(0), b"hit\n", b"warn\n"),
+        };
+        let mut outcome = outcome(termination, step.capture, stdout, stderr);
+        outcome.cached = first_argument(step) == "hit";
+        Ok(outcome)
+    })
+}
+
+/// The encoding rule's first regression: `json.encode` of a result is exactly the
+/// text that the struct `run()` returned before encoded to for the same values,
+/// an object of `rc`, `signal`, `stdout` and `stderr` or `output`, and `cached`, in
+/// that order, for both capture modes, an exit code and a signal, and a run and a
+/// cache hit; `fs.write_json` writes the same members with the same values.
+#[test]
+fn json_encode_gives_the_text_of_the_former_struct() -> TestResult {
+    let fixture = Fixture::new()?;
+    let task = fixture.block(
+        "a = run(\"tool\", \"one\")\nb = run(\"tool\", \"killed\", capture = \"merged\")\nc = \
+         run(\"tool\", \"hit\")\nd = run(\"tool\", \"killed\")\nfor r in [a, b, c, d]:\n    \
+         print(json.encode(r))\nfs.write_json(\"a.json\", a)\nfs.write_json(\"b.json\", \
+         b)\nfs.write_json(\"c.json\", c)\n",
+    )?;
+    let (run, printed) = run_whole(task, &encoded())?;
+    run.result.clone()?;
+    assert_eq!(printed, [
+        r#"Build it: {"rc":1,"signal":null,"stdout":"out\n","stderr":"","cached":false}"#,
+        r#"Build it: {"rc":null,"signal":9,"output":"out\nerr\n","cached":false}"#,
+        r#"Build it: {"rc":0,"signal":null,"stdout":"hit\n","stderr":"warn\n","cached":true}"#,
+        r#"Build it: {"rc":null,"signal":9,"stdout":"out\n","stderr":"err\n","cached":false}"#,
+    ]);
+    let written = |name: &str| -> TestResult<serde_json::Value> {
+        Ok(serde_json::from_str(&fs::read_to_string(
+            fixture.path().join(name),
+        )?)?)
+    };
+    assert_eq!(
+        written("a.json")?,
+        serde_json::json!({
+            "rc": 1,
+            "signal": null,
+            "stdout": "out\n",
+            "stderr": "",
+            "cached": false
+        })
+    );
+    assert_eq!(
+        written("b.json")?,
+        serde_json::json!({
+            "rc": null,
+            "signal": 9,
+            "output": "out\nerr\n",
+            "cached": false
+        })
+    );
+    assert_eq!(
+        written("c.json")?,
+        serde_json::json!({
+            "rc": 0,
+            "signal": null,
+            "stdout": "hit\n",
+            "stderr": "warn\n",
+            "cached": true
+        })
+    );
+    assert!(run.unchecked.is_empty(), "{:?}", run.unchecked);
+    Ok(())
+}
+
+/// The encoding rule's second regression: a non-zero exit, and a signal, whose
+/// result the program only encodes, with `json.encode`, also inside a list or a
+/// dict, or with `fs.write_json`, also inside a dict, is checked, while the same
+/// program without the encoding leaves it unchecked.
+#[test]
+fn encoding_a_result_checks_it() -> TestResult {
+    let fixture = Fixture::new()?;
+    let encodings = [
+        "json.encode(r)",
+        "json.encode([r])",
+        "json.encode({\"result\": r})",
+        "fs.write_json(\"r.json\", r)",
+        "fs.write_json(\"r.json\", {\"all\": [r]})",
+    ];
+    for program in ["fails", "killed"] {
+        for encoding in encodings {
+            let task = fixture.block(&format!("r = run(\"{program}\")\n{encoding}\n"))?;
+            let (run, _) = run_whole(task, &exits())?;
+            run.result?;
+            assert!(
+                run.unchecked.is_empty(),
+                "{program}, {encoding}: {:?}",
+                run.unchecked
+            );
+        }
+        let task = fixture.block(&format!(
+            "r = run(\"{program}\")\nkept = [r]\nprint(len(kept), r.stdout.strip())\n"
+        ))?;
+        let (run, printed) = run_whole(task, &exits())?;
+        run.result?;
+        assert_eq!(printed, ["Build it: 1 out"]);
+        assert_eq!(run.unchecked.len(), 1, "{program}: {:?}", run.unchecked);
+    }
+    Ok(())
+}
+
+/// The commands of the steps `executor` received, in order.
+fn commands(executor: &FakeExecutor) -> Vec<Vec<String>> {
+    executor.steps().into_iter().map(|step| step.argv).collect()
+}
+
+/// `words` as an owned command.
+fn command(words: &[&str]) -> Vec<String> {
+    words.iter().map(|&word| word.to_owned()).collect()
+}
+
+/// Lists and tuples among `run()`'s positional arguments expand in place, first,
+/// last, in the middle, nested, as the whole command, held in a variable, and as
+/// frozen values loaded from a module; empty ones add nothing, each string stays
+/// one argument, and the same list used twice adds its strings twice.
+#[test]
+fn lists_and_tuples_in_run_expand_into_the_command() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write(
+        "lib/flags.star",
+        "FLAGS = [\"--locked\", (\"--jobs\", \"2\")]\nEMPTY = ()\n",
+    )?;
+    let task = fixture.block(
+        "load(\"lib/flags.star\", \"FLAGS\", \"EMPTY\")\nrun(\"echo\", [\"this\", \"is\", \
+         \"test\"])\nrun([\"echo\", \"this\"], \"is\", \"test\")\nrun(\"echo\", [\"this\"], \
+         \"is\", (\"test\",))\nrun(\"echo\", [[\"this\"], (\"is\", [])], \"test\")\nrun([\"echo\", \
+         \"this\", \"is\", \"test\"])\nrun((\"printf\",), [], (), [[]], \"a b\", \"\")\nverbose = \
+         []\nrun(\"tool\", verbose, \"x\")\nverbose = [\"-v\"]\nrun(\"tool\", verbose, \"x\", \
+         verbose)\nrun(\"cargo\", \"build\", FLAGS, EMPTY)\n",
+    )?;
+    let executor = FakeExecutor::new();
+    let (result, _) = run(task, &executor)?;
+    result?;
+    let this_is_test = command(&["echo", "this", "is", "test"]);
+    assert_eq!(commands(&executor), [
+        this_is_test.clone(),
+        this_is_test.clone(),
+        this_is_test.clone(),
+        this_is_test.clone(),
+        this_is_test,
+        command(&["printf", "a b", ""]),
+        command(&["tool", "x"]),
+        command(&["tool", "-v", "x", "-v"]),
+        command(&["cargo", "build", "--locked", "--jobs", "2"]),
+    ]);
+    Ok(())
+}
+
+/// `run("cargo", "test", task.args)` passes the task's arguments through, each as
+/// one argument, and adds nothing when `task.args` is empty, as under a build.
+#[test]
+fn task_args_pass_through_as_one_list() -> TestResult {
+    let fixture = Fixture::new()?;
+    let source = "run(\"cargo\", \"test\", task.args)\n";
+    let mut task = fixture.block(source)?;
+    task.args = vec!["--release".to_owned(), "a b".to_owned()];
+    let executor = FakeExecutor::new();
+    let (result, _) = run(task, &executor)?;
+    result?;
+    assert_eq!(commands(&executor), [command(&[
+        "cargo",
+        "test",
+        "--release",
+        "a b"
+    ])]);
+
+    let executor = FakeExecutor::new();
+    let (result, _) = run(fixture.block(source)?, &executor)?;
+    result?;
+    assert_eq!(commands(&executor), [command(&["cargo", "test"])]);
+    Ok(())
+}
+
+/// Each error of the expansion fails the task with its exact message, and the
+/// failing call starts no step: a wrong type at the top and nested, for `int`,
+/// `bool`, `NoneType`, `dict`, `range` and `run_result`, a list or tuple that
+/// contains itself, and more than a million values; a call whose arguments hold no
+/// string at all fails as a call without a program.
+#[test]
+fn invalid_run_arguments_fail_the_task_and_start_no_step() -> TestResult {
+    let fixture = Fixture::new()?;
+    let no_program = "run() needs a program: run(\"program\", \"argument\", ...)";
+    for (source, message) in [
+        (
+            "run(\"p\", \"a\", 5)\n",
+            "run(): argument 3 is of type int, not a string, list or tuple",
+        ),
+        (
+            "run(\"p\", [True])\n",
+            "run(): argument 2 at [0] is of type bool, not a string, list or tuple",
+        ),
+        (
+            "run(\"p\", [\"a\", [None]])\n",
+            "run(): argument 2 at [1][0] is of type NoneType, not a string, list or tuple",
+        ),
+        (
+            "run({\"p\": 1})\n",
+            "run(): argument 1 is of type dict, not a string, list or tuple",
+        ),
+        (
+            "run(\"p\", (\"a\", range(3)))\n",
+            "run(): argument 2 at [1] is of type range, not a string, list or tuple",
+        ),
+        (
+            "run([], 5)\n",
+            "run(): argument 2 is of type int, not a string, list or tuple",
+        ),
+        (
+            "a = [\"x\"]\na.append(a)\nrun(\"p\", a)\n",
+            "run(): argument 2 at [1] is a list that contains itself",
+        ),
+        (
+            "a = []\nb = [a]\na.append(b)\nrun(\"p\", a)\n",
+            "run(): argument 2 at [0][0] is a list that contains itself",
+        ),
+        (
+            "l = []\nt = (\"a\", l)\nl.append(t)\nrun(\"p\", t)\n",
+            "run(): argument 2 at [1][0] is a tuple that contains itself",
+        ),
+        (
+            "a = [\"x\"]\nfor _ in range(21):\n    a = [a, a]\nrun(\"p\", a)\n",
+            "run(): the arguments expand to more than 1000000 strings, lists and tuples",
+        ),
+        ("run([])\n", no_program),
+        ("run([], ())\n", no_program),
+        ("run([[]])\n", no_program),
+    ] {
+        let executor = FakeExecutor::new();
+        let message_seen = program_message(run(fixture.block(source)?, &executor)?.0)?;
+        assert!(
+            message_seen.contains(message),
+            "{message:?} in {message_seen}"
+        );
+        assert_eq!(executor.steps(), [], "{source}");
+    }
+
+    let executor = FakeExecutor::new();
+    let task = fixture.block("r = run(\"first\")\nrun(\"p\", [r])\n")?;
+    let message = program_message(run(task, &executor)?.0)?;
+    assert!(
+        message.contains(
+            "run(): argument 2 at [0] is of type run_result, not a string, list or tuple"
+        ),
+        "{message}"
+    );
+    assert_eq!(commands(&executor), [command(&["first"])]);
+    Ok(())
+}
+
+/// `run("echo", ["this", "is", "test"])`, `run(["echo", "this"], "is", "test")`,
+/// `run(("echo",), [["this"], ("is", [])], "test")` and
+/// `run("echo", "this", "is", "test")` give equal step specifications, so one
+/// program hash and occurrence give them one step key.
+#[test]
+fn equivalent_forms_give_one_step_specification_and_key() -> TestResult {
+    let fixture = Fixture::new()?;
+    let mut specs = Vec::new();
+    for source in [
+        "run(\"echo\", [\"this\", \"is\", \"test\"])\n",
+        "run([\"echo\", \"this\"], \"is\", \"test\")\n",
+        "run((\"echo\",), [[\"this\"], (\"is\", [])], \"test\")\n",
+        "run(\"echo\", \"this\", \"is\", \"test\")\n",
+    ] {
+        let executor = FakeExecutor::new();
+        let (result, _) = run(fixture.block(source)?, &executor)?;
+        result?;
+        let [spec] = <[StepSpec; 1]>::try_from(executor.steps())
+            .map_err(|steps| format!("one step, not {steps:?}"))?;
+        specs.push(spec);
+    }
+    let program = hash(fixture.block("run(\"echo\", \"this\", \"is\", \"test\")\n"))?;
+    let first = specs.first().ok_or("no specification")?;
+    assert_eq!(first.argv, command(&["echo", "this", "is", "test"]));
+    let key = kizz_core::step_key(program, first, 0)?;
+    for spec in &specs {
+        assert_eq!(spec, first);
+        assert_eq!(kizz_core::step_key(program, spec, 0)?, key);
+    }
     Ok(())
 }

@@ -16,12 +16,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use minicbor::{Decode, Decoder, Encode, Encoder, bytes::ByteArray, decode, encode};
 
-use crate::records::{Family, Record, StepKey, TaskId};
+use crate::{
+    machine::{MachineChange, MachineStateRecord},
+    records::{Family, Record, StepKey, TaskId},
+};
 
 /// Encodes and decodes a path as a CBOR byte string of its bytes.
 pub(crate) mod path_bytes {
@@ -88,8 +91,8 @@ pub(crate) mod path_list {
     }
 }
 
-/// A BLAKE3 hash: of a file's content, of a directory's sorted entries, or of a
-/// task program.
+/// A BLAKE3 hash: of a file's content, of a directory's entries, or of a task
+/// program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentHash(pub [u8; 32]);
 
@@ -146,7 +149,8 @@ pub struct StepSpecRecord {
     /// The absolute working directory.
     #[cbor(n(1), with = "path_bytes")]
     pub cwd: PathBuf,
-    /// The argument vector as written: the program, then its arguments.
+    /// The argument vector as run: the program, then its arguments, each string as
+    /// written, after the expansion of any lists and tuples.
     #[n(2)]
     pub argv: Vec<String>,
     /// The exact environment passed to the process, sorted by name.
@@ -177,12 +181,20 @@ pub struct StepSpecRecord {
     /// The number of identical commands earlier in the same task run.
     #[n(11)]
     pub occurrence: u32,
+    /// Whether a different modification or change time of a file or directory that
+    /// the step read, ran, listed, or checked is a change.
+    #[n(12)]
+    pub timestamps: bool,
+    /// The names of the parts of the machine state that count as an input of the
+    /// step, as `run(..., machine = [...])` gave them, sorted and without repeats.
+    #[n(13)]
+    pub machine: Vec<String>,
 }
 
 /// The combined kinds of access a step made to one path, one bit per kind.
 ///
 /// The bits follow the order of the tracer interface's access kinds: read, probe,
-/// list, write, exec.
+/// list, write, exec, xattr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Encode, Decode)]
 #[cbor(transparent)]
 pub struct AccessBits(#[n(0)] pub u8);
@@ -198,6 +210,8 @@ impl AccessBits {
     pub const READ: u8 = 0b0000_0001;
     /// The path was created, modified, renamed, removed, or had its metadata changed.
     pub const WRITE: u8 = 0b0000_1000;
+    /// The path's extended attributes were read or listed.
+    pub const XATTR: u8 = 0b0010_0000;
 
     /// Whether every bit of `bit` is set.
     #[must_use]
@@ -207,6 +221,63 @@ impl AccessBits {
     ) -> bool {
         self.0 & bit == bit
     }
+}
+
+/// The permission bits of a mode: the low twelve bits, the set-user-ID,
+/// set-group-ID, and sticky bits included.
+pub const PERMISSION_BITS: u32 = 0o7777;
+
+/// The permission bits of `mode`, without its file type.
+#[must_use]
+pub const fn permission_bits(mode: u32) -> u32 {
+    mode & PERMISSION_BITS
+}
+
+/// The owner of a file or directory: its user and group numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Owner {
+    /// The user number.
+    #[n(0)]
+    pub uid: u32,
+    /// The group number.
+    #[n(1)]
+    pub gid: u32,
+}
+
+impl fmt::Display for Owner {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "{}:{}", self.uid, self.gid)
+    }
+}
+
+/// The modification and change times of a regular file or a directory, in
+/// nanoseconds since the Unix epoch. Access times are never recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct Times {
+    /// The modification time.
+    #[n(0)]
+    pub mtime_nanos: i64,
+    /// The change time.
+    #[n(1)]
+    pub ctime_nanos: i64,
+}
+
+/// Write a time in nanoseconds since the Unix epoch as seconds with nine decimals.
+fn write_time(
+    f: &mut fmt::Formatter<'_>,
+    nanos: i64,
+) -> fmt::Result {
+    let sign = if nanos < 0 { "-" } else { "" };
+    let magnitude = nanos.unsigned_abs();
+    write!(
+        f,
+        "{sign}{}.{:09}",
+        magnitude / 1_000_000_000,
+        magnitude % 1_000_000_000
+    )
 }
 
 /// The metadata of a regular file that a cache check compares.
@@ -230,6 +301,20 @@ pub struct FileMeta {
     /// The mode: the file type and permission bits.
     #[n(5)]
     pub mode: u32,
+    /// The owner.
+    #[n(6)]
+    pub owner: Owner,
+}
+
+impl FileMeta {
+    /// The modification and change times.
+    #[must_use]
+    pub const fn times(&self) -> Times {
+        Times {
+            mtime_nanos: self.mtime_nanos,
+            ctime_nanos: self.ctime_nanos,
+        }
+    }
 }
 
 /// The type of a directory entry, as the listing reports it, without following
@@ -291,16 +376,22 @@ pub struct DirEntry {
     pub kind: EntryKind,
 }
 
-/// The recorded contents of a listed directory.
+/// The recorded contents of a listed directory, in the order the file system
+/// returned its entries when kizz read it. Entry inode numbers are not recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct Listing {
-    /// The hash of the sorted entry names and types.
+    /// The hash of the entry names and types, in the order the file system
+    /// returned them.
     #[n(0)]
     pub hash: ContentHash,
-    /// The entries, sorted by name, when there are at most
-    /// [`MAX_LISTED_NAMES`]; `None` above that.
+    /// The entries, in the order the file system returned them, when there are at
+    /// most [`MAX_LISTED_NAMES`]; `None` above that.
     #[n(1)]
     pub entries: Option<Vec<DirEntry>>,
+    /// The hash of the same entries sorted by name and type, which tells a change
+    /// of order alone from a change of entries, in a directory of any size.
+    #[n(2)]
+    pub sorted_hash: ContentHash,
 }
 
 /// The most entries a listed directory may have for its names to be kept.
@@ -345,13 +436,22 @@ pub enum PathState {
         #[n(1)]
         hash: Option<ContentHash>,
     },
-    /// A directory: its sorted entries when it was listed, otherwise only its
-    /// existence and type.
+    /// A directory: its mode, owner, and times, and its listing, in the order the
+    /// file system returned its entries, when it was listed.
     #[n(2)]
     Directory {
-        /// The listing, when the directory was listed.
+        /// The mode: the file type and permission bits.
         #[n(0)]
+        mode: u32,
+        /// The owner.
+        #[n(1)]
+        owner: Owner,
+        /// The listing, when the directory was listed.
+        #[n(2)]
         listing: Option<Listing>,
+        /// The modification and change times.
+        #[n(3)]
+        times: Times,
     },
     /// A symbolic link: its target, and the state of what it points to.
     #[n(3)]
@@ -383,6 +483,34 @@ pub enum PathState {
     },
 }
 
+/// One extended attribute of a path: its name, and a BLAKE3 hash of its value.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Attribute {
+    /// The attribute's name, as bytes, such as `user.origin`.
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub name: Vec<u8>,
+    /// The BLAKE3 hash of the attribute's value.
+    #[n(1)]
+    pub hash: ContentHash,
+}
+
+/// The extended attributes recorded with a path whose attributes a step read or
+/// listed: those of the path itself and, for a symbolic link, those of what it
+/// points to, each sorted by name. A file system without attributes records none.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct Attributes {
+    /// The path's own attributes, without following a final symbolic link, sorted
+    /// by name, or `None` when they could not be read, as when nothing is at the
+    /// path.
+    #[n(0)]
+    pub own: Option<Vec<Attribute>>,
+    /// For a symbolic link, the attributes of what it points to, following every
+    /// link, sorted by name; `None` for a path that is not a symbolic link, or when
+    /// they could not be read, as for a link that points to nothing.
+    #[n(1)]
+    pub pointee: Option<Vec<Attribute>>,
+}
+
 /// One path a step touched, how it touched it, and its state when the step
 /// finished.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -400,6 +528,12 @@ pub struct Observation {
     /// The state of the path when the step finished.
     #[n(3)]
     pub state: PathState,
+    /// The extended attributes of the path when the step finished, part of its
+    /// state, recorded when the step read or listed them (the xattr kind); `None`
+    /// for any other path, and for a path under `/proc` or `/sys` that no `track`
+    /// pattern matched.
+    #[n(4)]
+    pub attributes: Option<Attributes>,
 }
 
 /// How a recorded step ended.
@@ -466,6 +600,38 @@ pub enum Change {
     /// can no longer be read.
     #[n(2)]
     Type,
+    /// A regular file's or a directory's permission bits changed, found without
+    /// hashing.
+    #[n(8)]
+    Permissions {
+        /// The recorded permission bits.
+        #[n(0)]
+        old: u32,
+        /// The current permission bits.
+        #[n(1)]
+        new: u32,
+    },
+    /// A regular file's or a directory's owner changed, found without hashing.
+    #[n(9)]
+    Owner {
+        /// The recorded owner.
+        #[n(0)]
+        old: Owner,
+        /// The current owner.
+        #[n(1)]
+        new: Owner,
+    },
+    /// A regular file's or a directory's modification or change time changed, found
+    /// without hashing, for a step run with `timestamps`.
+    #[n(10)]
+    Timestamps {
+        /// The recorded times.
+        #[n(0)]
+        old: Times,
+        /// The current times.
+        #[n(1)]
+        new: Times,
+    },
     /// A regular file's size changed, found without hashing.
     #[n(3)]
     Size {
@@ -484,9 +650,41 @@ pub enum Change {
     /// different metadata.
     #[n(5)]
     Metadata,
-    /// The entries of a listed directory changed.
+    /// The entries of a listed directory changed. The entries that appeared,
+    /// disappeared, or changed type are named when both listings kept their
+    /// entries; otherwise all three lists are empty.
     #[n(6)]
-    Entries,
+    Entries {
+        /// The entries that appeared, sorted by name.
+        #[n(0)]
+        appeared: Vec<DirEntry>,
+        /// The entries that disappeared, as recorded, sorted by name.
+        #[n(1)]
+        disappeared: Vec<DirEntry>,
+        /// The entries whose type changed, with their current type, sorted by name.
+        #[n(2)]
+        retyped: Vec<DirEntry>,
+    },
+    /// A listed directory has the same entries in a different order.
+    #[n(11)]
+    Order,
+    /// The extended attributes of a path whose attributes were recorded changed,
+    /// for the path itself or, for a symbolic link, for what it points to: the
+    /// attributes that appeared, disappeared, or changed value, each sorted by
+    /// name. All three lists are empty when only whether the attributes could be
+    /// read changed.
+    #[n(12)]
+    Attributes {
+        /// The attributes that appeared, with their current hash.
+        #[n(0)]
+        appeared: Vec<Attribute>,
+        /// The attributes that disappeared, as recorded.
+        #[n(1)]
+        disappeared: Vec<Attribute>,
+        /// The attributes whose value changed, with their current hash.
+        #[n(2)]
+        changed: Vec<Attribute>,
+    },
     /// A symbolic link points somewhere else.
     #[n(7)]
     LinkTarget {
@@ -508,10 +706,25 @@ impl fmt::Display for Change {
             Self::Appeared => f.write_str("appeared"),
             Self::Disappeared => f.write_str("disappeared"),
             Self::Type => f.write_str("type changed"),
+            Self::Permissions { old, new } => {
+                write!(f, "permissions changed from {old:04o} to {new:04o}")
+            },
+            Self::Owner { old, new } => write!(f, "owner changed from {old} to {new}"),
+            Self::Timestamps { old, new } => write_timestamps(f, old, new),
             Self::Size { old, new } => write!(f, "size changed from {old} to {new} bytes"),
             Self::Content => f.write_str("content changed"),
             Self::Metadata => f.write_str("metadata changed"),
-            Self::Entries => f.write_str("directory entries changed"),
+            Self::Entries {
+                appeared,
+                disappeared,
+                retyped,
+            } => write_entries(f, appeared, disappeared, retyped),
+            Self::Order => f.write_str("the order of its entries changed"),
+            Self::Attributes {
+                appeared,
+                disappeared,
+                changed,
+            } => write_attributes(f, appeared, disappeared, changed),
             Self::LinkTarget { old, new } => {
                 write!(
                     f,
@@ -522,6 +735,110 @@ impl fmt::Display for Change {
             },
         }
     }
+}
+
+/// The most entry names an entries change shows for each of appeared,
+/// disappeared, and changed type; the rest are counted.
+const SHOWN_ENTRY_NAMES: usize = 10;
+
+/// Write an entries change: the entries that appeared, disappeared, and changed
+/// type, each group when it is not empty, with at most [`SHOWN_ENTRY_NAMES`] names
+/// each.
+fn write_entries(
+    f: &mut fmt::Formatter<'_>,
+    appeared: &[DirEntry],
+    disappeared: &[DirEntry],
+    retyped: &[DirEntry],
+) -> fmt::Result {
+    f.write_str("directory entries changed")?;
+    let mut separator = ": ";
+    for (entries, what) in [
+        (appeared, "appeared"),
+        (disappeared, "disappeared"),
+        (retyped, "changed type"),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        f.write_str(separator)?;
+        separator = "; ";
+        for (index, entry) in entries.iter().take(SHOWN_ENTRY_NAMES).enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "`{}`", String::from_utf8_lossy(&entry.name))?;
+        }
+        let more = entries.len().saturating_sub(SHOWN_ENTRY_NAMES);
+        if more > 0 {
+            write!(f, " and {more} more")?;
+        }
+        write!(f, " {what}")?;
+    }
+    Ok(())
+}
+
+/// Write an extended-attribute change: the attributes that appeared, disappeared,
+/// and changed value, each group when it is not empty, with at most
+/// [`SHOWN_ENTRY_NAMES`] names each.
+fn write_attributes(
+    f: &mut fmt::Formatter<'_>,
+    appeared: &[Attribute],
+    disappeared: &[Attribute],
+    changed: &[Attribute],
+) -> fmt::Result {
+    f.write_str("extended attributes changed")?;
+    let mut separator = ": ";
+    for (attributes, what) in [
+        (appeared, "appeared"),
+        (disappeared, "disappeared"),
+        (changed, "changed"),
+    ] {
+        if attributes.is_empty() {
+            continue;
+        }
+        f.write_str(separator)?;
+        separator = "; ";
+        for (index, attribute) in attributes.iter().take(SHOWN_ENTRY_NAMES).enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "`{}`", String::from_utf8_lossy(&attribute.name))?;
+        }
+        let more = attributes.len().saturating_sub(SHOWN_ENTRY_NAMES);
+        if more > 0 {
+            write!(f, " and {more} more")?;
+        }
+        write!(f, " {what}")?;
+    }
+    Ok(())
+}
+
+/// Write a timestamp change: each time that differs, old and new, or both times
+/// when neither differs.
+fn write_timestamps(
+    f: &mut fmt::Formatter<'_>,
+    old: &Times,
+    new: &Times,
+) -> fmt::Result {
+    let mtime = old.mtime_nanos != new.mtime_nanos;
+    let ctime = old.ctime_nanos != new.ctime_nanos;
+    f.write_str("timestamps changed: ")?;
+    if mtime || !ctime {
+        f.write_str("modification time from ")?;
+        write_time(f, old.mtime_nanos)?;
+        f.write_str(" to ")?;
+        write_time(f, new.mtime_nanos)?;
+    }
+    if mtime && ctime {
+        f.write_str(", ")?;
+    }
+    if ctime || !mtime {
+        f.write_str("change time from ")?;
+        write_time(f, old.ctime_nanos)?;
+        f.write_str(" to ")?;
+        write_time(f, new.ctime_nanos)?;
+    }
+    Ok(())
 }
 
 /// One recorded path that a cache check found changed.
@@ -541,6 +858,167 @@ impl fmt::Display for Difference {
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         write!(f, "{}: {}", self.path.display(), self.change)
+    }
+}
+
+/// A file that changed during a run after the command first read it or ran it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct ChangedRead {
+    /// The absolute path that the command read or ran.
+    #[cbor(n(0), with = "path_bytes")]
+    pub path: PathBuf,
+    /// Whether the command wrote the path, as its access kinds show; when it did
+    /// not, something else changed the file while the command ran.
+    #[n(1)]
+    pub written: bool,
+}
+
+impl ChangedRead {
+    /// Who changed the file, as explanations say it.
+    #[must_use]
+    pub const fn changed_by(&self) -> &'static str {
+        if self.written {
+            "the command wrote it"
+        } else {
+            "something else changed it while the command ran"
+        }
+    }
+}
+
+/// The reason for files that changed during a run after the command first read
+/// them, with each path shown by `path`: how many files changed, then each file
+/// with who changed it, such as `a file changed after the command read it: in.txt
+/// (the command wrote it)`.
+#[must_use]
+pub fn changed_reads_text(
+    files: &[ChangedRead],
+    path: impl Fn(&Path) -> String,
+) -> String {
+    let shown: Vec<String> = files
+        .iter()
+        .map(|file| format!("{} ({})", path(&file.path), file.changed_by()))
+        .collect();
+    let head = if files.len() == 1 {
+        "a file changed after the command read it".to_owned()
+    } else {
+        format!("{} files changed after the command read them", files.len())
+    };
+    format!("{head}: {}", shown.join(", "))
+}
+
+/// The numbers of system calls that the tracer does not know, as text: `system
+/// call 400`, or `system calls 400 and 1000000` for several, in the order given.
+#[must_use]
+pub fn system_call_numbers(numbers: &[u32]) -> String {
+    let shown: Vec<String> = numbers.iter().map(ToString::to_string).collect();
+    match shown.split_last() {
+        None => "no system call".to_owned(),
+        Some((only, [])) => format!("system call {only}"),
+        Some((last, rest)) => format!("system calls {} and {last}", rest.join(", ")),
+    }
+}
+
+/// A connection that a command made to a service outside the trace: an IPv4 or
+/// IPv6 address and port, or a Unix socket by path or abstract name. What came back
+/// is an input that kizz cannot see, so it warns about the connection, and the
+/// result is still cached.
+///
+/// Connections are ordered by their kind, then by address or path, as a record
+/// keeps them: sorted and without repeats.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub enum Connection {
+    /// An IPv4 address and port.
+    #[n(0)]
+    Ipv4 {
+        /// The four bytes of the address, in network order.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        address: [u8; 4],
+        /// The port.
+        #[n(1)]
+        port: u16,
+    },
+    /// An IPv6 address and port, with the scope of the address, 0 for none.
+    #[n(1)]
+    Ipv6 {
+        /// The sixteen bytes of the address, in network order.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        address: [u8; 16],
+        /// The port.
+        #[n(1)]
+        port: u16,
+        /// The scope of the address, such as the index of a network interface.
+        #[n(2)]
+        scope: u32,
+    },
+    /// A Unix socket by its absolute path.
+    #[n(2)]
+    UnixPath {
+        /// The absolute path.
+        #[cbor(n(0), with = "path_bytes")]
+        path: PathBuf,
+    },
+    /// A Unix socket in the abstract namespace, by its name without the zero byte
+    /// that starts it.
+    #[n(3)]
+    UnixAbstract {
+        /// The name, which may hold more zero bytes.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        name: Vec<u8>,
+    },
+}
+
+impl Connection {
+    /// The connection as text, with a Unix socket's path shown by `path`: an
+    /// address with its port, such as `127.0.0.1:80` or `[fe80::1%2]:80`;
+    /// `Unix socket PATH`; or `abstract Unix socket @NAME`, with each byte of the
+    /// name that is not printable ASCII escaped, such as `\x00`.
+    #[must_use]
+    pub fn text(
+        &self,
+        path: impl Fn(&Path) -> String,
+    ) -> String {
+        match self {
+            Self::Ipv4 { address, port } => {
+                std::net::SocketAddrV4::new((*address).into(), *port).to_string()
+            },
+            Self::Ipv6 {
+                address,
+                port,
+                scope,
+            } => std::net::SocketAddrV6::new((*address).into(), *port, 0, *scope).to_string(),
+            Self::UnixPath { path: socket } => format!("Unix socket {}", path(socket.as_path())),
+            Self::UnixAbstract { name } => {
+                format!("abstract Unix socket @{}", name.escape_ascii())
+            },
+        }
+    }
+}
+
+impl fmt::Display for Connection {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.write_str(&self.text(|path| path.display().to_string()))
+    }
+}
+
+/// The connections `connections` as text, each shown by [`Connection::text`] with
+/// `path`, in the order given: `127.0.0.1:80`, `127.0.0.1:80 and Unix socket
+/// /run/s`, or `a, b and c` for several, and `no connection` for none.
+#[must_use]
+pub fn connections_text(
+    connections: &[Connection],
+    path: impl Fn(&Path) -> String,
+) -> String {
+    let shown: Vec<String> = connections
+        .iter()
+        .map(|connection| connection.text(&path))
+        .collect();
+    match shown.split_last() {
+        None => "no connection".to_owned(),
+        Some((only, [])) => only.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -584,6 +1062,23 @@ pub enum NotCachedReason {
         #[n(0)]
         code: i32,
     },
+    /// Files changed during the run after the command first read them or ran them,
+    /// so the recorded states may not be what the command consumed.
+    #[n(5)]
+    ChangedAfterRead {
+        /// Each changed file, sorted by path.
+        #[n(0)]
+        files: Vec<ChangedRead>,
+    },
+    /// The command made system calls that the tracer does not know, and the build
+    /// did not ask to cache such results with `kizz build --cache-unknown-syscalls`.
+    #[n(6)]
+    UnknownSystemCalls {
+        /// The number of each such call, as the tracer's filter saw it, sorted and
+        /// without repeats.
+        #[n(0)]
+        numbers: Vec<u32>,
+    },
 }
 
 impl fmt::Display for NotCachedReason {
@@ -601,6 +1096,18 @@ impl fmt::Display for NotCachedReason {
             },
             Self::Incomplete { detail } => write!(f, "incompletely traced: {detail}"),
             Self::StartFailed { message } => write!(f, "could not start: {message}"),
+            Self::ChangedAfterRead { files } => {
+                f.write_str(&changed_reads_text(files, |path| {
+                    path.display().to_string()
+                }))
+            },
+            Self::UnknownSystemCalls { numbers } => {
+                write!(
+                    f,
+                    "the command made {}, which the tracer does not know",
+                    system_call_numbers(numbers)
+                )
+            },
         }
     }
 }
@@ -618,12 +1125,18 @@ pub enum RunReason {
     /// The step is marked `always`, and this was its one run in the build.
     #[n(1)]
     Always,
-    /// A record existed, and the cache check found these recorded paths changed.
+    /// A record existed, and the cache check found these recorded paths changed,
+    /// or these values of the machine state that the step names.
     #[n(2)]
     InputsChanged {
         /// Every difference, sorted by path.
         #[n(0)]
         differences: Vec<Difference>,
+        /// Every value of the machine state that the step names and that changed, in
+        /// the order of the step's names; empty when the check compared none, or
+        /// none changed.
+        #[n(1)]
+        machine: Vec<MachineChange>,
     },
     /// The step's previous run could not be cached, and the cache check found these
     /// paths it touched changed since. In the build of that run, the check compares
@@ -638,6 +1151,14 @@ pub enum RunReason {
         #[n(1)]
         differences: Vec<Difference>,
     },
+    /// The step's task is marked `cache=never`, so every command of the task runs as
+    /// if it were marked `always`, and this was its one run in the build.
+    #[n(4)]
+    TaskCacheNever,
+    /// `kizz run --no-cache` was given, so the step ran although its record may
+    /// have been a cache hit, and this was its one run in the run of the task.
+    #[n(5)]
+    RunNoCache,
 }
 
 /// What is recorded about one run of a step, by step key, and the tasks that own
@@ -704,6 +1225,23 @@ pub struct StepRecord {
     /// A record with no owner is no task's entry, so no path reset changes it.
     #[n(12)]
     pub owners: BTreeSet<TaskId>,
+    /// The number of each system call that the command made and that the tracer
+    /// does not know, sorted and without repeats, whether the result was cached or
+    /// not: `kizz build --cache-unknown-syscalls` caches such a result, and without it
+    /// the record is marked with [`NotCachedReason::UnknownSystemCalls`] unless
+    /// another reason applies.
+    #[n(13)]
+    pub unknown_system_calls: Vec<u32>,
+    /// Every connection that the command made to an IPv4 or IPv6 address or to a
+    /// Unix socket, sorted and without repeats, whether the result was cached or
+    /// not. Connections never keep a result out of the cache.
+    #[n(14)]
+    pub connections: Vec<Connection>,
+    /// The machine and process state that the command started with, which the
+    /// engine queries right before it looks the program up and runs it, whether or
+    /// not the step names any part of it.
+    #[n(15)]
+    pub machine: MachineStateRecord,
 }
 
 impl Record for StepRecord {
@@ -737,11 +1275,17 @@ impl<'b, C> Decode<'b, C> for ProgramPath {
 
 /// Unit tests for the encoding of step records.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
+    use crate::machine::{DiskRecord, FileSystemRecord, KernelRecord, LimitRecord, MemoryRecord};
 
-    /// A step record with one observation of each state.
-    fn record() -> StepRecord {
+    /// One path state of each kind, with both kinds of directory state.
+    fn states() -> Vec<PathState> {
         let meta = FileMeta {
             size: 3,
             mtime_nanos: -1,
@@ -749,23 +1293,51 @@ mod tests {
             inode: 4,
             device: 5,
             mode: 0o100_644,
+            owner: Owner {
+                uid: 1_000,
+                gid: 100,
+            },
         };
-        let states = vec![
+        vec![
             PathState::Absent,
             PathState::File {
                 meta,
                 hash: Some(ContentHash([1; 32])),
             },
             PathState::File { meta, hash: None },
-            PathState::Directory { listing: None },
             PathState::Directory {
+                mode: 0o041_777,
+                owner: Owner { uid: 0, gid: 0 },
+                listing: None,
+                times: Times {
+                    mtime_nanos: -3,
+                    ctime_nanos: 4,
+                },
+            },
+            PathState::Directory {
+                mode: 0o040_750,
+                owner: Owner {
+                    uid: 1_000,
+                    gid: 1_000,
+                },
                 listing: Some(Listing {
                     hash: ContentHash([2; 32]),
-                    entries: Some(vec![DirEntry {
-                        name: b"a\xff".to_vec(),
-                        kind: EntryKind::Symlink,
-                    }]),
+                    entries: Some(vec![
+                        DirEntry {
+                            name: b"a\xff".to_vec(),
+                            kind: EntryKind::Symlink,
+                        },
+                        DirEntry {
+                            name: b"0".to_vec(),
+                            kind: EntryKind::File,
+                        },
+                    ]),
+                    sorted_hash: ContentHash([3; 32]),
                 }),
+                times: Times {
+                    mtime_nanos: 5,
+                    ctime_nanos: 6,
+                },
             },
             PathState::Symlink {
                 target: PathBuf::from("../x"),
@@ -776,7 +1348,34 @@ mod tests {
             },
             PathState::Untracked,
             PathState::Inaccessible { errno: 13 },
-        ];
+        ]
+    }
+
+    /// The recorded attributes of a symbolic link with one attribute of its own and
+    /// two of what it points to, one with a name that is not UTF-8.
+    fn attributes() -> Attributes {
+        Attributes {
+            own: Some(vec![Attribute {
+                name: b"user.link".to_vec(),
+                hash: ContentHash([6; 32]),
+            }]),
+            pointee: Some(vec![
+                Attribute {
+                    name: b"security.selinux".to_vec(),
+                    hash: ContentHash([7; 32]),
+                },
+                Attribute {
+                    name: b"user.\xff".to_vec(),
+                    hash: ContentHash([8; 32]),
+                },
+            ]),
+        }
+    }
+
+    /// A step record with one observation of each state, two of them with recorded
+    /// extended attributes.
+    fn record() -> StepRecord {
+        let states = states();
         StepRecord {
             spec: StepSpecRecord {
                 program_hash: ContentHash([9; 32]),
@@ -793,19 +1392,24 @@ mod tests {
                 always: false,
                 ignore: vec!["re:x".to_owned()],
                 track: vec!["/proc/cpuinfo".to_owned()],
+                timestamps: true,
                 expect: Some(vec![0, 1]),
                 occurrence: 2,
+                machine: vec!["kernel".to_owned(), "memory".to_owned()],
             },
             program: Some(ProgramPath(PathBuf::from("/usr/bin/cc"))),
             observations: states
                 .into_iter()
                 .enumerate()
                 .map(|(index, state)| {
+                    let xattr = matches!(index, 1 | 5);
+                    let bits = if xattr { AccessBits::XATTR } else { 0 };
                     Observation {
                         path: PathBuf::from(format!("/p/{index}")),
-                        access: AccessBits(AccessBits::READ | AccessBits::PROBE),
+                        access: AccessBits(AccessBits::READ | AccessBits::PROBE | bits),
                         tracked: index == 1,
                         state,
+                        attributes: xattr.then(attributes),
                     }
                 })
                 .collect(),
@@ -836,6 +1440,46 @@ mod tests {
                 },
             ]
             .into(),
+            unknown_system_calls: vec![400, 1_000_000],
+            connections: connections(),
+            machine: machine_state(),
+        }
+    }
+
+    /// A machine state with every part.
+    fn machine_state() -> MachineStateRecord {
+        MachineStateRecord {
+            kernel: Some(KernelRecord {
+                release: "6.12.0".to_owned(),
+                version: "#1 SMP".to_owned(),
+            }),
+            limits: Some(vec![LimitRecord {
+                resource: "nofile".to_owned(),
+                soft: Some(1_024),
+                hard: None,
+            }]),
+            affinity: Some(vec![0, 1]),
+            memory: Some(MemoryRecord {
+                total: 8_000,
+                available: 4_000,
+            }),
+            filesystem: Some(FileSystemRecord {
+                kind: 0xEF53,
+                flags: 0x1020,
+            }),
+            disk: Some(DiskRecord {
+                size: 100_000,
+                free: 40_000,
+            }),
+        }
+    }
+
+    /// A change of the kernel release.
+    fn kernel_change() -> MachineChange {
+        MachineChange {
+            value: "kernel release".to_owned(),
+            old: "6.12.0".to_owned(),
+            new: "6.13.0".to_owned(),
         }
     }
 
@@ -845,10 +1489,56 @@ mod tests {
             Change::Appeared,
             Change::Disappeared,
             Change::Type,
+            Change::Permissions {
+                old: 0o4755,
+                new: 0o644,
+            },
+            Change::Owner {
+                old: Owner {
+                    uid: 1_000,
+                    gid: 1_000,
+                },
+                new: Owner { uid: 0, gid: 0 },
+            },
+            Change::Timestamps {
+                old: Times {
+                    mtime_nanos: 1,
+                    ctime_nanos: -2,
+                },
+                new: Times {
+                    mtime_nanos: 3,
+                    ctime_nanos: 4,
+                },
+            },
             Change::Size { old: 1, new: 2 },
             Change::Content,
             Change::Metadata,
-            Change::Entries,
+            Change::Entries {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                retyped: Vec::new(),
+            },
+            Change::Entries {
+                appeared: vec![DirEntry {
+                    name: b"new\xff".to_vec(),
+                    kind: EntryKind::Directory,
+                }],
+                disappeared: vec![DirEntry {
+                    name: b"old".to_vec(),
+                    kind: EntryKind::File,
+                }],
+                retyped: vec![DirEntry {
+                    name: b"kind".to_vec(),
+                    kind: EntryKind::Symlink,
+                }],
+            },
+            Change::Order,
+            attributes_change(),
+            Change::Attributes {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                changed: Vec::new(),
+            },
             Change::LinkTarget {
                 old: PathBuf::from("a"),
                 new: PathBuf::from("b\u{e9}"),
@@ -872,12 +1562,20 @@ mod tests {
             NotCachedReason::StartFailed {
                 message: "out of memory".to_owned(),
             },
+            changed_after_read(),
+            unknown_system_calls(),
         ];
         let mut reasons = vec![
             RunReason::NeverRun,
             RunReason::Always,
+            RunReason::TaskCacheNever,
             RunReason::InputsChanged {
                 differences: differences.clone(),
+                machine: vec![kernel_change()],
+            },
+            RunReason::InputsChanged {
+                differences: differences.clone(),
+                machine: Vec::new(),
             },
         ];
         reasons.extend(whys.into_iter().map(|why| {
@@ -899,6 +1597,52 @@ mod tests {
         }
     }
 
+    /// The reason of a step whose task is marked `cache=never` encodes differently
+    /// from every other run reason, and a record that holds it round-trips.
+    #[test]
+    fn the_task_cache_never_reason_encodes_and_round_trips() {
+        let reasons = reasons();
+        let encoded: Vec<Vec<u8>> = reasons
+            .iter()
+            .map(|reason| minicbor::to_vec(reason).unwrap())
+            .collect();
+        let never = minicbor::to_vec(&RunReason::TaskCacheNever).unwrap();
+        assert_eq!(
+            minicbor::decode::<RunReason>(&never).unwrap(),
+            RunReason::TaskCacheNever
+        );
+        let matching: Vec<&RunReason> = reasons
+            .iter()
+            .zip(&encoded)
+            .filter(|(_, bytes)| **bytes == never)
+            .map(|(reason, _)| reason)
+            .collect();
+        assert_eq!(matching, [&RunReason::TaskCacheNever]);
+        let mut record = record();
+        record.reason = RunReason::TaskCacheNever;
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+    }
+
+    /// The reason of a step that ran because `kizz run --no-cache` was given encodes
+    /// differently from every other run reason, and a record that holds it
+    /// round-trips.
+    #[test]
+    fn the_run_no_cache_reason_encodes_and_round_trips() {
+        let no_cache = minicbor::to_vec(&RunReason::RunNoCache).unwrap();
+        assert_eq!(
+            minicbor::decode::<RunReason>(&no_cache).unwrap(),
+            RunReason::RunNoCache
+        );
+        for reason in reasons() {
+            assert_ne!(minicbor::to_vec(&reason).unwrap(), no_cache, "{reason:?}");
+        }
+        let mut record = record();
+        record.reason = RunReason::RunNoCache;
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+    }
+
     #[test]
     fn exits_and_not_cached_markers_round_trip() {
         let exits = [
@@ -918,6 +1662,8 @@ mod tests {
             Some(NotCachedReason::StartFailed {
                 message: "out of memory".to_owned(),
             }),
+            Some(changed_after_read()),
+            Some(unknown_system_calls()),
         ];
         for exit in exits {
             for not_cached in markers.clone() {
@@ -930,16 +1676,66 @@ mod tests {
         }
     }
 
+    /// A timestamp change names each time that changed, old and new, in seconds
+    /// with nine decimals.
+    #[test]
+    fn timestamp_changes_display() {
+        let times = |mtime_nanos, ctime_nanos| {
+            Times {
+                mtime_nanos,
+                ctime_nanos,
+            }
+        };
+        let shown: Vec<String> = [
+            (
+                times(1_700_000_000_000_000_000, 1_700_000_000_000_000_000),
+                times(1_700_000_001_500_000_000, 1_700_000_000_000_000_000),
+            ),
+            (times(1, 2), times(1, -1_000_000_001)),
+            (times(0, 0), times(1, 2)),
+        ]
+        .into_iter()
+        .map(|(old, new)| Change::Timestamps { old, new }.to_string())
+        .collect();
+        assert_eq!(shown, [
+            "timestamps changed: modification time from 1700000000.000000000 to \
+             1700000001.500000000",
+            "timestamps changed: change time from 0.000000002 to -1.000000001",
+            "timestamps changed: modification time from 0.000000000 to 0.000000001, change \
+             time from 0.000000000 to 0.000000002",
+        ]);
+    }
+
     #[test]
     fn changes_and_reasons_display() {
         let shown: Vec<String> = [
             Change::Appeared,
             Change::Disappeared,
             Change::Type,
+            Change::Permissions {
+                old: 0o755,
+                new: 0o644,
+            },
+            Change::Permissions {
+                old: 0o7777,
+                new: 0,
+            },
+            Change::Owner {
+                old: Owner {
+                    uid: 1_000,
+                    gid: 1_000,
+                },
+                new: Owner { uid: 0, gid: 0 },
+            },
             Change::Size { old: 1, new: 2 },
             Change::Content,
             Change::Metadata,
-            Change::Entries,
+            Change::Entries {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                retyped: Vec::new(),
+            },
+            Change::Order,
             Change::LinkTarget {
                 old: PathBuf::from("a"),
                 new: PathBuf::from("b"),
@@ -952,10 +1748,14 @@ mod tests {
             "appeared",
             "disappeared",
             "type changed",
+            "permissions changed from 0755 to 0644",
+            "permissions changed from 7777 to 0000",
+            "owner changed from 1000:1000 to 0:0",
             "size changed from 1 to 2 bytes",
             "content changed",
             "metadata changed",
             "directory entries changed",
+            "the order of its entries changed",
             "link target changed from a to b",
         ]);
         let difference = Difference {
@@ -973,6 +1773,18 @@ mod tests {
             NotCachedReason::StartFailed {
                 message: "out of memory".to_owned(),
             },
+            changed_after_read(),
+            NotCachedReason::ChangedAfterRead {
+                files: vec![ChangedRead {
+                    path: PathBuf::from("/p/in"),
+                    written: false,
+                }],
+            },
+            unknown_system_calls(),
+            NotCachedReason::UnknownSystemCalls { numbers: vec![400] },
+            NotCachedReason::UnknownSystemCalls {
+                numbers: vec![1, 2, 3],
+            },
         ]
         .iter()
         .map(ToString::to_string)
@@ -983,7 +1795,15 @@ mod tests {
             "interrupted, and exited with code 130",
             "incompletely traced: lost a process",
             "could not start: out of memory",
+            "2 files changed after the command read them: /p/a\u{e9} (the command wrote it), \
+             /p/b (something else changed it while the command ran)",
+            "a file changed after the command read it: /p/in (something else changed it while \
+             the command ran)",
+            "the command made system calls 400 and 1000000, which the tracer does not know",
+            "the command made system call 400, which the tracer does not know",
+            "the command made system calls 1, 2 and 3, which the tracer does not know",
         ]);
+        assert_eq!(system_call_numbers(&[]), "no system call");
     }
 
     #[test]
@@ -998,9 +1818,9 @@ mod tests {
     #[test]
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
-        // A definite-length array of thirteen fields, then the specification as a
-        // definite-length array of twelve.
-        assert_eq!(bytes.get(..2), Some(&[0x8D, 0x8C][..]));
+        // A definite-length array of sixteen fields, then the specification as a
+        // definite-length array of fourteen.
+        assert_eq!(bytes.get(..2), Some(&[0x90, 0x8E][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
@@ -1023,16 +1843,40 @@ mod tests {
             ("/a\u{e9}/kizz.md", 3),
             ("/b/kizz.md", 0)
         ]);
-        // The owners are the last field, a definite-length array of three task
-        // identities, each an array of the file's bytes and the block index.
+        // The owners come before the unknown system calls, the connections and the
+        // machine state, a definite-length array of three task identities, each an
+        // array of the file's bytes and the block index.
         let owners = minicbor::to_vec(&record.owners).unwrap();
-        assert!(bytes.ends_with(&owners));
+        let numbers = minicbor::to_vec(&record.unknown_system_calls).unwrap();
+        let connections = minicbor::to_vec(&record.connections).unwrap();
+        let machine = minicbor::to_vec(&record.machine).unwrap();
+        assert!(
+            bytes.ends_with(
+                &[
+                    owners.as_slice(),
+                    numbers.as_slice(),
+                    connections.as_slice(),
+                    machine.as_slice()
+                ]
+                .concat()
+            )
+        );
         assert_eq!(owners.first(), Some(&0x83));
         // A record with no owner keeps an empty set.
         let mut unowned = record;
         unowned.owners.clear();
         let bytes = minicbor::to_vec(&unowned).unwrap();
-        assert_eq!(bytes.last(), Some(&0x80));
+        assert!(
+            bytes.ends_with(
+                &[
+                    &[0x80_u8][..],
+                    numbers.as_slice(),
+                    connections.as_slice(),
+                    machine.as_slice()
+                ]
+                .concat()
+            )
+        );
         assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), unowned);
     }
 
@@ -1043,6 +1887,552 @@ mod tests {
         assert!(bits.contains(AccessBits::EXEC));
         assert!(!bits.contains(AccessBits::PROBE));
         assert_eq!(minicbor::to_vec(bits).unwrap(), [0x11]);
+    }
+
+    /// File states carry the owner as the last field of their metadata, directory
+    /// states carry their mode, owner, and times whether or not they were listed,
+    /// and both encode deterministically and round-trip.
+    #[test]
+    fn file_and_directory_states_carry_mode_owner_and_times() {
+        let owner = Owner {
+            uid: 1_000,
+            gid: 100,
+        };
+        let meta = FileMeta {
+            size: 3,
+            mtime_nanos: 1,
+            ctime_nanos: 2,
+            inode: 4,
+            device: 5,
+            mode: 0o104_755,
+            owner,
+        };
+        let owner_bytes = minicbor::to_vec(owner).unwrap();
+        assert_eq!(owner_bytes, [0x82, 0x19, 0x03, 0xE8, 0x18, 0x64]);
+        let meta_bytes = minicbor::to_vec(meta).unwrap();
+        // A definite-length array of seven fields, ending with the owner.
+        assert_eq!(meta_bytes.first(), Some(&0x87));
+        assert!(meta_bytes.ends_with(&owner_bytes));
+        let times = meta.times();
+        assert_eq!(times, Times {
+            mtime_nanos: 1,
+            ctime_nanos: 2,
+        });
+        let times_bytes = minicbor::to_vec(times).unwrap();
+        // A definite-length array of the modification and change times.
+        assert_eq!(times_bytes, [0x82, 0x01, 0x02]);
+
+        let file = PathState::File {
+            meta,
+            hash: Some(ContentHash([1; 32])),
+        };
+        let checked = PathState::Directory {
+            mode: 0o041_777,
+            owner,
+            listing: None,
+            times,
+        };
+        let listed = PathState::Directory {
+            mode: 0o040_755,
+            owner,
+            listing: Some(Listing {
+                hash: ContentHash([2; 32]),
+                entries: Some(Vec::new()),
+                sorted_hash: ContentHash([2; 32]),
+            }),
+            times,
+        };
+        for state in [file, checked.clone(), listed] {
+            let first = minicbor::to_vec(&state).unwrap();
+            assert_eq!(first, minicbor::to_vec(&state).unwrap());
+            assert_eq!(minicbor::decode::<PathState>(&first).unwrap(), state);
+        }
+        // The mode, the owner, and each time reach the bytes of a directory state,
+        // whose times are its last field.
+        let other_owner = PathState::Directory {
+            mode: 0o041_777,
+            owner: Owner { uid: 0, gid: 100 },
+            listing: None,
+            times,
+        };
+        let other_mode = PathState::Directory {
+            mode: 0o040_777,
+            owner,
+            listing: None,
+            times,
+        };
+        let later_modification = PathState::Directory {
+            mode: 0o041_777,
+            owner,
+            listing: None,
+            times: Times {
+                mtime_nanos: 7,
+                ..times
+            },
+        };
+        let later_change = PathState::Directory {
+            mode: 0o041_777,
+            owner,
+            listing: None,
+            times: Times {
+                ctime_nanos: 7,
+                ..times
+            },
+        };
+        let checked = minicbor::to_vec(&checked).unwrap();
+        assert!(checked.ends_with(&times_bytes));
+        for other in [other_owner, other_mode, later_modification, later_change] {
+            assert_ne!(checked, minicbor::to_vec(&other).unwrap());
+        }
+        assert_eq!(permission_bits(meta.mode), 0o4755);
+        assert_eq!(PERMISSION_BITS, 0o7777);
+    }
+
+    /// The `timestamps` option comes right before the `machine` names, the last
+    /// field of the specification's encoding, and both values round-trip.
+    #[test]
+    fn the_timestamps_option_encodes_deterministically_and_round_trips() {
+        for timestamps in [false, true] {
+            let mut spec = record().spec;
+            spec.timestamps = timestamps;
+            spec.machine = Vec::new();
+            let first = minicbor::to_vec(&spec).unwrap();
+            assert_eq!(first, minicbor::to_vec(&spec).unwrap());
+            let expected = [if timestamps { 0xF5 } else { 0xF4 }, 0x80];
+            assert_eq!(
+                first.get(first.len().saturating_sub(2)..),
+                Some(&expected[..])
+            );
+            assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
+        }
+    }
+
+    /// The `machine` names are the last field of the specification's encoding, an
+    /// array of text strings; and the machine state is the last field of the
+    /// record. Both encode deterministically and round-trip, a state whose parts
+    /// could not be read included.
+    #[test]
+    fn machine_names_and_state_encode_deterministically_and_round_trip() {
+        let mut spec = record().spec;
+        let first = minicbor::to_vec(&spec).unwrap();
+        assert_eq!(first, minicbor::to_vec(&spec).unwrap());
+        assert!(first.ends_with(b"\x82\x66kernel\x66memory"), "{first:x?}");
+        assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
+        spec.machine = vec!["disk".to_owned()];
+        let other = minicbor::to_vec(&spec).unwrap();
+        assert!(other.ends_with(b"\x81\x64disk"), "{other:x?}");
+
+        let state = minicbor::to_vec(machine_state()).unwrap();
+        let mut record = record();
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert!(bytes.ends_with(&state));
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+        record.machine = MachineStateRecord::default();
+        let unknown = minicbor::to_vec(&record).unwrap();
+        assert_eq!(unknown, minicbor::to_vec(&record).unwrap());
+        assert_eq!(minicbor::decode::<StepRecord>(&unknown).unwrap(), record);
+    }
+
+    /// An entries change names what appeared, disappeared, and changed type, each
+    /// group only when it is not empty and with at most ten names, and an order
+    /// change says that only the order changed.
+    #[test]
+    fn entries_and_order_changes_display() {
+        let entry = |name: &str| {
+            DirEntry {
+                name: name.as_bytes().to_vec(),
+                kind: EntryKind::File,
+            }
+        };
+        let many: Vec<DirEntry> = (0..12)
+            .map(|index| entry(&format!("f{index:02}")))
+            .collect();
+        let shown: Vec<String> = [
+            Change::Entries {
+                appeared: vec![entry("b.txt")],
+                disappeared: vec![entry("a.txt"), entry("c.txt")],
+                retyped: vec![entry("d")],
+            },
+            Change::Entries {
+                appeared: Vec::new(),
+                disappeared: vec![entry("gone")],
+                retyped: Vec::new(),
+            },
+            Change::Entries {
+                appeared: many,
+                disappeared: Vec::new(),
+                retyped: vec![DirEntry {
+                    name: b"x\xff".to_vec(),
+                    kind: EntryKind::Directory,
+                }],
+            },
+            Change::Order,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let many_and_invalid = format!(
+            "directory entries changed: `f00`, `f01`, `f02`, `f03`, `f04`, `f05`, `f06`, `f07`, \
+             `f08`, `f09` and 2 more appeared; `x{}` changed type",
+            char::REPLACEMENT_CHARACTER
+        );
+        assert_eq!(shown, [
+            "directory entries changed: `b.txt` appeared; `a.txt`, `c.txt` disappeared; `d` \
+             changed type",
+            "directory entries changed: `gone` disappeared",
+            many_and_invalid.as_str(),
+            "the order of its entries changed",
+        ]);
+    }
+
+    /// A listing keeps its entries in the order given, encodes deterministically as
+    /// a definite-length array of the ordered hash, the entries, and the sorted
+    /// hash, and round-trips, with or without its entries.
+    #[test]
+    fn listings_keep_their_order_encode_deterministically_and_round_trip() {
+        let entries = vec![
+            DirEntry {
+                name: b"z".to_vec(),
+                kind: EntryKind::File,
+            },
+            DirEntry {
+                name: b"a".to_vec(),
+                kind: EntryKind::Directory,
+            },
+        ];
+        let listed = Listing {
+            hash: ContentHash([4; 32]),
+            entries: Some(entries.clone()),
+            sorted_hash: ContentHash([5; 32]),
+        };
+        let large = Listing {
+            entries: None,
+            ..listed.clone()
+        };
+        for listing in [&listed, &large] {
+            let first = minicbor::to_vec(listing).unwrap();
+            assert_eq!(first, minicbor::to_vec(listing).unwrap());
+            assert_eq!(first.first(), Some(&0x83));
+            assert!(first.ends_with(&minicbor::to_vec(ContentHash([5; 32])).unwrap()));
+            assert_eq!(&minicbor::decode::<Listing>(&first).unwrap(), listing);
+        }
+        let decoded = minicbor::decode::<Listing>(&minicbor::to_vec(&listed).unwrap()).unwrap();
+        assert_eq!(decoded.entries, Some(entries.clone()));
+        // The same entries in another order encode differently.
+        let reversed = Listing {
+            entries: Some(entries.into_iter().rev().collect()),
+            ..listed.clone()
+        };
+        assert_ne!(
+            minicbor::to_vec(&listed).unwrap(),
+            minicbor::to_vec(&reversed).unwrap()
+        );
+    }
+
+    /// The reason of a run in which two files changed after the command read them:
+    /// one that the command wrote, with a path that is not ASCII, and one that
+    /// something else changed.
+    fn changed_after_read() -> NotCachedReason {
+        NotCachedReason::ChangedAfterRead {
+            files: vec![
+                ChangedRead {
+                    path: PathBuf::from("/p/a\u{e9}"),
+                    written: true,
+                },
+                ChangedRead {
+                    path: PathBuf::from("/p/b"),
+                    written: false,
+                },
+            ],
+        }
+    }
+
+    /// The reason of a run that made the system calls 400 and 1,000,000, which the
+    /// tracer does not know.
+    fn unknown_system_calls() -> NotCachedReason {
+        NotCachedReason::UnknownSystemCalls {
+            numbers: vec![400, 1_000_000],
+        }
+    }
+
+    /// The reason for unknown system calls encodes deterministically, as variant 6
+    /// with a definite-length array of the numbers, and round-trips, alone and as a
+    /// record's marker; the numbers of a record encode as its field 13, after the
+    /// owners, and round-trip with a marker and without one.
+    #[test]
+    fn unknown_system_calls_encode_deterministically_and_round_trip() {
+        let why = unknown_system_calls();
+        let first = minicbor::to_vec(&why).unwrap();
+        assert_eq!(first, minicbor::to_vec(why.clone()).unwrap());
+        // The variant index, then its one field: an array of 400 and 1,000,000.
+        assert_eq!(first, [
+            0x82, 0x06, 0x81, 0x82, 0x19, 0x01, 0x90, 0x1A, 0x00, 0x0F, 0x42, 0x40
+        ]);
+        assert_eq!(minicbor::decode::<NotCachedReason>(&first).unwrap(), why);
+        let numbers = minicbor::to_vec(vec![400_u32, 1_000_000]).unwrap();
+        let connections = minicbor::to_vec(connections()).unwrap();
+        let machine = minicbor::to_vec(machine_state()).unwrap();
+        for not_cached in [Some(why), None] {
+            let mut record = record();
+            record.not_cached = not_cached;
+            let bytes = minicbor::to_vec(&record).unwrap();
+            assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+            assert!(
+                bytes.ends_with(
+                    &[
+                        numbers.as_slice(),
+                        connections.as_slice(),
+                        machine.as_slice()
+                    ]
+                    .concat()
+                )
+            );
+            let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
+            assert_eq!(decoded, record);
+            assert_eq!(decoded.unknown_system_calls, [400, 1_000_000]);
+        }
+        let mut none = record();
+        none.unknown_system_calls = Vec::new();
+        let bytes = minicbor::to_vec(&none).unwrap();
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), none);
+    }
+
+    /// One connection of each kind, sorted: an IPv4 address, an IPv6 address with a
+    /// scope, a Unix socket by path, and an abstract name with a zero byte.
+    fn connections() -> Vec<Connection> {
+        vec![
+            Connection::Ipv4 {
+                address: [127, 0, 0, 1],
+                port: 80,
+            },
+            Connection::Ipv6 {
+                address: [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                port: 443,
+                scope: 2,
+            },
+            Connection::UnixPath {
+                path: PathBuf::from("/run/s"),
+            },
+            Connection::UnixAbstract {
+                name: b"k\0x".to_vec(),
+            },
+        ]
+    }
+
+    /// Each connection encodes deterministically, as its variant index with a
+    /// definite-length array of its fields, addresses, paths and names as byte
+    /// strings, and round-trips; the connections of a record encode as its field
+    /// 14, after the unknown system calls, and round-trip with a marker and
+    /// without one, and with no connection at all.
+    #[test]
+    fn connections_encode_deterministically_and_round_trip() {
+        let [ipv4, ipv6, path, abstract_name] = connections().try_into().unwrap();
+        let expected: [(&Connection, Vec<u8>); 4] = [
+            (&ipv4, vec![
+                0x82, 0x00, 0x82, 0x44, 0x7F, 0x00, 0x00, 0x01, 0x18, 0x50,
+            ]),
+            (&ipv6, {
+                let mut bytes = vec![0x82, 0x01, 0x83, 0x50, 0xFE, 0x80];
+                bytes.extend([0; 13]);
+                bytes.extend([0x01, 0x19, 0x01, 0xBB, 0x02]);
+                bytes
+            }),
+            (&path, vec![
+                0x82, 0x02, 0x81, 0x46, b'/', b'r', b'u', b'n', b'/', b's',
+            ]),
+            (&abstract_name, vec![
+                0x82, 0x03, 0x81, 0x43, b'k', 0x00, b'x',
+            ]),
+        ];
+        for (connection, bytes) in expected {
+            let first = minicbor::to_vec(connection).unwrap();
+            assert_eq!(first, minicbor::to_vec(connection.clone()).unwrap());
+            assert_eq!(first, bytes, "{connection}");
+            assert_eq!(minicbor::decode::<Connection>(&first).unwrap(), *connection);
+        }
+        let listed = minicbor::to_vec(connections()).unwrap();
+        assert_eq!(listed.first(), Some(&0x84));
+        let machine = minicbor::to_vec(machine_state()).unwrap();
+        for not_cached in [Some(NotCachedReason::Signaled { signal: 9 }), None] {
+            let mut record = record();
+            record.not_cached = not_cached;
+            let bytes = minicbor::to_vec(&record).unwrap();
+            assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+            assert!(bytes.ends_with(&[listed.as_slice(), machine.as_slice()].concat()));
+            let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
+            assert_eq!(decoded, record);
+            assert_eq!(decoded.connections, connections());
+        }
+        let mut none = record();
+        none.connections = Vec::new();
+        let bytes = minicbor::to_vec(&none).unwrap();
+        assert!(bytes.ends_with(&[&[0x80][..], machine.as_slice()].concat()));
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), none);
+    }
+
+    /// Connections read as an address and port, or as a Unix socket by path or
+    /// abstract name with its unprintable bytes escaped, alone and in lists.
+    #[test]
+    fn connections_read_as_text() {
+        let shown: Vec<String> = connections().iter().map(ToString::to_string).collect();
+        assert_eq!(shown, [
+            "127.0.0.1:80",
+            "[fe80::1%2]:443",
+            "Unix socket /run/s",
+            "abstract Unix socket @k\\x00x",
+        ]);
+        let relative = |path: &Path| {
+            path.strip_prefix("/run")
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        assert_eq!(connections_text(&[], relative), "no connection");
+        assert_eq!(
+            connections_text(&connections()[2..3], relative),
+            "Unix socket s"
+        );
+        assert_eq!(
+            connections_text(&connections()[..2], relative),
+            "127.0.0.1:80 and [fe80::1%2]:443"
+        );
+        assert_eq!(
+            connections_text(&connections(), relative),
+            "127.0.0.1:80, [fe80::1%2]:443, Unix socket s and abstract Unix socket @k\\x00x"
+        );
+    }
+
+    /// The reason for files that changed after the command read them encodes
+    /// deterministically, as variant 5 with a definite-length array of the files,
+    /// each a path as a byte string and whether the command wrote it, and
+    /// round-trips, alone and as a record's marker.
+    #[test]
+    fn changed_after_read_encodes_deterministically_and_round_trips() {
+        let why = changed_after_read();
+        let first = minicbor::to_vec(&why).unwrap();
+        assert_eq!(first, minicbor::to_vec(why.clone()).unwrap());
+        let file = minicbor::to_vec(ChangedRead {
+            path: PathBuf::from("/p/b"),
+            written: false,
+        })
+        .unwrap();
+        assert_eq!(file, b"\x82\x44/p/b\xf4");
+        // The variant index, then its one field: an array of two files.
+        assert_eq!(first.get(..3), Some(&[0x82, 0x05, 0x81][..]));
+        assert_eq!(first.get(3), Some(&0x82));
+        assert!(first.ends_with(&file));
+        assert_eq!(minicbor::decode::<NotCachedReason>(&first).unwrap(), why);
+        let mut record = record();
+        record.not_cached = Some(why);
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+        assert_eq!(minicbor::decode::<StepRecord>(&bytes).unwrap(), record);
+    }
+
+    /// An attribute named `name` whose value hashes to `byte` repeated.
+    fn attribute(
+        name: &[u8],
+        byte: u8,
+    ) -> Attribute {
+        Attribute {
+            name: name.to_vec(),
+            hash: ContentHash([byte; 32]),
+        }
+    }
+
+    /// An attribute change in which one attribute appeared, one disappeared, and
+    /// one, whose name is not UTF-8, changed value.
+    fn attributes_change() -> Change {
+        Change::Attributes {
+            appeared: vec![attribute(b"user.new", 1)],
+            disappeared: vec![attribute(b"user.old", 2)],
+            changed: vec![attribute(b"user.\xff", 3)],
+        }
+    }
+
+    /// Recorded attributes encode deterministically, each attribute as a
+    /// definite-length array of its name as a byte string and its hash, and
+    /// round-trip; attributes that could not be read differ from no attributes; and
+    /// the attribute change encodes as variant 12 and round-trips, alone and in a
+    /// record, as do observations with and without attributes.
+    #[test]
+    fn attributes_and_their_changes_encode_deterministically_and_round_trip() {
+        let mut expected = vec![0x82, 0x46];
+        expected.extend_from_slice(b"user.a");
+        expected.extend_from_slice(&[0x58, 0x20]);
+        expected.extend_from_slice(&[9; 32]);
+        assert_eq!(minicbor::to_vec(attribute(b"user.a", 9)).unwrap(), expected);
+        let none = Attributes {
+            own: Some(Vec::new()),
+            pointee: None,
+        };
+        let unreadable = Attributes {
+            own: None,
+            pointee: None,
+        };
+        for recorded in [attributes(), none.clone(), unreadable.clone()] {
+            let first = minicbor::to_vec(&recorded).unwrap();
+            assert_eq!(first, minicbor::to_vec(recorded.clone()).unwrap());
+            assert_eq!(minicbor::decode::<Attributes>(&first).unwrap(), recorded);
+        }
+        assert_ne!(
+            minicbor::to_vec(&none).unwrap(),
+            minicbor::to_vec(&unreadable).unwrap()
+        );
+
+        let change = attributes_change();
+        let first = minicbor::to_vec(&change).unwrap();
+        assert_eq!(first, minicbor::to_vec(change.clone()).unwrap());
+        assert_eq!(first.get(..3), Some(&[0x82, 0x0C, 0x83][..]));
+        assert_eq!(minicbor::decode::<Change>(&first).unwrap(), change);
+
+        let record = record();
+        let bytes = minicbor::to_vec(&record).unwrap();
+        assert_eq!(bytes, minicbor::to_vec(&record).unwrap());
+        let decoded = minicbor::decode::<StepRecord>(&bytes).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.observations[5].attributes, Some(attributes()));
+        assert!(decoded.observations[5].access.contains(AccessBits::XATTR));
+        assert_eq!(decoded.observations[0].attributes, None);
+    }
+
+    /// An attribute change names what appeared, disappeared, and changed value,
+    /// each group only when it is not empty and with at most ten names, and says
+    /// only that the attributes changed when it names none.
+    #[test]
+    fn attribute_changes_display() {
+        let many: Vec<Attribute> = (0..12)
+            .map(|index| attribute(format!("user.{index:02}").as_bytes(), 0))
+            .collect();
+        let shown: Vec<String> = [
+            attributes_change(),
+            Change::Attributes {
+                appeared: Vec::new(),
+                disappeared: Vec::new(),
+                changed: Vec::new(),
+            },
+            Change::Attributes {
+                appeared: Vec::new(),
+                disappeared: many,
+                changed: vec![attribute(b"user.x", 1)],
+            },
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let not_utf8 = format!(
+            "extended attributes changed: `user.new` appeared; `user.old` disappeared; `user.{}` \
+             changed",
+            char::REPLACEMENT_CHARACTER
+        );
+        assert_eq!(shown, [
+            not_utf8.as_str(),
+            "extended attributes changed",
+            "extended attributes changed: `user.00`, `user.01`, `user.02`, `user.03`, `user.04`, \
+             `user.05`, `user.06`, `user.07`, `user.08`, `user.09` and 2 more disappeared; \
+             `user.x` changed",
+        ]);
+        assert_eq!(AccessBits::XATTR, 0b0010_0000);
     }
 
     #[test]

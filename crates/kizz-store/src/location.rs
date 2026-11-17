@@ -107,6 +107,11 @@ fn non_empty(value: Option<&OsStr>) -> Option<&OsStr> {
 
 /// Unit tests for the location rules.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use super::*;
 

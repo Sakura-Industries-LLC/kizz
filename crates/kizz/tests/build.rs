@@ -11,21 +11,37 @@
 //! their programs. The golden tests run with `--color never --no-banner`.
 //!
 //! Every task block in these projects starts with `env.inherit("PATH")`, so with a
-//! one-line body, the blocks of a `kizz.md` open on lines 3, 10, 17, and so on.
+//! one-line body, the blocks of a `kizz.md` open on lines 3, 10, 17, and so on;
+//! only the tests of a `run()` without `PATH` write a block that inherits nothing.
+
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, lock and print"
+)]
 
 use std::{
     error::Error,
+    ffi::CString,
     fs,
     io::{self, BufRead as _, BufReader, Lines},
+    net::{Ipv4Addr, TcpListener},
     os::unix::{
-        fs::{PermissionsExt as _, symlink},
+        ffi::OsStrExt as _,
+        fs::{MetadataExt as _, PermissionsExt as _, symlink},
         process::CommandExt as _,
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
+    time::SystemTime,
 };
 
-use kizz_store::{LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store};
+use kizz_store::{
+    Change, ChangedRead, Connection, LOCK_FILE_NAME, NotCachedReason, PathState, StepRecord, Store,
+    Times,
+};
 use tempfile::TempDir;
 
 /// The result of a test or a test helper.
@@ -318,6 +334,142 @@ fn explain_prints_the_full_reason_for_every_command() -> TestResult {
         ])
     );
     assert_eq!(second.stderr, "", "{second:?}");
+    Ok(())
+}
+
+/// The `kizz.md` of [`a_cache_never_task_runs_in_every_build`]: a task marked
+/// `cache=never` that reads `in.txt`, and a named task without targets that would
+/// write `deployed.txt`.
+const CACHE_NEVER_AND_NAMED: &str = "# Fresh
+
+```starlark ci cache=never
+env.inherit(\"PATH\")
+run(\"cat\", \"in.txt\")
+```
+
+# Deploy
+
+```starlark name=deploy
+env.inherit(\"PATH\")
+run(\"sh\", \"-c\", \"echo deployed > deployed.txt\")
+```
+";
+
+/// With the real tracer, a task marked `cache=never` runs its command in two
+/// consecutive builds, whose inputs are unchanged, and `--explain` and `kizz why`
+/// give the task option as the reason; `kizz build` never runs a named task without
+/// targets, which draws no warning.
+#[test]
+fn a_cache_never_task_runs_in_every_build() -> TestResult {
+    let project = Project::new()?;
+    project.write("in.txt", "input\n")?;
+    project.write("kizz.md", CACHE_NEVER_AND_NAMED)?;
+    let ran_line = "ran `cat in.txt` in kizz.md:3 (Fresh) step 1\n";
+
+    let first = project.run("", &["build", "--explain", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first
+            .stdout
+            .starts_with(&format!("{ran_line}  ran because:\n    {NEVER_RUN}\n")),
+        "{first:?}"
+    );
+    assert_eq!(first.stderr, "", "{first:?}");
+
+    for build in 2..=3 {
+        let again = project.run("", &["build", "--explain", "ci"])?;
+        assert_eq!(again.status, Some(0), "{build}: {again:?}");
+        assert!(
+            again.stdout.starts_with(&format!(
+                "{ran_line}  ran because:\n    its task is marked `cache=never`\n"
+            )),
+            "{build}: {again:?}"
+        );
+        assert_eq!(
+            again.stdout.matches(ran_line).count(),
+            1,
+            "{build}: {again:?}"
+        );
+        assert_eq!(again.stderr, "", "{build}: {again:?}");
+
+        let why = project.run("", &["why"])?;
+        assert_eq!(why.status, Some(0), "{why:?}");
+        assert!(
+            why.stdout.contains(
+                "  step 1: `cat in.txt`\n    ran because:\n      its task is marked `cache=never`\n"
+            ),
+            "{why:?}"
+        );
+    }
+    let records = project.step_records()?;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let commands: Vec<&[String]> = records
+        .iter()
+        .map(|record| record.spec.argv.as_slice())
+        .collect();
+    assert_eq!(commands, [
+        ["cat".to_owned(), "in.txt".to_owned()].as_slice()
+    ]);
+    assert_eq!(
+        records.first().map(|record| &record.reason),
+        Some(&kizz_store::RunReason::TaskCacheNever)
+    );
+    assert!(!project.root.join("deployed.txt").exists());
+    Ok(())
+}
+
+/// A later task's program that changes a cached command's input is work: pass 2
+/// starts with a line that says a task program changed a file in pass 1, runs
+/// `cat` again, and names the program as the input's last writer; the summary
+/// reports the passes, and the next build, in the learned order, settles in one.
+#[test]
+fn a_task_program_that_changes_an_input_runs_the_command_again() -> TestResult {
+    let project = Project::new()?;
+    project.write("in.txt", "old\n")?;
+    project.kizz_md("", &[("Use", "run(\"cat\", \"in.txt\")")])?;
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        text(&[
+            &ran("cat in.txt", "kizz.md:3 (Use)", NEVER_RUN),
+            &pass(2),
+            "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+
+    project.kizz_md("", &[
+        ("Use", "run(\"cat\", \"in.txt\")"),
+        ("Update", "fs.write(\"in.txt\", \"newer text\\n\")"),
+    ])?;
+    let second = project.run("", &["build", "--explain", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(
+        second.stdout,
+        text(&[
+            "cached `cat in.txt` in kizz.md:3 (Use) step 1",
+            "  cached: no recorded input changed",
+            "pass 2: a task program changed a file in pass 1, so every selected task is checked \
+             again",
+            "ran `cat in.txt` in kizz.md:3 (Use) step 1",
+            "  ran because:",
+            "    1 input changed:",
+            "      `in.txt`: size changed from 4 to 11 bytes; last written by the program of \
+             kizz.md:10 (Update) in this build",
+            &pass(3),
+            "build succeeded: 2 tasks, settled in 2 passes; 1 command ran, 0 cached",
+        ])
+    );
+    assert_eq!(second.stderr, "", "{second:?}");
+
+    let third = project.run("", &["build", "ci"])?;
+    assert_eq!(third.status, Some(0), "{third:?}");
+    assert_eq!(
+        third.stdout,
+        text(&["build succeeded: 2 tasks, settled in 1 pass; 0 commands ran, 1 cached"])
+    );
+    assert_eq!(third.stderr, "", "{third:?}");
+    assert!(!project.has_lock_file());
     Ok(())
 }
 
@@ -697,6 +849,281 @@ fn a_task_that_keeps_failing_runs_once_then_fails_from_the_cache() -> TestResult
     Ok(())
 }
 
+/// A task that runs `./tool.sh`, an executable script, is cached until
+/// `chmod a-x tool.sh` leaves its bytes as they were: the next build runs the step
+/// again, its reason names the permission change, and the task fails because the
+/// program is not executable.
+#[test]
+fn a_script_that_loses_its_execute_bits_runs_again_and_fails() -> TestResult {
+    let project = Project::new()?;
+    project.write("tool.sh", "#!/bin/sh\necho tool\n")?;
+    let tool = project.root.join("tool.sh");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))?;
+    project.kizz_md("", &[("Tool", "run(\"./tool.sh\", expect = [0])")])?;
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert_eq!(
+        first.stdout,
+        text(&[
+            &ran("./tool.sh", "kizz.md:3 (Tool)", NEVER_RUN),
+            &pass(2),
+            "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(
+        second.stdout,
+        text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"])
+    );
+
+    // `chmod a-x`: the mode loses every execute bit, and the bytes stay the same.
+    let mode = fs::metadata(&tool)?.permissions().mode();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(mode & !0o111))?;
+    let third = project.run("", &["build", "ci"])?;
+    assert_eq!(third.status, Some(1), "{third:?}");
+    assert_eq!(
+        third.stdout,
+        text(&[
+            &ran(
+                "./tool.sh",
+                "kizz.md:3 (Tool)",
+                "`tool.sh` changed (permissions changed from 0755 to 0644)"
+            ),
+            &pass(2),
+            "build failed: 1 task, 1 failed, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    for expected in ["error: kizz.md:3 (Tool) failed:\n", "is not executable"] {
+        assert!(third.stderr.contains(expected), "{expected:?}: {third:?}");
+    }
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// The message of a `run("true")` whose task environment has no `PATH`, which
+/// `NoPathError` gives.
+const NO_PATH: &str = "cannot run `true`: a program name without `/` is looked up in the task \
+                       environment's PATH, but the task environment has no PATH; set it with \
+                       env.set(\"PATH\", ...) or inherit it with env.inherit(\"PATH\")";
+
+/// The task `Bare` of target `ci`, whose `run("true")` has no `PATH`, because its
+/// program inherits nothing; its block opens on line 3.
+const BARE: &str = "# Bare\n\n```starlark ci name=bare\nrun(\"true\")\n```\n";
+
+/// Whether `line` is a line that `kizz build` prints for a command that ran:
+/// "ran `COMMAND` in TASK step N: REASON".
+fn is_ran_line(line: &str) -> bool {
+    line.starts_with("ran `") && line.contains(" step ") && line.contains(": ")
+}
+
+/// `kizz build` of a task whose `run("true")` has no `PATH` fails before kizz
+/// starts anything: it exits with 1, prints the task's error with the message of
+/// `NoPathError` once, prints no `ran` line and no "did not settle", and its summary
+/// counts no command and one pass.
+#[test]
+fn a_build_whose_run_has_no_path_fails_after_one_pass() -> TestResult {
+    let project = Project::new()?;
+    project.write("kizz.md", BARE)?;
+
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    assert_eq!(
+        run.stdout,
+        text(&["build failed: 1 task, 1 failed, settled in 1 pass; 0 commands ran, 0 cached"])
+    );
+    assert!(!run.stdout.lines().any(is_ran_line), "{run:?}");
+    assert_eq!(run.stderr.matches(NO_PATH).count(), 1, "{run:?}");
+    assert_eq!(
+        run.stderr
+            .matches("error: kizz.md:3 (Bare) failed:\n")
+            .count(),
+        1,
+        "{run:?}"
+    );
+    assert!(
+        run.stderr
+            .lines()
+            .any(|line| line == format!("  error: run(): {NO_PATH}")),
+        "{run:?}"
+    );
+    for output in [&run.stdout, &run.stderr] {
+        assert!(!output.contains("did not settle"), "{run:?}");
+        assert!(!output.contains("run(): run():"), "{run:?}");
+    }
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// With a second task whose command writes a file, the build of a task whose
+/// `run("true")` has no `PATH` ends after a second pass that runs nothing: it exits
+/// with 1, prints the error once, the line of pass 2 and the `ran` line of the
+/// second task's command only, and no "did not settle".
+#[test]
+fn a_run_without_path_does_not_keep_the_build_from_settling() -> TestResult {
+    let project = Project::new()?;
+    let make = [
+        "# Make",
+        "",
+        "```starlark ci",
+        "env.inherit(\"PATH\")",
+        "run(\"sh\", \"-c\", \"echo made > out.txt\")",
+        "```",
+    ];
+    project.write("kizz.md", &format!("{BARE}\n{}", text(&make)))?;
+
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    assert_eq!(
+        run.stdout,
+        text(&[
+            &ran("sh -c echo made > out.txt", "kizz.md:9 (Make)", NEVER_RUN),
+            &pass(2),
+            "build failed: 2 tasks, 1 failed, settled in 1 pass; 1 command ran, 0 cached",
+        ])
+    );
+    assert_eq!(run.stderr.matches(NO_PATH).count(), 1, "{run:?}");
+    for output in [&run.stdout, &run.stderr] {
+        assert!(!output.contains("did not settle"), "{run:?}");
+        assert!(!output.contains("run(): run():"), "{run:?}");
+    }
+    assert_eq!(fs::read_to_string(project.root.join("out.txt"))?, "made\n");
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// A pattern that starts with `~/`, with no `HOME` in kizz's environment, fails its
+/// task with the Starlark error of `run()`, whose line holds the prefix `run(): `
+/// once, and no output holds `run(): run():`.
+#[test]
+fn a_pattern_error_has_one_run_prefix() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[("Home", "run(\"true\", ignore = [\"~/x\"])")])?;
+
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    let expected = "  error: run(): pattern `~/x` starts with `~/`, but the caller environment \
+                    has no HOME";
+    assert_eq!(
+        run.stderr.lines().filter(|line| *line == expected).count(),
+        1,
+        "{run:?}"
+    );
+    assert_eq!(
+        run.stderr
+            .matches(
+                "run(): pattern `~/x` starts with `~/`, but the caller environment has no HOME"
+            )
+            .count(),
+        1,
+        "{run:?}"
+    );
+    assert_eq!(
+        run.stdout,
+        text(&["build failed: 1 task, 1 failed, settled in 1 pass; 0 commands ran, 0 cached"])
+    );
+    for output in [&run.stdout, &run.stderr] {
+        assert!(!output.contains("run(): run():"), "{run:?}");
+    }
+    Ok(())
+}
+
+/// The modification and change times of `path`.
+fn times(path: &Path) -> TestResult<Times> {
+    let metadata = fs::metadata(path)?;
+    let nanos = |seconds: i64, nanoseconds: i64| {
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanoseconds))
+            .ok_or("time out of range")
+    };
+    Ok(Times {
+        mtime_nanos: nanos(metadata.mtime(), metadata.mtime_nsec())?,
+        ctime_nanos: nanos(metadata.ctime(), metadata.ctime_nsec())?,
+    })
+}
+
+/// Give `path` the current time as its modification time, as `touch` does.
+fn touch(path: &Path) -> TestResult {
+    fs::File::open(path)?.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))?;
+    Ok(())
+}
+
+/// `run("sh", "-c", "cat in.txt > out.txt", timestamps = True)` runs again after
+/// `touch in.txt`, with the old and new times of `in.txt` as its reason, and the
+/// same task without the option stays cached.
+#[test]
+fn a_command_run_with_timestamps_runs_again_after_touch() -> TestResult {
+    let copy = "sh -c cat in.txt > out.txt";
+    for timestamps in [true, false] {
+        let project = Project::new()?;
+        project.write("in.txt", "input\n")?;
+        let option = if timestamps {
+            ", timestamps = True"
+        } else {
+            ""
+        };
+        project.kizz_md("", &[(
+            "Copy",
+            &format!("run(\"sh\", \"-c\", \"cat in.txt > out.txt\"{option})"),
+        )])?;
+        let first = project.run("", &["build", "ci"])?;
+        assert_eq!(first.status, Some(0), "{first:?}");
+        assert_eq!(
+            first.stdout,
+            text(&[
+                &ran(copy, "kizz.md:3 (Copy)", NEVER_RUN),
+                &pass(2),
+                "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+            ])
+        );
+        let cached =
+            text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"]);
+        let second = project.run("", &["build", "ci"])?;
+        assert_eq!(
+            (second.status, &second.stdout),
+            (Some(0), &cached),
+            "{second:?}"
+        );
+
+        let input = project.root.join("in.txt");
+        let old = times(&input)?;
+        touch(&input)?;
+        let new = times(&input)?;
+        assert_ne!(old, new);
+        let third = project.run("", &["build", "ci"])?;
+        assert_eq!(third.status, Some(0), "{third:?}");
+        if timestamps {
+            let change = Change::Timestamps { old, new };
+            assert_eq!(
+                third.stdout,
+                text(&[
+                    &ran(
+                        copy,
+                        "kizz.md:3 (Copy)",
+                        &format!("`in.txt` changed ({change})")
+                    ),
+                    &pass(2),
+                    "build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached",
+                ])
+            );
+            assert!(change.to_string().starts_with("timestamps changed: "));
+        } else {
+            assert_eq!(third.stdout, cached, "{third:?}");
+        }
+        assert_eq!(fs::read_to_string(project.root.join("out.txt"))?, "input\n");
+        let fourth = project.run("", &["build", "ci"])?;
+        assert_eq!(
+            (fourth.status, &fourth.stdout),
+            (Some(0), &cached),
+            "{fourth:?}"
+        );
+        assert!(!project.has_lock_file());
+    }
+    Ok(())
+}
+
 /// `kizz build` without a target lists the available targets and exits with
 /// status 2, and says so when there is no task.
 #[test]
@@ -803,15 +1230,120 @@ fn a_target_that_selects_no_task_warns() -> TestResult {
 
 /// Act as a helper program when [`HELPER_VARIABLE`] says so, and do nothing
 /// otherwise. In mode `x32`, make one system call through the x32 interface, which
-/// the tracer cannot decode.
+/// the tracer cannot decode. In mode `xattr`, read the file `input.txt` and its
+/// extended attribute `user.kizz`, and print both.
 #[test]
 fn helper_process() {
-    if std::env::var_os(HELPER_VARIABLE).is_some_and(|mode| mode == "x32") {
+    let mode = std::env::var_os(HELPER_VARIABLE);
+    if mode.as_ref().is_some_and(|mode| mode == "x32") {
         // SAFETY: `getpid` takes no arguments; the kernel either runs it or rejects
         // the x32 number with `ENOSYS`.
         let ret = unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
         eprintln!("x32 getpid returned {ret}");
     }
+    if mode.as_ref().is_some_and(|mode| mode == "xattr") {
+        let content = fs::read_to_string("input.txt").unwrap();
+        let path = CString::new("input.txt").unwrap();
+        let name = CString::new("user.kizz").unwrap();
+        let mut value = [0_u8; 64];
+        // SAFETY: `path` and `name` are NUL-terminated strings, and `value` has room
+        // for `value.len()` bytes, which is all the kernel writes.
+        let size = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        let size = usize::try_from(size).unwrap();
+        println!(
+            "{} {}",
+            content.trim_end(),
+            String::from_utf8_lossy(&value[..size])
+        );
+    }
+}
+
+/// Set the extended attribute `name` of the file at `path` to `value`, as the test
+/// itself, outside any build.
+fn set_attribute(
+    path: &Path,
+    name: &str,
+    value: &[u8],
+) -> TestResult {
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let name = CString::new(name)?;
+    // SAFETY: `path` and `name` are NUL-terminated strings, and `value` holds
+    // `value.len()` bytes, which the kernel only reads.
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// With the real tracer, a command that read a file and one of its extended
+/// attributes stays cached while nothing changes, runs again when only that
+/// attribute's value changes, with the reason naming the attribute, and is cached
+/// again afterwards.
+#[test]
+fn a_command_that_read_an_extended_attribute_runs_again_when_it_changes() -> TestResult {
+    let project = Project::new()?;
+    project.write("input.txt", "input\n")?;
+    let input = project.root.join("input.txt");
+    set_attribute(&input, "user.kizz", b"one")?;
+    let helper = std::env::current_exe()?;
+    let helper = helper
+        .to_str()
+        .ok_or("the test executable's path is not UTF-8")?;
+    project.kizz_md("", &[(
+        "Attr",
+        &format!(
+            "run(\"{helper}\", \"helper_process\", \"--exact\", \"--test-threads=1\", env = \
+             {{\"{HELPER_VARIABLE}\": \"xattr\"}})"
+        ),
+    )])?;
+    let command = format!("{helper} helper_process --exact --test-threads=1");
+    let cached = text(&["build succeeded: 1 task, settled in 1 pass; 0 commands ran, 1 cached"]);
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first.stdout.starts_with(&format!(
+            "{}\n",
+            ran(&command, "kizz.md:3 (Attr)", NEVER_RUN)
+        )),
+        "{first:?}"
+    );
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.stdout, cached, "{second:?}");
+
+    set_attribute(&input, "user.kizz", b"two")?;
+    let third = project.run("", &["build", "ci"])?;
+    assert_eq!(third.status, Some(0), "{third:?}");
+    assert!(
+        third.stdout.starts_with(&format!(
+            "{}\n",
+            ran(
+                &command,
+                "kizz.md:3 (Attr)",
+                "`input.txt` changed (extended attributes changed: `user.kizz` changed)"
+            )
+        )),
+        "{third:?}"
+    );
+    let fourth = project.run("", &["build", "ci"])?;
+    assert_eq!(fourth.stdout, cached, "{fourth:?}");
+    Ok(())
 }
 
 /// A command that the tracer traces incompletely gets a loud warning, repeated in
@@ -1097,5 +1629,525 @@ fn retargeting_or_replacing_a_link_into_proc_runs_the_command_again() -> TestRes
         ),
     )?;
     assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// The review's example: a command that reads `input` and then rewrites it. Its
+/// result is not cached, without a warning, because the command itself changed
+/// the file, and the next build runs it again with a reason that names `input` and
+/// says that the command wrote it.
+#[test]
+fn a_command_that_rewrites_a_file_it_read_runs_again_without_a_warning() -> TestResult {
+    let project = Project::new()?;
+    project.write("input", "the old input\n")?;
+    project.kizz_md("", &[(
+        "Rewrite",
+        "run(\"sh\", \"-c\", \"cat input > output; printf 'new\\\\n' > input\")",
+    )])?;
+    let command = "sh -c cat input > output; printf 'new\\n' > input";
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first.stdout.starts_with(&format!(
+            "{}\n",
+            ran(command, "kizz.md:3 (Rewrite)", NEVER_RUN)
+        )),
+        "{first:?}"
+    );
+    assert_eq!(first.stderr, "", "{first:?}");
+    assert_eq!(
+        fs::read_to_string(project.root.join("output"))?,
+        "the old input\n"
+    );
+    let records = project.step_records()?;
+    let record = records.first().ok_or("no record")?;
+    assert_eq!(
+        record.not_cached,
+        Some(NotCachedReason::ChangedAfterRead {
+            files: vec![ChangedRead {
+                path: project.root.join("input"),
+                written: true,
+            }],
+        }),
+        "{record:?}"
+    );
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert!(
+        second.stdout.starts_with(&format!(
+            "{}\n",
+            ran(
+                command,
+                "kizz.md:3 (Rewrite)",
+                "the previous run could not be cached: a file changed after the command read \
+                 it: `input` (the command wrote it)"
+            )
+        )),
+        "{second:?}"
+    );
+    assert_eq!(second.stderr, "", "{second:?}");
+    Ok(())
+}
+
+/// Make a FIFO at `path`.
+fn make_fifo(path: &Path) -> TestResult {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    // SAFETY: `path` is a NUL-terminated string.
+    if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// A command that reads a file and then waits on a FIFO, which the test opens only
+/// after it has rewritten that file, so the edit falls inside the run: the result
+/// is not cached, and a loud warning, repeated in the summary, names the command
+/// and the file and says that something else changed it while the command ran.
+#[test]
+fn a_file_changed_by_something_else_during_a_run_is_a_loud_warning() -> TestResult {
+    let project = Project::new()?;
+    project.write("input", "the old input\n")?;
+    make_fifo(&project.root.join("fifo"))?;
+    let script = "cat input > copy; echo started; cat fifo";
+    project.kizz_md("", &[(
+        "Wait",
+        &format!("run(\"sh\", \"-c\", \"{script}\", stream = True)"),
+    )])?;
+    let (child, lines) = project.start_build()?;
+    // The command has read `input`: edit it, then let the command finish.
+    project.write("input", "edited while the command ran\n")?;
+    {
+        let mut fifo = fs::OpenOptions::new()
+            .write(true)
+            .open(project.root.join("fifo"))?;
+        io::Write::write_all(&mut fifo, b"done\n")?;
+    }
+    let rest: Vec<String> = lines.collect::<Result<_, _>>()?;
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{rest:?} {stderr}");
+    let command = format!("sh -c {script}");
+    let message = format!(
+        "something else changed `input` while `{command}` in . ran, after the command read \
+         it, so its result was not cached and it runs again on the next build"
+    );
+    assert_eq!(
+        stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{rest:?}"
+    );
+    let records = project.step_records()?;
+    let record = records.first().ok_or("no record")?;
+    assert_eq!(
+        record.not_cached,
+        Some(NotCachedReason::ChangedAfterRead {
+            files: vec![ChangedRead {
+                path: project.root.join("input"),
+                written: false,
+            }],
+        }),
+        "{record:?}"
+    );
+    assert!(!project.has_lock_file());
+    Ok(())
+}
+
+/// A command that connects to a loopback address, here `bash` through `/dev/tcp`
+/// to a listener that the test opens, is cached, and the build warns once, naming
+/// the command and the address, that kizz cannot see what came back, that the
+/// result is still cached, and that `always = True` runs a command on every build;
+/// the summary repeats the warning. The record lists the connection, the next build
+/// is a cache hit without the warning, and `kizz why` lists the connection.
+#[test]
+fn a_command_that_connects_warns_and_is_still_cached() -> TestResult {
+    let project = Project::new()?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
+    project.kizz_md("", &[(
+        "Connect",
+        &format!("run(\"bash\", \"-c\", \"{script}\", expect = [0])"),
+    )])?;
+    let command = format!("bash -c {script}");
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first.stdout.starts_with(&format!(
+            "{}\n",
+            ran(&command, "kizz.md:3 (Connect)", NEVER_RUN)
+        )),
+        "{first:?}"
+    );
+    let message = format!(
+        "`{command}` in . connected to 127.0.0.1:{port}; kizz cannot see what came back, and \
+         its result is still cached; `always = True` runs a command on every build"
+    );
+    assert_eq!(
+        first.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{first:?}"
+    );
+    let records = project.step_records()?;
+    let [record] = records.as_slice() else {
+        return Err(format!("expected one record, found {records:?}").into());
+    };
+    assert_eq!(record.not_cached, None, "{record:?}");
+    assert_eq!(record.connections, [Connection::Ipv4 {
+        address: [127, 0, 0, 1],
+        port,
+    }]);
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert_eq!(second.stderr, "", "{second:?}");
+    assert!(!second.stdout.contains("ran `"), "{second:?}");
+    assert!(second.stdout.contains(", 1 cached"), "{second:?}");
+
+    let why = project.run("", &["why"])?;
+    assert_eq!(why.status, Some(0), "{why:?}");
+    assert!(
+        why.stdout
+            .contains(&format!("\n    connections: 127.0.0.1:{port}\n")),
+        "{why:?}"
+    );
+    drop(listener);
+    Ok(())
+}
+
+/// With the real tracer, a step records every part of the machine state, with the
+/// kernel release that the kernel reports; a step that names `kernel` is a cache hit
+/// in the next build, since the kernel stayed the same; `kizz why` shows the part
+/// that it names, and `kizz --verbose why` shows every part, one line for each.
+#[test]
+fn the_machine_state_is_recorded_and_shown_by_why() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[(
+        "Kernel",
+        "run(\"true\", machine = [\"kernel\"], expect = [0])",
+    )])?;
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    let release = fs::read_to_string("/proc/sys/kernel/osrelease")?
+        .trim_end()
+        .to_owned();
+    let records = project.step_records()?;
+    let [record] = records.as_slice() else {
+        return Err(format!("expected one record, found {records:?}").into());
+    };
+    assert_eq!(record.spec.machine, ["kernel"]);
+    let machine = &record.machine;
+    assert_eq!(
+        machine
+            .kernel
+            .as_ref()
+            .map(|kernel| kernel.release.as_str()),
+        Some(release.as_str())
+    );
+    assert!(
+        machine
+            .limits
+            .as_ref()
+            .is_some_and(|limits| !limits.is_empty())
+    );
+    assert!(
+        machine
+            .affinity
+            .as_ref()
+            .is_some_and(|cpus| !cpus.is_empty())
+    );
+    assert!(machine.memory.is_some_and(|memory| memory.total > 0));
+    assert!(machine.filesystem.is_some());
+    assert!(machine.disk.is_some_and(|disk| disk.size > 0));
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert!(!second.stdout.contains("ran `"), "{second:?}");
+    assert!(second.stdout.contains(", 1 cached"), "{second:?}");
+
+    let machine_lines = |stdout: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("    machine "))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    let why = project.run("", &["why"])?;
+    assert_eq!(why.status, Some(0), "{why:?}");
+    let shown = machine_lines(&why.stdout);
+    let [kernel] = shown.as_slice() else {
+        return Err(format!("expected one machine line, found {shown:?}").into());
+    };
+    assert!(
+        kernel.starts_with(&format!(
+            "    machine kernel: kernel release {release}, kernel version "
+        )),
+        "{why:?}"
+    );
+
+    let verbose = project.run("", &["--verbose", "why"])?;
+    assert_eq!(verbose.status, Some(0), "{verbose:?}");
+    let shown = machine_lines(&verbose.stdout);
+    let starts = [
+        format!("    machine kernel (checked): kernel release {release}, kernel version "),
+        "    machine limits: soft limit of cpu ".to_owned(),
+        "    machine affinity: CPUs ".to_owned(),
+        "    machine memory: total memory ".to_owned(),
+        "    machine filesystem: file system type 0x".to_owned(),
+        "    machine disk: file system size ".to_owned(),
+    ];
+    assert_eq!(shown.len(), starts.len(), "{verbose:?}");
+    for (line, start) in shown.iter().zip(&starts) {
+        assert!(line.starts_with(start.as_str()), "{start:?} in {verbose:?}");
+        assert!(!line.contains("unknown"), "{verbose:?}");
+    }
+    Ok(())
+}
+
+/// The warning `kizz build` prints for the step `run("false")` of the task `task`,
+/// as warnings name it, which its program left unchecked; `cached` says that the
+/// result came from the cache, and `fail` that `--fail-unchecked` was given.
+fn unchecked_false(
+    task: &str,
+    cached: bool,
+    fail: bool,
+) -> String {
+    format!(
+        "{task} left `false` in . unchecked: exit code 1, but its `run()` has no `expect` and \
+         the task program never read the result's `rc` or `signal`{}; {}",
+        if cached {
+            "; the result came from the cache"
+        } else {
+            ""
+        },
+        if fail {
+            "the task fails because `kizz build --fail-unchecked` was given"
+        } else {
+            "`kizz build --fail-unchecked` makes this fail the task"
+        }
+    )
+}
+
+/// The warning `kizz build` prints for the step `run("false")` of the task on line
+/// 3 of the root `kizz.md`, headed `Ignore`, which its program left unchecked;
+/// `cached` says that the result came from the cache, and `fail` that
+/// `--fail-unchecked` was given.
+fn false_unchecked(
+    cached: bool,
+    fail: bool,
+) -> String {
+    unchecked_false("kizz.md:3 (Ignore)", cached, fail)
+}
+
+/// Only the results that stand when the build settles warn: `Use` runs `cat
+/// out.txt` before `Make` writes `out.txt`, so `cat` fails unchecked in pass 1 and
+/// succeeds in pass 2, and `Ignore` ignores `run("false")`. The build settles in two
+/// passes, and its standard error is exactly the warning for `false`, without the
+/// cache note, then the summary with it; the next build prints the same warning
+/// with the cache note.
+#[test]
+fn only_the_unchecked_exits_that_stand_warn() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[
+        ("Use", "run(\"cat\", \"out.txt\")"),
+        ("Make", "run(\"sh\", \"-c\", \"echo made > out.txt\")"),
+        ("Ignore", "run(\"false\")"),
+    ])?;
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(
+        first
+            .stdout
+            .ends_with("build succeeded: 3 tasks, settled in 2 passes; 4 commands ran, 0 cached\n"),
+        "{first:?}"
+    );
+    let message = unchecked_false("kizz.md:17 (Ignore)", false, false);
+    assert_eq!(
+        first.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{first:?}"
+    );
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    let message = unchecked_false("kizz.md:17 (Ignore)", true, false);
+    assert_eq!(
+        second.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{second:?}"
+    );
+    Ok(())
+}
+
+/// When a task that ignores `run("false")` runs before a task that calls `fail()`,
+/// standard error holds the later task's failure, then the warning for `false`,
+/// which comes after the last pass, then the `failed:` line, then the summary of
+/// warnings, in that order.
+#[test]
+fn the_unchecked_warning_comes_after_the_last_pass() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[
+        ("Ignore", "run(\"false\")"),
+        ("Stop", "fail(\"stopped on purpose\")"),
+    ])?;
+    let run = project.run("", &["build", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    let message = false_unchecked(false, false);
+    let warning = format!("warning: {message}\n");
+    let summary = format!("1 warning:\n  {message}\n");
+    let parts = [
+        "error: kizz.md:10 (Stop) failed:",
+        warning.as_str(),
+        "failed: kizz.md:10 (Stop)\n",
+        summary.as_str(),
+    ];
+    let mut from = 0_usize;
+    for part in parts {
+        let found = run
+            .stderr
+            .get(from..)
+            .and_then(|rest| rest.find(part))
+            .ok_or_else(|| format!("{part:?} after byte {from} in {run:?}"))?;
+        from = from.saturating_add(found).saturating_add(part.len());
+    }
+    assert!(run.stderr.ends_with(&summary), "{run:?}");
+    assert_eq!(
+        run.stderr.matches(&warning).count(),
+        1,
+        "the warning is printed once, then repeated in the summary: {run:?}"
+    );
+    Ok(())
+}
+
+/// A task that runs `false` and ignores the result builds with exit status 0, with
+/// one loud warning that names the task, the command and how it ended, repeated in
+/// the summary; the next build, whose result comes from the cache, warns again. The
+/// same build with `--fail-unchecked` exits with status 1 and prints the command,
+/// its exit status and its captured output, and so does a fresh build with it.
+#[test]
+fn an_unchecked_false_warns_and_fails_with_fail_unchecked() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[("Ignore", "run(\"false\")")])?;
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    let message = false_unchecked(false, false);
+    assert_eq!(
+        first.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{first:?}"
+    );
+    assert!(
+        first
+            .stdout
+            .ends_with("build succeeded: 1 task, settled in 1 pass; 1 command ran, 0 cached\n"),
+        "{first:?}"
+    );
+
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    let message = false_unchecked(true, false);
+    assert_eq!(
+        second.stderr,
+        format!("warning: {message}\n1 warning:\n  {message}\n"),
+        "{second:?}"
+    );
+
+    let failing = project.run("", &["build", "--fail-unchecked", "ci"])?;
+    assert_eq!(failing.status, Some(1), "{failing:?}");
+    let fresh = Project::new()?;
+    fresh.kizz_md("", &[("Ignore", "run(\"false\")")])?;
+    let fresh_run = fresh.run("", &["build", "--fail-unchecked", "ci"])?;
+    assert_eq!(fresh_run.status, Some(1), "{fresh_run:?}");
+    for (run, cached) in [(&failing, true), (&fresh_run, false)] {
+        let message = false_unchecked(cached, true);
+        for part in [
+            "error: kizz.md:3 (Ignore) failed:\n  the task program left a non-zero exit \
+             unchecked, and `kizz build --fail-unchecked` makes that fail the task\n  command \
+             `false`: exit code 1, which the task program never checked: its `run()` has no \
+             `expect`, and the program never read the result's `rc` or `signal`\n  --- stdout \
+             ---\n  --- stderr ---\n"
+                .to_owned(),
+            format!("warning: {message}\n"),
+            "failed: kizz.md:3 (Ignore)\n".to_owned(),
+            format!("1 warning:\n  {message}\n"),
+        ] {
+            assert!(run.stderr.contains(&part), "{part:?} in {run:?}");
+        }
+        assert!(
+            run.stdout
+                .contains("build failed: 1 task, 1 failed, settled in 1 pass; "),
+            "{run:?}"
+        );
+    }
+    Ok(())
+}
+
+/// With `--fail-unchecked`, the failure of a task that leaves a command's non-zero
+/// exit unchecked prints the command's captured output.
+#[test]
+fn fail_unchecked_prints_the_captured_output() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[(
+        "Noisy",
+        "run(\"sh\", \"-c\", \"echo printed; echo complained >&2; exit 3\")",
+    )])?;
+    let run = project.run("", &["build", "--fail-unchecked", "ci"])?;
+    assert_eq!(run.status, Some(1), "{run:?}");
+    assert!(
+        run.stderr.contains(
+            "  command `sh -c echo printed; echo complained >&2; exit 3`: exit code 3, which the \
+             task program never checked"
+        ),
+        "{run:?}"
+    );
+    assert!(
+        run.stderr
+            .contains("  --- stdout ---\n  printed\n  --- stderr ---\n  complained\n"),
+        "{run:?}"
+    );
+    Ok(())
+}
+
+/// `run("false", expect = [1])` accepts the exit, a task that reads `rc` checks
+/// it, and a task that writes `json.encode(result)` with `fs.write`, or the result
+/// with `fs.write_json`, encodes it, which checks it: none warns, and
+/// `--fail-unchecked` fails none. The files hold the result's attributes.
+#[test]
+fn checked_exits_warn_about_nothing() -> TestResult {
+    let project = Project::new()?;
+    project.kizz_md("", &[
+        ("Expect", "run(\"false\", expect = [1])"),
+        (
+            "Read",
+            "if run(\"false\", \"read\").rc != 1:\n    fail(\"unexpected\")",
+        ),
+        (
+            "Encode",
+            "fs.write(\"encoded.json\", json.encode(run(\"false\", \"encode\")))",
+        ),
+        (
+            "Write",
+            "fs.write_json(\"written.json\", run(\"false\", \"write\"))",
+        ),
+    ])?;
+    for args in [
+        &["build", "ci"][..],
+        &["build", "--fail-unchecked", "ci"][..],
+    ] {
+        let run = project.run("", args)?;
+        assert_eq!(run.status, Some(0), "{args:?}: {run:?}");
+        assert_eq!(run.stderr, "", "{args:?}: {run:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(project.root.join("encoded.json"))?,
+        r#"{"rc":1,"signal":null,"stdout":"","stderr":"","cached":true}"#
+    );
+    let written = fs::read_to_string(project.root.join("written.json"))?;
+    assert!(written.contains("\"rc\": 1"), "{written}");
+    assert!(written.contains("\"signal\": null"), "{written}");
     Ok(())
 }

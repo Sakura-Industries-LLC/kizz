@@ -7,16 +7,17 @@
 
 use std::{env, process::ExitCode};
 
-use kizz_core::{LoadError, TargetExpr, Warning, load};
+use kizz_core::{LoadError, TargetExpr, Warning, WorkerPool, load};
 
 use crate::{cli::USAGE_ERROR, ui};
 
 /// List the tasks under the current directory that `targets` selects, or every task
 /// without it, and return the exit status.
 ///
-/// A malformed target expression, an unreadable current directory, and configuration
-/// errors in a `kizz.md` exit with [`USAGE_ERROR`]. Configuration errors still show
-/// every warning found while loading, and repeat them in the final summary.
+/// A malformed target expression, an unreadable current directory, configuration
+/// errors in a `kizz.md`, and a worker pool for discovery that cannot start exit with
+/// [`USAGE_ERROR`]. Configuration errors still show every warning found while
+/// loading, and repeat them in the final summary.
 pub(crate) fn run(targets: Option<&str>) -> ExitCode {
     let expression = match targets.map(str::parse::<TargetExpr>).transpose() {
         Ok(expression) => expression,
@@ -28,7 +29,11 @@ pub(crate) fn run(targets: Option<&str>) -> ExitCode {
             return usage_error(&format!("cannot read the current directory: {error}"));
         },
     };
-    let project = match load(&root) {
+    let pool = match WorkerPool::new() {
+        Ok(pool) => pool,
+        Err(error) => return usage_error(&error.to_string()),
+    };
+    let project = match load(&root, &pool) {
         Ok(project) => project,
         Err(LoadError::Config { errors, warnings }) => {
             let warnings = print_warnings(&warnings);
@@ -46,7 +51,11 @@ pub(crate) fn run(targets: Option<&str>) -> ExitCode {
     if let Some(expression) = expression {
         let selected = expression.select(&project.tasks);
         for chosen in &selected {
-            ui::print_task(&chosen.task.location(), &chosen.task.targets);
+            ui::print_task(
+                &chosen.task.location(),
+                &chosen.task.targets,
+                &chosen.task.options.words(),
+            );
         }
         ui::print_summary(&format!(
             "{} of {all} selected by `{expression}`.",
@@ -54,7 +63,7 @@ pub(crate) fn run(targets: Option<&str>) -> ExitCode {
         ));
     } else {
         for task in &project.tasks {
-            ui::print_task(&task.location(), &task.targets);
+            ui::print_task(&task.location(), &task.targets, &task.options.words());
         }
         ui::print_summary(&format!(
             "{all} in {}.",

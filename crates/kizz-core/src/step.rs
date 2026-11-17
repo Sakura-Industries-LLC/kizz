@@ -17,7 +17,8 @@ use kizz_trace::{AbsolutePath, CaptureMode, CapturedOutput, Termination};
 /// One step, as a `run()` call in a task program specifies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepSpec {
-    /// The argument vector exactly as written: the program, then its arguments.
+    /// The argument vector: the program, then its arguments, each string exactly as
+    /// written, after `run()` expanded the lists and tuples among its arguments.
     pub argv: Vec<String>,
     /// The text for standard input, or `None` to connect `/dev/null`.
     pub stdin: Option<String>,
@@ -37,6 +38,15 @@ pub struct StepSpec {
     pub ignore: Vec<String>,
     /// The `/proc` and `/sys` files whose content counts as an input.
     pub track: Vec<String>,
+    /// Whether a different modification or change time of a file or directory that
+    /// the step read, ran, listed, or checked is a change, even when the content is
+    /// the same.
+    pub timestamps: bool,
+    /// The names of the parts of the machine state that count as an input of the
+    /// step, sorted and without repeats; each is a [`MachinePart`] name.
+    ///
+    /// [`MachinePart`]: kizz_store::MachinePart
+    pub machine: Vec<String>,
     /// The acceptable exit codes, or `None` when the exit status never fails the
     /// task.
     pub expect: Option<Vec<i32>>,

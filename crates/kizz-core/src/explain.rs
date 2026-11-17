@@ -10,21 +10,27 @@
 //! * A step key with no record is explained through the step-position records: when the
 //!   task used another key at the same position last time, the reasons compare that key's
 //!   specification with this one. The task program, the arguments, the environment, the
-//!   working directory, `stdin`, the capture mode, the ignore patterns, and the `track`
-//!   patterns each give their own reason; a changed program names its block or each
-//!   loaded module that changed, from the part hashes of the task record. Without an
-//!   earlier specification, or when only the occurrence number differs, the step never
-//!   ran.
+//!   working directory, `stdin`, the capture mode, the ignore patterns, the `track`
+//!   patterns, the `timestamps` option, and the `machine` names each give their own
+//!   reason; a changed program names its block or each loaded module that changed, from
+//!   the part hashes of the task record. Without an earlier specification, or when only
+//!   the occurrence number differs, the step never ran.
+//! * A step whose record names parts of the machine state, and whose cache check found
+//!   values of them changed, gives a reason of its own that names each changed value, old
+//!   and new, after the changed inputs.
 //! * Each changed input names who last wrote it, from the last-writer records: this
 //!   command on its previous run, another step in this build, a step of an earlier build,
-//!   or something outside kizz. A write that kizz recorded before the step's recorded
-//!   state was taken cannot have changed the path since, so then the writer is something
-//!   outside kizz.
+//!   the program of a task, through `fs.write` or `fs.write_json`, in this build or an
+//!   earlier one, or something outside kizz. A write that kizz recorded before the step's
+//!   recorded state was taken cannot have changed the path since, so then the writer is
+//!   something outside kizz. A task program is named as the writer even when it is the
+//!   program of the step's own task.
 //! * A changed input is self-inflicted when this command last wrote it on its previous
 //!   run and also reads it, or when the step that wrote it in this build runs on every
-//!   build, because it is marked `always` or re-runs for a self-inflicted reason itself.
-//!   A path the command read and wrote before is not self-inflicted when something
-//!   outside kizz or another task changed it since.
+//!   build, because it is marked `always`, its task is marked `cache=never`, or it
+//!   re-runs for a self-inflicted reason itself. A path the command read and wrote before
+//!   is not self-inflicted when something outside kizz, another task, or a task program
+//!   changed it since; a change that a task program made is never self-inflicted.
 //! * A step that re-runs for a self-inflicted input that also made it run in its task's
 //!   previous build gets the loud warning for consecutive builds: the step-position
 //!   record carries the self-inflicted inputs of the previous build's run.
@@ -38,7 +44,7 @@ use kizz_store::{
     AccessBits, BuildId, ChangedInput, ContentHash, Difference, EnvChange, LastWriter,
     ModuleChange, ModuleChangeKind, ModuleHash, Observation, PathKey, PositionKey, Reason,
     SelfInflicted, StepKey, StepPosition, StepSpecRecord, StoreError, TaskId, TaskLabel,
-    TaskRecord, Txn, Verdict, Writer,
+    TaskRecord, Txn, Verdict, Writer, WrittenBy,
 };
 use kizz_trace::AbsolutePath;
 
@@ -75,7 +81,7 @@ impl TaskIdentity {
                 index: task.index,
             },
             line: u32::try_from(task.line).unwrap_or(u32::MAX),
-            heading: task.name.clone(),
+            heading: task.heading.clone(),
             targets: task.targets.clone(),
             program: program.hash(),
             parts: program.parts().clone(),
@@ -256,6 +262,18 @@ pub fn spec_reasons(
             new: new.track.clone(),
         });
     }
+    if old.timestamps != new.timestamps {
+        reasons.push(Reason::TimestampsChanged {
+            old: old.timestamps,
+            new: new.timestamps,
+        });
+    }
+    if old.machine != new.machine {
+        reasons.push(Reason::MachineNamesChanged {
+            old: old.machine.clone(),
+            new: new.machine.clone(),
+        });
+    }
     reasons
 }
 
@@ -396,23 +414,26 @@ fn attribute(
         // path since did so outside kizz.
         return Ok(Writer::Outside);
     }
+    let this_build = entry.build == context.build;
+    let WrittenBy::Step { step, position } = entry.by else {
+        let task = label_of(txn, context.identity, &entry.task)?;
+        return Ok(if this_build {
+            Writer::ProgramThisBuild { task }
+        } else {
+            Writer::ProgramEarlierBuild { task }
+        });
+    };
     let same_position = context
         .identity
-        .is_some_and(|identity| identity.id == entry.task && entry.position == context.position);
-    if entry.step == context.key || same_position {
+        .is_some_and(|identity| identity.id == entry.task && position == context.position);
+    if step == context.key || same_position {
         return Ok(Writer::ThisCommand);
     }
     let task = label_of(txn, context.identity, &entry.task)?;
-    Ok(if entry.build == context.build {
-        Writer::ThisBuild {
-            task,
-            position: entry.position,
-        }
+    Ok(if this_build {
+        Writer::ThisBuild { task, position }
     } else {
-        Writer::EarlierBuild {
-            task,
-            position: entry.position,
-        }
+        Writer::EarlierBuild { task, position }
     })
 }
 
@@ -445,21 +466,25 @@ fn label_of(
 }
 
 /// Whether the step that `entry` names, which wrote its path in `build`, runs on
-/// every build: in this build it ran because it is marked `always` or for a
-/// self-inflicted reason.
+/// every build: in this build it ran because it is marked `always`, because its task
+/// is marked `cache=never`, or for a self-inflicted reason. A task program is not a
+/// step, so this is never so for one.
 fn writes_every_build(
     txn: &Txn<'_>,
     entry: &LastWriter,
     build: BuildId,
 ) -> Result<bool, StoreError> {
-    let position = txn.get::<StepPosition>(&PositionKey {
+    let WrittenBy::Step { step, position } = entry.by else {
+        return Ok(false);
+    };
+    let position_record = txn.get::<StepPosition>(&PositionKey {
         task: entry.task.clone(),
-        position: entry.position,
+        position,
     })?;
-    Ok(position.is_some_and(|position| {
-        position.build == build
-            && position.step == entry.step
-            && matches!(&position.verdict, Verdict::Ran(explanation) if explanation.runs_every_build())
+    Ok(position_record.is_some_and(|record| {
+        record.build == build
+            && record.step == step
+            && matches!(&record.verdict, Verdict::Ran(explanation) if explanation.runs_every_build())
     }))
 }
 
@@ -487,6 +512,11 @@ pub fn carried_from(
 
 /// Unit tests for the comparison of specifications and the carried inputs.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use kizz_store::{Capture, Change, Explanation};
 
@@ -510,6 +540,8 @@ mod tests {
             always: false,
             ignore: Vec::new(),
             track: Vec::new(),
+            timestamps: false,
+            machine: Vec::new(),
             expect: None,
             occurrence: 0,
         }
@@ -569,6 +601,8 @@ mod tests {
         new.capture = Capture::Merged;
         new.ignore = vec!["*.o".to_owned()];
         new.track = vec!["/proc/cpuinfo".to_owned()];
+        new.timestamps = true;
+        new.machine = vec!["kernel".to_owned()];
         let parts = ProgramParts {
             block: [7; 32],
             modules: vec![
@@ -634,6 +668,14 @@ mod tests {
             Reason::TrackChanged {
                 old: Vec::new(),
                 new: vec!["/proc/cpuinfo".to_owned()],
+            },
+            Reason::TimestampsChanged {
+                old: false,
+                new: true,
+            },
+            Reason::MachineNamesChanged {
+                old: Vec::new(),
+                new: vec!["kernel".to_owned()],
             },
         ]);
     }
@@ -713,6 +755,7 @@ mod tests {
                 access: AccessBits(access),
                 tracked: false,
                 state: kizz_store::PathState::Absent,
+                attributes: None,
             }
         };
         let baseline = Baseline::new(

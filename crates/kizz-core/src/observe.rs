@@ -10,14 +10,22 @@
 //!
 //! * absent paths: [`PathState::Absent`];
 //! * regular files: size, modification and change times in nanoseconds, inode, device,
-//!   and mode, plus a BLAKE3 hash of the content only when the file was read or run,
-//!   hashed with several threads for large files, through the build's [`FileStates`], so
-//!   a file is hashed once per build;
-//! * directories: a hash of the sorted entry names and types when they were listed, plus
-//!   the entries when there are at most [`MAX_LISTED_NAMES`], and otherwise only
-//!   existence and type;
+//!   mode, and owner, plus a BLAKE3 hash of the content only when the file was read or
+//!   run, hashed with several threads for large files, through the build's
+//!   [`FileStates`], so a file is hashed once per build;
+//! * directories: mode, owner, and modification and change times, and when they were
+//!   listed, also a hash of the entry names and types in the order the file system
+//!   returned them, a hash of the same entries sorted, and the entries in that order when
+//!   there are at most [`MAX_LISTED_NAMES`]; entry inode numbers are not recorded;
 //! * symbolic links: the target, plus the state of what the link points to;
 //! * devices, FIFOs, and sockets: type only.
+//!
+//! A path whose extended attributes the step read or listed, the xattr kind, also
+//! records them with its state (see [`record_attributes`]): each name with a BLAKE3
+//! hash of its value, sorted by name, for the path itself and, for a symbolic link,
+//! for what it points to. Kizz reads them only through the attribute query of the
+//! tracer interface, [`Tracer::extended_attributes`], because the standard library
+//! cannot read them.
 //!
 //! Paths under `/proc` and `/sys` are recorded as [`PathState::Untracked`] unless a
 //! `track` pattern matches them; a tracked one gets its state, with the content of
@@ -28,6 +36,10 @@
 //! retargeting, removing, or replacing one of them changes the step. A final link is
 //! recorded as [`PathState::Symlink`] with an untracked pointee, and every other link
 //! on the way is recorded as such a link too, as a probe.
+//!
+//! [`changed_after_read`] compares the first-read metadata that the tracer noted
+//! with the recorded states, to find the files that changed during the run after
+//! the command first read them or ran them.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -43,16 +55,21 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, ContentHash, DirEntry, EntryKind, FileMeta, Listing, MAX_LISTED_NAMES, Observation,
-    PathState, SpecialKind,
+    AccessBits, Attribute, Attributes, ChangedRead, ContentHash, DirEntry, EntryKind, FileMeta,
+    Listing, MAX_LISTED_NAMES, Observation, Owner, PathState, SpecialKind, Times,
 };
-use kizz_trace::{AbsolutePath, AccessKind, AccessKinds, Accesses};
+use kizz_trace::{
+    AbsolutePath, AccessKind, AccessKinds, Accesses, ExtendedAttributes, FileMetadata, FirstReads,
+    Tracer,
+};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use crate::{patterns::PathPatterns, states::FileStates};
 
-/// The context string from which directory listing hashes are derived.
-const LISTING_CONTEXT: &str = "kizz directory listing, version 1";
+/// The context string from which directory listing hashes are derived, both the
+/// hash of the entries in the order the file system returned them and the hash of
+/// the same entries sorted.
+const LISTING_CONTEXT: &str = "kizz directory listing, version 2";
 
 /// The kernel interfaces whose paths are recorded but not compared unless tracked.
 const KERNEL_ROOTS: [&str; 2] = ["/proc", "/sys"];
@@ -216,28 +233,33 @@ pub fn access_bits(kinds: AccessKinds) -> AccessBits {
             AccessKind::List => AccessBits::LIST,
             AccessKind::Write => AccessBits::WRITE,
             AccessKind::Exec => AccessBits::EXEC,
+            AccessKind::Xattr => AccessBits::XATTR,
         }
     }))
 }
 
-/// Record the state of every path in `accesses`, concurrently, leaving out and
-/// counting the paths that `ignore` matches, and hashing the `/proc` and `/sys`
-/// paths that `track` matches. Hashes go through `states`.
+/// Record the state of every path in `accesses`, concurrently on the worker pool of
+/// `states`, leaving out and counting the paths that `ignore` matches, and hashing
+/// the `/proc` and `/sys` paths that `track` matches. Hashes go through `states`, and
+/// the extended attributes of the paths whose attributes were read or listed come
+/// from the attribute query of `tracer`.
 #[must_use]
 pub fn observe(
     accesses: &Accesses,
     ignore: &PathPatterns,
     track: &PathPatterns,
     states: &FileStates,
+    tracer: &dyn Tracer,
 ) -> Observed {
     let (kept, ignored): (Vec<_>, Vec<_>) = accesses
         .iter()
         .map(|(path, kinds)| (path, *kinds))
         .partition(|(path, _)| !ignore.matches(path));
-    let recorded: Vec<(Observation, Vec<Observation>)> = kept
-        .par_iter()
-        .map(|&(path, kinds)| observation(path, kinds, track, states))
-        .collect();
+    let recorded: Vec<(Observation, Vec<Observation>)> = states.pool().install(|| {
+        kept.par_iter()
+            .map(|&(path, kinds)| observation(path, kinds, track, states, tracer))
+            .collect()
+    });
     let mut observations = BTreeMap::new();
     let mut links = Vec::new();
     for (observation, on_the_way) in recorded {
@@ -257,21 +279,30 @@ pub fn observe(
 }
 
 /// The observation of one path that a step touched with `kinds`, and the
-/// observations of the symbolic links that lead it into `/proc` or `/sys`.
+/// observations of the symbolic links that lead it into `/proc` or `/sys`. A path
+/// whose extended attributes were read or listed records them, unless it leads
+/// into `/proc` or `/sys` and no `track` pattern matched it.
 fn observation(
     path: &AbsolutePath,
     kinds: AccessKinds,
     track: &PathPatterns,
     states: &FileStates,
+    tracer: &dyn Tracer,
 ) -> (Observation, Vec<Observation>) {
     let route = kernel_route(path.as_path());
     let tracked = route.is_some() && track.matches(path);
+    let attributes = || {
+        kinds
+            .contains(AccessKind::Xattr)
+            .then(|| record_attributes(path.as_path(), tracer))
+    };
     let Some(route) = route else {
         let observation = Observation {
             path: path.as_path().to_path_buf(),
             access: access_bits(kinds),
             tracked,
             state: path_state(path.as_path(), kinds, false, states),
+            attributes: attributes(),
         };
         return (observation, Vec::new());
     };
@@ -293,6 +324,7 @@ fn observation(
                 access: AccessBits(AccessBits::PROBE),
                 tracked: false,
                 state: untracked_link(target),
+                attributes: None,
             }
         })
         .collect();
@@ -301,8 +333,43 @@ fn observation(
         access: access_bits(kinds),
         tracked,
         state,
+        attributes: if tracked { attributes() } else { None },
     };
     (observation, on_the_way)
+}
+
+/// The extended attributes of `path` now, as a path whose attributes were read or
+/// listed records them, read through the attribute query of `tracer`: those of the
+/// path itself, without following a final symbolic link, and, when the path is a
+/// symbolic link, those of what it points to. Each list holds every name with a
+/// BLAKE3 hash of its value, sorted by name, or is `None` when the query fails, as
+/// it does when nothing is at the path; a file system without attributes has none.
+///
+/// A cache check reads them again the same way and compares the two.
+#[must_use]
+pub fn record_attributes(
+    path: &Path,
+    tracer: &dyn Tracer,
+) -> Attributes {
+    let hashed = |follow: bool| tracer.extended_attributes(path, follow).ok().map(hashes);
+    let link = fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    Attributes {
+        own: hashed(false),
+        pointee: if link { hashed(true) } else { None },
+    }
+}
+
+/// Each attribute of `attributes` with a BLAKE3 hash of its value, sorted by name.
+fn hashes(attributes: ExtendedAttributes) -> Vec<Attribute> {
+    attributes
+        .into_iter()
+        .map(|(name, value)| {
+            Attribute {
+                name,
+                hash: ContentHash(*blake3::hash(&value).as_bytes()),
+            }
+        })
+        .collect()
 }
 
 /// The state of a symbolic link to `target`, which leads into `/proc` or `/sys`:
@@ -390,7 +457,12 @@ fn state_of(
         } else {
             None
         };
-        PathState::Directory { listing }
+        PathState::Directory {
+            mode: metadata.mode(),
+            owner: owner(metadata),
+            listing,
+            times: times(metadata),
+        }
     } else {
         PathState::Special {
             kind: special_kind(file_type),
@@ -423,15 +495,37 @@ const fn nanos(
         .saturating_add(nanoseconds)
 }
 
-/// The metadata of a regular file that a cache check compares.
-pub(crate) fn file_meta(metadata: &Metadata) -> FileMeta {
-    FileMeta {
-        size: metadata.size(),
+/// The modification and change times of a regular file or a directory whose
+/// metadata is `metadata`.
+pub(crate) fn times(metadata: &Metadata) -> Times {
+    Times {
         mtime_nanos: nanos(metadata.mtime(), metadata.mtime_nsec()),
         ctime_nanos: nanos(metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+/// The metadata of a regular file that a cache check compares.
+pub(crate) fn file_meta(metadata: &Metadata) -> FileMeta {
+    let Times {
+        mtime_nanos,
+        ctime_nanos,
+    } = times(metadata);
+    FileMeta {
+        size: metadata.size(),
+        mtime_nanos,
+        ctime_nanos,
         inode: metadata.ino(),
         device: metadata.dev(),
         mode: metadata.mode(),
+        owner: owner(metadata),
+    }
+}
+
+/// The owner of a file or directory whose metadata is `metadata`.
+pub(crate) fn owner(metadata: &Metadata) -> Owner {
+    Owner {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
     }
 }
 
@@ -456,8 +550,8 @@ fn entry_kind(file_type: FileType) -> EntryKind {
     }
 }
 
-/// The listing of the directory at `path`: the hash of its sorted entry names and
-/// types, and the entries when there are at most [`MAX_LISTED_NAMES`].
+/// The listing of the directory at `path`, with its entries in the order the file
+/// system returns them (see [`listing`]).
 pub(crate) fn list(path: &Path) -> io::Result<Listing> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(path)? {
@@ -468,26 +562,296 @@ pub(crate) fn list(path: &Path) -> io::Result<Listing> {
             kind,
         });
     }
-    entries.sort();
+    Ok(listing(entries))
+}
+
+/// The listing of `entries`, in the order given: the hash of their names and types
+/// in that order, the hash of the same entries sorted by name and type, and the
+/// entries in that order when there are at most [`MAX_LISTED_NAMES`].
+#[must_use]
+pub fn listing(entries: Vec<DirEntry>) -> Listing {
+    let mut sorted: Vec<&DirEntry> = entries.iter().collect();
+    sorted.sort();
+    let sorted_hash = listing_hash(sorted);
+    Listing {
+        hash: listing_hash(&entries),
+        sorted_hash,
+        entries: (entries.len() <= MAX_LISTED_NAMES).then_some(entries),
+    }
+}
+
+/// The hash of `entries`, in the order given: for each entry, the length of its
+/// name as eight little-endian bytes, the name, and the code of its type.
+fn listing_hash<'a>(entries: impl IntoIterator<Item = &'a DirEntry>) -> ContentHash {
     let mut hasher = blake3::Hasher::new_derive_key(LISTING_CONTEXT);
-    for entry in &entries {
+    for entry in entries {
         let length = u64::try_from(entry.name.len()).unwrap_or(u64::MAX);
         hasher.update(&length.to_le_bytes());
         hasher.update(&entry.name);
         hasher.update(&[entry.kind.code()]);
     }
-    Ok(Listing {
-        hash: ContentHash(*hasher.finalize().as_bytes()),
-        entries: (entries.len() <= MAX_LISTED_NAMES).then_some(entries),
-    })
+    ContentHash(*hasher.finalize().as_bytes())
 }
 
-/// Unit tests for recognizing paths that lead into `/proc` and `/sys`.
+/// The files that changed during a run after the command first read them or ran
+/// them, sorted by path: each path in `first_reads` whose recorded state in
+/// `observations`, following a final symbolic link, is not a regular file with the
+/// noted device, inode, size, modification and change times, mode, and owner.
+/// No file, another type, and an inaccessible path are changes too. Each says
+/// whether the command wrote the path, as its access kinds show.
+///
+/// A path that no observation holds, because an ignore pattern matched it, is not
+/// compared, and neither is a path under `/proc` or `/sys`, or one that symbolic
+/// links lead there, tracked or not.
+#[must_use]
+pub fn changed_after_read(
+    observations: &[Observation],
+    first_reads: &FirstReads,
+) -> Vec<ChangedRead> {
+    first_reads
+        .iter()
+        .filter_map(|(path, noted)| {
+            let path = path.as_path();
+            let index = observations
+                .binary_search_by(|observation| observation.path.as_path().cmp(path))
+                .ok()?;
+            let observation = observations.get(index)?;
+            if observation.tracked || is_kernel_path(path) {
+                return None;
+            }
+            let unchanged = same_file(&observation.state, noted)?;
+            (!unchanged).then(|| {
+                ChangedRead {
+                    path: path.to_path_buf(),
+                    written: observation.access.contains(AccessBits::WRITE),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Whether the recorded `state`, following a final symbolic link, is the regular
+/// file that `noted` describes, unchanged; `None` when the state is untracked, so
+/// it is not compared.
+fn same_file(
+    state: &PathState,
+    noted: &FileMetadata,
+) -> Option<bool> {
+    match state {
+        PathState::Untracked => None,
+        PathState::Symlink { pointee, .. } => same_file(pointee, noted),
+        PathState::File { meta, .. } => {
+            Some(
+                meta.device == noted.device
+                    && meta.inode == noted.inode
+                    && meta.size == noted.size
+                    && meta.mtime_nanos == noted.mtime_nanos
+                    && meta.ctime_nanos == noted.ctime_nanos
+                    && meta.mode == noted.mode
+                    && meta.owner
+                        == (Owner {
+                            uid: noted.uid,
+                            gid: noted.gid,
+                        }),
+            )
+        },
+        PathState::Absent
+        | PathState::Directory { .. }
+        | PathState::Special { .. }
+        | PathState::Inaccessible { .. } => Some(false),
+    }
+}
+
+/// Unit tests for listing hashes, for recognizing paths that lead into `/proc` and
+/// `/sys`, and for comparing first reads with recorded states.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    /// A regular-file entry named `name`.
+    fn entry(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.as_bytes().to_vec(),
+            kind: EntryKind::File,
+        }
+    }
+
+    /// The noted metadata of a regular file with `inode`.
+    fn noted(inode: u64) -> FileMetadata {
+        FileMetadata {
+            device: 1,
+            inode,
+            size: 2,
+            mtime_nanos: 3,
+            ctime_nanos: 4,
+            mode: 0o100_644,
+            uid: 5,
+            gid: 6,
+        }
+    }
+
+    /// The recorded state of the regular file that `noted(inode)` describes.
+    fn file(inode: u64) -> PathState {
+        PathState::File {
+            meta: FileMeta {
+                size: 2,
+                mtime_nanos: 3,
+                ctime_nanos: 4,
+                inode,
+                device: 1,
+                mode: 0o100_644,
+                owner: Owner { uid: 5, gid: 6 },
+            },
+            hash: None,
+        }
+    }
+
+    /// An observation of `path` with `access` and `state`.
+    fn observed(
+        path: &str,
+        access: u8,
+        tracked: bool,
+        state: PathState,
+    ) -> Observation {
+        Observation {
+            path: PathBuf::from(path),
+            access: AccessBits(access),
+            tracked,
+            state,
+            attributes: None,
+        }
+    }
+
+    /// Each noted file is compared with its final state through a final link; any
+    /// differing field, another type, or no file is a change, with whether the
+    /// command wrote the path; ignored, untracked and tracked kernel paths are not
+    /// compared.
+    #[test]
+    fn first_reads_are_compared_with_the_recorded_states() {
+        let read = AccessBits::READ;
+        let written = AccessBits::READ | AccessBits::WRITE;
+        let link = |state| {
+            PathState::Symlink {
+                target: PathBuf::from("t"),
+                pointee: Box::new(state),
+            }
+        };
+        let mut moved = file(1);
+        if let PathState::File { meta, .. } = &mut moved {
+            meta.mode = 0o100_600;
+        }
+        let observations = vec![
+            observed("/p/absent", written, false, PathState::Absent),
+            observed("/p/dir", read, false, PathState::Directory {
+                mode: 0o040_755,
+                owner: Owner { uid: 5, gid: 6 },
+                listing: None,
+                times: Times {
+                    mtime_nanos: 3,
+                    ctime_nanos: 4,
+                },
+            }),
+            observed("/p/link-other", written, false, link(file(9))),
+            observed("/p/link-same", read, false, link(file(1))),
+            observed("/p/mode", read, false, moved),
+            observed("/p/same", read, false, file(1)),
+            observed("/proc/version", read, true, file(9)),
+            observed("/sys/kernel", read, false, PathState::Untracked),
+            observed("/x/untracked", read, false, link(PathState::Untracked)),
+        ];
+        let mut first_reads = FirstReads::new();
+        let accesses = Accesses::new();
+        for path in [
+            "/p/absent",
+            "/p/dir",
+            "/p/ignored",
+            "/p/link-other",
+            "/p/link-same",
+            "/p/mode",
+            "/p/same",
+            "/proc/version",
+            "/sys/kernel",
+            "/x/untracked",
+        ] {
+            first_reads.note(&AbsolutePath::new(path).unwrap(), noted(1), &accesses);
+        }
+        let changed: Vec<(String, bool)> = changed_after_read(&observations, &first_reads)
+            .into_iter()
+            .map(|file| (file.path.display().to_string(), file.written))
+            .collect();
+        assert_eq!(changed, [
+            ("/p/absent".to_owned(), true),
+            ("/p/dir".to_owned(), false),
+            ("/p/link-other".to_owned(), true),
+            ("/p/mode".to_owned(), false),
+        ]);
+    }
+
+    /// The same entries in two orders have different listing hashes and the same
+    /// sorted hash, and the same entries in the same order have the same hashes.
+    #[test]
+    fn order_changes_the_listing_hash_and_not_the_sorted_hash() {
+        let forward = listing(vec![entry("a"), entry("b"), entry("c")]);
+        let backward = listing(vec![entry("c"), entry("b"), entry("a")]);
+        assert_ne!(forward.hash, backward.hash);
+        assert_eq!(forward.sorted_hash, backward.sorted_hash);
+        let again = listing(vec![entry("a"), entry("b"), entry("c")]);
+        assert_eq!(again, forward);
+        // Sorted entries hash the same both ways; other entries hash differently.
+        assert_eq!(forward.hash, forward.sorted_hash);
+        let other = listing(vec![entry("a"), entry("b")]);
+        assert_ne!(other.sorted_hash, forward.sorted_hash);
+        // A type is part of an entry.
+        let retyped = listing(vec![entry("a"), entry("b"), DirEntry {
+            name: b"c".to_vec(),
+            kind: EntryKind::Directory,
+        }]);
+        assert_ne!(retyped.sorted_hash, forward.sorted_hash);
+        assert_eq!(
+            backward.entries,
+            Some(vec![entry("c"), entry("b"), entry("a")])
+        );
+    }
+
+    /// A listing keeps the entries in the order the file system returns them, and
+    /// keeps them only up to the limit, while both hashes cover every entry.
+    #[test]
+    fn listings_keep_the_file_system_order_up_to_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["m", "a", "z", "k"] {
+            fs::write(dir.path().join(name), "").unwrap();
+        }
+        fs::create_dir(dir.path().join("d")).unwrap();
+        let returned: Vec<DirEntry> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                DirEntry {
+                    name: entry.file_name().into_vec(),
+                    kind: entry_kind(entry.file_type().unwrap()),
+                }
+            })
+            .collect();
+        let listed = list(dir.path()).unwrap();
+        assert_eq!(listed, listing(returned.clone()));
+        assert_eq!(listed.entries, Some(returned));
+
+        let many: Vec<DirEntry> = (0..=MAX_LISTED_NAMES)
+            .map(|index| entry(&index.to_string()))
+            .collect();
+        let large = listing(many.clone());
+        assert_eq!(large.entries, None);
+        let fewer = listing(many.iter().skip(1).cloned().collect());
+        assert_ne!(large.hash, fewer.hash);
+        assert_ne!(large.sorted_hash, fewer.sorted_hash);
+    }
 
     /// Paths under `/proc` and `/sys`, and the standard links into them, reach a
     /// kernel interface.

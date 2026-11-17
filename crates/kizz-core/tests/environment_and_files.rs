@@ -10,6 +10,14 @@
 //! step specifications the fake executor received, the lines the program printed,
 //! the files it wrote, and the accesses recorded against the task.
 
+#![allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "test code: the tests assert, borrow cells, lock and print"
+)]
+
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -85,7 +93,7 @@ struct Printed {
 }
 
 impl Printed {
-    /// The lines printed so far, without the task name prefix.
+    /// The lines printed so far, without the `print` prefix, the task's heading.
     fn lines(&self) -> Vec<String> {
         self.lines
             .borrow()
@@ -110,7 +118,7 @@ struct Ran {
     run: TaskRun,
     /// The steps the executor received.
     executor: FakeExecutor,
-    /// The lines the program printed, without the task name prefix.
+    /// The lines the program printed, without the `print` prefix, the task's heading.
     printed: Vec<String>,
 }
 
@@ -187,7 +195,7 @@ impl Fixture {
         Ok(fs::read_to_string(self.project().join(relative))?)
     }
 
-    /// The task named `Task` whose block is `source`.
+    /// The task with the heading `Task` and no name, whose block is `source`.
     fn task(
         &self,
         source: &str,
@@ -635,6 +643,38 @@ fn unchanged_writes_leave_the_file_untouched() -> TestResult {
         ("project/same.json".to_owned(), "write".to_owned()),
         ("project/same.txt".to_owned(), "write".to_owned()),
     ]);
+    Ok(())
+}
+
+/// The run reports the files that `fs.write` and `fs.write_json` changed, in the
+/// order the program first changed each, without repeats; a write that leaves the
+/// file as it was is no change, and the other `fs` functions change nothing.
+#[test]
+fn the_run_reports_the_files_its_writes_changed() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.write("same.txt", "unchanged\n")?;
+    fixture.write("same.json", "{\n  \"a\": 1\n}\n")?;
+    fixture.write("old.txt", "old\n")?;
+    let ran = fixture.run(
+        "fs.write(\"same.txt\", \"unchanged\\n\")\nfs.write_json(\"same.json\", {\"a\": \
+         1})\nfs.write(\"old.txt\", \"new\\n\")\nfs.write_json(\"gen/new.json\", {\"b\": \
+         2})\nfs.write(\"old.txt\", \"newer\\n\")\nfs.write(\"old.txt\", \"newer\\n\")\n\
+         print(fs.read(\"old.txt\"), fs.exists(\"gen\"), fs.list(\"gen\"))\n",
+        &Env::new(),
+    )?;
+    ran.run.result.clone()?;
+    let changed: Vec<PathBuf> = ran
+        .run
+        .changes
+        .paths()
+        .iter()
+        .map(|path| path.as_path().to_path_buf())
+        .collect();
+    assert_eq!(changed, [
+        fixture.root().join("project/old.txt"),
+        fixture.root().join("project/gen/new.json"),
+    ]);
+    assert_eq!(fixture.read("old.txt")?, "newer\n");
     Ok(())
 }
 

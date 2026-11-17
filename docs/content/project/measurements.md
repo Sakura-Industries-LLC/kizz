@@ -1,8 +1,12 @@
++++
+weight = 1
++++
+
 # Phase 9 measurements
 
-This report covers phase 9 of the version 1 plan in [architecture.md](../architecture.md):
-tracing overhead and cache-check time on real projects, discovery time on large trees, cache cleanup on a large cache,
-and the decision on a tracer fast path.
+This report covers phase 9 of the version 1 plan in
+[architecture.md](https://github.com/Sakura-Industries-LLC/kizz/blob/main/architecture.md): tracing overhead and cache-check time on
+real projects, discovery time on large trees, cache cleanup on a large cache, and the decision on a tracer fast path.
 It ends with the defect the measurements found and fixed, and the follow-up work.
 
 ## Summary

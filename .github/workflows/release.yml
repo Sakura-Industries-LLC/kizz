@@ -1,0 +1,115 @@
+# Build and publish the `kizz` binary when a `v*` tag is pushed.
+#
+# The tag must match the `kizz` crate version (`crates/kizz/Cargo.toml`),
+# e.g. `v0.0.1`. Library crate versions are independent and not checked.
+#
+# Only x86_64 Linux is built: the tracer (`kizz-trace-linux`) supports no other
+# architecture and refuses to compile for one.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+  TARGET: x86_64-unknown-linux-musl
+  CARGO_TERM_COLOR: always
+  # The workspace denies all warnings; lint enforcement belongs to `just fix-ci`,
+  # not the release build, so a new compiler lint cannot block a tagged release.
+  RUSTFLAGS: --cap-lints=warn
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-version:
+    name: Check tag matches kizz version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Compare tag with crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "kizz") | .version')
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match kizz version ${version}"
+            exit 1
+          fi
+
+  build:
+    name: Build x86_64-unknown-linux-musl
+    needs: check-version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.TARGET }}
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked -p kizz --target "${TARGET}"
+      - name: Package
+        run: |
+          name="kizz-${GITHUB_REF_NAME}-${TARGET}"
+          mkdir "${name}"
+          cp "target/${TARGET}/release/kizz" README.md LICENSE "${name}/"
+          tar -czf "${name}.tar.gz" "${name}"
+          sha256sum "${name}.tar.gz" > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: kizz-${{ github.ref_name }}-${{ env.TARGET }}.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: |
+            kizz-${{ github.ref_name }}-${{ env.TARGET }}.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "kizz ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/kizz-* dist/SHA256SUMS

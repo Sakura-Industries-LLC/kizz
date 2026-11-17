@@ -1,0 +1,3 @@
+base_url = "/"
+title = "kizz"
+description = "Kizz is a build engine for Linux that traces every command it runs and records what each one touched."

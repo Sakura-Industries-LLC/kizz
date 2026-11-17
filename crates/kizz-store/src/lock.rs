@@ -19,6 +19,13 @@
 //! * Releasing the lock, explicitly or by dropping the [`CacheLock`], deletes the file
 //!   while the lock is still held, so a normal exit, or an interrupted exit that unwinds
 //!   to the release, leaves no file behind.
+//! * While the lock is held, its path is noted through `kizz_threads::overflow`, so that
+//!   kizz's handler of stack overflows deletes the file before kizz exits; the note is
+//!   dropped before a release deletes the file.
+//!
+//! The holder's start time, which messages show in UTC, is converted with checked
+//! arithmetic, so no time read from another process's file can make an operator
+//! overflow and panic ("Kizz never panics").
 
 use std::{
     ffi::CStr,
@@ -175,6 +182,9 @@ pub struct CacheLock {
     path: PathBuf,
     /// The locked file, `None` once released.
     file: Option<File>,
+    /// The note that makes kizz's handler of stack overflows delete the lock file,
+    /// `None` once released.
+    note: Option<kizz_threads::overflow::Note>,
 }
 
 impl CacheLock {
@@ -227,12 +237,16 @@ impl CacheLock {
         self.release_inner()
     }
 
-    /// Deletes the lock file while the lock is still held, then releases the lock by
-    /// closing the file. Does nothing when already released.
+    /// Forgets the note of the lock file, deletes the file while the lock is still
+    /// held, then releases the lock by closing the file. Does nothing when already
+    /// released.
     fn release_inner(&mut self) -> Result<(), LockError> {
         let Some(file) = self.file.take() else {
             return Ok(());
         };
+        // The handler of stack overflows must not delete a file that is no longer
+        // kizz's, so the note goes first.
+        drop(self.note.take());
         let removed = match fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 Err(LockError::Remove {
@@ -302,6 +316,7 @@ fn acquire_inner(
                     }
                 })?;
                 return Ok(CacheLock {
+                    note: Some(kizz_threads::overflow::note_lock(&path)),
                     path,
                     file: Some(file),
                 });
@@ -377,8 +392,9 @@ fn user_name() -> String {
         .into_owned()
 }
 
-/// The host name of the machine, or `(unknown)` when it cannot be read.
-fn host_name() -> String {
+/// The host name of the machine, or `(unknown)` when it cannot be read; the lock
+/// file and the cache identity both name it.
+pub(crate) fn host_name() -> String {
     let mut buffer = [0_u8; 256];
     // SAFETY: the pointer and length describe `buffer`, which outlives the call.
     let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -392,42 +408,70 @@ fn host_name() -> String {
 }
 
 /// Formats nanoseconds since the Unix epoch as a UTC time, such as
-/// `2026-10-24T05:12:00Z`.
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "the civil-date conversion divides and adds non-negative values that a u64 \
-              of nanoseconds keeps far below overflow"
-)]
+/// `2026-10-24T05:12:00Z`, or as the number of nanoseconds after the epoch when the
+/// conversion cannot be made, which no `u64` causes.
 fn format_utc(nanos: u64) -> String {
-    let seconds = nanos / 1_000_000_000;
-    let days = seconds / 86_400;
-    let second_of_day = seconds % 86_400;
+    civil_utc(nanos).unwrap_or_else(|| format!("{nanos} nanoseconds after the epoch"))
+}
+
+/// The UTC time `nanos` nanoseconds after the Unix epoch, converted to a civil date
+/// with checked arithmetic, which cannot panic where the arithmetic operators would
+/// on an overflow ("Kizz never panics"); `None` when a step overflows.
+fn civil_utc(nanos: u64) -> Option<String> {
+    let seconds = nanos.checked_div(1_000_000_000)?;
+    let days = seconds.checked_div(86_400)?;
+    let second_of_day = seconds.checked_rem(86_400)?;
     // The conversion from days since the epoch to a civil date, for days on or after
     // 1970-01-01.
-    let shifted = days + 719_468;
-    let era = shifted / 146_097;
-    let day_of_era = shifted % 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let shifted = days.checked_add(719_468)?;
+    let era = shifted.checked_div(146_097)?;
+    let day_of_era = shifted.checked_rem(146_097)?;
+    let year_of_era = day_of_era
+        .checked_sub(day_of_era.checked_div(1_460)?)?
+        .checked_add(day_of_era.checked_div(36_524)?)?
+        .checked_sub(day_of_era.checked_div(146_096)?)?
+        .checked_div(365)?;
+    let day_of_year = day_of_era.checked_sub(
+        year_of_era
+            .checked_mul(365)?
+            .checked_add(year_of_era.checked_div(4)?)?
+            .checked_sub(year_of_era.checked_div(100)?)?,
+    )?;
+    let shifted_month = day_of_year
+        .checked_mul(5)?
+        .checked_add(2)?
+        .checked_div(153)?;
+    let day = day_of_year
+        .checked_sub(
+            shifted_month
+                .checked_mul(153)?
+                .checked_add(2)?
+                .checked_div(5)?,
+        )?
+        .checked_add(1)?;
     let month = if shifted_month < 10 {
-        shifted_month + 3
+        shifted_month.checked_add(3)?
     } else {
-        shifted_month - 9
+        shifted_month.checked_sub(9)?
     };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    format!(
+    let year = year_of_era
+        .checked_add(era.checked_mul(400)?)?
+        .checked_add(u64::from(month <= 2))?;
+    Some(format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        second_of_day / 3_600,
-        second_of_day % 3_600 / 60,
-        second_of_day % 60
-    )
+        second_of_day.checked_div(3_600)?,
+        second_of_day.checked_rem(3_600)?.checked_div(60)?,
+        second_of_day.checked_rem(60)?
+    ))
 }
 
 /// Unit tests for the lock file within one process.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: a thread of a scope waits for the lock, and the tests assert"
+)]
 mod tests {
     use std::cell::Cell;
 

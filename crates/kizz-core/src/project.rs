@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use crate::{
     discovery::{Discovery, KizzFile, discover},
+    pool::WorkerPool,
     targets::TARGET_NAME_RULE,
-    tasks::{Task, parse_tasks},
+    tasks::{OptionProblem, Task, parse_tasks},
     warning::{Warning, location, shown},
 };
 
@@ -56,6 +57,20 @@ pub enum ConfigError {
         /// The invalid target.
         target: String,
     },
+    /// A task block has a task option that is unknown, repeated, or has a value that
+    /// the option does not accept, or a name that another task of its file has.
+    TaskOption {
+        /// The `kizz.md` that holds the block.
+        file: PathBuf,
+        /// The line of the block's opening fence, counting from 1.
+        line: usize,
+        /// The nearest heading above the block, if there is one.
+        heading: Option<String>,
+        /// The option, as the info string writes it.
+        option: String,
+        /// What is wrong with it.
+        problem: OptionProblem,
+    },
     /// A `kizz.md` has more task blocks than a task position can number.
     TooManyTasks {
         /// The file.
@@ -80,6 +95,20 @@ impl fmt::Display for ConfigError {
                     f,
                     "{}: invalid target name `{target}`: {TARGET_NAME_RULE}",
                     location(file, *line, heading.as_deref())
+                )
+            },
+            Self::TaskOption {
+                file,
+                line,
+                heading,
+                option,
+                problem,
+            } => {
+                write!(
+                    f,
+                    "{}: {}",
+                    location(file, *line, heading.as_deref()),
+                    problem.message(option)
                 )
             },
             Self::TooManyTasks { file } => {
@@ -131,15 +160,18 @@ impl fmt::Display for LoadError {
     }
 }
 
-/// Discover every `kizz.md` under `root` and parse its tasks.
+/// Discover every `kizz.md` under `root`, walking on `pool`, and parse its tasks.
 ///
 /// # Errors
 ///
 /// [`LoadError::Root`] when `root` is not a readable directory, and
 /// [`LoadError::Config`] with every configuration error found when any `kizz.md`
-/// cannot be read or has an invalid target name, together with every discovery and
-/// parsing warning found.
-pub fn load(root: &Path) -> Result<Project, LoadError> {
+/// cannot be read or has an invalid target name or task option, together with every
+/// discovery and parsing warning found.
+pub fn load(
+    root: &Path,
+    pool: &WorkerPool,
+) -> Result<Project, LoadError> {
     let root_error = |source| {
         LoadError::Root {
             root: root.to_path_buf(),
@@ -154,7 +186,7 @@ pub fn load(root: &Path) -> Result<Project, LoadError> {
     let Discovery {
         files,
         mut warnings,
-    } = discover(&root);
+    } = discover(&root, pool);
     let mut tasks: Vec<Task> = Vec::new();
     let mut errors: Vec<ConfigError> = Vec::new();
     for file in &files {
@@ -186,11 +218,21 @@ pub fn load(root: &Path) -> Result<Project, LoadError> {
 
 /// Unit tests for loading projects.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::{fs, io, path::Path};
 
-    use super::{ConfigError, LoadError, load};
-    use crate::{tasks::Task, warning::Warning};
+    use super::{ConfigError, LoadError};
+    use crate::{pool::WorkerPool, tasks::Task, warning::Warning};
+
+    /// Load the project under `root` with a worker pool of its own.
+    fn load(root: &Path) -> Result<super::Project, LoadError> {
+        super::load(root, &WorkerPool::new().unwrap())
+    }
 
     /// The recursive-link warning that [`link_up`] causes for `dir`.
     fn recursive_link_warning(dir: &str) -> String {
@@ -334,7 +376,9 @@ mod tests {
         let warnings: Vec<String> = warnings.iter().map(ToString::to_string).collect();
         assert_eq!(warnings, [
             recursive_link_warning("a"),
-            "kizz.md:3 (Notes): this starlark block has no targets, so it is not a task".to_owned(),
+            "kizz.md:3 (Notes): this starlark block has neither targets nor a name, so it is not \
+             a task"
+                .to_owned(),
         ]);
     }
 
@@ -357,7 +401,8 @@ mod tests {
         let warnings: Vec<String> = warnings.iter().map(ToString::to_string).collect();
         assert_eq!(warnings, [
             recursive_link_warning("sub"),
-            "sub/kizz.md:3 (Sub): this starlark block has no targets, so it is not a task"
+            "sub/kizz.md:3 (Sub): this starlark block has neither targets nor a name, so it is \
+             not a task"
                 .to_owned(),
         ]);
     }

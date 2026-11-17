@@ -14,16 +14,16 @@
 //! finds it cached. A task is under a path when its `kizz.md` is in the path or under
 //! it, compared by path components.
 //!
-//! * [`clean`] checks every recorded path concurrently, the `kizz.md` of every owner of a
-//!   step record included. A step record that depends on a path that existed when kizz
-//!   recorded it and no longer exists is removed as a whole; the step's working directory
-//!   counts as such a dependency. From each step record it keeps, it takes out the owners
-//!   whose `kizz.md` no longer exists, and it removes no record for that alone, so a
-//!   record may be left with no owner. Task records, step positions, and learned order
-//!   for `kizz.md` files that no longer exist are removed, as are last-writer entries for
-//!   paths that no longer exist. A dependency on a path that did not exist when it was
-//!   recorded is still valid and is kept, and so are untracked `/proc` and `/sys`
-//!   accesses, which are never dependencies.
+//! * [`clean`] checks every recorded path concurrently, on the command's worker pool, the
+//!   `kizz.md` of every owner of a step record included. A step record that depends on a
+//!   path that existed when kizz recorded it and no longer exists is removed as a whole;
+//!   the step's working directory counts as such a dependency. From each step record it
+//!   keeps, it takes out the owners whose `kizz.md` no longer exists, and it removes no
+//!   record for that alone, so a record may be left with no owner. Task records, step
+//!   positions, and learned order for `kizz.md` files that no longer exist are removed,
+//!   as are last-writer entries for paths that no longer exist. A dependency on a path
+//!   that did not exist when it was recorded is still valid and is kept, and so are
+//!   untracked `/proc` and `/sys` accesses, which are never dependencies.
 //! * [`plan_reset`] selects every entry for the tasks under a directory: their task
 //!   records, step positions, and learned order, the last-writer entries for paths under
 //!   it, and the step records they own. A step record is removed when it has an owner and
@@ -46,6 +46,8 @@ use kizz_store::{
 };
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 
+use crate::pool::WorkerPool;
+
 /// What [`clean`] found and removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cleaned {
@@ -60,13 +62,16 @@ pub struct Cleaned {
 /// Removes the cache entries about files and dependencies that existed when kizz
 /// recorded them but no longer exist, and takes the tasks whose `kizz.md` no longer
 /// exists out of the owners of the step records it keeps, after checking every
-/// recorded path concurrently, in one transaction.
+/// recorded path concurrently on `pool`, in one transaction.
 ///
 /// # Errors
 ///
 /// A [`StoreError`] when the cache cannot be read or the removal cannot be
 /// committed; then nothing is removed.
-pub fn clean(store: &Store) -> Result<Cleaned, StoreError> {
+pub fn clean(
+    store: &Store,
+    pool: &WorkerPool,
+) -> Result<Cleaned, StoreError> {
     let mut txn = store.write()?;
     let steps = txn.scan::<StepRecord>(&[])?;
     let positions: Vec<PositionKey> = keys(txn.scan::<StepPosition>(&[])?);
@@ -83,11 +88,13 @@ pub fn clean(store: &Store) -> Result<Cleaned, StoreError> {
     paths.extend(tasks.iter().chain(&orders).map(|id| id.file.as_path()));
     paths.extend(writers.iter().map(|key| key.0.as_path()));
     let checked = paths.len();
-    let gone: HashSet<PathBuf> = paths
-        .into_par_iter()
-        .filter(|path| is_gone(path))
-        .map(Path::to_path_buf)
-        .collect();
+    let gone: HashSet<PathBuf> = pool.install(|| {
+        paths
+            .into_par_iter()
+            .filter(|path| is_gone(path))
+            .map(Path::to_path_buf)
+            .collect()
+    });
 
     let mut removed = Removal::default();
     for (key, record) in &steps {
@@ -343,6 +350,11 @@ impl Removal {
 
 /// Unit tests for the check for gone paths.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::disallowed_methods,
+    reason = "test code: the tests assert and lock"
+)]
 mod tests {
     use std::path::Path;
 

@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The report of `kizz why`: the reasons stored by the most recent build for the
-//! tasks under a path, with each step's untracked `/proc` and `/sys` accesses and how
-//! many accesses it ignored.
+//! tasks under a path, with each step's untracked `/proc` and `/sys` accesses, its
+//! connections to the network and to Unix sockets, the system calls it made that
+//! the tracer does not know, the recorded machine state of the parts it names, or
+//! of every part with `--verbose`, and how many accesses it ignored.
 //!
 //! The tasks under a directory are the task records whose `kizz.md` is under it; a
 //! path that names a file selects the tasks of that file. Among those, the most
@@ -18,8 +20,9 @@ use std::{
 };
 
 use kizz_store::{
-    AccessBits, BuildId, PathState, StepKey, StepPosition, StepRecord, Store, StoreError, TaskId,
-    TaskLabel, TaskRecord, Verdict, path_prefix,
+    AccessBits, BuildId, Connection, MachinePart, MachineStateRecord, PathState, StepKey,
+    StepPosition, StepRecord, Store, StoreError, TaskId, TaskLabel, TaskRecord, Verdict,
+    path_prefix,
 };
 
 use crate::{explain::RepeatedWarning, render::Render};
@@ -40,6 +43,18 @@ pub struct WhyStep {
     pub untracked: Vec<(PathBuf, AccessBits)>,
     /// The number of accesses that ignore patterns left out.
     pub ignored: u64,
+    /// The numbers of the system calls that the step's command made and that the
+    /// tracer does not know, sorted, as its record lists them.
+    pub unknown_system_calls: Vec<u32>,
+    /// The connections that the step's command made to IPv4 or IPv6 addresses or to
+    /// Unix sockets, sorted, as its record lists them.
+    pub connections: Vec<Connection>,
+    /// The names of the parts of the machine state that the step names, sorted, as
+    /// its specification lists them.
+    pub machine_names: Vec<String>,
+    /// The machine state that the step's command started with, as its record keeps
+    /// it; every part is unknown when the step record is gone.
+    pub machine: MachineStateRecord,
 }
 
 impl WhyStep {
@@ -169,18 +184,37 @@ fn step(
     position: u32,
     stored: StepPosition,
 ) -> WhyStep {
-    let (argv, untracked, ignored) = record.map_or_else(
-        || (None, Vec::new(), 0),
-        |record| {
-            let untracked = record
-                .observations
-                .iter()
-                .filter(|observation| observation.state == PathState::Untracked)
-                .map(|observation| (observation.path.clone(), observation.access))
-                .collect();
-            (Some(record.spec.argv), untracked, record.ignored)
-        },
-    );
+    let (argv, untracked, ignored, unknown_system_calls, connections, machine_names, machine) =
+        record.map_or_else(
+            || {
+                (
+                    None,
+                    Vec::new(),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    MachineStateRecord::default(),
+                )
+            },
+            |record| {
+                let untracked = record
+                    .observations
+                    .iter()
+                    .filter(|observation| observation.state == PathState::Untracked)
+                    .map(|observation| (observation.path.clone(), observation.access))
+                    .collect();
+                (
+                    Some(record.spec.argv),
+                    untracked,
+                    record.ignored,
+                    record.unknown_system_calls,
+                    record.connections,
+                    record.spec.machine,
+                    record.machine,
+                )
+            },
+        );
     WhyStep {
         position,
         key: stored.step,
@@ -188,13 +222,20 @@ fn step(
         argv,
         untracked,
         ignored,
+        unknown_system_calls,
+        connections,
+        machine_names,
+        machine,
     }
 }
 
 impl Render {
     /// The report of `kizz why` as text: each task with its targets, and each step
     /// with its command, its full reasons, its untracked `/proc` and `/sys` accesses,
-    /// and how many accesses it ignored.
+    /// on a line of their own its connections, or that it made none, and the system
+    /// calls it made that the tracer does not know, when there are any, the recorded
+    /// machine state of each part it names, or with `--verbose` of every part, one
+    /// line for each, and how many accesses it ignored.
     #[must_use]
     pub fn why(
         &self,
@@ -237,11 +278,67 @@ impl Render {
                         .map(|line| format!("    {line}")),
                 );
                 lines.push(format!("    {}", self.untracked(&step.untracked)));
+                lines.push(format!("    {}", self.connections(&step.connections)));
+                if !step.unknown_system_calls.is_empty() {
+                    let numbers: Vec<String> = step
+                        .unknown_system_calls
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                    lines.push(format!(
+                        "    system calls that the tracer does not know: {}",
+                        numbers.join(", ")
+                    ));
+                }
+                if step.argv.is_some() {
+                    lines.extend(
+                        self.machine(step)
+                            .into_iter()
+                            .map(|line| format!("    {line}")),
+                    );
+                }
                 lines.push(format!("    ignored accesses: {}", step.ignored));
             }
         }
         lines.push(String::new());
         lines.join("\n")
+    }
+
+    /// The recorded machine state of a step, one line for each part, in the order
+    /// of the spec's list: the parts that the step names, or with `--verbose` every
+    /// part, those that the step names marked `checked`.
+    fn machine(
+        &self,
+        step: &WhyStep,
+    ) -> Vec<String> {
+        MachinePart::ALL
+            .into_iter()
+            .filter_map(|part| {
+                let named = step.machine_names.iter().any(|name| name == part.name());
+                let text = step.machine.text(part);
+                match (named, self.verbose) {
+                    (true, true) => Some(format!("machine {part} (checked): {text}")),
+                    (true, false) | (false, true) => Some(format!("machine {part}: {text}")),
+                    (false, false) => None,
+                }
+            })
+            .collect()
+    }
+
+    /// The connections of a step on one line, each Unix socket path relative to the
+    /// base and in backticks, or `none`.
+    fn connections(
+        &self,
+        connections: &[Connection],
+    ) -> String {
+        if connections.is_empty() {
+            return "connections: none".to_owned();
+        }
+        let shown: Vec<String> = connections
+            .iter()
+            .map(|connection| connection.text(|path| format!("`{}`", self.path(path))))
+            .collect();
+        format!("connections: {}", shown.join(", "))
     }
 
     /// The untracked `/proc` and `/sys` accesses of a step on one line.
