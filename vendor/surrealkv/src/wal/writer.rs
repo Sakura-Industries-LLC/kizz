@@ -18,6 +18,7 @@ use super::{
 	WritableFile,
 	BLOCK_SIZE,
 	HEADER_SIZE,
+	SYNC_MARK_LEN,
 };
 use crate::tde::{FileCipher, TAG_LEN};
 
@@ -30,6 +31,18 @@ struct Sealer {
 	/// The index of the next batch of the segment, which is also the position it is sealed at. It
 	/// moves on before a batch is sealed and is never given back, whatever happens to the batch.
 	next_index: u64,
+}
+
+/// What a writer has said of how far its segment is synced, see [`RecordType::SyncMark`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marks {
+	/// The segment holds no marks: it is sealed, or marks are off.
+	Off,
+	/// A new segment, whose first append starts with its leading mark.
+	Leading,
+	/// The synced length that the writer's last mark claimed. An append writes a mark first
+	/// when the synced length differs from it.
+	Last(u64),
 }
 
 /// Writer for WAL records.
@@ -63,6 +76,9 @@ pub struct Writer {
 	/// Set when an append failed and the segment could not be cut back to its last whole record,
 	/// so that it may hold the start of a record, or whole records that were never acknowledged.
 	uncut: bool,
+
+	/// Whether appends write sync marks, and what the last one said. Never in a sealed segment.
+	marks: Marks,
 }
 
 impl Writer {
@@ -87,7 +103,45 @@ impl Writer {
 			held: None,
 			sealer: None,
 			uncut: false,
+			marks: Marks::Off,
 		}
+	}
+
+	/// Has the appends to this plaintext segment write sync marks, see [`RecordType::SyncMark`].
+	///
+	/// A `new_segment` gets its leading mark with its first append, which is what tells recovery
+	/// that the segment holds marks. A segment that already holds records (one this writer
+	/// reopened) gets none: it may have been written by a binary that writes no marks, and
+	/// recovery reads it as such. Its later appends write marks all the same, from the first fsync
+	/// on, which covers everything in the file: the writer knows nothing of what it synced before.
+	pub(crate) fn write_sync_marks(&mut self, new_segment: bool) {
+		if self.sealer.is_none() {
+			self.marks = if new_segment {
+				Marks::Leading
+			} else {
+				Marks::Last(0)
+			};
+		}
+	}
+
+	/// Frames a mark of how far the segment is synced into the buffer: the leading mark of a new
+	/// segment, or a mark of a synced length that moved on since the last mark. Nothing if the
+	/// segment holds no marks. A mark is one physical record that never crosses a block: a block
+	/// with too little room left for it is padded with zeros first.
+	///
+	/// The synced length is the one the last fsync to complete covered, see `SyncGate::synced`,
+	/// so a mark never claims bytes that an fsync in flight may not cover.
+	fn write_sync_mark_unflushed(&mut self) -> Result<()> {
+		let synced = self.dest.synced();
+		match self.marks {
+			Marks::Off => return Ok(()),
+			Marks::Last(last) if last == synced => return Ok(()),
+			Marks::Leading | Marks::Last(_) => {}
+		}
+		self.switch_block_unless_room(HEADER_SIZE + SYNC_MARK_LEN)?;
+		self.emit_physical_record(RecordType::SyncMark, &synced.to_be_bytes())?;
+		self.marks = Marks::Last(synced);
+		Ok(())
 	}
 
 	/// Starts a sealed segment on the new, empty file behind `dest`: writes its header record, and
@@ -199,6 +253,11 @@ impl Writer {
 		self.dest.gate()
 	}
 
+	/// The length of the segment once everything appended is written, if known.
+	pub(crate) fn len(&self) -> Option<u64> {
+		self.dest.len()
+	}
+
 	/// Adds a record to the WAL.
 	///
 	/// The record is automatically fragmented if it doesn't fit in the current
@@ -217,7 +276,10 @@ impl Writer {
 		}
 		let compressed = self.compress_records(slice, &[slice.len()])?;
 		let slice = compressed.as_ref().map_or(slice, |(blocks, _)| &blocks[..]);
-		self.guard_append(|writer| writer.write_record(slice))
+		self.guard_append(|writer| {
+			writer.write_sync_mark_unflushed()?;
+			writer.write_record(slice)
+		})
 	}
 
 	/// Adds several records, `buf[ends[i - 1]..ends[i]]` being record `i` (`ends[-1]` is 0),
@@ -246,6 +308,7 @@ impl Writer {
 			// cut back to it. Checked once the writer is known not to be poisoned: a failed
 			// cut can leave bytes in the buffer, and that must be an error, not a panic.
 			debug_assert!(writer.dest.is_flushed());
+			writer.write_sync_mark_unflushed()?;
 			let mut start = 0;
 			for &end in ends {
 				writer.write_record_unflushed(&buf[start..end])?;
@@ -355,7 +418,7 @@ impl Writer {
 		// Fragment the record if necessary and emit it
 		while begin || !ptr.is_empty() {
 			// Switch to new block if less than HEADER_SIZE bytes remain
-			self.maybe_switch_to_new_block()?;
+			self.switch_block_unless_room(HEADER_SIZE)?;
 
 			// Calculate how much data fits in the current block
 			let avail = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
@@ -485,6 +548,21 @@ impl Writer {
 		self.dest.close()
 	}
 
+	/// [`close`](Self::close), and then, if the segment holds marks, a trailing mark of the length
+	/// that the last fsync covered, synced too: recovery then knows that the whole segment was on
+	/// disk, and refuses damage anywhere in it. A writer that took no append writes none.
+	pub(crate) fn close_with_trailing_mark(&mut self) -> Result<()> {
+		self.sync()?;
+		if matches!(self.marks, Marks::Last(_)) && self.check_writable().is_ok() {
+			self.guard_append(|writer| {
+				writer.write_sync_mark_unflushed()?;
+				writer.write_buffer()
+			})?;
+			self.sync()?;
+		}
+		self.dest.close()
+	}
+
 	/// Runs an append. If it fails, part of a record may be in the segment, and
 	/// recovery stops at the first damaged record, so every record acknowledged
 	/// after it would be dropped. The segment is cut back to the last complete
@@ -501,12 +579,16 @@ impl Writer {
 		// cutting it there would extend it.
 		let last_good_len = self.dest.len().filter(|_| self.dest.is_flushed());
 		let last_good_block_offset = self.block_offset;
+		let last_good_marks = self.marks;
 
 		let result = append(self);
 		if result.is_err() {
 			self.poisoned = true;
 			match last_good_len.map(|len| self.dest.truncate(len)) {
-				Some(Ok(())) => self.block_offset = last_good_block_offset,
+				Some(Ok(())) => {
+					self.block_offset = last_good_block_offset;
+					self.marks = last_good_marks;
+				}
 				Some(Err(e)) => {
 					self.uncut = true;
 					tracing::error!("Failed to cut a partial record off the WAL segment: {e}")
@@ -541,22 +623,21 @@ impl Writer {
 		Ok(())
 	}
 
-	/// Switches to a new block if there's not enough space for a header.
+	/// Switches to a new block if less than `room` bytes are left in this one, padding what is
+	/// left with zeros.
 	///
-	/// Only pads when `leftover < HEADER_SIZE` (< 7 bytes remaining).
-	/// Padding is always less than 7 bytes, which the reader discards
-	/// when `buffer_remaining() < HEADER_SIZE`.
-	fn maybe_switch_to_new_block(&mut self) -> Result<()> {
+	/// A fragment of a record needs a header's room, so the padding in front of one is less than
+	/// [`HEADER_SIZE`] bytes, which the reader discards when `buffer_remaining() < HEADER_SIZE`. A
+	/// sync mark needs its whole length, so the padding in front of one can be longer, and the
+	/// reader takes that for a record of type zero, which pads a block.
+	fn switch_block_unless_room(&mut self, room: usize) -> Result<()> {
+		const ZEROS: [u8; HEADER_SIZE + SYNC_MARK_LEN] = [0u8; HEADER_SIZE + SYNC_MARK_LEN];
+		debug_assert!(room <= ZEROS.len(), "no physical record needs more room than a mark");
 		let leftover = BLOCK_SIZE - self.block_offset;
-
-		// Pad when there's not enough space for a header
-		if leftover < HEADER_SIZE {
-			// Pad remaining space with zeros (will be 1-6 bytes)
-			const ZEROS: [u8; HEADER_SIZE] = [0u8; HEADER_SIZE];
+		if leftover < room {
 			self.dest.append(&ZEROS[..leftover])?;
 			self.block_offset = 0;
 		}
-
 		Ok(())
 	}
 

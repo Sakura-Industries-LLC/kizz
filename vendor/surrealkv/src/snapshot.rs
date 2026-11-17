@@ -10,6 +10,7 @@ use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
+use crate::sstable::block::{BlockValue, SmallKeyBuf};
 use crate::sstable::table::Table;
 use crate::vlog::ValueLocation;
 use crate::{
@@ -128,6 +129,7 @@ impl SnapshotTracker {
 
 // ===== Iterator State =====
 /// Holds references to all LSM tree components needed for iteration.
+#[derive(Clone)]
 pub(crate) struct IterState {
 	/// The active memtable receiving current writes
 	pub active: Arc<MemTable>,
@@ -182,6 +184,49 @@ fn covered_by_range(
 	})
 }
 
+/// The memtables and tables of `core`, as one consistent state to iterate.
+fn collect_iter_state(core: &Core) -> Result<IterState> {
+	// The three locks are held together, in the order everything else takes them: a restore
+	// replaces the memtables and the manifest under all of them, and a state read one lock at a
+	// time could be the memtable from before it over the tables it restored.
+	let active_guard = core.active_memtable.read()?;
+	let levels_guard = core.level_manifest.read()?;
+	let immutable_guard = core.immutable_memtables.read()?;
+	let active = Arc::clone(&active_guard);
+	let immutable = immutable_guard.iter().map(|entry| Arc::clone(&entry.memtable)).collect();
+	let levels = levels_guard.levels.clone();
+	drop((immutable_guard, levels_guard, active_guard));
+
+	Ok(IterState {
+		active,
+		immutable,
+		levels,
+	})
+}
+
+/// An encoded value as a read finds it: in the arena of a memtable, which the view holds, or in
+/// a data block, which the value holds.
+pub(crate) enum StoredValue<'v> {
+	Memtable(&'v [u8]),
+	Block(BlockValue),
+}
+
+impl StoredValue<'_> {
+	pub(crate) fn as_slice(&self) -> &[u8] {
+		match self {
+			Self::Memtable(value) => value,
+			Self::Block(value) => value.as_slice(),
+		}
+	}
+}
+
+/// The memtables and tables a snapshot reads many keys from, captured once.
+pub(crate) struct ReadView {
+	state: IterState,
+	/// The range deletions of the tables, `(start, end, seq)`, of the snapshot's time or before
+	table_range_deletions: Vec<(Key, Key, u64)>,
+}
+
 // ===== Snapshot Implementation =====
 /// A consistent point-in-time view of the LSM tree.
 ///
@@ -218,22 +263,7 @@ impl Snapshot {
 	/// This is a helper method used by both iterators and optimized operations
 	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
-		// The three locks are held together, in the order everything else takes them: a restore
-		// replaces the memtables and the manifest under all of them, and a state read one lock
-		// at a time could be the memtable from before it over the tables it restored.
-		let active_guard = self.core.active_memtable.read()?;
-		let levels_guard = self.core.level_manifest.read()?;
-		let immutable_guard = self.core.immutable_memtables.read()?;
-		let active = Arc::clone(&active_guard);
-		let immutable = immutable_guard.iter().map(|entry| Arc::clone(&entry.memtable)).collect();
-		let levels = levels_guard.levels.clone();
-		drop((immutable_guard, levels_guard, active_guard));
-
-		Ok(IterState {
-			active,
-			immutable,
-			levels,
-		})
+		collect_iter_state(&self.core)
 	}
 
 	/// Gets a single key from the snapshot.
@@ -262,16 +292,17 @@ impl Snapshot {
 				}
 			}
 
-			if let Some(item) = active_lock.get(key, Some(self.seq_num)) {
-				if item.0.is_tombstone() {
+			if let Some((trailer, val)) = active_lock.get_raw(key, Some(self.seq_num)) {
+				if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 					return Ok(None);
 				}
+				let seq_num = crate::trailer_to_seq_num(trailer);
 				if let Some(rseq) = max_range_delete_seq {
-					if item.0.seq_num() <= rseq {
+					if seq_num <= rseq {
 						return Ok(None);
 					}
 				}
-				return Ok(Some((item.1, item.0.seq_num())));
+				return Ok(Some((val, seq_num)));
 			}
 		}
 
@@ -288,16 +319,17 @@ impl Snapshot {
 						}
 					}
 				}
-				if let Some(item) = memtable.get(key, Some(self.seq_num)) {
-					if item.0.is_tombstone() {
+				if let Some((trailer, val)) = memtable.get_raw(key, Some(self.seq_num)) {
+					if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 						return Ok(None);
 					}
+					let seq_num = crate::trailer_to_seq_num(trailer);
 					if let Some(rseq) = max_range_delete_seq {
-						if item.0.seq_num() <= rseq {
+						if seq_num <= rseq {
 							return Ok(None);
 						}
 					}
-					return Ok(Some((item.1, item.0.seq_num())));
+					return Ok(Some((val, seq_num)));
 				}
 			}
 		}
@@ -318,7 +350,7 @@ impl Snapshot {
 			}
 		}
 
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
+		let key_encoded = SmallKeyBuf::from_internal_parts(key, self.seq_num, InternalKeyKind::Set);
 
 		for (level_idx, level) in level_manifest.levels.get_levels().iter().enumerate() {
 			if level_idx == 0 {
@@ -329,39 +361,134 @@ impl Snapshot {
 						continue;
 					}
 
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
+					if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
+						if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 							return Ok(None);
 						}
+						let seq_num = crate::trailer_to_seq_num(trailer);
 						if let Some(rseq) = max_range_delete_seq {
-							if ikey.seq_num() <= rseq {
+							if seq_num <= rseq {
 								return Ok(None);
 							}
 						}
-						return Ok(Some((item.1, ikey.seq_num())));
+						return Ok(Some((val, seq_num)));
 					}
 				}
 			} else {
 				// Level 1+: Non-overlapping, binary search for the one table with zero allocations
 				if let Some(table) = level.find_table_for_user_key(key, &self.core.opts.comparator)
 				{
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
+					if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
+						if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 							return Ok(None);
 						}
+						let seq_num = crate::trailer_to_seq_num(trailer);
 						if let Some(rseq) = max_range_delete_seq {
-							if ikey.seq_num() <= rseq {
+							if seq_num <= rseq {
 								return Ok(None);
 							}
 						}
-						return Ok(Some((item.1, ikey.seq_num())));
+						return Ok(Some((val, seq_num)));
 					}
+				}
+			}
+		}
+
+		Ok(None)
+	}
+
+	/// Captures the memtables and tables once, to read many keys through
+	/// [`Snapshot::get_in_view`] without taking the tree's locks again for each.
+	///
+	/// The view is an `Arc` copy of the state, so no lock is held while the keys are read, and a
+	/// flush or a compaction that runs meanwhile does not wait for the reader.
+	pub(crate) fn read_view(&self) -> Result<ReadView> {
+		let state = collect_iter_state(&self.core)?;
+		// The range deletions of the tables that this snapshot reads, found once instead of by
+		// a walk over every table for each key
+		let mut table_range_deletions = Vec::new();
+		for level in &state.levels {
+			for table in &level.tables {
+				if table.has_range_deletions() {
+					table_range_deletions.extend(
+						table
+							.range_deletions
+							.read()
+							.iter()
+							.filter(|r| r.2 <= self.seq_num)
+							.cloned(),
+					);
+				}
+			}
+		}
+		Ok(ReadView {
+			state,
+			table_range_deletions,
+		})
+	}
+
+	/// Gets a single key as [`Snapshot::get`] does, from a view captured by
+	/// [`Snapshot::read_view`], with the encoded value where it is held instead of a copy of it.
+	pub(crate) fn get_in_view_ref<'v>(
+		&self,
+		view: &'v ReadView,
+		key: &[u8],
+	) -> crate::Result<Option<(StoredValue<'v>, u64)>> {
+		let mut max_range_delete_seq: Option<u64> = None;
+		let mut cover = |start: &Key, end: &Key, seq: u64| {
+			if seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+				max_range_delete_seq = Some(max_range_delete_seq.map_or(seq, |s| s.max(seq)));
+			}
+		};
+
+		// A found version answers unless a delete or a range delete hides it
+		let answer = |trailer: u64, val: StoredValue<'v>, rseq: Option<u64>| {
+			if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
+				return None;
+			}
+			let seq_num = crate::trailer_to_seq_num(trailer);
+			if rseq.is_some_and(|rseq| seq_num <= rseq) {
+				return None;
+			}
+			Some((val, seq_num))
+		};
+
+		// 1. The active memtable, then 2. the immutable ones, newest first
+		for memtable in std::iter::once(&view.state.active).chain(view.state.immutable.iter().rev())
+		{
+			if memtable.has_range_deletions() {
+				for (start, end, seq) in memtable.range_deletions.read().iter() {
+					cover(start, end, *seq);
+				}
+			}
+			if let Some((trailer, val)) = memtable.get_raw_ref(key, Some(self.seq_num)) {
+				return Ok(answer(trailer, StoredValue::Memtable(val), max_range_delete_seq));
+			}
+		}
+
+		// 3. The tables
+		for (start, end, seq) in &view.table_range_deletions {
+			cover(start, end, *seq);
+		}
+		let key_encoded = SmallKeyBuf::from_internal_parts(key, self.seq_num, InternalKeyKind::Set);
+		for (level_idx, level) in view.state.levels.0.iter().enumerate() {
+			if level_idx == 0 {
+				// Level 0: Tables can overlap, check newest to oldest
+				for table in level.tables.iter() {
+					if !table.is_user_key_in_range(key) {
+						continue;
+					}
+					if let Some((trailer, val)) =
+						table.get_encoded_ref(key, key_encoded.as_slice())?
+					{
+						return Ok(answer(trailer, StoredValue::Block(val), max_range_delete_seq));
+					}
+				}
+			} else if let Some(table) =
+				level.find_table_for_user_key(key, &self.core.opts.comparator)
+			{
+				if let Some((trailer, val)) = table.get_encoded_ref(key, key_encoded.as_slice())? {
+					return Ok(answer(trailer, StoredValue::Block(val), max_range_delete_seq));
 				}
 			}
 		}
@@ -384,16 +511,17 @@ impl Snapshot {
 					}
 				}
 			}
-			if let Some(item) = active_lock.get(key, Some(self.seq_num)) {
-				if item.0.is_tombstone() {
+			if let Some((trailer, val)) = active_lock.get_raw(key, Some(self.seq_num)) {
+				if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 					return Ok(None);
 				}
+				let seq_num = crate::trailer_to_seq_num(trailer);
 				if let Some(rseq) = max_range_delete_seq {
-					if item.0.seq_num() <= rseq {
+					if seq_num <= rseq {
 						return Ok(None);
 					}
 				}
-				return Ok(Some((item.1, item.0.seq_num())));
+				return Ok(Some((val, seq_num)));
 			}
 		}
 
@@ -410,22 +538,22 @@ impl Snapshot {
 						}
 					}
 				}
-				if let Some(item) = memtable.get(key, Some(self.seq_num)) {
-					if item.0.is_tombstone() {
+				if let Some((trailer, val)) = memtable.get_raw(key, Some(self.seq_num)) {
+					if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 						return Ok(None);
 					}
+					let seq_num = crate::trailer_to_seq_num(trailer);
 					if let Some(rseq) = max_range_delete_seq {
-						if item.0.seq_num() <= rseq {
+						if seq_num <= rseq {
 							return Ok(None);
 						}
 					}
-					return Ok(Some((item.1, item.0.seq_num())));
+					return Ok(Some((val, seq_num)));
 				}
 			}
 		}
 
 		// 3. Collect level tables while holding level_manifest lock, then drop lock before awaiting
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
 		let tables_to_check: Vec<Arc<Table>> = {
 			let level_manifest = self.core.level_manifest.read()?;
 			for level in &level_manifest.levels {
@@ -461,20 +589,26 @@ impl Snapshot {
 			tables
 		};
 
+		if tables_to_check.is_empty() {
+			return Ok(None);
+		}
+
 		// 4. Asynchronously search SSTables without holding any synchronous locks across await
+		let key_encoded = SmallKeyBuf::from_internal_parts(key, self.seq_num, InternalKeyKind::Set);
 		for table in tables_to_check {
-			let maybe_item = table.get_async(&ikey).await?;
-			if let Some(item) = maybe_item {
-				let ikey = &item.0;
-				if ikey.is_tombstone() {
+			if let Some((trailer, val)) =
+				table.get_encoded_async(key, key_encoded.as_slice()).await?
+			{
+				if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 					return Ok(None);
 				}
+				let seq_num = crate::trailer_to_seq_num(trailer);
 				if let Some(rseq) = max_range_delete_seq {
-					if ikey.seq_num() <= rseq {
+					if seq_num <= rseq {
 						return Ok(None);
 					}
 				}
-				return Ok(Some((item.1, ikey.seq_num())));
+				return Ok(Some((val, seq_num)));
 			}
 		}
 
@@ -560,14 +694,23 @@ impl Snapshot {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
 		}
+		self.version_at_in(key, timestamp, self.collect_iter_state()?)
+	}
 
+	/// [`Snapshot::version_at`] over a state the caller captured, so that many keys read one
+	/// capture of the tree instead of one each.
+	pub(crate) fn version_at_in(
+		&self,
+		key: &[u8],
+		timestamp: u64,
+		iter_state: IterState,
+	) -> Result<Option<SnapshotVersion>> {
 		let mut upper = key.to_vec();
 		upper.push(0);
 		let range = crate::user_range_to_internal_range(
 			Bound::Included(key),
 			Bound::Excluded(upper.as_slice()),
 		);
-		let iter_state = self.collect_iter_state()?;
 		let range_deletions = iter_state.range_deletions(Some(key));
 		let mut merge = KMergeIterator::new_from(iter_state, range);
 		// After every version of the key: the next key's first entry, or the end. Going back from
@@ -623,7 +766,7 @@ impl Snapshot {
 		match best {
 			Some((time, false, value)) => Ok(Some(SnapshotVersion {
 				time,
-				value: Some(self.core.resolve_value(&value)?),
+				value: Some(self.core.resolve_owned_value(value)?),
 			})),
 			Some((time, true, _)) => Ok(Some(SnapshotVersion {
 				time,
@@ -673,6 +816,175 @@ pub(crate) enum MergeDirection {
 	Backward,
 }
 
+/// The order of two encoded internal keys: user keys bytewise, then the newer version (the
+/// higher sequence number) first. It is `InternalKeyComparator` over bytewise user keys, which is
+/// what every merge of a snapshot reads with, without its two dynamic calls.
+#[inline]
+fn compare_internal(a: &[u8], b: &[u8]) -> Ordering {
+	match InternalKey::user_key_from_encoded(a).cmp(InternalKey::user_key_from_encoded(b)) {
+		Ordering::Equal => {
+			InternalKey::seq_num_from_encoded(b).cmp(&InternalKey::seq_num_from_encoded(a))
+		}
+		ord => ord,
+	}
+}
+
+/// The tables of one level past the first, read as one sorted run.
+///
+/// The tables of such a level do not overlap and are in key order, so a merge needs only one of
+/// them at a time: the iterator opens a table when it reaches it and drops it when it leaves it.
+/// A range read thus opens and seeks the one table of the level where it starts, not every table
+/// the range covers, and the merge compares one key per level, not one per table.
+pub(crate) struct LevelIterator<'a> {
+	/// The tables of the level that overlap the range, in key order.
+	tables: &'a [Arc<Table>],
+	range: InternalKeyRange,
+	cmp: Arc<dyn Comparator>,
+	/// Tables whose versions all lie before this timestamp range are passed over.
+	ts_range: Option<(u64, u64)>,
+	/// The table open, and its index in `tables`.
+	at: usize,
+	current: Option<crate::sstable::table::TableIterator<'a>>,
+}
+
+impl<'a> LevelIterator<'a> {
+	fn new(
+		tables: &'a [Arc<Table>],
+		range: InternalKeyRange,
+		cmp: Arc<dyn Comparator>,
+		ts_range: Option<(u64, u64)>,
+	) -> Self {
+		Self {
+			tables,
+			range,
+			cmp,
+			ts_range,
+			at: 0,
+			current: None,
+		}
+	}
+
+	/// Opens table `at`; `false`, with nothing open, when it is passed over.
+	fn open(&mut self, at: usize) -> Result<bool> {
+		self.current = None;
+		self.at = at;
+		let table = &self.tables[at];
+		if table_lies_before(table, self.ts_range) {
+			return Ok(false);
+		}
+		self.current =
+			Some(table.iter_with_comparator(Some(self.range.clone()), Arc::clone(&self.cmp))?);
+		Ok(true)
+	}
+
+	/// Positions on the first entry of the tables from `from` on.
+	fn first_from(&mut self, from: usize) -> Result<bool> {
+		for at in from..self.tables.len() {
+			if self.open(at)? {
+				if let Some(it) = self.current.as_mut() {
+					if it.seek_first()? {
+						return Ok(true);
+					}
+				}
+			}
+		}
+		self.current = None;
+		Ok(false)
+	}
+
+	/// Positions on the last entry of the tables up to `to`, inclusive.
+	fn last_to(&mut self, to: usize) -> Result<bool> {
+		for at in (0..=to).rev() {
+			if self.open(at)? {
+				if let Some(it) = self.current.as_mut() {
+					if it.seek_last()? {
+						return Ok(true);
+					}
+				}
+			}
+		}
+		self.current = None;
+		Ok(false)
+	}
+}
+
+impl LSMIterator for LevelIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		let user_key = InternalKey::user_key_from_encoded(target);
+		// The first table whose largest key is not before the target's user key.
+		let from = self.tables.partition_point(|table| {
+			table
+				.meta
+				.largest_point
+				.as_ref()
+				.is_some_and(|largest| largest.user_key.as_slice() < user_key)
+		});
+		if from >= self.tables.len() {
+			self.current = None;
+			return Ok(false);
+		}
+		if self.open(from)? {
+			if let Some(it) = self.current.as_mut() {
+				if it.seek(target)? {
+					return Ok(true);
+				}
+			}
+		}
+		self.first_from(from + 1)
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.first_from(0)
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		match self.tables.len().checked_sub(1) {
+			Some(last) => self.last_to(last),
+			None => Ok(false),
+		}
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		let Some(it) = self.current.as_mut() else {
+			return Ok(false);
+		};
+		if it.next()? {
+			return Ok(true);
+		}
+		self.first_from(self.at + 1)
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		let Some(it) = self.current.as_mut() else {
+			return Ok(false);
+		};
+		if it.prev()? {
+			return Ok(true);
+		}
+		match self.at.checked_sub(1) {
+			Some(to) => self.last_to(to),
+			None => {
+				self.current = None;
+				Ok(false)
+			}
+		}
+	}
+
+	fn valid(&self) -> bool {
+		self.current.as_ref().is_some_and(|it| it.valid())
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		self.current.as_ref().expect("a valid level iterator has a table open").key()
+	}
+
+	fn value_encoded(&self) -> Result<&[u8]> {
+		debug_assert!(self.valid());
+		self.current.as_ref().expect("a valid level iterator has a table open").value_encoded()
+	}
+}
+
 /// A merge iterator that sorts by key+seqno.
 /// Uses index-based tracking for zero-allocation iteration.
 pub(crate) struct KMergeIterator<'iter> {
@@ -685,20 +997,19 @@ pub(crate) struct KMergeIterator<'iter> {
 	// Owned state retained for drop order and backing buffer lifetime
 	_iter_state: Box<IterState>,
 
-	/// Current winner index (None if exhausted)
+	/// Current winner index (None if exhausted): the root of `heap`.
 	winner: Option<usize>,
 
-	/// Number of active (valid) iterators
-	active_count: usize,
+	/// The indices of the valid iterators, a binary heap ordered by their current keys in the
+	/// direction of iteration: the root is the winner. Only the iterator that moved is put back
+	/// in place, so a step costs a few comparisons whatever the number of iterators.
+	heap: Vec<usize>,
 
 	/// Direction of iteration
 	direction: MergeDirection,
 
 	/// Whether the iterator has been initialized
 	initialized: bool,
-
-	/// Comparator for key comparison
-	cmp: Arc<dyn Comparator>,
 }
 
 impl<'a> KMergeIterator<'a> {
@@ -790,21 +1101,17 @@ impl<'a> KMergeIterator<'a> {
 					}
 				}
 			} else {
-				// Level 1+: Tables have non-overlapping key ranges, use binary search
+				// Level 1+: the tables of a level do not overlap and are in key order, so the
+				// level is one sorted run, read through one table at a time.
 				let start_idx = level.find_first_overlapping_table(&query_range);
 				let end_idx = level.find_last_overlapping_table(&query_range);
-
-				for table in &level.tables[start_idx..end_idx] {
-					// Skip tables whose versions all lie before the timestamp range (if specified)
-					if table_lies_before(table, ts_range) {
-						continue;
-					}
-					// Use custom comparator for table iteration
-					if let Ok(table_iter) =
-						table.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
-					{
-						iterators.push(Box::new(table_iter) as BoxedLSMIterator<'a>);
-					}
+				if start_idx < end_idx {
+					iterators.push(Box::new(LevelIterator::new(
+						&level.tables[start_idx..end_idx],
+						(*query_range).clone(),
+						Arc::clone(&cmp),
+						ts_range,
+					)) as BoxedLSMIterator<'a>);
 				}
 			}
 		}
@@ -813,75 +1120,70 @@ impl<'a> KMergeIterator<'a> {
 			iterators,
 			_iter_state: boxed_state,
 			winner: None,
-			active_count: 0,
+			heap: Vec::new(),
 			direction: MergeDirection::Forward,
 			initialized: false,
-			cmp,
 		}
 	}
 
-	/// Compare two iterators by their current key (zero-copy)
+	/// Whether iterator `a` comes before iterator `b` in the direction of iteration. Both are
+	/// valid. Keys are internal keys: user keys bytewise, then the newer version first, which is
+	/// the order `InternalKeyComparator` over bytewise user keys gives.
 	#[inline]
-	fn compare(&self, a: usize, b: usize) -> Ordering {
-		let iter_a = &self.iterators[a];
-		let iter_b = &self.iterators[b];
-
-		let valid_a = iter_a.valid();
-		let valid_b = iter_b.valid();
-
-		match (valid_a, valid_b) {
-			(false, false) => Ordering::Equal,
-			(true, false) => Ordering::Less, // a wins (valid beats invalid)
-			(false, true) => Ordering::Greater, // b wins
-			(true, true) => {
-				// Both valid - compare keys (zero-copy from iterators)
-				let key_a = iter_a.key().encoded();
-				let key_b = iter_b.key().encoded();
-				let ord = self.cmp.compare(key_a, key_b);
-				if self.direction == MergeDirection::Backward {
-					ord.reverse()
-				} else {
-					ord
-				}
-			}
+	fn before(&self, a: usize, b: usize) -> bool {
+		let key_a = self.iterators[a].key().encoded();
+		let key_b = self.iterators[b].key().encoded();
+		let ord = compare_internal(key_a, key_b);
+		match self.direction {
+			MergeDirection::Forward => ord == Ordering::Less,
+			MergeDirection::Backward => ord == Ordering::Greater,
 		}
 	}
 
-	/// Find the winner (min for forward, max for backward) among all valid iterators
+	/// Moves the heap entry at `at` down to where it belongs.
+	#[inline]
+	fn sift_down(&mut self, mut at: usize) {
+		let len = self.heap.len();
+		loop {
+			let left = 2 * at + 1;
+			if left >= len {
+				break;
+			}
+			let right = left + 1;
+			let child = if right < len && self.before(self.heap[right], self.heap[left]) {
+				right
+			} else {
+				left
+			};
+			if !self.before(self.heap[child], self.heap[at]) {
+				break;
+			}
+			self.heap.swap(at, child);
+			at = child;
+		}
+	}
+
+	/// Rebuild the heap from every valid iterator and take its root as the winner.
 	fn find_winner(&mut self) {
-		if self.iterators.is_empty() || self.active_count == 0 {
-			self.winner = None;
-			return;
-		}
-
-		let mut best_idx = None;
+		self.heap.clear();
 		for i in 0..self.iterators.len() {
-			if !self.iterators[i].valid() {
-				continue;
-			}
-			match best_idx {
-				None => best_idx = Some(i),
-				Some(b) => {
-					if self.compare(i, b) == Ordering::Less {
-						best_idx = Some(i);
-					}
-				}
+			if self.iterators[i].valid() {
+				self.heap.push(i);
 			}
 		}
-
-		self.winner = best_idx;
+		for at in (0..self.heap.len() / 2).rev() {
+			self.sift_down(at);
+		}
+		self.winner = self.heap.first().copied();
 	}
 
 	/// Initialize for forward iteration
 	fn init_forward(&mut self) -> Result<()> {
 		self.direction = MergeDirection::Forward;
-		self.active_count = 0;
 
 		// Position all iterators at first
 		for iter in &mut self.iterators {
-			if iter.seek_first()? {
-				self.active_count += 1;
-			}
+			iter.seek_first()?;
 		}
 
 		self.find_winner();
@@ -892,13 +1194,10 @@ impl<'a> KMergeIterator<'a> {
 	/// Initialize for backward iteration
 	fn init_backward(&mut self) -> Result<()> {
 		self.direction = MergeDirection::Backward;
-		self.active_count = 0;
 
 		// Position all iterators at last
 		for iter in &mut self.iterators {
-			if iter.seek_last()? {
-				self.active_count += 1;
-			}
+			iter.seek_last()?;
 		}
 
 		self.find_winner();
@@ -914,27 +1213,19 @@ impl<'a> KMergeIterator<'a> {
 	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
 		let current_idx = self.winner;
 		self.direction = MergeDirection::Forward;
-		self.active_count = 0;
 
 		for (idx, iter) in self.iterators.iter_mut().enumerate() {
 			if Some(idx) == current_idx {
 				// Current iterator: just call next() once
-				if iter.next()? {
-					self.active_count += 1;
-				}
-			} else {
-				// Non-current: seek to target, then advance past it
-				if iter.seek(target)? {
-					// Advance while key <= target (need to be strictly greater)
-					while iter.valid()
-						&& self.cmp.compare(iter.key().encoded(), target) != Ordering::Greater
-					{
-						if !iter.next()? {
-							break;
-						}
-					}
-					if iter.valid() {
-						self.active_count += 1;
+				iter.next()?;
+			} else if iter.seek(target)? {
+				// Non-current: seek to target, then advance while key <= target (need to be
+				// strictly greater)
+				while iter.valid()
+					&& compare_internal(iter.key().encoded(), target) != Ordering::Greater
+				{
+					if !iter.next()? {
+						break;
 					}
 				}
 			}
@@ -952,34 +1243,24 @@ impl<'a> KMergeIterator<'a> {
 	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
 		let current_idx = self.winner;
 		self.direction = MergeDirection::Backward;
-		self.active_count = 0;
 
 		for (idx, iter) in self.iterators.iter_mut().enumerate() {
 			if Some(idx) == current_idx {
 				// Current iterator: just call prev() once
-				if iter.prev()? {
-					self.active_count += 1;
+				iter.prev()?;
+			} else if iter.seek(target)? {
+				// Non-current: seek to target, then move backward while key >= target (need to
+				// be strictly less)
+				while iter.valid()
+					&& compare_internal(iter.key().encoded(), target) != Ordering::Less
+				{
+					if !iter.prev()? {
+						break;
+					}
 				}
 			} else {
-				// Non-current: seek to target, then move before it
-				if iter.seek(target)? {
-					// Move backward while key >= target (need to be strictly less)
-					while iter.valid()
-						&& self.cmp.compare(iter.key().encoded(), target) != Ordering::Less
-					{
-						if !iter.prev()? {
-							break;
-						}
-					}
-					if iter.valid() {
-						self.active_count += 1;
-					}
-				} else {
-					// Iterator positioned past all keys, go to last
-					if iter.seek_last()? {
-						self.active_count += 1;
-					}
-				}
+				// Iterator positioned past all keys, go to last
+				iter.seek_last()?;
 			}
 		}
 
@@ -989,11 +1270,9 @@ impl<'a> KMergeIterator<'a> {
 
 	/// Advance the current winner and find new winner
 	fn advance_winner(&mut self) -> Result<bool> {
-		if self.active_count == 0 || self.winner.is_none() {
+		let Some(winner_idx) = self.winner else {
 			return Ok(false);
-		}
-
-		let winner_idx = self.winner.unwrap();
+		};
 		let iter = &mut self.iterators[winner_idx];
 
 		// Advance the winning iterator
@@ -1003,12 +1282,17 @@ impl<'a> KMergeIterator<'a> {
 			iter.prev()?
 		};
 
+		// Put it back in place, or take it out of the heap once it is exhausted
 		if !still_valid {
-			self.active_count = self.active_count.saturating_sub(1);
+			let last = self.heap.pop().expect("the winner is in the heap");
+			if self.heap.is_empty() {
+				self.winner = None;
+				return Ok(false);
+			}
+			self.heap[0] = last;
 		}
-
-		// Find new winner
-		self.find_winner();
+		self.sift_down(0);
+		self.winner = self.heap.first().copied();
 
 		Ok(self.winner.is_some())
 	}
@@ -1023,12 +1307,9 @@ impl<'a> KMergeIterator<'a> {
 impl LSMIterator for KMergeIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
-		self.active_count = 0;
 
 		for iter in &mut self.iterators {
-			if iter.seek(target)? {
-				self.active_count += 1;
-			}
+			if iter.seek(target)? {}
 		}
 
 		self.find_winner();
@@ -1106,10 +1387,8 @@ pub(crate) struct SnapshotIterator<'a> {
 	/// Last user key seen (forward direction) - reusable buffer
 	last_key_fwd: Vec<u8>,
 
-	/// For backward iteration: buffered key/value when we've read past current user key
+	/// For backward iteration: reusable user key buffer for the current group
 	buffered_back_key: Vec<u8>,
-	buffered_back_value: Vec<u8>,
-	has_buffered_back: bool,
 
 	/// For backward iteration: the current entry we're returning
 	/// (stored because merge_iter has already moved past it)
@@ -1130,22 +1409,15 @@ pub(crate) struct SnapshotIterator<'a> {
 impl SnapshotIterator<'_> {
 	/// Creates a new iterator over a specific key range
 	fn new_from(core: Arc<Core>, seq_num: u64, range: InternalKeyRange) -> Result<Self> {
-		// Create a temporary snapshot to use the helper method
-		let snapshot = Snapshot::new(Arc::clone(&core), seq_num);
-		let iter_state = snapshot.collect_iter_state()?;
+		// The caller's snapshot (or transaction) holds `seq_num` registered while the iterator
+		// lives, so the state is collected without registering it again.
+		let iter_state = collect_iter_state(&core)?;
 
 		// From the state the iterator reads, not from the tree again: a restore in between would
 		// give it the range deletions of the state that replaced it.
-		let mut range_deletions = Vec::new();
-		range_deletions.extend(iter_state.active.range_deletions.read().clone());
-		for memtable in &iter_state.immutable {
-			range_deletions.extend(memtable.range_deletions.read().clone());
-		}
-		for level in &iter_state.levels {
-			for table in &level.tables {
-				range_deletions.extend(table.range_deletions.read().clone());
-			}
-		}
+		// Only the memtables and tables that hold any are read, so a range read takes no lock of
+		// a table that has none.
+		let range_deletions = iter_state.range_deletions(None);
 
 		let merge_iter = KMergeIterator::new_from(iter_state, range);
 
@@ -1156,8 +1428,6 @@ impl SnapshotIterator<'_> {
 			range_deletions,
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
-			buffered_back_value: Vec::new(),
-			has_buffered_back: false,
 			current_back_key: Vec::new(),
 			current_back_value: Vec::new(),
 			has_current_back: false,
@@ -1235,34 +1505,33 @@ impl SnapshotIterator<'_> {
 	/// or invisible to this snapshot until a valid live entry is found or the iterator exhausts.
 	fn find_latest_visible_backward(&mut self) -> Result<bool> {
 		loop {
-			// Position merge_iter at the start of the next user key to examine.
-			//
-			// `has_buffered_back` is set when a prior iteration crossed into a
-			// new user key while walking versions of the previous one; the
-			// boundary key is already loaded into merge_iter, so we just clear
-			// the flag and fall through.
-			if self.has_buffered_back {
-				self.has_buffered_back = false;
-			} else if !self.merge_iter.valid() {
+			// merge_iter is positioned at the start of the next user key to examine
+			// (either from initial seek_last / forward_to_backward, or from the prior
+			// iteration's inner loop stopping on a user key boundary).
+			if !self.merge_iter.valid() {
 				self.has_current_back = false;
 				return Ok(false);
 			}
 
 			let first_key_ref = self.merge_iter.key();
-			let current_user_key: Vec<u8> = first_key_ref.user_key().to_vec();
+			self.buffered_back_key.clear();
+			self.buffered_back_key.extend_from_slice(first_key_ref.user_key());
 
-			let mut latest_key: Option<Vec<u8>> = None;
-			let mut latest_value: Option<Vec<u8>> = None;
+			let mut found_visible = false;
 
 			if self.is_visible_ref(&first_key_ref) {
-				latest_key = Some(first_key_ref.encoded().to_vec());
-				latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
+				self.current_back_key.clear();
+				self.current_back_key.extend_from_slice(first_key_ref.encoded());
+				let val = self.merge_iter.value_encoded()?;
+				self.current_back_value.clear();
+				self.current_back_value.extend_from_slice(val);
+				found_visible = true;
 			}
 
 			// Walk older versions of this same user key, picking up the latest
 			// visible one. Stops when merge_iter goes invalid or crosses into
-			// a different user key (which becomes the buffered start for the
-			// next outer iteration).
+			// a different user key (leaving merge_iter positioned at that key
+			// for the next outer iteration).
 			loop {
 				self.merge_iter.prev()?;
 
@@ -1273,24 +1542,23 @@ impl SnapshotIterator<'_> {
 				let key_ref = self.merge_iter.key();
 				let user_key = key_ref.user_key();
 
-				if user_key != current_user_key.as_slice() {
-					self.buffered_back_key.clear();
-					self.buffered_back_key.extend_from_slice(key_ref.encoded());
-					self.buffered_back_value.clear();
-					self.buffered_back_value.extend_from_slice(self.merge_iter.value_encoded()?);
-					self.has_buffered_back = true;
+				if user_key != self.buffered_back_key.as_slice() {
 					break;
 				}
 
 				if self.is_visible_ref(&key_ref) {
-					latest_key = Some(key_ref.encoded().to_vec());
-					latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
+					self.current_back_key.clear();
+					self.current_back_key.extend_from_slice(key_ref.encoded());
+					let val = self.merge_iter.value_encoded()?;
+					self.current_back_value.clear();
+					self.current_back_value.extend_from_slice(val);
+					found_visible = true;
 				}
 			}
 
 			// Decide the outcome for this user key.
-			if let (Some(key_bytes), Some(value_bytes)) = (latest_key, latest_value) {
-				let key_ref = InternalKeyRef::from_encoded(&key_bytes);
+			if found_visible {
+				let key_ref = InternalKeyRef::from_encoded(&self.current_back_key);
 				if key_ref.is_tombstone()
 					|| self.is_deleted_by_range(key_ref.user_key(), key_ref.seq_num())
 				{
@@ -1299,10 +1567,6 @@ impl SnapshotIterator<'_> {
 					self.has_current_back = false;
 					continue;
 				}
-				self.current_back_key.clear();
-				self.current_back_key.extend_from_slice(&key_bytes);
-				self.current_back_value.clear();
-				self.current_back_value.extend_from_slice(&value_bytes);
 				self.has_current_back = true;
 				return Ok(true);
 			}
@@ -1318,27 +1582,25 @@ impl SnapshotIterator<'_> {
 		self.direction = MergeDirection::Forward;
 
 		// Get current user key from backward state (equivalent to saved_key_)
-		let current_user_key = if self.has_current_back {
-			InternalKeyRef::from_encoded(&self.current_back_key).user_key().to_vec()
-		} else {
+		if !self.has_current_back {
 			// No current position in backward mode
-			self.has_buffered_back = false;
 			return Ok(false);
-		};
-
-		// Clear backward state
-		self.has_current_back = false;
-		self.has_buffered_back = false;
+		}
 
 		// Set last_key_fwd so skip_to_valid_forward() will skip this user key
 		// (equivalent to FindNextUserEntry(skipping_saved_key=true))
+		let current_user_key = InternalKeyRef::from_encoded(&self.current_back_key).user_key();
 		self.last_key_fwd.clear();
-		self.last_key_fwd.extend_from_slice(&current_user_key);
+		self.last_key_fwd.extend_from_slice(current_user_key);
+
+		// Clear backward state
+		self.has_current_back = false;
 
 		// Seek to first entry >= current user key
 		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
-		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set);
-		self.merge_iter.seek(&seek_key.encode())?;
+		let seek_key =
+			SmallKeyBuf::from_internal_parts(&self.last_key_fwd, u64::MAX, InternalKeyKind::Set);
+		self.merge_iter.seek(seek_key.as_slice())?;
 
 		// skip_to_valid_forward() will skip entries with user_key == last_key_fwd
 		// and return the first visible entry with a DIFFERENT user key
@@ -1350,7 +1612,6 @@ impl SnapshotIterator<'_> {
 		self.direction = MergeDirection::Backward;
 
 		// Clear backward buffers
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 
 		// In forward mode, merge_iter is positioned at the current entry
@@ -1361,7 +1622,7 @@ impl SnapshotIterator<'_> {
 		}
 
 		// find_latest_visible_backward will scan this user key's entries
-		// to find the latest visible version, then buffer the next user key
+		// to find the latest visible version, then leave merge_iter at the next user key
 		self.skip_to_valid_backward()
 	}
 }
@@ -1370,7 +1631,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek(target)?;
 		self.initialized = true;
@@ -1380,7 +1640,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 	fn seek_first(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek_first()?;
 		self.initialized = true;
@@ -1389,7 +1648,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 
 	fn seek_last(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Backward;
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek_last()?;
 		self.initialized = true;
@@ -1425,7 +1683,7 @@ impl LSMIterator for SnapshotIterator<'_> {
 		}
 
 		// Normal backward iteration
-		if !self.merge_iter.valid() && !self.has_buffered_back {
+		if !self.merge_iter.valid() {
 			self.has_current_back = false;
 			return Ok(false);
 		}

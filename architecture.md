@@ -735,7 +735,7 @@ The store opens SurrealKV with the patch's clock option, so SurrealKV starts no 
 That clock reads the system clock directly on every reading, and each reading is greater than the one before.
 SurrealKV's write pacing is turned off, with its write stalls, and the patched pacing starts no thread.
 To replay several log segments, SurrealKV starts a thread when it can, and otherwise replays them on the calling thread.
-`vendor/surrealkv/KIZZ-PATCHES.md` lists each change against SurrealKV 1.0.0, with its reason, to offer upstream.
+`vendor/surrealkv/KIZZ-PATCHES.md` lists each change against SurrealKV 1.4.0, with its reason, to offer upstream.
 
 ### Lock file
 
@@ -1184,7 +1184,7 @@ The command line and output use the same libraries as the cbork CLI: `bpaf` with
 | Hashing | `blake3` with `rayon` and `mmap` | 1.8.2, pinned by `starlark` 0.14.2 |
 | Task programs | `starlark` | 0.14.2 |
 | Markdown | `pulldown-cmark` | 0.13.5 |
-| Database | `surrealkv`, built from kizz's patched copy in `vendor/surrealkv` | 1.0.0 |
+| Database | `surrealkv`, built from kizz's patched copy in `vendor/surrealkv` | 1.0.0, re-vendored at 1.4.0 |
 | Records and step keys | `minicbor` with `derive` | 2.3.1 |
 | JSON | `serde_json` | 1.0.154 |
 | Ignore patterns | `globset`, `regex` | 0.4.20, 1.13.1 |
@@ -1226,7 +1226,7 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
   Zola's table of contents of those pages generates their entries, so a new heading appears without a change to the templates.
   The options of each command and the entries of `run()` are in collapsible `<details>` elements that are closed by default.
   The members of `env`, `fs`, `task` and `json` are open by default, so every command, global and member is one click away.
-* `vendor/surrealkv` holds SurrealKV 1.0.0 with kizz's patch, which `[patch.crates-io]` uses instead of the published crate.
+* `vendor/surrealkv` holds SurrealKV 1.4.0 with kizz's patch, which `[patch.crates-io]` uses instead of the published crate.
   The workspace excludes it, and the format, Markdown and spelling checks skip it.
   Only the changes that `vendor/surrealkv/KIZZ-PATCHES.md` lists may differ from the published crate.
 

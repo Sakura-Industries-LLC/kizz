@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.86"
 name = "surrealkv"
-version = "1.0.0"
+version = "1.4.0"
 build = false
 publish = true
 autolib = false
@@ -49,6 +49,14 @@ name = "surrealkv"
 path = "src/lib.rs"
 
 [[example]]
+name = "get_many_bench"
+path = "examples/get_many_bench.rs"
+
+[[example]]
+name = "scan_bench"
+path = "examples/scan_bench.rs"
+
+[[example]]
 name = "wasi_fs_test"
 path = "examples/wasi_fs_test.rs"
 
@@ -65,12 +73,36 @@ name = "encryption_guard"
 path = "tests/encryption_guard.rs"
 
 [[test]]
+name = "fs_lint_guard"
+path = "tests/fs_lint_guard.rs"
+
+[[test]]
 name = "opfs_concurrency_test"
 path = "tests/opfs_concurrency_test.rs"
 
 [[test]]
+name = "opfs_engine_test"
+path = "tests/opfs_engine_test.rs"
+
+[[test]]
+name = "opfs_migrate_test"
+path = "tests/opfs_migrate_test.rs"
+
+[[test]]
+name = "opfs_options_test"
+path = "tests/opfs_options_test.rs"
+
+[[test]]
+name = "opfs_sessions_test"
+path = "tests/opfs_sessions_test.rs"
+
+[[test]]
 name = "opfs_store_test"
 path = "tests/opfs_store_test.rs"
+
+[[test]]
+name = "opfs_two_workers_test"
+path = "tests/opfs_two_workers_test.rs"
 
 [[test]]
 name = "opfs_window_test"
@@ -80,6 +112,14 @@ path = "tests/opfs_window_test.rs"
 name = "opfs_worker_test"
 path = "tests/opfs_worker_test.rs"
 
+[[test]]
+name = "passthrough_guard"
+path = "tests/passthrough_guard.rs"
+
+[[test]]
+name = "rt_guard"
+path = "tests/rt_guard.rs"
+
 [[bench]]
 name = "alloc_bench"
 path = "benches/alloc_bench.rs"
@@ -88,6 +128,11 @@ harness = false
 [[bench]]
 name = "tde_bench"
 path = "benches/tde_bench.rs"
+harness = false
+
+[[bench]]
+name = "validate_bench"
+path = "benches/validate_bench.rs"
 harness = false
 
 [dependencies.aes-gcm]
@@ -151,13 +196,13 @@ default-features = false
 version = "1.0.0"
 
 [dependencies.surrealkv-compat-indxdb]
-version = "0.1.0"
+version = "0.2.4"
 
 [dependencies.surrealkv-compat-rocksdb]
-version = "0.1.0"
+version = "0.2.4"
 
 [dependencies.surrealkv-compat-v1]
-version = "0.1.0"
+version = "0.2.4"
 
 [dependencies.tokio]
 version = "1.36"
@@ -165,7 +210,6 @@ features = [
     "rt",
     "sync",
     "macros",
-    "time",
 ]
 
 [dependencies.tracing]
@@ -183,6 +227,10 @@ default-features = false
 [dependencies.zstd]
 version = "0.13"
 default-features = false
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies.tokio]
+version = "1.36"
+features = ["time"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokio]
 version = "1.36"
@@ -219,8 +267,31 @@ features = ["full"]
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies.wasm-bindgen-test]
 version = "0.3"
 
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies.web-sys]
+version = "0.3"
+features = [
+    "Blob",
+    "BlobPropertyBag",
+    "DedicatedWorkerGlobalScope",
+    "ErrorEvent",
+    "Event",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbVersionChangeEvent",
+    "MessageEvent",
+    "Url",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+]
+
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom]
-version = "0.3.3"
+version = "0.3.4"
 features = ["wasm_js"]
 
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom_04]
@@ -240,9 +311,12 @@ version = "0.4"
 [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 version = "0.3"
 features = [
+    "DomException",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
     "FileSystemGetFileOptions",
+    "FileSystemRemoveOptions",
     "FileSystemSyncAccessHandle",
     "FileSystemReadWriteOptions",
     "StorageManager",
@@ -274,7 +348,7 @@ bool_assert_comparison = "allow"
 clone_on_ref_ptr = "warn"
 cloned_instead_of_copied = "warn"
 debug_assert_with_mut_call = "warn"
-disallowed_methods = "warn"
+disallowed_methods = "deny"
 expl_impl_clone_on_copy = "warn"
 explicit_into_iter_loop = "warn"
 fallible_impl_from = "warn"

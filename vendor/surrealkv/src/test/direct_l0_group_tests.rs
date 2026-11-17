@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::{collect_transaction_all, collect_transaction_reverse};
+use super::{collect_transaction_all, collect_transaction_reverse, sfs, tfs};
 use crate::batch::Batch;
 use crate::lsm::FlushHook;
 use crate::memtable::{max_entry_bytes, MemTable};
@@ -59,8 +59,8 @@ fn abandon(tree: &Tree) {
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -69,7 +69,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -723,6 +723,9 @@ async fn close_while_a_direct_commit_flushes_waits_for_it_and_loses_nothing() {
 /// it, and what it holds is the tree before the commit or after it.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_taken_during_the_flush_of_a_direct_commit_is_whole() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("adv_l0_checkpoint").unwrap();
 	let live = dir.path().join("live");
 	let tree = Arc::new(Tree::new(options(&live, false)).unwrap());
@@ -859,11 +862,11 @@ async fn recover_after_a_failed_direct_write() -> (Model, Vec<Model>) {
 	// the direct batch takes the one after it.
 	let next = tree.core.inner.level_manifest.read().unwrap().next_table_id.load(Ordering::SeqCst);
 	let blocker = tree.core.inner.opts.sstable_file_path(next + 1);
-	std::fs::create_dir(&blocker).unwrap();
+	sfs::create_dir(&blocker).unwrap();
 	let batches = stamped(&tree, &group);
 	let outcome = tree.core.commit_pipeline.flush_group(&batches, true).await;
 	assert!(outcome.is_err(), "control: the group fails with the table of its direct batch");
-	std::fs::remove_dir(&blocker).unwrap();
+	sfs::remove_dir(&blocker).unwrap();
 
 	let image = dir.path().join("image");
 	copy_dir(&live, &image);
@@ -895,10 +898,10 @@ async fn a_group_whose_direct_write_fails_is_recovered_whole() {
 fn non_empty_segments(tree: &Tree) -> Vec<u64> {
 	let wal = tree.core.inner.wal.read();
 	let mut ids = Vec::new();
-	for entry in std::fs::read_dir(wal.get_dir_path()).unwrap() {
+	for entry in sfs::read_dir(wal.get_dir_path()).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal")
-			&& std::fs::metadata(&path).unwrap().len() > 0
+			&& sfs::metadata(&path).unwrap().len() > 0
 		{
 			ids.push(path.file_stem().unwrap().to_str().unwrap().parse().unwrap());
 		}
@@ -910,6 +913,9 @@ fn non_empty_segments(tree: &Tree) -> Vec<u64> {
 /// Opens a copy of a crashed tree, with the background tasks stopped.
 async fn reopen(image: &Path) -> Tree {
 	let tree = Tree::new(options(image, false)).unwrap();
+	// The groups of the tests that commit through this tree hold an oversized batch with others:
+	// see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background(&tree).await;
 	tree
 }
@@ -940,11 +946,9 @@ async fn recovered_tree(root: &Path, queued: usize) -> (Tree, std::path::PathBuf
 		let segment = inner.wal.read().get_active_log_number();
 		assert!(!active.is_empty(), "control: recovery put the crashed rows in the memtable");
 		assert_eq!(active.get_wal_number(), segment, "control: it is tagged with the new segment");
+		// The open moved the segment that held the rows to the number of the tag.
 		let held = non_empty_segments(&tree);
-		assert!(
-			!held.is_empty() && held.iter().all(|s| *s < segment),
-			"control: the rows are in segments older than the tag ({held:?}, tag {segment})"
-		);
+		assert_eq!(held, vec![segment], "control: the rows are in the segment of the tag");
 	}
 	assert_reads(&read_only(&tree), &model, &keys(), "recovered");
 
@@ -973,6 +977,7 @@ async fn assert_survives_two_crashes(
 	tree: &Tree,
 	root: &Path,
 	expected: &Model,
+	holds_records: bool,
 	what: &str,
 ) {
 	let second = root.join("crash_two");
@@ -980,7 +985,11 @@ async fn assert_survives_two_crashes(
 	abandon(tree);
 	let again = reopen(&second).await;
 	assert_eq!(all_keys(&again), *expected, "{what}: the image of the recovered tree");
-	assert!(!non_empty_segments(&again).is_empty(), "control: the image holds records");
+	// A group that ends with a direct batch has no record left to replay: its segment went with
+	// the table, which holds the group.
+	if holds_records {
+		assert!(!non_empty_segments(&again).is_empty(), "control: the image holds records");
+	}
 
 	let third = root.join("crash_three");
 	copy_dir(&second, &third);
@@ -1021,7 +1030,11 @@ async fn group_on_a_recovered_tree(group: Vec<Vec<Op>>, queued: usize, durable: 
 	assert_reads(&read_only(&tree), &model, &keys(), &format!("{what}: live"));
 	assert_eq!(tree.core.inner.immutable_count(), 0, "{what}: the queue was flushed");
 
-	assert_survives_two_crashes(&live, &tree, dir.path(), &model, &what).await;
+	// The segment of a group that ends with a direct batch went with its table.
+	let ends_direct = group.last().is_some_and(|ops| {
+		ops.iter().any(|op| matches!(op, Op::Set(_, value) if value.len() > MEMTABLE))
+	});
+	assert_survives_two_crashes(&live, &tree, dir.path(), &model, !ends_direct, &what).await;
 }
 
 #[test(tokio::test)]
@@ -1094,20 +1107,20 @@ async fn failing_group_on_a_recovered_tree(queued: usize, fails: Fails) {
 			});
 			*tree.core.inner.flush_hook.lock() = Some(hook);
 		}
-		Fails::DirectTable => std::fs::create_dir(&blocker).unwrap(),
+		Fails::DirectTable => sfs::create_dir(&blocker).unwrap(),
 	}
 	let handles: Vec<_> =
 		group.iter().map(|ops| tokio::spawn(commit_ops(Arc::clone(&tree), ops.clone()))).collect();
 	for handle in handles {
 		let outcome = handle.await.unwrap();
 		assert!(
-			matches!(outcome, Err(Error::DatabaseStopped(_))),
+			matches!(outcome.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
 			"{what}: every committer of the group is told the database stopped, got {outcome:?}"
 		);
 	}
 	*tree.core.inner.flush_hook.lock() = None;
 	match fails {
-		Fails::DirectTable => std::fs::remove_dir(&blocker).unwrap(),
+		Fails::DirectTable => sfs::remove_dir(&blocker).unwrap(),
 		Fails::Flush(at) => {
 			assert!(calls.load(Ordering::SeqCst) > at, "{what}: control: the flush ran");
 		}
@@ -1119,7 +1132,7 @@ async fn failing_group_on_a_recovered_tree(queued: usize, fails: Fails) {
 	for ops in &group {
 		apply(&mut whole, ops);
 	}
-	assert_survives_two_crashes(&live, &tree, dir.path(), &whole, &what).await;
+	assert_survives_two_crashes(&live, &tree, dir.path(), &whole, true, &what).await;
 }
 
 #[test(tokio::test)]

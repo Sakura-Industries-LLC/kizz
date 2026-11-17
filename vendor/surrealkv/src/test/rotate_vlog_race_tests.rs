@@ -19,15 +19,16 @@
 //! The byte-level checks use `vlog::SYNCED_VLOG_LENGTHS`, next to `vlog::SYNCED_VLOG_FILES`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sfs::{self as fs, File};
 use tempfile::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::ring::PipelineHook;
 use crate::vlog::{VLog, ValueLocation, ValuePointer, SYNCED_VLOG_FILES, SYNCED_VLOG_LENGTHS};
@@ -336,7 +337,7 @@ fn power_loss_image(live: &Path, image: &Path, active: u64, wal_synced_len: u64)
 		set_len(&in_image, durable_len(&file).min(file_len(&in_image)));
 	}
 	let segment = seg_path(image, active);
-	if segment.exists() {
+	if sfs::exists(&segment) {
 		set_len(&segment, wal_synced_len.min(file_len(&segment)));
 	}
 }
@@ -391,14 +392,17 @@ fn small_vlog() -> (Arc<VLog>, TempDir) {
 		vlog_checksum_verification: VLogChecksumLevel::Full,
 		..Default::default()
 	});
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	(Arc::new(VLog::new(opts).unwrap()), dir)
+	tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
+	(Arc::new(tfs::vlog_new(opts).unwrap()), dir)
 }
 
 /// A file created while a sync runs is not covered by it, nor is its name: the next `sync_dirty`
 /// fsyncs the file and the directory.
 #[test(tokio::test)]
 async fn a_file_created_during_a_sync_is_dirty_after_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, dir) = small_vlog();
 	let first = vlog.append(b"key-0", &value_of(0, 600)).unwrap();
 	let old = vlog.vlog_file_path(first.file_id);
@@ -416,7 +420,7 @@ async fn a_file_created_during_a_sync_is_dirty_after_it() {
 	vlog.set_sync_gap(None);
 	assert_eq!(vlog.dir_syncs() - base, 1, "the sync covered the first file's name");
 	let new = vlog.vlog_file_path(2);
-	assert!(new.exists(), "the gap rolled the file over");
+	assert!(sfs::exists(&new), "the gap rolled the file over");
 	assert_eq!(fsyncs_of(dir.path(), &new), 0);
 
 	vlog.sync_dirty().unwrap();
@@ -430,6 +434,9 @@ async fn a_file_created_during_a_sync_is_dirty_after_it() {
 #[cfg(unix)]
 #[test(tokio::test)]
 async fn a_failed_directory_fsync_leaves_the_log_dirty() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, dir) = small_vlog();
 	let first = vlog.append(b"key-0", &value_of(0, 100)).unwrap();
 	let file = vlog.vlog_file_path(first.file_id);
@@ -462,6 +469,9 @@ async fn a_failed_directory_fsync_leaves_the_log_dirty() {
 #[cfg(unix)]
 #[test(tokio::test)]
 async fn a_failed_directory_fsync_fails_the_rotation_and_leaves_the_wal_as_it_was() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let live = dir.path().join("live");
 	let tree = eventual_commits_across_a_rollover(&live).await;
@@ -509,8 +519,9 @@ async fn a_failed_directory_fsync_fails_the_rotation_and_leaves_the_wal_as_it_wa
 }
 
 /// The rotation the flusher makes when the next batch does not fit the memtable fails with the
-/// commit that needs it, when the vlog fsync fails: the commit is not logged and not applied,
-/// the WAL is not poisoned, and the same commit goes through on retry.
+/// commit that needs it, when the vlog fsync fails: the commit is not logged and not applied, and
+/// the WAL is not poisoned. The failed fsync ends the value log, so the retry is refused with the
+/// database stopped, and nothing is rotated or logged after it.
 #[test(tokio::test)]
 async fn a_commit_whose_rotation_cannot_fsync_the_vlog_fails_whole_and_is_not_logged() {
 	let dir = TempDir::new().unwrap();
@@ -550,21 +561,23 @@ async fn a_commit_whose_rotation_cannot_fsync_the_vlog_fails_whole_and_is_not_lo
 	);
 	assert!(!logged.contains(&failed_key), "the failed commit was logged: {logged:?}");
 
-	put(&tree, &failed_key, &failed_value, Durability::Eventual).await;
-	assert_eq!(active_no(&tree), first + 1, "the retry rotated");
-	assert_eq!(get(&tree, &failed_key).unwrap(), Some(failed_value.clone()));
+	match try_put(&tree, &failed_key, &failed_value, Durability::Eventual)
+		.await
+		.as_ref()
+		.map_err(Error::poisoned_by)
+	{
+		Err(Error::DatabaseStopped(message)) => {
+			assert!(message.contains("value log"), "the cause is the value log: {message}")
+		}
+		other => panic!("the retry after the failed fsync: expected a stopped database, {other:?}"),
+	}
+	assert!(vlog_of(&tree).sync_failed());
+	assert_eq!(active_no(&tree), first, "a rotation followed the failed fsync");
+	assert_eq!(get(&tree, &failed_key).unwrap(), None, "the refused retry is visible");
 	for (key, value) in &acked {
 		assert_eq!(get(&tree, key).unwrap().as_ref(), Some(value), "{key}");
 	}
-	watch.assert_ordered();
-	assert_eq!(watch.fsyncs.load(Ordering::SeqCst), 1);
-
-	// Everything acknowledged before the rotation is in the sealed segment, with its values.
-	let expected: BTreeMap<String, Vec<u8>> = acked.iter().cloned().collect();
-	let universe: BTreeSet<String> = expected.keys().cloned().chain([failed_key.clone()]).collect();
-	let image = dir.path().join("image");
-	power_loss_image(&live, &image, first + 1, 0);
-	assert_recovers(&image, &universe, &expected);
+	assert_eq!(watch.fsyncs.load(Ordering::SeqCst), 0, "the segment was fsynced after the failure");
 	crash(tree);
 }
 
@@ -577,6 +590,9 @@ async fn a_failed_vlog_fsync_in_a_rotation_after_part_of_a_group_was_applied_sto
 	let dir = TempDir::new().unwrap();
 	let live = dir.path().join("live");
 	let tree = Arc::new(Tree::new(vlog_opts_with(&live, 4 * 1024)).unwrap());
+	// This test is about a group that rotates the memtable in the middle: the bound on a group's
+	// estimates (see `group_est_budget`) is lifted so that the pile-up forms one.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background_tasks(&tree).await;
 	put(&tree, "before", &payload(0, 300), Durability::Eventual).await;
 	let visible = tree.core.seq_num();
@@ -594,8 +610,9 @@ async fn a_failed_vlog_fsync_in_a_rotation_after_part_of_a_group_was_applied_sto
 	}
 	let mut errors = Vec::new();
 	for handle in handles {
-		match handle.await.unwrap() {
-			Err(Error::DatabaseStopped(message)) => errors.push(message),
+		let result = handle.await.unwrap();
+		match result.as_ref().map_err(Error::poisoned_by) {
+			Err(Error::DatabaseStopped(message)) => errors.push(message.clone()),
 			other => panic!("expected the database to be stopped, got {other:?}"),
 		}
 	}
@@ -612,7 +629,10 @@ async fn a_failed_vlog_fsync_in_a_rotation_after_part_of_a_group_was_applied_sto
 		assert_eq!(get(&tree, key).unwrap(), None, "{key} is visible");
 	}
 	assert!(matches!(
-		try_put(&tree, "after", &payload(99, 300), Durability::Eventual).await,
+		try_put(&tree, "after", &payload(99, 300), Durability::Eventual)
+			.await
+			.as_ref()
+			.map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 

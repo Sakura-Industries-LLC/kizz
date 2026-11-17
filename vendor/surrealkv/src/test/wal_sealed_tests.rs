@@ -457,7 +457,12 @@ fn each_batch_is_sealed_at_its_index_counted_from_one_with_the_segment_and_the_d
 #[test]
 fn a_plaintext_segment_is_framed_as_it_always_was() {
 	let dir = TempDir::new().unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	// Without sync marks, which are records of their own around the batches.
+	let options = WalOptions {
+		sync_marks: false,
+		..WalOptions::default()
+	};
+	let mut wal = Wal::open(dir.path(), options).unwrap();
 	wal.append(b"abc").unwrap();
 	wal.append(b"hello world").unwrap();
 	wal.close().unwrap();
@@ -721,14 +726,15 @@ fn a_plaintext_segment_is_refused_by_a_sealed_reader_whatever_it_starts_with() {
 		wal.close().unwrap();
 		let before = snapshot(dir.path());
 
-		// The first record is a batch, or the record that says how the batches are compressed.
+		// The first record is the leading sync mark, or the record that says how the batches are
+		// compressed.
 		let first_type = fs::read(segment_path(dir.path(), 0)).unwrap()[6];
 		assert_eq!(
 			first_type,
 			if compression == CompressionType::None {
-				1
+				RecordType::SyncMark as u8
 			} else {
-				9
+				RecordType::SetCompressionType as u8
 			}
 		);
 
@@ -779,4 +785,33 @@ fn a_segment_that_cannot_be_opened_with_the_key_at_hand_changes_nothing() {
 		fs::remove_file(&renamed).unwrap();
 	}
 	assert_eq!(snapshot(dir.path()), before);
+}
+
+// ---------------------------------------------------------------------------
+// the rewrite at open
+// ---------------------------------------------------------------------------
+
+/// The rewrite at open moves the newest segment of a plaintext log. A sealed segment is not moved:
+/// the replay of a sealed log names no segment to rewrite, so the open starts a segment of its own.
+#[test]
+fn the_replay_of_a_sealed_log_names_no_segment_to_rewrite() {
+	let dir = TempDir::new().unwrap();
+	let enc = context(CipherSuite::Aes256Gcm);
+	let batch = encoded_batch(100, "alpha", 3, 40);
+	let segment = write_segment(dir.path(), &enc, CompressionType::Lz4, &[batch]);
+
+	let (max_seq, memtable, _, rewrite) = crate::lsm::Core::replay_wal_in(
+		&sealed_context(&enc),
+		dir.path(),
+		0,
+		"sealed replay",
+		crate::WalRecoveryMode::AbsoluteConsistency,
+		1 << 20,
+		None,
+		|_, _, _| Ok(()),
+	)
+	.unwrap();
+	assert!(max_seq.is_some(), "the batch was replayed");
+	assert!(memtable.is_some_and(|memtable| !memtable.is_empty()), "into the active memtable");
+	assert_eq!(rewrite, None, "segment {segment} is sealed, so it is not rewritten");
 }

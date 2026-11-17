@@ -3,18 +3,21 @@ use std::fs::create_dir_all;
 #[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 
 use crate::batch::Batch;
 use crate::checkpoint::{CheckpointGate, CheckpointMetadata, DatabaseCheckpoint};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
+use crate::compaction::manual::RangeStrategy;
 use crate::compaction::CompactionStrategy;
-use crate::error::{BackgroundErrorHandler, Result};
+use crate::error::{BackgroundErrorHandler, Result, WriteStallReason};
 use crate::levels::{
 	check_manifest_before_open,
+	encode_manifest,
 	plan_orphan_cleanup,
-	write_manifest_to_disk,
+	resolve_encryption_in,
+	write_encoded_manifest_in,
 	LevelManifest,
 	ManifestChangeSet,
 };
@@ -25,16 +28,20 @@ use crate::sstable::table::Table;
 use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
+use crate::vfs::{CreateOpts, Fs, FsKind, FsWriter};
 use crate::vlog::{VLog, ValueLocation};
 use crate::wal::recovery::{
-	classify_wal_damage,
-	repair_corrupted_wal_segment,
+	classify_wal_damage_in,
+	repair_corrupted_wal_segment_in,
 	replay_wal_inner_with,
 	WalDamage,
 	WalRecoveryReport,
 };
-use crate::wal::{self, cleanup_old_segments_for, list_segment_ids, Wal, WalManager};
+use crate::wal::tail::{self, TailCheck, TailEnd};
+use crate::wal::{self, cleanup_old_segments_for_in, list_segment_ids_in, Wal, WalManager};
 use crate::{
+	rt,
+	CompactRangeOptions,
 	Comparator,
 	Error,
 	FilterPolicy,
@@ -57,8 +64,9 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Performs compaction according to the specified strategy.
 	/// Compaction merges SSTables to reduce read amplification and remove
-	/// tombstones.
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
+	/// tombstones. Returns whether tables were moved into a lower level, after which the
+	/// strategy may have more to do (see `Compactor::compact`).
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<bool>;
 
 	/// Returns a reference to the background error handler
 	fn error_handler(&self) -> Arc<BackgroundErrorHandler>;
@@ -71,6 +79,40 @@ pub trait CompactionOperations: Send + Sync {
 	/// nothing for a database that is not encrypted.
 	fn prepare_keys(&self) -> Result<()> {
 		Ok(())
+	}
+
+	/// What the memtable flush task awaits before it flushes: the spare files of a pool. `None`
+	/// for every other file system, and for a tree that has nothing to wait for.
+	fn spares_for_flush(&self) -> Option<crate::vfs::SpareWait> {
+		None
+	}
+
+	/// What the compaction task awaits before it compacts.
+	fn spares_for_compaction(&self) -> Option<crate::vfs::SpareWait> {
+		None
+	}
+
+	/// How many creations the file system has refused for want of a file, ever. A task reads it
+	/// before and after a unit of work: a failure of a unit during which it advanced is not
+	/// permanent, whatever shape the failure took through the layers it came up.
+	fn pool_exhaustions(&self) -> u64 {
+		0
+	}
+
+	/// Called when a unit of background work is over: cleans some of the files that were removed.
+	fn after_background_unit(&self) {}
+
+	/// Whether a pool refused a creation since `exhaustions` was read from `pool_exhaustions`, and
+	/// is not at its limit, which is what makes a failure one that passes.
+	fn exhausted_since(&self, exhaustions: u64) -> bool {
+		let _ = exhaustions;
+		false
+	}
+
+	/// Called with the outcome of a level compaction, so that the next one waits for as many files
+	/// as the last one needed.
+	fn compaction_ran(&self, result: &Result<bool>) {
+		let _ = result;
 	}
 }
 
@@ -111,6 +153,16 @@ pub trait CompactionOperations: Send + Sync {
 /// `compactions` comes before them too: a compaction holds it shared from the moment it picks its
 /// tables to the removal of what it made obsolete, and takes the locks above under it, and a
 /// restore holds it exclusively. Nothing waits for it while holding any of them.
+///
+/// `manifest_io` serializes the writers of the manifest file, and the manifest's `log_number`, from
+/// the encode of a change to its apply in memory (see `LevelManifest::encode_with_changeset`). It
+/// is held across the write and fsync of the file, which none of the three locks above is, so
+/// readers are not held up by it. A checkpoint holds it shared while it copies the manifest file,
+/// so checkpoints run side by side and no writer replaces the file under one. It comes after
+/// `flush_lock` and `compactions`, which the flushes and compactions that take it hold, and before
+/// `active_memtable`: nothing waits for it while holding `active_memtable`, `level_manifest` or
+/// `immutable_memtables`. Opening a tree and a restore write the manifest without it: nothing else
+/// writes then, and a restore holds `flush_lock` and `compactions` exclusively.
 ///
 /// `rotations`, which serializes the rotations of the memtable and the WAL with a restore, comes
 /// before `active_memtable`, and after `flush_lock` and `compactions`, which a restore takes first
@@ -169,6 +221,11 @@ pub(crate) struct CoreInner {
 	/// oldest one first, and a restore never replaces the manifest under a flush.
 	pub(crate) flush_lock: parking_lot::Mutex<()>,
 
+	/// Held exclusively by every writer of the manifest file from the encode of its change to the
+	/// apply of that change in memory, and shared by a checkpoint while it copies the file. See
+	/// the lock order.
+	pub(crate) manifest_io: Arc<parking_lot::RwLock<()>>,
+
 	/// Held shared by every compaction for its whole run, and exclusively by a restore. A
 	/// compaction names its inputs and takes the ids of its outputs from the manifest it picked
 	/// from, writes the outputs, and then applies a changeset to the manifest and deletes the
@@ -177,6 +234,11 @@ pub(crate) struct CoreInner {
 	/// write over the ones that have the ids of its outputs, and list what it made in a manifest
 	/// it was not computed from.
 	pub(crate) compactions: parking_lot::RwLock<()>,
+
+	/// Held by one compaction at a time, from the pick of its inputs to the removal of them. The
+	/// background task and `Tree::compact_range` both pick from the manifest, and two picks that
+	/// overlap would merge the same tables twice.
+	compaction_serial: parking_lot::Mutex<()>,
 
 	/// Held for the whole of a rotation of the memtable and the WAL (`rotate_memtable()`,
 	/// `seal_active_wal_segment()`, `replace_failed_wal()`), taken before the active memtable's
@@ -267,6 +329,11 @@ pub(crate) struct CoreInner {
 	#[cfg(test)]
 	pub(crate) direct_table_hook: parking_lot::Mutex<Option<FlushHook>>,
 
+	/// Test-only observer called by `remove_obsolete_wal_segments` with the `log_number` of the
+	/// manifest, after the direct table is registered and before any segment is removed.
+	#[cfg(test)]
+	pub(crate) direct_cleanup_hook: parking_lot::Mutex<Option<FlushHook>>,
+
 	/// Test-only observer called by `create_checkpoint` at each of its stages.
 	#[cfg(test)]
 	pub(crate) checkpoint_hook: parking_lot::Mutex<Option<crate::checkpoint::CheckpointHook>>,
@@ -279,6 +346,42 @@ pub(crate) struct CoreInner {
 
 	/// Report of actions taken during WAL recovery at database open.
 	pub(crate) recovery_report: parking_lot::RwLock<WalRecoveryReport>,
+
+	/// Whether the file system is a pool, which has a fixed number of files to create from. Every
+	/// call that only a pool needs (waiting for spare files, cleaning dead ones, reading the
+	/// exhaustion counter) is made behind this, so that a database on `std` does nothing more than
+	/// it did.
+	pub(crate) pooled: bool,
+
+	/// The spare files that one commit group may need to create, a bound that is derived once from
+	/// the options (`ring::pipeline::group_need_of`, set when the commit pipeline is made) and not
+	/// measured, and that the file system keeps back for the commit path from the compaction that
+	/// would eat them (`PoolControl::set_reserve`). 0 until then.
+	pub(crate) group_need: AtomicUsize,
+
+	/// Whether the cap of the pool (`PoolConfig::max_files`) is too low for the full bound
+	/// `group_need`: a pool that cannot hold it twice over, with `cap_band` to spare, could be
+	/// made to refuse every commit, and every compaction, once its database has grown a little
+	/// (see `commit_group_need`). The database then degrades, in the way that `commit_group_need`
+	/// says, and does not wedge. False for a pool with the default cap, and for every file system
+	/// that is not a pool.
+	cap_limited: AtomicBool,
+
+	/// With `cap_limited`: the files, above `cap_floor`, that only a delete-only commit group and
+	/// a compaction may take. A group that holds anything else is not started while fewer than
+	/// `cap_floor + cap_band` files are free, so that a compaction always has `cap_band` files to
+	/// make its outputs in, and what it frees brings the commits back.
+	cap_band: AtomicUsize,
+
+	/// With `cap_limited`: the files that the commit path keeps back from the outputs of a
+	/// compaction, which is what a group of the usual size needs (`small_group_need_of`), and
+	/// never less than a flush does.
+	cap_floor: AtomicUsize,
+
+	/// How many spare files beyond `group_need` the next level compaction waits for. It starts at
+	/// `COMPACTION_HINT_MIN`, doubles each time a compaction met an empty pool, up to
+	/// `COMPACTION_HINT_MAX`, and starts again after a compaction that worked.
+	compaction_hint: AtomicUsize,
 }
 
 /// What a failed `write_batch_direct_to_l0_sst` leaves behind.
@@ -294,6 +397,60 @@ struct DirectL0Progress {
 #[cfg(test)]
 pub(crate) type FlushHook = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
 
+/// `need`, or the files that `fs` can have at all if that is fewer: the free ones and what is left
+/// of its limit. Always `need` for a file system that is not a pool.
+pub(crate) fn clamp_to_pool(fs: &dyn Fs, need: usize) -> usize {
+	match fs.pool() {
+		Some(pool) => {
+			let stats = pool.stats();
+			let potential = stats.clean + stats.dirty + stats.max_files.saturating_sub(stats.total);
+			need.min(potential)
+		}
+		None => need,
+	}
+}
+
+/// The spare files that a flush of a memtable waits for: its table, the manifest that lists it (a
+/// replaced manifest frees its old file only once it is clean), a roll of the value log, and room
+/// to spare.
+pub(crate) const FLUSH_NEED: usize = 8;
+
+/// The least and the most files that `CoreInner::cap_band` keeps for the work that frees files in
+/// a pool whose cap is below the bound of a commit group.
+const CAP_BAND_MIN: usize = 4;
+const CAP_BAND_MAX: usize = 32;
+
+/// What a commit group is, as far as the files it needs go: see `CoreInner::commit_group_need`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GroupShape {
+	/// What a group of this size needs if it is not a batch of its own: one segment of the log
+	/// for each rotation of the memtable that it can make, and a margin
+	/// (`ring::pipeline::small_group_need_of`).
+	pub(crate) usual: usize,
+	/// Every entry of every batch is a delete.
+	pub(crate) delete_only: bool,
+	/// A batch of it is bigger than a memtable.
+	pub(crate) oversized: bool,
+}
+
+/// The first wait of a compaction for spare files, beyond what the commit path keeps back.
+const COMPACTION_HINT_MIN: usize = 4;
+
+/// The most that a compaction waits for beyond what the commit path keeps back.
+const COMPACTION_HINT_MAX: usize = 256;
+
+/// How long `close` waits for the pool to make the files of the shutdown flush before it flushes
+/// with the files that the pool has.
+const CLOSE_SPARES_WAIT: std::time::Duration = if cfg!(test) {
+	std::time::Duration::from_millis(300)
+} else {
+	std::time::Duration::from_secs(5)
+};
+
+/// How many dead files of a pool a background unit cleans when it is done. A clean is a few writes
+/// and one flush of a file, and the worker is the one that serves queries.
+const MAINTAIN_BUDGET: usize = 32;
+
 impl CoreInner {
 	/// Creates a new LSM tree core instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
@@ -304,7 +461,7 @@ impl CoreInner {
 
 		// Acquire database lock to prevent multiple processes from opening the same
 		// database
-		let mut lockfile = LockFile::new(&opts.path);
+		let mut lockfile = opts.fs.lock_file(&opts.path);
 		lockfile.acquire()?;
 
 		// Initialize immutable memtables
@@ -312,8 +469,8 @@ impl CoreInner {
 
 		// Initialize level manifest FIRST to get log_number. Whether it exists must be read
 		// first, because `LevelManifest::new` creates one when it does not.
-		let manifest_loaded_from_disk = opts.manifest_file_path(0).exists();
-		let manifest = LevelManifest::new(Arc::clone(&opts))?;
+		let manifest_loaded_from_disk = opts.fs.exists(&opts.manifest_file_path(0));
+		let manifest = LevelManifest::new_in(&*opts.fs, Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
 		// Whether the table files that the manifest does not list are this database's is read
@@ -335,8 +492,11 @@ impl CoreInner {
 		// The value log is opened before the WAL is: opening the WAL makes a segment and removes
 		// what a repair left, and an open that the value log refuses (a file in the clear in an
 		// encrypted database, or one that the key does not open) must not have done either.
+		let error_handler = Arc::new(BackgroundErrorHandler::new());
 		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
+			let vlog = VLog::new_in(Arc::clone(&opts.fs), Arc::clone(&opts))?;
+			vlog.set_error_handler(Arc::clone(&error_handler));
+			Some(Arc::new(vlog))
 		} else {
 			None
 		};
@@ -363,12 +523,16 @@ impl CoreInner {
 
 		let memory_controller = Arc::new(crate::memory::MemoryController::default());
 
+		let pooled = opts.fs.kind() == FsKind::Pool;
+
 		Ok(Self {
 			opts,
 			active_memtable,
 			immutable_memtables,
 			flush_lock: parking_lot::Mutex::new(()),
+			manifest_io: Arc::new(parking_lot::RwLock::new(())),
 			compactions: parking_lot::RwLock::new(()),
+			compaction_serial: parking_lot::Mutex::new(()),
 			rotations: parking_lot::Mutex::new(()),
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
@@ -376,7 +540,7 @@ impl CoreInner {
 			vlog,
 			wal: WalManager::new(wal_instance),
 			lockfile: Mutex::new(lockfile),
-			error_handler: Arc::new(BackgroundErrorHandler::new()),
+			error_handler,
 			visible_seq_num,
 			group_wal_pin: AtomicU64::new(u64::MAX),
 			unapplied_group_below: AtomicU64::new(0),
@@ -388,11 +552,234 @@ impl CoreInner {
 			#[cfg(test)]
 			direct_table_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
+			direct_cleanup_hook: parking_lot::Mutex::new(None),
+			#[cfg(test)]
 			checkpoint_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
 			compaction_stage_hook: parking_lot::Mutex::new(None),
 			recovery_report: parking_lot::RwLock::new(WalRecoveryReport::default()),
+			pooled,
+			group_need: AtomicUsize::new(0),
+			cap_limited: AtomicBool::new(false),
+			cap_band: AtomicUsize::new(0),
+			cap_floor: AtomicUsize::new(0),
+			compaction_hint: AtomicUsize::new(COMPACTION_HINT_MIN),
 		})
+	}
+
+	/// Records the files that one commit group may need (see `group_need_of`) and has the pool keep
+	/// that many back from the outputs of a compaction. Called once, when the commit pipeline is
+	/// made, and only for a pool.
+	///
+	/// `usual` is what the largest group that is not a batch of its own needs
+	/// (`small_group_need_max`). A pool whose cap is below `2 * need + band` is `cap_limited`:
+	/// what the pool keeps back is then `usual`, and the bound `need` is asked only of a batch that
+	/// is bigger than a memtable, which the pool then refuses with `PoolFull` when it cannot be
+	/// given.
+	pub(crate) fn set_group_need(&self, need: usize, usual: usize) {
+		self.group_need.store(need, Ordering::Release);
+		let Some(pool) = self.opts.fs.pool() else {
+			return;
+		};
+		let max_files = pool.stats().max_files;
+		let band = (max_files / 8).clamp(CAP_BAND_MIN, CAP_BAND_MAX);
+		if max_files < need.saturating_mul(2).saturating_add(band) {
+			let floor = usual.max(FLUSH_NEED);
+			self.cap_band.store(band, Ordering::Release);
+			self.cap_floor.store(floor, Ordering::Release);
+			self.cap_limited.store(true, Ordering::Release);
+			pool.set_reserve(floor);
+		} else {
+			pool.set_reserve(need);
+		}
+	}
+
+	/// Whether the cap of the pool is too low for the full bound of a commit group: see
+	/// `cap_limited`.
+	pub(crate) fn is_cap_limited(&self) -> bool {
+		self.cap_limited.load(Ordering::Acquire)
+	}
+
+	/// The files that a commit group of this `shape` waits for, `vlog` of them for the rolls of
+	/// the value log, in a pool.
+	///
+	/// With a cap that holds the full bound it is `group_need`, as it always was. In a
+	/// `cap_limited` pool the bound could never be met once the database has grown, so what a group
+	/// needs is what it can use: one log segment for each time it can rotate the memtable, and a
+	/// margin (`small_group_need_of`), but at least `cap_floor`, which compaction leaves free. A
+	/// group of puts and merges also asks for `cap_band` more, so that the last files of the pool
+	/// are left to the work that frees files: a delete-only group (a delete does not grow the
+	/// database, and is how a full one is made smaller) and the outputs of a compaction. A batch
+	/// that is bigger than a memtable needs the full bound, because it writes a table of its own
+	/// after flushing the queue, and a pool that cannot hold that refuses it with `PoolFull`.
+	pub(crate) fn commit_group_need(&self, shape: GroupShape, vlog: usize) -> usize {
+		let full = self.group_need.load(Ordering::Acquire);
+		if !self.is_cap_limited() || shape.oversized {
+			return full + vlog;
+		}
+		let floor = self.cap_floor.load(Ordering::Acquire);
+		let base = (shape.usual + vlog).max(floor);
+		if shape.delete_only {
+			base
+		} else {
+			base + self.cap_band.load(Ordering::Acquire)
+		}
+	}
+
+	/// The wait of the flush of a memtable for the files it creates.
+	fn spares_for_flush(&self) -> Option<crate::vfs::SpareWait> {
+		if !self.pooled {
+			return None;
+		}
+		self.opts.fs.ensure_spares(FLUSH_NEED)
+	}
+
+	/// The wait of a level compaction for the files its outputs take, which are created only while
+	/// more than `group_need` files are free (more than `cap_floor` in a `cap_limited` pool, and
+	/// then at most `cap_band` of them are waited for, which is all that the commits leave it).
+	/// Never for more than the pool can have: a wait for more would fail with `PoolFull` every
+	/// time, before the compaction was tried.
+	fn spares_for_compaction(&self) -> Option<crate::vfs::SpareWait> {
+		if !self.pooled {
+			return None;
+		}
+		let hint =
+			self.compaction_hint.load(Ordering::Acquire).max(self.compaction_outputs_bound());
+		let need = if self.is_cap_limited() {
+			self.cap_floor.load(Ordering::Acquire) + hint.min(self.cap_band.load(Ordering::Acquire))
+		} else {
+			self.group_need.load(Ordering::Acquire) + hint
+		};
+		self.opts.fs.ensure_spares(self.clamped_to_pool(need))
+	}
+
+	/// How many output files the next compaction may make, as far as the tables that it can merge
+	/// say: the two shallowest levels that hold tables, over `target_file_size`, and two more. An
+	/// upper bound for the compaction that is likely, so that its first wait is for about what it
+	/// needs, and the one that merges most of a database is not run again and again with a
+	/// doubling hint, each run merging every input anew. At most `COMPACTION_HINT_MAX`, and never
+	/// more than the pool can have.
+	fn compaction_outputs_bound(&self) -> usize {
+		let Ok(manifest) = self.level_manifest.read() else {
+			return 0;
+		};
+		let bytes: u64 = manifest
+			.levels
+			.get_levels()
+			.iter()
+			.filter(|level| !level.tables.is_empty())
+			.take(2)
+			.flat_map(|level| level.tables.iter())
+			.map(|table| table.file_size)
+			.sum();
+		drop(manifest);
+		let target = self.opts.target_file_size.max(1);
+		let outputs =
+			usize::try_from(bytes.div_ceil(target)).unwrap_or(usize::MAX).saturating_add(2);
+		clamp_to_pool(&*self.opts.fs, outputs.min(COMPACTION_HINT_MAX))
+	}
+
+	/// The wait of `close` for the files that the shutdown flush creates: a table and a manifest
+	/// for every memtable that is queued and for the active one, and a roll of the value log.
+	fn spares_for_close(&self) -> Option<crate::vfs::SpareWait> {
+		if !self.pooled {
+			return None;
+		}
+		let need = 3 * (self.immutable_count() + 1) + 4;
+		self.opts.fs.ensure_spares(self.clamped_to_pool(need))
+	}
+
+	/// `need`, or what the pool can have if that is less: a wait for more than that would fail at
+	/// once with the error of a pool that is at its limit, before the work that needs fewer was
+	/// tried.
+	pub(crate) fn clamped_to_pool(&self, need: usize) -> usize {
+		clamp_to_pool(&*self.opts.fs, need)
+	}
+
+	/// Removes the segments of the log below `min_wal_to_keep`, at the close, when every memtable
+	/// is in a table and the segment that was active goes too.
+	///
+	/// In a pool a removal is a write that a crash may keep or lose on its own: the removals that
+	/// are not flushed are lost or kept in any combination, and a crash that keeps the removal of
+	/// the newest segment and loses that of an older one leaves a database whose manifest is past
+	/// every segment that is there, which the open refuses (`log_number exceeds WAL segments`),
+	/// with all of its data in tables. So a pool removes all of them but the newest, makes those
+	/// removals durable (`maintain_pool` cleans the files and flushes each), and removes the
+	/// newest last: whatever a crash keeps, the newest segment is there or nothing is.
+	///
+	/// On `std` it is the one pass that it always was. A journaled file system keeps the removals
+	/// of one directory in the order they were made, which is the case that this does not change
+	/// (a file system that does not is not known to be one of those that are used: unverified).
+	fn remove_obsolete_wal_segments_at_close(
+		&self,
+		wal_dir: &Path,
+		min_wal_to_keep: u64,
+	) -> Result<usize> {
+		let context = self.opts.encryption_context().map(Arc::as_ref);
+		let newest = if self.pooled {
+			list_segment_ids_in(&*self.opts.fs, wal_dir, Some("wal"))
+				.ok()
+				.and_then(|ids| ids.into_iter().filter(|id| *id < min_wal_to_keep).max())
+		} else {
+			None
+		};
+		let mut removed = 0;
+		if let Some(newest) = newest {
+			removed += cleanup_old_segments_for_in(context, &*self.opts.fs, wal_dir, newest)?;
+			self.maintain_pool(usize::MAX);
+		}
+		Ok(removed
+			+ cleanup_old_segments_for_in(context, &*self.opts.fs, wal_dir, min_wal_to_keep)?)
+	}
+
+	/// Removes, at the open, the segments of the log that nothing needs, after the recovery has put
+	/// the records that it replayed in tables (all but `data_segment`, which holds those of the
+	/// recovered memtable) and a new segment, `active`, has been started.
+	///
+	/// A session that ends without a close (a browser tab cannot run one) is the usual end of a
+	/// session on the web, and every open starts a segment: a recovery flush moves the manifest's
+	/// `log_number` and removes nothing, and one that finds no records moves nothing, so without
+	/// this each of those sessions leaves one more file, and a file pool at its limit then cannot
+	/// open the database. The segments below `data_segment` are removed as a close does it, with
+	/// the newest of them last; those between it and `active` hold no record at all, and a
+	/// crash that keeps any of the removals leaves a log that opens, as the one that was there.
+	///
+	/// Best effort: what stays is removed by the next open, a flush or the close.
+	fn remove_dead_wal_segments_at_open(&self, data_segment: Option<u64>, active: u64) {
+		// A sealed log names, checks and numbers its segments in its own way, and is on `std`,
+		// which has no limit of files: it keeps what it kept.
+		if self.opts.encryption_context().is_some() {
+			return;
+		}
+		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
+		let bound = data_segment.unwrap_or(active).min(active);
+		if let Err(e) = self.remove_obsolete_wal_segments_at_close(&wal_dir, bound) {
+			tracing::warn!("Failed to clean up old WAL segments at open: {}", e);
+			return;
+		}
+		let Some(data_segment) = data_segment else {
+			return;
+		};
+		let Ok(ids) = list_segment_ids_in(&*self.opts.fs, &wal_dir, Some("wal")) else {
+			return;
+		};
+		for id in ids.into_iter().filter(|id| *id > data_segment && *id < active) {
+			if let Err(e) = self.opts.fs.remove_file(&wal_dir.join(format!("{id:020}.wal"))) {
+				tracing::warn!("Failed to remove the empty WAL segment {}: {}", id, e);
+				return;
+			}
+		}
+		self.maintain_pool(usize::MAX);
+	}
+
+	/// Cleans some of the files that were removed, so that they return to the free ones without
+	/// waiting for the pool's own refill. A no-op for a file system that is not a pool.
+	pub(crate) fn maintain_pool(&self, budget: usize) {
+		if self.pooled {
+			if let Some(pool) = self.opts.fs.pool() {
+				pool.maintain(budget);
+			}
+		}
 	}
 
 	pub(crate) fn immutable_count(&self) -> usize {
@@ -474,8 +861,11 @@ impl CoreInner {
 			)
 			.map_err(|e| match e {
 				// An encryption error keeps its type: a key that could not be had may be asked for
-				// again, and no other of them may, which a text does not say.
-				Error::Encryption(_) => e,
+				// again, and no other of them may, which a text does not say. A pool that has
+				// no free file keeps its type too: it passes once the pool is refilled, which a
+				// text does not say either, and one that is at its limit does not.
+				Error::Encryption(_) | Error::FilePoolExhausted => e,
+				e if e.is_storage_full() => e,
 				e => Error::Other(format!(
 					"Failed to flush memtable to SST table_id={}: {}",
 					table_id, e
@@ -496,31 +886,35 @@ impl CoreInner {
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
 
-		// Step 4: Apply changeset atomically
+		// Step 3: Make the changeset durable, and only then apply it, so that the manifest is
+		// never written under a lock that readers need (see `manifest_io`).
+		let _manifest_io = self.manifest_io.write();
 		// Lock order: level_manifest → immutable_memtables
-		let mut manifest = self.level_manifest.write()?;
-		let mut memtable_lock = self.immutable_memtables.write()?;
+		let (path, content, log_number) = {
+			let manifest = self.level_manifest.read()?;
+			let memtable_lock = self.immutable_memtables.read()?;
 
-		// A memtable queued ahead of this one (a checkpoint can rotate while the shutdown flush
-		// runs) keeps its WAL segment: `log_number` only moves forward, so passing the segment
-		// would lose the memtable if the process died before its flush.
-		let log_number = Self::hold_log_number(
-			memtable_lock.log_number_after(Some(table_id), wal_number),
-			manifest.get_log_number(),
-			self.group_wal_pin.load(Ordering::Acquire).min(hold),
-		);
-		changeset.log_number = Some(log_number);
+			// A memtable queued ahead of this one (a checkpoint can rotate while the shutdown
+			// flush runs) keeps its WAL segment: `log_number` only moves forward, so passing the
+			// segment would lose the memtable if the process died before its flush. A memtable
+			// queued after this read is tagged with a newer segment than this one.
+			let log_number = Self::hold_log_number(
+				memtable_lock.log_number_after(Some(table_id), wal_number),
+				manifest.get_log_number(),
+				self.group_wal_pin.load(Ordering::Acquire).min(hold),
+			);
+			changeset.log_number = Some(log_number);
 
-		tracing::debug!(
-			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-			table_id,
-			log_number,
-			wal_number
-		);
+			tracing::debug!(
+				"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+				table_id,
+				log_number,
+				wal_number
+			);
 
-		let rollback = manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			manifest.revert_changeset(rollback);
+			(manifest.path.clone(), manifest.encode_with_changeset(&changeset)?, log_number)
+		};
+		if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 			return Err(self.manifest_write_error(
 				e,
 				format!(
@@ -529,6 +923,12 @@ impl CoreInner {
 				),
 			));
 		}
+
+		// Step 4: Publish the table and drop the memtable in one step
+		// Lock order: level_manifest → immutable_memtables
+		let mut manifest = self.level_manifest.write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
+		manifest.apply_changeset(&changeset)?;
 
 		// Remove successfully flushed memtable from immutables tracking. The
 		// Arc<MemTable> in `memtable` (function parameter) falls out of scope at
@@ -557,6 +957,11 @@ impl CoreInner {
 	/// The error for a failed write of the manifest. An uncertain write keeps its kind, which
 	/// the background task does not retry, and makes the next flush settle the manifest first.
 	fn manifest_write_error(&self, error: Error, context: String) -> Error {
+		// A pool that is at its limit of files keeps its type: it does not pass by waiting, and
+		// the layer below only lets through the one that does.
+		if error.is_storage_full() {
+			return error;
+		}
 		crate::levels::manifest_write_error(&self.manifest_uncertain, error, &context)
 	}
 
@@ -566,8 +971,23 @@ impl CoreInner {
 		if !self.manifest_uncertain.load(Ordering::Acquire) {
 			return Ok(());
 		}
-		let manifest = self.level_manifest.write()?;
-		write_manifest_to_disk(&manifest)
+		let manifest_io = self.manifest_io.write();
+		self.settle_manifest_held(&manifest_io)
+	}
+
+	/// [`Self::settle_manifest`] for a caller that holds `manifest_io`.
+	pub(crate) fn settle_manifest_held(
+		&self,
+		_manifest_io: &parking_lot::RwLockWriteGuard<'_, ()>,
+	) -> Result<()> {
+		if !self.manifest_uncertain.load(Ordering::Acquire) {
+			return Ok(());
+		}
+		let (path, content) = {
+			let manifest = self.level_manifest.read()?;
+			(manifest.path.clone(), encode_manifest(&manifest)?)
+		};
+		write_encoded_manifest_in(&*self.opts.fs, &path, &content)
 			.map_err(|e| self.manifest_write_error(e, "Failed to settle the manifest".into()))?;
 		self.manifest_uncertain.store(false, Ordering::Release);
 		Ok(())
@@ -628,7 +1048,8 @@ impl CoreInner {
 					"Kept the table file of a failed direct L0 write that the manifest may list: table_id={}",
 					table_id
 				);
-			} else if let Err(e) = std::fs::remove_file(self.opts.sstable_file_path(table_id)) {
+			} else if let Err(e) = self.opts.fs.remove_file(&self.opts.sstable_file_path(table_id))
+			{
 				if e.kind() != std::io::ErrorKind::NotFound {
 					tracing::warn!(
 						"Failed to remove the table file of a failed direct L0 write: table_id={}: {}",
@@ -677,10 +1098,17 @@ impl CoreInner {
 			.sort_by(|a, b| self.opts.internal_comparator.compare(&a.0.encode(), &b.0.encode()));
 
 		{
-			let file = std::fs::File::create(&table_file_path)?;
+			// The same order as the flush of a memtable (`MemTable::flush`): created empty, written
+			// through the handle that is dropped when the writer finishes, made durable by path,
+			// and opened again for reading.
+			let file = self.opts.fs.create_truncate(&table_file_path, CreateOpts::default())?;
 			progress.created = true;
-			let mut table_writer =
-				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&self.opts), 0);
+			let mut table_writer = crate::sstable::table::TableWriter::new(
+				FsWriter(file),
+				table_id,
+				Arc::clone(&self.opts),
+				0,
+			);
 
 			for (key, val) in point_entries {
 				table_writer.add(key, val)?;
@@ -697,9 +1125,10 @@ impl CoreInner {
 			vlog.sync()?;
 		}
 
-		crate::vfs::fsync_file(&table_file_path)?;
-		crate::lsm::fsync_directory(self.opts.sstable_dir())?;
-		let file: Arc<dyn crate::vfs::File> = Arc::new(std::fs::File::open(&table_file_path)?);
+		let fs = &*self.opts.fs;
+		fs.sync_file(&table_file_path)?;
+		fs.sync_dir(&self.opts.sstable_dir())?;
+		let file: Arc<dyn crate::vfs::File> = fs.open_read(&table_file_path)?;
 		let file_size = file.size()?;
 
 		let created_table =
@@ -721,8 +1150,10 @@ impl CoreInner {
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&created_table)));
 
+		// The changeset is made durable before it is applied (see `manifest_io`).
+		let manifest_io = self.manifest_io.write();
 		// Lock order: level_manifest -> immutable_memtables (matches flush_immutable_to_sst).
-		let mut manifest = self.level_manifest.write()?;
+		let manifest = self.level_manifest.read()?;
 
 		// Only advance `log_number` past `batch_wal_number` if no OLDER immutable
 		// memtable is still waiting to be flushed. `flush_immutable_to_sst` can bump
@@ -745,23 +1176,25 @@ impl CoreInner {
 			));
 		}
 
-		let rollback = manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			manifest.revert_changeset(rollback);
+		let path = manifest.path.clone();
+		let content = manifest.encode_with_changeset(&changeset)?;
+		drop(manifest);
+		if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 			let error = self.manifest_write_error(
 				e,
 				format!(
 					"Failed to update the manifest for the direct L0 table table_id={table_id}"
 				),
 			);
-			drop(manifest);
 			if matches!(error, Error::ManifestWriteUncertain(_)) {
 				// The manifest on disk may list the table: write the one in memory again, which
 				// does not. Until that works the file stays.
-				progress.table_may_be_listed = self.settle_manifest().is_err();
+				progress.table_may_be_listed = self.settle_manifest_held(&manifest_io).is_err();
 			}
 			return Err(error);
 		}
+		self.level_manifest.write()?.apply_changeset(&changeset)?;
+		drop(manifest_io);
 
 		tracing::debug!(
 			"Direct-to-L0 flush completed: table_id={}, file_size={}",
@@ -807,7 +1240,11 @@ impl CoreInner {
 			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
 			self.rotate_wal(&mut wal_guard).map_err(|e| {
-				Self::rotation_error("Failed to rotate WAL before memtable rotation", e)
+				Self::rotation_error(
+					self.pooled,
+					"Failed to rotate WAL before memtable rotation",
+					e,
+				)
 			})?;
 			let new_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
@@ -874,6 +1311,17 @@ impl CoreInner {
 		})
 	}
 
+	/// The rewrite at open: see `Wal::rewrite_active_with`. Like `rotate_wal`, the value log is
+	/// synced first, before the records that point to it are made durable.
+	fn rewrite_wal(&self, wal: &mut Wal, valid_end: u64) -> wal::Result<Option<u64>> {
+		wal.rewrite_active_with(valid_end, || match self.vlog {
+			Some(ref vlog) => {
+				vlog.sync_dirty().map_err(|e| std::io::Error::other(e.to_string()).into())
+			}
+			None => Ok(()),
+		})
+	}
+
 	/// Ensures the WAL segment currently backing the active memtable can never receive
 	/// another write, and returns that WAL number.
 	///
@@ -901,7 +1349,7 @@ impl CoreInner {
 
 		let mut wal_guard = self.wal.write();
 		self.rotate_wal(&mut wal_guard).map_err(|e| {
-			Self::rotation_error("Failed to rotate WAL before direct-to-L0 flush", e)
+			Self::rotation_error(self.pooled, "Failed to rotate WAL before direct-to-L0 flush", e)
 		})?;
 		let new_wal_number = wal_guard.get_active_log_number();
 		drop(wal_guard);
@@ -934,8 +1382,9 @@ impl CoreInner {
 		};
 		if active_memtable.is_empty() {
 			let mut wal_guard = self.wal.write();
-			self.rotate_wal(&mut wal_guard)
-				.map_err(|e| Self::rotation_error("Failed to replace the failed WAL segment", e))?;
+			self.rotate_wal(&mut wal_guard).map_err(|e| {
+				Self::rotation_error(self.pooled, "Failed to replace the failed WAL segment", e)
+			})?;
 			let new_wal_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 			active_memtable.set_wal_number(new_wal_number);
@@ -943,7 +1392,8 @@ impl CoreInner {
 		}
 
 		self.rotate_memtable_locked(active_memtable).map_err(|e| match e {
-			Error::Encryption(_) => e,
+			Error::Encryption(_) | Error::FilePoolExhausted => e,
+			e if e.is_storage_full() => e,
 			e => replace_error(&e),
 		})?;
 		Ok(Some(true))
@@ -971,8 +1421,10 @@ impl CoreInner {
 		if !current() {
 			return Err(Error::PipelineStall);
 		}
+		// The changeset is made durable before it is applied (see `manifest_io`).
+		let _manifest_io = self.manifest_io.write();
 		// Lock order: level_manifest -> immutable_memtables (matches flush_immutable_to_sst).
-		let mut manifest = self.level_manifest.write()?;
+		let manifest = self.level_manifest.read()?;
 		if manifest.get_log_number() < below {
 			if self.immutable_memtables.read()?.iter().any(|entry| entry.wal_number < below) {
 				return Err(Error::Other(
@@ -985,14 +1437,16 @@ impl CoreInner {
 				log_number: Some(below),
 				..Default::default()
 			};
-			let rollback = manifest.apply_changeset(&changeset)?;
-			if let Err(e) = write_manifest_to_disk(&manifest) {
-				manifest.revert_changeset(rollback);
+			let path = manifest.path.clone();
+			let content = manifest.encode_with_changeset(&changeset)?;
+			drop(manifest);
+			if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 				return Err(self.manifest_write_error(
 					e,
 					format!("Failed to move log_number past a failed commit group: {below}"),
 				));
 			}
+			self.level_manifest.write()?.apply_changeset(&changeset)?;
 			// The manifest in memory is on disk whole, whatever an earlier write left there.
 			self.manifest_uncertain.store(false, Ordering::Release);
 		}
@@ -1007,10 +1461,29 @@ impl CoreInner {
 
 	/// The error of a rotation of the WAL that failed. An encryption error keeps its type: a key
 	/// that could not be had may be asked for again, and no other of them may, which a text does
-	/// not say.
-	fn rotation_error(what: &str, error: wal::Error) -> Error {
+	/// not say. So does a pool that had no free file for the new segment: it passes once the pool
+	/// is refilled.
+	///
+	/// A pool that is at its limit of files, and a browser that is out of quota, fail the new
+	/// segment with an I/O error of the kind `StorageFull`, which the log keeps only as a kind and
+	/// a text. It is given its type again here (see `Error::is_storage_full`), so that it is
+	/// soft and the committer can tell it from a disk that failed. Only on a pool: no file system
+	/// of a pool gives an error of an operating system, and the full disk of a native one (the
+	/// same kind, with a code) is as it always was.
+	fn rotation_error(pooled: bool, what: &str, error: wal::Error) -> Error {
 		match error {
 			wal::Error::Encryption(error) => Error::Encryption(error),
+			wal::Error::PoolExhausted => Error::FilePoolExhausted,
+			wal::Error::IO(error) if pooled && error.kind() == std::io::ErrorKind::StorageFull => {
+				Error::Io(Arc::new(std::io::Error::new(
+					std::io::ErrorKind::StorageFull,
+					format!("{what}: {error}"),
+				)))
+			}
+			wal::Error::StorageFull(message) => Error::Io(Arc::new(std::io::Error::new(
+				std::io::ErrorKind::StorageFull,
+				format!("{what}: {message}"),
+			))),
 			error => Error::Other(format!("{what}: {error}")),
 		}
 	}
@@ -1095,15 +1568,34 @@ impl CoreInner {
 		)?;
 
 		// Clean up the WAL segments the flush made obsolete
-		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = Self::hold_log_number(
 			entry.wal_number + 1,
 			self.level_manifest.read()?.get_log_number(),
 			self.group_wal_pin.load(Ordering::Acquire),
 		);
+		self.remove_wal_segments_below(min_wal_to_keep);
 
-		match cleanup_old_segments_for(
+		self.cleanup_vlog("flush");
+
+		tracing::debug!(
+			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
+			table.id,
+			table.file_size
+		);
+
+		Ok(Some(table))
+	}
+
+	/// Removes the WAL segments below `min_wal_to_keep`, which the manifest's `log_number` has
+	/// moved past. Best effort: a segment that stays is removed by the next flush or by `close`,
+	/// and recovery starts at `log_number`, so it is never read.
+	///
+	/// The caller holds `flush_lock`, which a restore holds while it replaces the WAL directory.
+	fn remove_wal_segments_below(&self, min_wal_to_keep: u64) {
+		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
+		match cleanup_old_segments_for_in(
 			self.opts.encryption_context().map(Arc::as_ref),
+			&*self.opts.fs,
 			&wal_dir,
 			min_wal_to_keep,
 		) {
@@ -1119,23 +1611,36 @@ impl CoreInner {
 				tracing::warn!("Failed to clean up old WAL segments: {}", e);
 			}
 		}
+	}
 
-		self.cleanup_vlog("flush");
+	/// Removes the WAL segments that the manifest's `log_number` is past, after a direct L0 write
+	/// moved it. The bound is the manifest's own value, which already holds back the segments
+	/// that the rest of the commit group and the queued memtables still need, see
+	/// `hold_log_number`. See `remove_wal_segments_below`.
+	pub(crate) fn remove_obsolete_wal_segments(&self) {
+		let Ok(manifest) = self.level_manifest.read() else {
+			return;
+		};
+		let log_number = manifest.get_log_number();
+		drop(manifest);
 
-		tracing::debug!(
-			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
-			table.id,
-			table.file_size
-		);
+		#[cfg(test)]
+		{
+			let hook = self.direct_cleanup_hook.lock().clone();
+			if let Some(hook) = hook {
+				let _ = hook(log_number);
+			}
+		}
 
-		Ok(Some(table))
+		self.remove_wal_segments_below(log_number);
 	}
 
 	/// Flushes the immutable memtables that are queued when it is called, synchronously.
 	/// Used by Tree::flush() and checkpoint for forced/sync flush.
 	/// Blocks until they are all in tables, including one that another flush had started. Ones
 	/// rotated meanwhile are left to the background task: waiting for them too would keep a
-	/// checkpoint of a tree under steady writes from ever finishing.
+	/// checkpoint of a tree under steady writes from ever finishing. This function does not wake
+	/// that task. `Tree::flush`, `compact_range` and `create_checkpoint` do, when any remain.
 	pub(crate) fn flush_all_immutables_sync(&self) -> Result<()> {
 		let Some(newest) = self.immutable_memtables.read()?.iter().next_back().map(|e| e.table_id)
 		else {
@@ -1358,8 +1863,10 @@ impl CoreInner {
 			if flushed_count > 0 {
 				let current_wal = self.wal.read().get_active_log_number();
 
+				// The changeset is made durable before it is applied (see `manifest_io`).
+				let _manifest_io = self.manifest_io.write();
 				// A memtable rotated after the queue was read keeps its WAL segment.
-				let mut manifest = self.level_manifest.write()?;
+				let manifest = self.level_manifest.read()?;
 				let log_number =
 					self.immutable_memtables.read()?.log_number_after(None, current_wal);
 				let changeset = ManifestChangeSet {
@@ -1367,18 +1874,22 @@ impl CoreInner {
 					..Default::default()
 				};
 
-				let rollback = manifest.apply_changeset(&changeset)?;
-				if let Err(e) = write_manifest_to_disk(&manifest) {
-					manifest.revert_changeset(rollback);
+				let path = manifest.path.clone();
+				let content = manifest.encode_with_changeset(&changeset)?;
+				drop(manifest);
+				if let Err(e) = write_encoded_manifest_in(&*self.opts.fs, &path, &content) {
 					return Err(match e {
-						// A manifest that could not be sealed keeps the error of the key.
-						Error::Encryption(_) => e,
+						// A manifest that could not be sealed keeps the error of the key, and one
+						// that a pool had no file for keeps the type that says it passes.
+						Error::Encryption(_) | Error::FilePoolExhausted => e,
+						e if e.is_storage_full() => e,
 						e => Error::Other(format!(
 							"Failed to update manifest log_number after immutable flush: {}",
 							e
 						)),
 					});
 				}
+				self.level_manifest.write()?.apply_changeset(&changeset)?;
 
 				tracing::debug!(
 					"Updated manifest log_number to {} after immutable flushes",
@@ -1407,8 +1918,9 @@ impl CoreInner {
 		}
 
 		let sstable_dir = self.opts.sstable_dir();
+		let fs = &*self.opts.fs;
 
-		if !sstable_dir.exists() {
+		if !fs.exists(&sstable_dir) {
 			return Ok(());
 		}
 
@@ -1432,12 +1944,11 @@ impl CoreInner {
 		};
 
 		// Scan SST directory for orphaned files
-		let entries = std::fs::read_dir(&sstable_dir)?;
+		let entries = fs.read_dir(&sstable_dir)?;
 		let mut removed_count = 0;
 
 		for entry in entries {
-			let entry = entry?;
-			let filename = entry.file_name();
+			let filename = &entry.name;
 			let filename_str = filename.to_string_lossy();
 
 			// Parse table ID from filename (format: {id:020}.sst)
@@ -1447,8 +1958,8 @@ impl CoreInner {
 					if !live_table_ids.contains(&table_id)
 						&& removable.as_ref().is_none_or(|removable| removable.contains(&table_id))
 					{
-						let path = entry.path();
-						match std::fs::remove_file(&path) {
+						let path = sstable_dir.join(filename);
+						match fs.remove_file(&path) {
 							Ok(_) => {
 								removed_count += 1;
 								tracing::debug!("Removed orphaned SST file: table_id={}", table_id);
@@ -1494,8 +2005,25 @@ impl CoreInner {
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from
 	/// VLog if needed
 	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
-		let location = ValueLocation::decode(value)?;
-		location.resolve_value(self.vlog.as_ref())
+		ValueLocation::resolve_raw_value(value, self.vlog.as_ref()).map(|cow| cow.into_owned())
+	}
+
+	/// Resolves a value, borrowing inline bytes directly without allocation.
+	pub(crate) fn resolve_value_ref<'a>(
+		&self,
+		value: &'a [u8],
+	) -> Result<std::borrow::Cow<'a, [u8]>> {
+		ValueLocation::resolve_raw_value(value, self.vlog.as_ref())
+	}
+
+	/// Resolves an owned encoded value, stripping the header in-place for inline values.
+	pub(crate) fn resolve_owned_value(&self, value: Value) -> Result<Value> {
+		ValueLocation::resolve_owned_value(value, self.vlog.as_ref())
+	}
+
+	/// Resolves an encoded value into `out`, reusing its capacity.
+	pub(crate) fn resolve_value_into(&self, value: &[u8], out: &mut Vec<u8>) -> Result<()> {
+		ValueLocation::resolve_value_into(value, self.vlog.as_ref(), out)
 	}
 }
 
@@ -1512,7 +2040,7 @@ impl CompactionOperations for CoreInner {
 	/// - Merges overlapping SSTables to reduce read amplification
 	/// - Removes deleted entries to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<bool> {
 		// A stopped database moves no table: a table may hold batches of the group that failed, and
 		// recovery has to find the group as it was left. A compaction that was already running
 		// keeps what readers can see, because it keeps every version above the visible sequence
@@ -1528,15 +2056,14 @@ impl CompactionOperations for CoreInner {
 
 		// Kept for the whole run, so that a restore waits for it, see `compactions`.
 		let _running = self.compactions.read();
+		let _serial = self.compaction_serial.lock();
 
 		// Create compaction options from the current LSM tree state
 		let options = CompactionOptions::from(self);
 
 		// Execute compaction according to the chosen strategy
 		let compactor = Compactor::new(options, strategy);
-		compactor.compact()?;
-
-		Ok(())
+		compactor.compact()
 	}
 
 	/// Returns a reference to the background error handler
@@ -1552,6 +2079,55 @@ impl CompactionOperations for CoreInner {
 		match self.opts.encryption_context() {
 			Some(context) => Ok(context.refresh_in_use()?),
 			None => Ok(()),
+		}
+	}
+
+	fn spares_for_flush(&self) -> Option<crate::vfs::SpareWait> {
+		CoreInner::spares_for_flush(self)
+	}
+
+	fn spares_for_compaction(&self) -> Option<crate::vfs::SpareWait> {
+		CoreInner::spares_for_compaction(self)
+	}
+
+	fn pool_exhaustions(&self) -> u64 {
+		if self.pooled {
+			self.opts.fs.pool_exhaustions()
+		} else {
+			0
+		}
+	}
+
+	fn after_background_unit(&self) {
+		self.maintain_pool(MAINTAIN_BUDGET);
+	}
+
+	fn exhausted_since(&self, exhaustions: u64) -> bool {
+		if !self.pooled || self.opts.fs.pool_exhaustions() == exhaustions {
+			return false;
+		}
+		// A pool at its limit is not a pool that passes: the files have to be released first.
+		match self.opts.fs.pool() {
+			Some(pool) => {
+				let stats = pool.stats();
+				stats.total < stats.max_files
+			}
+			None => false,
+		}
+	}
+
+	fn compaction_ran(&self, result: &Result<bool>) {
+		if !self.pooled {
+			return;
+		}
+		match result {
+			Ok(_) => self.compaction_hint.store(COMPACTION_HINT_MIN, Ordering::Release),
+			Err(Error::FilePoolExhausted) => {
+				let hint = self.compaction_hint.load(Ordering::Acquire);
+				self.compaction_hint
+					.store(hint.saturating_mul(2).min(COMPACTION_HINT_MAX), Ordering::Release);
+			}
+			Err(_) => {}
 		}
 	}
 }
@@ -1587,7 +2163,7 @@ pub(crate) struct Core {
 	pub(crate) write_stall: Arc<crate::stall::WriteStallController>,
 
 	/// Handle to the background flusher task
-	pub(crate) flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+	pub(crate) flusher_handle: Mutex<Option<rt::JoinHandle<()>>>,
 
 	/// Atomic flag indicating if the core has been closed
 	pub(crate) is_closed: AtomicBool,
@@ -1609,6 +2185,12 @@ impl std::ops::Deref for Core {
 	}
 }
 
+/// What the replay of the log leaves for the open: the highest sequence number, the memtable of
+/// the records that are in no table, the report, and the newest segment with the offset where its
+/// last complete record ends, when the open may rewrite it (see [`Core::replay_wal_in`]).
+pub(crate) type ReplayedLog =
+	(Option<u64>, Option<Arc<MemTable>>, WalRecoveryReport, Option<(u64, u64)>);
+
 impl Core {
 	/// Replays a plaintext WAL, see [`replay_wal_in`](Self::replay_wal_in).
 	#[cfg(test)]
@@ -1623,15 +2205,17 @@ impl Core {
 	where
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
-		Self::replay_wal_in(
+		let (max_seq, memtable, report, _) = Self::replay_wal_in(
 			&wal::WalContext::plaintext(),
 			wal_path,
 			min_wal_number,
 			context,
 			recovery_mode,
 			arena_size,
+			None,
 			flush_memtable,
-		)
+		)?;
+		Ok((max_seq, memtable, report))
 	}
 
 	/// Replays WAL with configurable corruption handling.
@@ -1662,20 +2246,34 @@ impl Core {
 		context: &str,
 		recovery_mode: WalRecoveryMode,
 		arena_size: usize,
+		mut tail: Option<&mut TailCheck<'_>>,
 		mut flush_memtable: F,
-	) -> Result<(Option<u64>, Option<Arc<MemTable>>, WalRecoveryReport)>
+	) -> Result<ReplayedLog>
 	where
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
 		let mut report = WalRecoveryReport::default();
 		let mut repair_attempts = 0;
 
-		let (wal_seq_num_opt, memtables) = loop {
+		// Before anything of the log is replayed, so that no memtable is made of a record that the
+		// segment is then cut before. Once: the records that are kept were all looked at.
+		if let Some(tail) = tail.as_deref_mut() {
+			Self::cut_tail_of_log(
+				tail,
+				wal_context,
+				wal_path,
+				min_wal_number,
+				recovery_mode,
+				&mut report,
+			)?;
+		}
+
+		let (wal_seq_num_opt, memtables, newest_end) = loop {
 			match replay_wal_inner_with(wal_context, wal_path, min_wal_number, arena_size) {
-				Ok((seq, memtables, total_batches, segments_processed)) => {
+				Ok((seq, memtables, total_batches, segments_processed, newest_end)) => {
 					report.records_replayed = total_batches;
 					report.segments_replayed = segments_processed;
-					break (seq, memtables);
+					break (seq, memtables, newest_end);
 				}
 				Err(Error::WalCorruption {
 					segment_id,
@@ -1716,11 +2314,16 @@ impl Core {
 						}
 
 						let segment_path = wal_path.join(format!("{segment_id:020}.wal"));
-						let all_ids = list_segment_ids(wal_path, Some("wal"))?;
+						let all_ids = list_segment_ids_in(&*wal_context.fs, wal_path, Some("wal"))?;
 						let max_segment_id = all_ids.into_iter().max().unwrap_or(segment_id as u64);
 						let is_last_segment = segment_id as u64 == max_segment_id;
 
-						let damage = classify_wal_damage(&segment_path, offset, is_last_segment)?;
+						let damage = classify_wal_damage_in(
+							&*wal_context.fs,
+							&segment_path,
+							offset,
+							is_last_segment,
+						)?;
 						match damage {
 							WalDamage::TornTail {
 								last_valid_offset,
@@ -1731,11 +2334,33 @@ impl Core {
 										(file size {file_size}). Trimming torn tail and quarantining original."
 									);
 								let (quarantine_path, bytes_trimmed) =
-									repair_corrupted_wal_segment(
+									repair_corrupted_wal_segment_in(
+										&*wal_context.fs,
 										wal_path,
 										segment_id,
 										last_valid_offset,
 									)?;
+								report.quarantined_files.push(quarantine_path);
+								report.bytes_trimmed += bytes_trimmed;
+							}
+							WalDamage::UnsyncedTail {
+								last_valid_offset,
+								intact_records_after,
+								file_size,
+							} => {
+								tracing::info!(
+										"Damage in the unsynced tail of the last WAL segment {segment_id} at offset {last_valid_offset} \
+										(file size {file_size}): no sync mark after it says it was synced. Trimming the tail, with \
+										its {intact_records_after} intact record(s) that were never synced, and quarantining the original."
+									);
+								let (quarantine_path, bytes_trimmed) =
+									repair_corrupted_wal_segment_in(
+										&*wal_context.fs,
+										wal_path,
+										segment_id,
+										last_valid_offset,
+									)?;
+								report.records_dropped += intact_records_after;
 								report.quarantined_files.push(quarantine_path);
 								report.bytes_trimmed += bytes_trimmed;
 							}
@@ -1749,6 +2374,9 @@ impl Core {
 									format!(
 											"WAL segment {segment_id} is an older segment (newest is {max_segment_id}); older segments cannot have torn tails"
 										)
+								} else if intact_records_after == 0 {
+									"a sync mark after it says the damaged bytes had been synced"
+										.to_string()
 								} else {
 									format!(
 											"found {intact_records_after} intact record(s) after corruption offset {last_valid_offset}"
@@ -1786,16 +2414,26 @@ impl Core {
 						}
 
 						let segment_path = wal_path.join(format!("{segment_id:020}.wal"));
-						let all_ids = list_segment_ids(wal_path, Some("wal"))?;
+						let all_ids = list_segment_ids_in(&*wal_context.fs, wal_path, Some("wal"))?;
 						let max_segment_id = all_ids.into_iter().max().unwrap_or(segment_id as u64);
 						let is_last_segment = segment_id as u64 == max_segment_id;
 
-						let damage = classify_wal_damage(&segment_path, offset, is_last_segment)?;
+						let damage = classify_wal_damage_in(
+							&*wal_context.fs,
+							&segment_path,
+							offset,
+							is_last_segment,
+						)?;
 						let (last_valid_offset, intact_records_after) = match damage {
 							WalDamage::TornTail {
 								last_valid_offset,
 								..
 							} => (last_valid_offset, 0),
+							WalDamage::UnsyncedTail {
+								last_valid_offset,
+								intact_records_after,
+								..
+							} => (last_valid_offset, intact_records_after),
 							WalDamage::InteriorCorruption {
 								last_valid_offset,
 								intact_records_after,
@@ -1810,8 +2448,12 @@ impl Core {
 						};
 
 						report.records_dropped += intact_records_after;
-						let (quarantine_path, bytes_trimmed) =
-							repair_corrupted_wal_segment(wal_path, segment_id, last_valid_offset)?;
+						let (quarantine_path, bytes_trimmed) = repair_corrupted_wal_segment_in(
+							&*wal_context.fs,
+							wal_path,
+							segment_id,
+							last_valid_offset,
+						)?;
 						report.quarantined_files.push(quarantine_path);
 						report.bytes_trimmed += bytes_trimmed;
 					}
@@ -1820,9 +2462,21 @@ impl Core {
 			}
 		};
 
+		// What the records of the last segment point to is made durable before anything else is
+		// started on top of them: the open starts the next segment once this returns.
+		if let Some(tail) = tail.as_deref() {
+			tail.make_durable()?;
+		}
+
+		// Every replayed record is durable before anything is built on it: a record that was
+		// readable but never synced would otherwise be lost to a power cut that keeps the
+		// commits made on top of it. After the values of the last segment, so that none of its
+		// records reaches the disk ahead of its value.
+		wal::recovery::sync_replayed_segments_in(&*wal_context.fs, wal_path, min_wal_number)?;
+
 		// If no memtables, nothing was recovered
 		if memtables.is_empty() {
-			return Ok((None, None, report));
+			return Ok((None, None, report, None));
 		}
 
 		// Flush all memtables except the last to SST
@@ -1851,6 +2505,17 @@ impl Core {
 		// nothing to do with `opts.max_memtable_size`, so it would silently blow
 		// through the configured memory bound for however long it stays active. Flush
 		// it immediately like the other recovered memtables instead.
+		// The records of the newest segment are moved at the open into the segment after it, when
+		// they are one memtable that is kept active: the segment is then all of its records. The
+		// result names the segment and where its records end, see `Wal::rewrite_active_with`. Never
+		// for a sealed log, which is not rewritten.
+		let rewrite = memtables
+			.last()
+			.filter(|(_, oversized, wal_number)| {
+				!*oversized && memtables.iter().filter(|(_, _, w)| w == wal_number).count() == 1
+			})
+			.and(newest_end)
+			.filter(|_| !wal_context.is_sealed());
 		let (last_memtable, oversized, last_wal_number) = memtables.into_iter().last().unwrap();
 		if oversized {
 			tracing::debug!(
@@ -1863,7 +2528,7 @@ impl Core {
 			if !last_memtable.is_empty() {
 				flush_memtable(last_memtable, last_wal_number, false)?;
 			}
-			return Ok((wal_seq_num_opt, None, report));
+			return Ok((wal_seq_num_opt, None, report, None));
 		}
 		let entry_count = {
 			let mut iter = last_memtable.iter();
@@ -1882,7 +2547,61 @@ impl Core {
 			entry_count
 		);
 
-		Ok((wal_seq_num_opt, Some(last_memtable), report))
+		// Tagged with the segment that its records are in, until the caller gives it the segment
+		// that it will be written to: the open reads the tag to know which segments hold
+		// nothing that is not in a table.
+		last_memtable.set_wal_number(last_wal_number);
+
+		let rewrite = rewrite.filter(|(newest, _)| *newest == last_wal_number);
+		Ok((wal_seq_num_opt, Some(last_memtable), report, rewrite))
+	}
+
+	/// Holds the records of the last segment of the log to the value log, and cuts the segment
+	/// before the first record whose value is not in it, as `recovery_mode` allows. The segment as
+	/// it was is kept, as for every repair of the log, and the report says what was cut.
+	fn cut_tail_of_log(
+		tail: &mut TailCheck<'_>,
+		wal_context: &wal::WalContext,
+		wal_path: &Path,
+		min_wal_number: u64,
+		recovery_mode: WalRecoveryMode,
+		report: &mut WalRecoveryReport,
+	) -> Result<()> {
+		let fs = &*wal_context.fs;
+		let Some(segment) = tail::last_segment(fs, wal_path, min_wal_number)? else {
+			return Ok(());
+		};
+		let TailEnd::Cut {
+			record,
+			offset,
+			dropped,
+		} = tail.run(wal_context, &segment, recovery_mode)?
+		else {
+			return Ok(());
+		};
+
+		let segment_id = segment.id as usize;
+		let (quarantined, trimmed) = if wal_context.is_sealed() {
+			let before = fs.file_len(&segment.file_path)?;
+			let kept = wal::sealed_recovery::keep_first_batches(
+				wal_context,
+				wal_path,
+				segment_id,
+				record,
+			)?;
+			(kept, before.saturating_sub(fs.file_len(&segment.file_path)?))
+		} else {
+			repair_corrupted_wal_segment_in(fs, wal_path, segment_id, offset)?
+		};
+		tracing::warn!(
+			"WAL segment {segment_id} ends before record {record}, at offset {offset}: the value it \
+			 points to is not in the value log. {dropped} record(s) and {trimmed} byte(s) were left \
+			 out, and the segment as it was is kept as {quarantined:?}."
+		);
+		report.records_dropped += dropped;
+		report.bytes_trimmed += trimmed;
+		report.quarantined_files.push(quarantined);
+		Ok(())
 	}
 
 	/// Creates a new LSM tree with background task management
@@ -1905,13 +2624,15 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let (wal_seq_num_opt, recovered_memtable, startup_report) = Self::replay_wal_in(
+		let mut tail = inner.vlog.as_deref().map(TailCheck::new);
+		let (wal_seq_num_opt, recovered_memtable, startup_report, rewrite) = Self::replay_wal_in(
 			&wal::WalContext::for_options(&opts)?,
 			&wal_path,
 			min_wal_number,
 			"Database startup",
 			opts.wal_recovery_mode,
 			opts.max_memtable_size,
+			tail.as_mut(),
 			|memtable, wal_number, continues| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = inner.level_manifest.read()?.next_table_id();
@@ -1946,14 +2667,53 @@ impl Core {
 		}
 		*inner.recovery_report.write() = startup_report;
 
-		// Always continue in a fresh segment: replay may have repaired (replaced) the
-		// segment the writer was opened on, or flushed it and moved the manifest's
-		// log number past it. Like every rotation it goes through `rotate_wal()`, which
-		// syncs the value log first if it holds unsynced values.
+		// The segments that the open writes from here on hold sync marks, which a binary that
+		// knows no marks must not read: the manifest is of the version that such a binary refuses
+		// first. Not before: nothing up to here writes a mark, and an open that failed before
+		// this leaves the directory to the binary it came from.
+		inner.level_manifest.write()?.upgrade_format_in(&*opts.fs)?;
+
+		// The records of the newest segment, when they are the recovered memtable and nothing else,
+		// are rewritten into the segment after it, which then takes the commits: the open starts no
+		// segment beside the one it replayed, so a session that ends without a close adds no
+		// segment and no table (see `Wal::rewrite_active_with`). Otherwise a fresh segment is
+		// started, as every open did: replay may have flushed the newest segment, or moved the
+		// manifest's log number past it. A rotation goes through `rotate_wal()`, which syncs the
+		// value log first if it holds unsynced values, and a rewrite does the same before its
+		// rename.
 		{
 			let mut wal_guard = inner.wal.write();
-			inner.rotate_wal(&mut wal_guard)?;
+			let recovered_in_newest = match (rewrite, recovered_memtable.as_ref()) {
+				(Some((newest, valid_end)), Some(memtable))
+					if memtable.get_wal_number() == newest
+						&& wal_guard.get_active_log_number() == newest =>
+				{
+					Some(valid_end)
+				}
+				_ => None,
+			};
+			// A tail that the rewrite does not take is left as it is, and a segment starts after
+			// it. A torn record at the end of the segment is not such a tail: the replay has
+			// trimmed it already, with a copy of it kept, so the segment ends at the records it
+			// read. What the rewrite accepts past them is sync marks and padding.
+			let rewritten = match recovered_in_newest {
+				Some(valid_end) => inner.rewrite_wal(&mut wal_guard, valid_end)?.is_some(),
+				None => false,
+			};
+			if !rewritten {
+				inner.rotate_wal(&mut wal_guard)?;
+			}
 		}
+
+		// The segment that holds the records of the recovered memtable, which no table has: the
+		// only one below the new segment that a later open still has to read. Every other one
+		// holds records that are in tables, or none. Its number is kept when the segment is
+		// rewritten, so that the quarantine copies of the segments below it stay under the
+		// retention rule of the quarantine.
+		let data_segment = recovered_memtable
+			.as_ref()
+			.filter(|memtable| !memtable.is_empty())
+			.map(|memtable| memtable.get_wal_number());
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
@@ -1966,6 +2726,7 @@ impl Core {
 			let active_memtable = inner.active_memtable.read()?;
 			let current_wal_number = inner.wal.read().get_active_log_number();
 			active_memtable.set_wal_number(current_wal_number);
+			inner.remove_dead_wal_segments_at_open(data_segment, current_wal_number);
 		}
 
 		// Get last_sequence from manifest
@@ -2024,6 +2785,18 @@ impl Core {
 			Arc::clone(&opts),
 			Arc::clone(&write_stall),
 		));
+		// A stalled writer makes no flush of its own, so it asks for the work that ends the stall.
+		// A memtable queued by a sync flush is not always followed by a wake, and the flush task
+		// stays asleep until one comes. The tasks hold the controller, so it holds them weakly.
+		let tasks = Arc::downgrade(&task_manager);
+		write_stall.set_rearm(move |reason| {
+			if let Some(tasks) = tasks.upgrade() {
+				match reason {
+					WriteStallReason::MemtableLimit => tasks.wake_up_memtable(),
+					WriteStallReason::L0FileLimit => tasks.wake_up_level(),
+				}
+			}
+		});
 
 		// Initialize the CommitPipeline for lock-free OCC commits and background flushing.
 		let commit_pipeline = Arc::new(crate::ring::CommitPipeline::new(
@@ -2107,30 +2880,56 @@ impl Core {
 		if sync && self.wal.read().is_held() {
 			return Err(wal::segment_held().into());
 		}
-		if let Some(ref vlog) = self.vlog {
+		let Some(ref vlog) = self.vlog else {
 			if sync {
-				vlog.sync()?;
+				self.wal.sync()?;
 			} else {
-				vlog.flush()?;
+				self.wal.flush()?;
 			}
-		}
-		if sync {
-			self.wal.sync()?;
-		} else {
+			return Ok(());
+		};
+		if !sync {
+			vlog.flush()?;
 			self.wal.flush()?;
+			return Ok(());
 		}
+		// A record reaches the WAL after its values reach the value log, so the sync of the value
+		// log covers the values of every record that the WAL holds before it. The commits that
+		// land in between have values it may not cover: the fsync of the WAL makes their records
+		// durable too, but the marks of the segment claim only what it held before.
+		let bound = self.wal.sync_bound();
+		vlog.sync()?;
+		self.wal.sync_within(&bound)?;
 		Ok(())
 	}
 
-	/// Test-only: ends the flusher and the background tasks the way a crash does, so that a tree
-	/// a test abandons does not stay alive until the runtime is dropped.
-	#[cfg(all(test, not(target_arch = "wasm32")))]
+	/// Ends the flusher and the background tasks the way a crash does, without waiting for them:
+	/// a tree that is abandoned, or that a test abandons, does not stay alive until the runtime is
+	/// dropped. Used by `Tree::abandon`, and by the tests that crash a tree.
 	pub(crate) fn abort_background_tasks(&self) {
 		if let Some(handle) = self.flusher_handle.lock().unwrap().take() {
 			handle.abort();
 		}
 		if let Some(task_manager) = self.task_manager.lock().unwrap().take() {
 			task_manager.abort();
+		}
+	}
+
+	/// Ends the tree the way a crash does, from a function that is not async: it is marked closed
+	/// (so that no drop of it flushes or closes anything afterwards), its three tasks are aborted,
+	/// and its lock is released. Nothing is flushed, no log is synced and no manifest is written,
+	/// and the commits that were in flight are not decided: they end with `Error::PipelineStall`,
+	/// as they do after a close, whether or not they are in the log. What the file system holds
+	/// is what a crash at this point would have left, as far as the file system is concerned.
+	pub(crate) fn abandon(&self) {
+		self.is_closed.store(true, Ordering::SeqCst);
+		self.abort_background_tasks();
+		self.write_stall.signal_shutdown();
+		// Nothing more is logged: the flusher is gone, and a commit that arrives is refused. The
+		// commits that were admitted are told so, and none waits for the flusher.
+		self.commit_pipeline.abandon();
+		if let Ok(mut lockfile) = self.inner.lockfile.lock() {
+			let _ = lockfile.release();
 		}
 	}
 
@@ -2156,6 +2955,13 @@ impl Core {
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before
 	/// flushing. This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
+		self.close_with(true).await
+	}
+
+	/// [`close`](Self::close), with or without the trailing sync mark of the active WAL segment
+	/// (see `Wal::close`). The close that a drop spawns writes none: it runs whenever the runtime
+	/// gets to it, and the segment may by then be another open's, which repaired or replayed it.
+	pub(crate) async fn close_with(&self, trailing_mark: bool) -> Result<()> {
 		let _closing = self.closing.lock().await;
 		if self.is_closed.load(Ordering::SeqCst) {
 			return Ok(());
@@ -2191,10 +2997,20 @@ impl Core {
 			tracing::debug!("Background task manager stopped");
 		}
 
-		// Close the VLog if present
+		// Close the VLog if present. A log that cannot be synced (one whose fsync failed refuses
+		// every sync) ends the shutdown here, the way a crash ends the tree: nothing after it may
+		// be made durable, as the WAL's records and the tables of a flush would point at values
+		// that may be lost. The tree is closed already, so a second `close` does nothing: the
+		// lock is released now, so that the database can be opened again and recovery decide what
+		// survived.
 		if let Some(ref vlog) = self.inner.vlog {
 			tracing::debug!("Closing VLog...");
-			vlog.close()?;
+			if let Err(error) = vlog.close() {
+				if let Ok(mut lockfile) = self.inner.lockfile.lock() {
+					let _ = lockfile.release();
+				}
+				return Err(error);
+			}
 			tracing::debug!("VLog closed");
 		}
 
@@ -2208,10 +3024,44 @@ impl Core {
 		if self.inner.opts.flush_on_close && !stopped_by_commit_group {
 			tracing::debug!("Flushing all memtables on shutdown (flush_on_close=true)");
 
+			// A pool has a fixed number of files: the tables and the manifests that the flush
+			// creates are waited for first, with nothing held. The wait ends with an error if the
+			// pool is closed or cannot make them, and `close` then fails with it instead of waiting
+			// for ever. A refill that does not answer at all is waited for a while, and then the
+			// flush is tried with what the pool has: it is the files that it may not find, and its
+			// error says so.
+			if let Some(wait) = self.inner.spares_for_close() {
+				match rt::timeout(CLOSE_SPARES_WAIT, wait).await {
+					Ok(done) => done.map_err(Error::from)?,
+					Err(_) => tracing::warn!(
+						"The pool did not make the files for the shutdown flush in {:?}: flushing with the \
+						 files that it has",
+						CLOSE_SPARES_WAIT
+					),
+				}
+			}
+
+			// The failures of the unit are read against the pool's counter, as a background unit's
+			// are: an error that went through a layer that turned it into text is still the one
+			// that a pool that has no free file made. Only a pool has one.
+			let exhaustions = if self.inner.pooled {
+				self.inner.opts.fs.pool_exhaustions()
+			} else {
+				0
+			};
+
 			// Flush ALL memtables: immutables first (older data), then active (newest data)
 			self.inner.flush_all_memtables_for_shutdown().map_err(|e| match e {
-				// A key that could not be had stays what it is, for the caller of `close`.
-				Error::Encryption(_) => e,
+				// A key that could not be had stays what it is, for the caller of `close`, and a
+				// pool that has no free file stays one that passes.
+				Error::Encryption(_) | Error::FilePoolExhausted => e,
+				e if e.is_storage_full() => e,
+				// Not a typed error that a layer turned into text, but the pool did refuse a file
+				// during the flush: say that it passes.
+				e if self.inner.pooled && self.inner.exhausted_since(exhaustions) => {
+					tracing::debug!("The shutdown flush met a pool with no free file: {e}");
+					Error::FilePoolExhausted
+				}
 				e => Error::Other(format!("Failed to flush memtables during shutdown: {}", e)),
 			})?;
 
@@ -2221,6 +3071,15 @@ impl Core {
 			// closed. One that cannot be released reports the hold when the WAL is closed.
 			let _ = self.inner.try_release_wal_hold();
 		}
+
+		// A pool keeps one handle per file, and the log of values has handles of its own on the
+		// files it wrote and read, which keep a file from being removed or opened again. The
+		// flush above was the last thing to append to it, so they go now, with an fsync first.
+		// The files stay, and a read that comes later opens its file again.
+		let vlog_released = match self.inner.vlog {
+			Some(ref vlog) if self.inner.pooled => vlog.release_files(),
+			_ => Ok(()),
+		};
 
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are
@@ -2232,8 +3091,9 @@ impl Core {
 		// A WAL that cannot be closed (the fsync of its segment failed) does not keep the rest of
 		// the shutdown from running: its error is returned at the end.
 		let mut wal_guard = self.inner.wal.write();
-		let wal_closed =
-			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)));
+		let wal_closed = wal_guard
+			.close_with(trailing_mark)
+			.map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)));
 		if wal_closed.is_ok() {
 			tracing::debug!("WAL #{:020} closed and synced", wal_log_number);
 		}
@@ -2248,11 +3108,7 @@ impl Core {
 
 		tracing::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
-		match cleanup_old_segments_for(
-			self.inner.opts.encryption_context().map(Arc::as_ref),
-			&wal_dir,
-			min_wal_to_keep,
-		) {
+		match self.inner.remove_obsolete_wal_segments_at_close(&wal_dir, min_wal_to_keep) {
 			Ok(count) if count > 0 => {
 				tracing::debug!("Cleaned up {} obsolete WAL files during shutdown", count);
 			}
@@ -2282,7 +3138,14 @@ impl Core {
 			final_manifest.get_log_number(),
 			final_manifest.get_last_sequence()
 		);
+		drop(final_manifest);
 
+		// The files that this shutdown removed (the log segments of the memtables that were just
+		// flushed) are clean and free for the next open, or for the next database in this pool,
+		// without waiting for its own refill.
+		self.inner.maintain_pool(usize::MAX);
+
+		vlog_released.map_err(|e| Error::Other(format!("Failed to release the value log: {e}")))?;
 		wal_closed
 	}
 }
@@ -2290,13 +3153,81 @@ impl Core {
 #[derive(Clone)]
 pub struct Tree {
 	pub(crate) core: Arc<Core>,
+	/// What the `Tree` values of one database share, and nothing else does: the last of them to be
+	/// dropped closes the database (see [`TreeHandle`]). A browser build only: a native `Tree`
+	/// closes the database when any of its clones is dropped, as it always has.
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[allow(
+		dead_code,
+		reason = "it is never read: dropping the last of the trees is what it is for"
+	)]
+	handle: Arc<TreeHandle>,
+}
+
+/// The close of a database that no `Tree` is left to close.
+///
+/// A transaction, a snapshot and an iterator keep the core of the tree alive, and a count of the
+/// references to the core would never see the last `Tree` go while one of them lives: the
+/// database would stay open for good, holding its lock and its files, and could not be opened
+/// again in the worker. The `Tree` values of a database share one of these instead, and nothing
+/// else holds it, so it is dropped when the last of them is, whatever else is alive. Dropping it
+/// closes the database in the background, and a transaction that is still running finds the
+/// commit pipeline shut down, and its commit fails with `PipelineStall`, as it does after `close`.
+#[cfg_attr(not(any(test, all(target_arch = "wasm32", target_os = "unknown"))), allow(dead_code))]
+pub(crate) struct TreeHandle {
+	core: Arc<Core>,
+}
+
+#[cfg_attr(not(any(test, all(target_arch = "wasm32", target_os = "unknown"))), allow(dead_code))]
+impl TreeHandle {
+	pub(crate) fn new(core: Arc<Core>) -> Self {
+		Self {
+			core,
+		}
+	}
+}
+
+impl Drop for TreeHandle {
+	fn drop(&mut self) {
+		if self.core.is_closed.load(Ordering::SeqCst) {
+			return;
+		}
+		let core = Arc::clone(&self.core);
+		let spawned = rt::try_spawn(async move {
+			if let Err(err) = core.close_with(false).await {
+				tracing::error!("Error closing store: {}", err);
+			}
+		});
+		if !spawned {
+			tracing::warn!("No runtime available for closing the store correctly");
+		}
+	}
 }
 
 impl Tree {
+	/// The attempts that [`TreeBuilder::build_async`] makes to open a database on a pool that has
+	/// too few files for the recovery it needs.
+	const OPEN_ATTEMPTS: usize = 16;
+
 	/// Creates a new LSM tree with the specified options
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		// Validate options before creating the tree
 		opts.validate()?;
+
+		// A file system that has nothing mounted is refused before any call asks it whether a
+		// database exists: on it every such call answers `false`, and a sync `build()` would
+		// make an empty database of that, or (while the engine still reads `opts.path` itself)
+		// write one to the operating system's disk. A no-op for every other file system.
+		opts.fs.check_available()?;
+		let fs = Arc::clone(&opts.fs);
+		// The migrators, and everything else that reads the operating system's files by path, are
+		// for a database that is in them: on another file system they would look at a directory
+		// that is not there and take it for one that is empty.
+		let native = fs.kind() == FsKind::Std;
+
+		// What a file system that is not the operating system's cannot do yet is refused here, with
+		// nothing created or read: see `refuse_what_the_file_system_cannot_do`.
+		Self::refuse_what_the_file_system_cannot_do(&opts)?;
 
 		// Fail before anything is created or moved if a restore into the directory did not
 		// finish. This must stay ahead of the migrations, the directory creation and the lock
@@ -2306,13 +3237,15 @@ impl Tree {
 		// Whether the database is encrypted is read from its manifest, and the key checked by
 		// opening it, before anything is created or moved. This writes nothing: an encrypted
 		// database that is new writes its first manifest, sealed, before any other file.
-		let opts = crate::levels::resolve_encryption(opts)?;
+		let opts = resolve_encryption_in(&*fs, opts)?;
 
 		// A RocksDB database written by SurrealDB is migrated next, and a migration that was
 		// interrupted is finished or undone: it has to come before anything looks for a manifest,
 		// which a RocksDB directory does not have.
-		if let Some(report) = crate::migrate::rocksdb::migrate_if_needed(&opts)? {
-			tracing::info!("migrated a RocksDB database: {report:?}");
+		if native {
+			if let Some(report) = crate::migrate::rocksdb::migrate_if_needed(&opts)? {
+				tracing::info!("migrated a RocksDB database: {report:?}");
+			}
 		}
 
 		// Fail before anything is created or moved if the directory holds database files
@@ -2322,8 +3255,10 @@ impl Tree {
 
 		// A database written by SurrealKV v0.x is migrated to the current format before
 		// anything else reads it, with every version and timestamp it holds.
-		if let Some(report) = crate::migrate::legacy::migrate_if_needed(&opts)? {
-			tracing::info!("migrated a SurrealKV v0.x database: {report:?}");
+		if native {
+			if let Some(report) = crate::migrate::legacy::migrate_if_needed(&opts)? {
+				tracing::info!("migrated a SurrealKV v0.x database: {report:?}");
+			}
 		}
 
 		// Values that live in the value log can only be read with it. A directory that holds
@@ -2331,7 +3266,7 @@ impl Tree {
 		let opts = Self::opts_with_existing_value_log(opts)?;
 
 		// If the path contains an existing IndexedDB dump or store, automatically migrate it
-		if surrealkv_compat_indxdb::is_indxdb_dump_dir(&opts.path) {
+		if native && surrealkv_compat_indxdb::is_indxdb_dump_dir(&opts.path) {
 			Self::migrate_from_indxdb(&opts)?;
 		}
 
@@ -2343,7 +3278,7 @@ impl Tree {
 		// it, then try again.
 		let core = match Core::new(Arc::clone(&opts)) {
 			Err(Error::LegacyFormat(_))
-				if crate::migrate::legacy::migrate_forced(&opts)?.is_some() =>
+				if native && crate::migrate::legacy::migrate_forced(&opts)?.is_some() =>
 			{
 				Core::new(Arc::clone(&opts))?
 			}
@@ -2353,9 +3288,219 @@ impl Tree {
 		// Ensure directory changes are persisted
 		sync_directory_structure(&opts)?;
 
-		Ok(Self {
-			core: Arc::new(core),
-		})
+		Ok(Self::from_core(core))
+	}
+
+	/// Opens the database, after waiting for the files of a pool that the open creates. A file
+	/// system that is not a pool has nothing to wait for, and this is `new` behind an `async fn`.
+	pub(crate) async fn open_async(opts: Arc<Options>) -> Result<Self> {
+		// `new` validates the options and asks the file system whether it is there, in that order:
+		// a file system that is not a pool goes straight to it, so that an open on `std` does each
+		// of them once.
+		if opts.fs.kind() != FsKind::Pool {
+			return Self::new(opts);
+		}
+		opts.validate()?;
+		let fs = Arc::clone(&opts.fs);
+		// Before anything: a file system that has nothing mounted answers with its own error here,
+		// and not with the `false` that a question about a manifest would make of it.
+		fs.check_available()?;
+		// What a pool cannot do is refused before it is asked for the files of an open.
+		Self::refuse_what_the_file_system_cannot_do(&opts)?;
+
+		let mut need = Self::open_need(&*fs, &opts);
+		let mut attempt = 1;
+		loop {
+			if let Some(wait) = fs.ensure_spares(clamp_to_pool(&*fs, need)) {
+				wait.await.map_err(Error::from)?;
+			}
+			let exhaustions = fs.pool_exhaustions();
+			let error = match Self::new(Arc::clone(&opts)) {
+				Ok(tree) => return Ok(tree),
+				Err(error) => error,
+			};
+			// What passes is a pool that ran short: the typed error, or a pool that refused a
+			// creation during the attempt, whatever the error looks like now. A pool that is at its
+			// limit does not pass, and the attempts stop there.
+			let passes = !error.is_pool_full()
+				&& (matches!(error, Error::FilePoolExhausted)
+					|| fs.pool_exhaustions() != exhaustions)
+				&& fs.pool().is_none_or(|pool| {
+					let stats = pool.stats();
+					stats.total < stats.max_files
+				});
+			if !passes || attempt >= Self::OPEN_ATTEMPTS {
+				return Err(error);
+			}
+			tracing::debug!(
+				"Opening the database found the pool short of files (attempt {attempt}): {error}"
+			);
+			attempt += 1;
+			need = need.saturating_mul(2);
+		}
+	}
+
+	/// How many files the open of the database creates in a pool, as the files that are there say.
+	///
+	/// A recovery turns the records of every segment of the log that the manifest does not say is
+	/// flushed (the ones numbered from its `log_number`) into a memtable, and flushes every one of
+	/// them but the last, a table and a manifest each. The count is of segments that have bytes in
+	/// them, not of bytes: how many memtables a segment becomes is known only when it has been
+	/// read, which is what the attempts that follow are for. The rest is the open itself: the first
+	/// manifest, the segments the open starts, the vlog's first file, a repair and its copy.
+	fn open_need(fs: &dyn Fs, opts: &Options) -> usize {
+		const OPEN_BASE: usize = 8;
+		let log_number = fs
+			.read(&opts.manifest_file_path(0))
+			.ok()
+			.and_then(|data| crate::levels::unseal_manifest(data, None).ok())
+			.and_then(|body| crate::levels::DecodedManifest::decode(body).ok())
+			.map_or(0, |manifest| manifest.log_number);
+		let wal_dir = opts.wal_dir();
+		let segments = fs
+			.read_dir(&wal_dir)
+			.map(|entries| {
+				entries
+					.iter()
+					.filter(|entry| entry.kind == crate::vfs::EntryKind::File)
+					.filter_map(|entry| {
+						let (id, extension) =
+							wal::parse_segment_name(&entry.name.to_string_lossy()).ok()?;
+						wal::should_include_file(Some("wal"), extension).then_some((id, entry))
+					})
+					.filter(|(id, _)| *id >= log_number)
+					.filter(|(_, entry)| {
+						fs.file_len(&wal_dir.join(&entry.name)).map_or(true, |len| len > 0)
+					})
+					.count()
+			})
+			.unwrap_or(0);
+		2 * segments + 1 + OPEN_BASE
+	}
+
+	/// A tree over a core that is open.
+	fn from_core(core: Core) -> Self {
+		let core = Arc::new(core);
+		Self {
+			#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+			handle: Arc::new(TreeHandle::new(Arc::clone(&core))),
+			core,
+		}
+	}
+
+	/// Refuses, before anything is read or created, what the engine does not do on a file system
+	/// that is not the operating system's (spec 2.2 of the browser port): encryption at rest, the
+	/// sealed log and the sealed value log that come with it, which read and repair their files
+	/// by path. Checkpoints and restores are refused where they begin, and the migrators are not
+	/// run (see `Tree::new`). A refusal is an `Error::InvalidArgument` that names the feature.
+	///
+	/// The migrators are not run in a pool, and a directory that one of them would have had to
+	/// convert is refused too, with an `Error::MigrationFailed` that names the other store: a
+	/// RocksDB directory, a migration of one that was cut short (its marker), an IndexedDB dump,
+	/// and the marker of a v0.x migration. They are the files of other stores, which a pool holds
+	/// only if somebody put them there. A v0.x directory whose tables are in the old layout is
+	/// refused with `Error::LegacyFormat`, when its tables are opened.
+	fn refuse_what_the_file_system_cannot_do(opts: &Options) -> Result<()> {
+		if opts.fs.kind() != FsKind::Std {
+			if opts.key_manager.is_some() || opts.encryption_context().is_some() {
+				return Err(Self::unsupported_here("encryption at rest"));
+			}
+			Self::refuse_a_directory_that_needs_a_migration(&*opts.fs, opts)?;
+		}
+		Ok(())
+	}
+
+	/// Refuses to open a database in a file system that is not the operating system's if a copy
+	/// of an IndexedDB database into it was begun and not finished: a file at the root of the
+	/// pool says so. What the files hold then is part of a copy, which the next call of
+	/// `migrate_from_indexeddb` removes and makes again, so whatever an application wrote there
+	/// would be lost. It is an `Error::MigrationFailed` that names the unfinished copy, and the
+	/// open is refused before anything is read or created. The copy opens the database itself
+	/// without this check, with `open_async`: only what an application calls goes through it, which
+	/// is the builder.
+	fn refuse_an_unfinished_import(opts: &Options) -> Result<()> {
+		let fs = &*opts.fs;
+		if fs.kind() == FsKind::Std {
+			return Ok(());
+		}
+		// A file system that has nothing mounted answers every question with `false`: it is asked
+		// to say so first, as `new` does.
+		fs.check_available()?;
+		if fs.try_exists(Path::new(crate::migrate::INDEXEDDB_MARKER))? {
+			return Err(Error::MigrationFailed(format!(
+				"the copy of an IndexedDB database into {:?} was begun and not finished (the file \
+				 {:?} is at the root of the file system), so what is there is not a database yet. \
+				 Call migrate_from_indexeddb again, which makes the copy again, before the database \
+				 is opened, or remove the files of the database to start without one.",
+				opts.path,
+				crate::migrate::INDEXEDDB_MARKER
+			)));
+		}
+		Ok(())
+	}
+
+	/// Refuses, in a file system that is not the operating system's, the directory of another
+	/// store that the migrators convert on `std`: see `refuse_what_the_file_system_cannot_do`. It
+	/// reads the names in the directory, and the first bytes of the three files that a name alone
+	/// does not settle, and nothing is created or changed.
+	fn refuse_a_directory_that_needs_a_migration(fs: &dyn Fs, opts: &Options) -> Result<()> {
+		let refuse = |store: &str| {
+			Error::MigrationFailed(format!(
+				"{:?} holds {store}, which is converted only in the files of the operating \
+				 system, and not in this file system yet. Nothing was read, moved or created.",
+				opts.path
+			))
+		};
+		let is_a_dump = |path: &Path| {
+			matches!(
+				fs.read_prefix(path, surrealkv_compat_indxdb::INDXDB_DUMP_MAGIC.len()),
+				Ok(Some(head)) if head == surrealkv_compat_indxdb::INDXDB_DUMP_MAGIC
+			)
+		};
+		// A dump can be the path itself.
+		match fs.entry(&opts.path)? {
+			Some(crate::vfs::EntryKind::File) if is_a_dump(&opts.path) => {
+				return Err(refuse("an IndexedDB dump"));
+			}
+			Some(crate::vfs::EntryKind::Dir) => {}
+			_ => return Ok(()),
+		}
+		let entries = match fs.read_dir(&opts.path) {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(e) => return Err(e.into()),
+		};
+		for entry in entries.iter().filter(|entry| entry.kind == crate::vfs::EntryKind::File) {
+			let path = opts.path.join(&entry.name);
+			match entry.name.to_string_lossy().as_ref() {
+				"MIGRATING_ROCKSDB" => {
+					return Err(refuse("a RocksDB migration that was cut short"))
+				}
+				"MIGRATING" => return Err(refuse("a SurrealKV v0.x migration that was cut short")),
+				"indxdb_dump.bin" if is_a_dump(&path) => {
+					return Err(refuse("an IndexedDB dump"));
+				}
+				// What RocksDB does: `CURRENT` names the manifest, which is there.
+				"CURRENT" => {
+					let named = fs
+						.read(&path)
+						.ok()
+						.and_then(|content| String::from_utf8(content).ok())
+						.map(|text| text.trim_end_matches(['\n', '\r']).to_string())
+						.filter(|name| name.starts_with("MANIFEST-"));
+					if named.is_some_and(|name| fs.is_file(&opts.path.join(name))) {
+						return Err(refuse("a RocksDB database"));
+					}
+				}
+				_ => {}
+			}
+		}
+		Ok(())
+	}
+
+	/// The error of a feature that this file system does not support yet.
+	pub(crate) fn unsupported_here(feature: &str) -> Error {
+		Error::InvalidArgument(format!("{feature} is not supported on this file system yet"))
 	}
 
 	/// Refuses to migrate a database of another store into one that is meant to be encrypted. A
@@ -2382,10 +3527,10 @@ impl Tree {
 		if opts.enable_vlog {
 			return Ok(opts);
 		}
-		let has_files = match std::fs::read_dir(opts.vlog_dir()) {
-			Ok(entries) => {
-				entries.flatten().any(|e| e.path().extension().is_some_and(|ext| ext == "vlog"))
-			}
+		let has_files = match opts.fs.read_dir(&opts.vlog_dir()) {
+			Ok(entries) => entries
+				.iter()
+				.any(|e| Path::new(&e.name).extension().is_some_and(|ext| ext == "vlog")),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
 			Err(e) => return Err(e.into()),
 		};
@@ -2402,6 +3547,10 @@ impl Tree {
 	}
 
 	/// Automatically migrates an existing IndexedDB dump to SurrealKV v2 format.
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "the migration of an IndexedDB dump runs only for a native build, behind the file system kind check in Tree::new"
+	)]
 	fn migrate_from_indxdb(opts: &Options) -> Result<()> {
 		Self::refuse_migration_into_an_encrypted_database(opts, "IndexedDB")?;
 		tracing::info!("Detected existing IndexedDB dump at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
@@ -2474,17 +3623,18 @@ impl Tree {
 
 	/// Creates all required directory structure for the LSM tree
 	fn create_directory_structure(opts: &Options) -> Result<()> {
+		let fs = &*opts.fs;
 		// Create base directory
-		create_dir_all(&opts.path)?;
+		fs.create_dir_all(&opts.path)?;
 
 		// Create all subdirectories
-		create_dir_all(opts.sstable_dir())?;
-		create_dir_all(opts.wal_dir())?;
-		create_dir_all(opts.manifest_dir())?;
+		fs.create_dir_all(&opts.sstable_dir())?;
+		fs.create_dir_all(&opts.wal_dir())?;
+		fs.create_dir_all(&opts.manifest_dir())?;
 
 		// Create VLog directories
 		if opts.enable_vlog {
-			create_dir_all(opts.vlog_dir())?;
+			fs.create_dir_all(&opts.vlog_dir())?;
 		}
 
 		Ok(())
@@ -2544,14 +3694,20 @@ impl Tree {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		// A checkpoint copies and links the files of the database by path.
+		self.refuse_on_a_file_system_that_is_not_std("checkpoints")?;
 		let _running = self.core.checkpoints.enter()?;
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		let result = checkpoint.create_checkpoint(checkpoint_dir);
 
 		// The checkpoint flushed memtables on this thread, which the background tasks did not
-		// see: the level-0 tables it added may need compacting, and writers may be waiting for
-		// either.
+		// see: the level-0 tables it added may need compacting. A rotation after that flush's
+		// snapshot is still queued, so the memtable task is woken when any remain, unless the
+		// checkpoint failed: a failed flush woken again is a background error.
 		if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
+			if result.is_ok() && self.core.inner.has_pending_immutables() {
+				task_manager.wake_up_memtable();
+			}
 			task_manager.wake_up_level();
 		}
 		self.core.write_stall.signal_work_done();
@@ -2569,6 +3725,7 @@ impl Tree {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		self.refuse_on_a_file_system_that_is_not_std("restoring from a checkpoint")?;
 		// A checkpoint of this tree that is running copies the files this replaces, and takes the
 		// locks below to flush: wait for it, before anything else so that commits are not refused
 		// meanwhile, and keep the next one from starting until the restore is done.
@@ -2670,13 +3827,15 @@ impl Tree {
 		}
 
 		// Replay any WAL entries that were restored
-		let (wal_seq_num_opt, recovered_memtable, restore_report) = Core::replay_wal_in(
+		let mut tail = self.core.inner.vlog.as_deref().map(TailCheck::new);
+		let (wal_seq_num_opt, recovered_memtable, restore_report, _) = Core::replay_wal_in(
 			&wal::WalContext::for_options(&self.core.inner.opts)?,
 			&wal_path,
 			manifest_log_number,
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,
+			tail.as_mut(),
 			|memtable, wal_number, continues| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
@@ -2701,6 +3860,9 @@ impl Tree {
 		)?;
 
 		*self.core.inner.recovery_report.write() = restore_report;
+
+		// The restored directory gets segments with sync marks from here on, see `Core::new`.
+		self.core.inner.level_manifest.write()?.upgrade_format_in(&*self.core.inner.opts.fs)?;
 
 		// Always continue in a fresh segment: replay may have repaired (replaced) the
 		// segment the writer was opened on, or flushed it and moved the manifest's
@@ -2754,6 +3916,15 @@ impl Tree {
 		Ok(metadata)
 	}
 
+	/// Refuses `feature`, which copies, links or replaces the files of the database by path, on a
+	/// file system that is not the operating system's, before anything is touched.
+	fn refuse_on_a_file_system_that_is_not_std(&self, feature: &str) -> Result<()> {
+		if self.core.inner.opts.fs.kind() != FsKind::Std {
+			return Err(Self::unsupported_here(feature));
+		}
+		Ok(())
+	}
+
 	/// Asks the key manager again for the keys this database uses: the key that new files are
 	/// written under, and every key that its files were found to use.
 	///
@@ -2802,6 +3973,16 @@ impl Tree {
 		self.core.close().await
 	}
 
+	/// Ends the tree the way a crash does: its tasks are aborted, its lock is released, and nothing
+	/// is flushed, no log is synced and no manifest is written. Commits that are in flight end with
+	/// `Error::PipelineStall`, and whether they reached the log is not said. For the tests of a
+	/// file system that crashes, which then remount it and open the database again: it is not
+	/// part of the interface of the crate.
+	#[doc(hidden)]
+	pub fn abandon(&self) {
+		self.core.abandon();
+	}
+
 	/// Flushes all memtables to disk synchronously.
 	/// This is a blocking operation that ensures all data is persisted before returning.
 	#[cfg(test)]
@@ -2815,12 +3996,98 @@ impl Tree {
 			}
 		}
 
-		// Step 2: Flush all immutable memtables synchronously
+		// Step 2: Flush the memtables queued at entry. A rotation after that snapshot
+		// stays queued, so the flush task is woken when any remain. A failed flush wakes
+		// nothing: the task would repeat it and record a background error the caller already
+		// has.
 		self.core.inner.flush_all_immutables_sync()?;
+		if self.core.inner.has_pending_immutables() {
+			if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
+				task_manager.wake_up_memtable();
+			}
+		}
 
 		// Step 3: Signal stall controller that work completed
 		self.core.write_stall.signal_work_done();
 
+		Ok(())
+	}
+
+	/// Compacts the keys of `[start, end)` down the tree, blocking until it is done. `None` leaves
+	/// a bound open, so `compact_range(None, None, ..)` compacts the whole tree.
+	///
+	/// Memtables are flushed first when [`CompactRangeOptions::flush_memtable`] is set, since only
+	/// tables are compacted. Then, one level at a time from level 0, every table that overlaps the
+	/// range is merged into the next level, down to [`CompactRangeOptions::target_level`]. A table
+	/// that only partly overlaps is merged whole, as are the tables that share a user key with it.
+	/// Merging into the last level drops the tombstones and the versions that no reader can see,
+	/// which is what frees the space of deleted data.
+	///
+	/// The compaction runs between the steps of the background compactor, never at the same time
+	/// as one, and writes and reads carry on meanwhile. Data that is written after the call began
+	/// may be left uncompacted. It keeps every version a snapshot or a transaction can still see.
+	///
+	/// This is blocking file I/O: call it from `spawn_blocking` in an async context. A failure
+	/// leaves the tree as it was before the step that failed, and the steps that finished stay
+	/// done. A tree that is closing makes it return [`Error::DatabaseStopped`].
+	///
+	/// # Errors
+	///
+	/// [`Error::InvalidArgument`] if `start` is greater than `end`.
+	pub fn compact_range(
+		&self,
+		start: Option<&[u8]>,
+		end: Option<&[u8]>,
+		options: &CompactRangeOptions,
+	) -> Result<()> {
+		let inner = &self.core.inner;
+		if let (Some(start), Some(end)) = (start, end) {
+			if inner.opts.comparator.compare(start, end) == std::cmp::Ordering::Greater {
+				return Err(Error::InvalidArgument("compact_range: start is after end".into()));
+			}
+		}
+		let stopped = || {
+			self.core.is_closed.load(Ordering::SeqCst)
+				|| self.core.inner.error_handler.commit_group_error().is_some()
+		};
+		let stopped_error = || Error::DatabaseStopped("compact_range: the tree is closing".into());
+		if stopped() {
+			return Err(stopped_error());
+		}
+
+		if options.flush_memtable {
+			let has_data = !inner.active_memtable.read()?.is_empty();
+			if has_data {
+				inner.rotate_memtable()?;
+			}
+			// Same snapshot as `Tree::flush`: a later rotation stays queued, so the flush
+			// task is woken when any remain, unless the flush failed.
+			inner.flush_all_immutables_sync()?;
+			if inner.has_pending_immutables() {
+				if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
+					task_manager.wake_up_memtable();
+				}
+			}
+		}
+
+		let last = inner.opts.level_count.saturating_sub(1);
+		let target = options.target_level.map_or(last, |level| level.min(last));
+		let comparator = || Arc::clone(&inner.opts.comparator);
+		let run = |source: u8, same_level: bool| -> Result<()> {
+			if stopped() {
+				return Err(stopped_error());
+			}
+			let strategy = RangeStrategy::new(source, same_level, start, end, comparator());
+			self.core.inner.compact(Arc::new(strategy))?;
+			self.core.write_stall.signal_work_done();
+			Ok(())
+		};
+		for source in 0..target {
+			run(source, false)?;
+		}
+		if target == last && options.rewrite_bottommost {
+			run(last, true)?;
+		}
 		Ok(())
 	}
 
@@ -2875,15 +4142,14 @@ impl Drop for Tree {
 		{
 			// Only attempt async shutdown if the core is not already closed
 			if !self.core.is_closed.load(Ordering::SeqCst) {
-				if let Ok(handle) = tokio::runtime::Handle::try_current() {
-					// Clone the Arc to move into the async task
-					let core = Arc::clone(&self.core);
-					handle.spawn(async move {
-						if let Err(err) = core.close().await {
-							tracing::error!("Error closing store: {}", err);
-						}
-					});
-				} else {
+				// Clone the Arc to move into the async task
+				let core = Arc::clone(&self.core);
+				let spawned = rt::try_spawn(async move {
+					if let Err(err) = core.close_with(false).await {
+						tracing::error!("Error closing store: {}", err);
+					}
+				});
+				if !spawned {
 					tracing::warn!("No runtime available for closing the store correctly");
 				}
 			}
@@ -2918,6 +4184,12 @@ impl TreeBuilder {
 	/// Sets the database path.
 	pub fn with_path(mut self, path: std::path::PathBuf) -> Self {
 		self.opts = self.opts.with_path(path);
+		self
+	}
+
+	/// Puts the database in `fs`: see [`Options::with_file_system`].
+	pub fn with_file_system(mut self, fs: crate::FileSystem) -> Self {
+		self.opts = self.opts.with_file_system(fs);
 		self
 	}
 
@@ -3113,7 +4385,35 @@ impl TreeBuilder {
 	/// This method ensures type safety by using the same key type K
 	/// for both the builder and the resulting tree.
 	pub fn build(self) -> Result<Tree> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
 		Tree::new(Arc::new(self.opts))
+	}
+
+	/// Builds the LSM tree: the entry point for a browser, and the same as [`build`](Self::build)
+	/// on a native build for now.
+	///
+	/// A file system that has nothing mounted is refused first, with an error that says what to
+	/// do, before anything is read or created.
+	///
+	/// On a pool of files (a browser's, or the memory file system), the open waits until the pool
+	/// has the files that it creates: its first manifest, the log segments of the open, and a table
+	/// and a manifest for each memtable that a recovery flushes, which is counted from the log
+	/// that is there. If the pool turns out to have too few, the open is done again with twice as
+	/// many, up to sixteen times, which is safe because a database that was opened and failed is
+	/// what a crash during the recovery leaves. A pool that is at its limit of files fails the open
+	/// at once, with an error that says so.
+	pub async fn build_async(self) -> Result<Tree> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
+		Tree::open_async(Arc::new(self.opts)).await
+	}
+
+	/// [`build_async`](Self::build_async), returning the options as well, as
+	/// [`build_with_options`](Self::build_with_options) does.
+	pub async fn build_with_options_async(self) -> Result<(Tree, Arc<Options>)> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
+		let opts = Arc::new(self.opts);
+		let tree = Tree::open_async(Arc::clone(&opts)).await?;
+		Ok((tree, opts))
 	}
 
 	/// Builds the LSM tree and returns both the tree and the options.
@@ -3121,6 +4421,7 @@ impl TreeBuilder {
 	/// This is useful when you need to keep a reference to the options
 	/// after creating the tree.
 	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
 		// The options as they were given, and not the ones the tree runs with: those carry the
 		// identity of the database they were opened for, and a caller that moves them to another
 		// path would make a second database with the first one's identity.
@@ -3142,6 +4443,10 @@ pub(crate) static SYNCED_DIRECTORIES: parking_lot::Mutex<Vec<std::path::PathBuf>
 	parking_lot::Mutex::new(Vec::new());
 
 /// Syncs a directory to ensure all changes are persisted to disk
+#[allow(
+	clippy::disallowed_methods,
+	reason = "this is the body of StdFs::sync_dir and of the tools that run on std::fs; no other file system calls it"
+)]
 pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let path = path.as_ref();
 
@@ -3169,7 +4474,8 @@ pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 /// Returns explicit errors indicating which path failed
 fn sync_directory_structure(opts: &Options) -> Result<()> {
 	// Sync all subdirectories with explicit error handling
-	fsync_directory(opts.sstable_dir()).map_err(|e| {
+	let fs = &*opts.fs;
+	fs.sync_dir(&opts.sstable_dir()).map_err(|e| {
 		Error::Other(format!(
 			"Failed to sync SSTable directory '{}': {}",
 			opts.sstable_dir().display(),
@@ -3177,11 +4483,11 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 		))
 	})?;
 
-	fsync_directory(opts.wal_dir()).map_err(|e| {
+	fs.sync_dir(&opts.wal_dir()).map_err(|e| {
 		Error::Other(format!("Failed to sync WAL directory '{}': {}", opts.wal_dir().display(), e))
 	})?;
 
-	fsync_directory(opts.manifest_dir()).map_err(|e| {
+	fs.sync_dir(&opts.manifest_dir()).map_err(|e| {
 		Error::Other(format!(
 			"Failed to sync manifest directory '{}': {}",
 			opts.manifest_dir().display(),
@@ -3191,7 +4497,7 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 
 	// Sync VLog directories
 	if opts.enable_vlog {
-		fsync_directory(opts.vlog_dir()).map_err(|e| {
+		fs.sync_dir(&opts.vlog_dir()).map_err(|e| {
 			Error::Other(format!(
 				"Failed to sync vlog directory '{}': {}",
 				opts.vlog_dir().display(),
@@ -3200,7 +4506,7 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 		})?;
 	}
 
-	fsync_directory(&opts.path).map_err(|e| {
+	fs.sync_dir(&opts.path).map_err(|e| {
 		Error::Other(format!("Failed to sync base directory '{}': {}", opts.path.display(), e))
 	})?;
 

@@ -21,14 +21,13 @@ use std::task::{Context, Poll, Waker};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
 use super::compaction_memory_proofs::count_allocations;
+use super::{collect_transaction_all, tfs};
 use crate::batch::Batch;
 use crate::clock::LogicalClock;
 use crate::memtable::{max_entry_bytes, MemTable};
 use crate::ring::{CommitPipeline, PipelineHook};
 use crate::vlog::ValueLocation;
-use crate::wal::parallel_recovery::decode_segment_batches;
 use crate::{
 	Error,
 	InternalKeyKind,
@@ -258,7 +257,7 @@ fn edge_records() -> Vec<Rec> {
 /// Every WAL segment of a database, as `(segment id, path)` in segment order.
 fn wal_segments(dir: &Path) -> Vec<(u64, PathBuf)> {
 	let mut segments = Vec::new();
-	for entry in std::fs::read_dir(dir.join("wal")).unwrap() {
+	for entry in super::sfs::read_dir(dir.join("wal")).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal") {
 			let id: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
@@ -281,11 +280,11 @@ struct WalImage {
 
 fn wal_image(dir: &Path) -> WalImage {
 	let mut segments = wal_segments(dir);
-	segments.retain(|(_, path)| std::fs::metadata(path).unwrap().len() > 0);
+	segments.retain(|(_, path)| super::sfs::metadata(path).unwrap().len() > 0);
 	let mut len = 0u64;
 	let mut fnv = 0xcbf2_9ce4_8422_2325u64;
 	for (_, path) in &segments {
-		let bytes = std::fs::read(path).unwrap();
+		let bytes = super::sfs::read(path).unwrap();
 		len += bytes.len() as u64;
 		for byte in bytes {
 			fnv = (fnv ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -302,7 +301,7 @@ fn wal_image(dir: &Path) -> WalImage {
 fn wal_batches(dir: &Path) -> Vec<Batch> {
 	wal_segments(dir)
 		.into_iter()
-		.flat_map(|(id, path)| decode_segment_batches(&path, id).unwrap().1)
+		.flat_map(|(id, path)| tfs::decode_segment_batches(&path, id).unwrap().1)
 		.collect()
 }
 
@@ -317,6 +316,8 @@ fn options(path: &Path, vlog: bool) -> Arc<Options> {
 		clock: Arc::new(StepClock::default()),
 		enable_vlog: vlog,
 		vlog_value_threshold: VLOG_THRESHOLD,
+		// The framing under test is of groups; a sync mark in front of one would move it.
+		wal_sync_marks: false,
 		..Default::default()
 	})
 }
@@ -939,14 +940,22 @@ async fn a_batch_that_overflows_the_memtable_in_the_middle_of_a_group_is_applied
 	let capacity = tree.core.inner.active_memtable.read().unwrap().arena_capacity();
 	assert!(capacity >= SMALL_MEMTABLE, "the arena is as big as the memtable size");
 
-	let first_ops = vec![Op::Set(b"first".to_vec(), vec![0xA1; 10], 1)];
+	// The first batch holds more than the third may take, so that the second, which leaves room
+	// for the third in an empty memtable, does not fit after the first.
+	let first_ops = vec![Op::Set(b"first".to_vec(), vec![0xA1; 3000], 1)];
+	let third_ops = vec![Op::Set(b"third".to_vec(), vec![0xC3; 20], 3)];
 	let key = b"second".to_vec();
 	// What the group logs is encoded, so what is probed is too.
 	let first = copied_batch(&raw_batch(&first_ops, 0, 1));
-	let value_len = overflowing_value_len(&first, key.len()) - 2;
-	let second_ops = vec![Op::Set(key, vec![0xB2; value_len], 2)];
+	let third = copied_batch(&raw_batch(&third_ops, 0, 1)).memtable_size_estimate() as usize;
+	let value_len = overflowing_value_len(&first, key.len()) - third;
+	let second_ops = vec![Op::Set(key.clone(), vec![0xB2; value_len], 2)];
+	let after_first = MemTable::new(SMALL_MEMTABLE);
+	after_first.add(&first).unwrap();
+	let second = copied_batch(&raw_batch(&second_ops, 0, 2)).memtable_size_estimate();
+	assert!(!after_first.can_fit(second), "the second batch does not fit after the first");
 
-	let group = vec![first_ops, second_ops, vec![Op::Set(b"third".to_vec(), vec![0xC3; 20], 3)]];
+	let group = vec![first_ops, second_ops, third_ops];
 	let batches = stamped(&tree, &group);
 	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
 	publish_all(&tree);
@@ -1047,16 +1056,19 @@ async fn a_value_log_group_is_sized_after_its_values_are_replaced_by_pointers() 
 		publish_all(&tree);
 
 		let tables = tree.core.inner.level_manifest.read().unwrap().get_all_tables().len();
-		assert_eq!(
-			tables,
-			if vlog {
-				0
-			} else {
-				2
-			},
-			"vlog={vlog}: only without the value log is the huge value too big for a memtable, and \
-			 then it is written to a table after the memtable of the batches before it"
-		);
+		if vlog {
+			assert_eq!(
+				tables, 0,
+				"vlog={vlog}: with the value log nothing is too big for a memtable"
+			);
+		} else {
+			// The inline values of the batches before it fill more than one memtable.
+			assert!(
+				tables >= 2,
+				"vlog={vlog}: only without the value log is the huge value too big for a memtable, \
+				 and then it is written to a table after the memtables of the batches before it"
+			);
+		}
 		assert!(
 			!records_by_sequence(dir.path()).is_empty(),
 			"vlog={vlog}: control: the WAL holds the group"
@@ -1185,6 +1197,9 @@ async fn every_group_is_made_of_the_commits_of_its_own_round_only() {
 /// not poisoned: once the value log works again, later commits go through.
 #[test(tokio::test)]
 async fn a_value_log_failure_in_the_middle_of_a_group_fails_the_group_and_logs_none_of_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("alloc_diet").unwrap();
 	let opts = Arc::new(Options {
 		path: dir.path().to_path_buf(),
@@ -1204,7 +1219,7 @@ async fn a_value_log_failure_in_the_middle_of_a_group_fails_the_group_and_logs_n
 
 	// The value log directory is gone: the next file cannot be created.
 	let moved = dir.path().join("vlog_moved");
-	std::fs::rename(opts.vlog_dir(), &moved).unwrap();
+	super::sfs::rename(opts.vlog_dir(), &moved).unwrap();
 	let doomed = [
 		vec![Op::Set(b"inline".to_vec(), b"small".to_vec(), 2)],
 		vec![Op::Set(b"large".to_vec(), large(2), 3), Op::Set(b"other".to_vec(), large(3), 3)],
@@ -1229,7 +1244,7 @@ async fn a_value_log_failure_in_the_middle_of_a_group_fails_the_group_and_logs_n
 	}
 
 	// The value log works again, and the writer is not poisoned.
-	std::fs::rename(&moved, opts.vlog_dir()).unwrap();
+	super::sfs::rename(&moved, opts.vlog_dir()).unwrap();
 	let later = vec![Op::Set(b"later".to_vec(), large(4), 5)];
 	transaction_of(&tree, &later).commit().await.unwrap();
 	assert_eq!(wal_batches(dir.path()).len(), records_before + 1);
@@ -1340,7 +1355,7 @@ fn add_owned_leaves_the_memtable_as_add_does() {
 	}
 
 	// The reservation was given back: all that is left of the arena can still be claimed.
-	let left = (by_add_owned.arena_capacity() - by_add_owned.size()) as u64;
+	let left = by_add_owned.room();
 	assert!(by_add_owned.can_fit(left));
 }
 
@@ -1383,7 +1398,7 @@ fn add_owned_leaves_a_batch_that_does_not_fit_untouched() {
 	assert_eq!(memtable.lsn(), lsn);
 	assert_eq!(contents(&memtable), kept);
 	assert_eq!(*memtable.range_deletions.read(), ranges);
-	assert!(memtable.can_fit((memtable.arena_capacity() - memtable.size()) as u64));
+	assert!(memtable.can_fit(memtable.room()));
 }
 
 /// `add_owned` trusts the size it is given. If that size was too small and the arena runs out
@@ -1427,7 +1442,7 @@ fn add_owned_reports_a_drifting_estimate_as_an_error_that_is_not_arena_full() {
 	assert_eq!(memtable.lsn(), 0, "the sequence number is only published for a whole batch");
 	assert_eq!(contents(&memtable).len(), failed);
 	// The reservation is given back all the same.
-	assert!(memtable.can_fit((memtable.arena_capacity() - memtable.size()) as u64));
+	assert!(memtable.can_fit(memtable.room()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,11 +1556,14 @@ async fn allocations_per_group(
 /// still fails for a single allocation per entry from a group of 8: the gather, the encoding,
 /// the log, the apply and the completion allocate nothing per commit or per entry.
 ///
-/// The values that arrive without room to spare cost one reallocation each, which is the only
-/// allocation per entry there is: a group of `n` entries counts `n` more, no matter how its
-/// commits and entries divide it.
+/// The values that arrive without room to spare cost one reallocation each, which their committers
+/// make when they prepare the batch (`Batch::prepare_inline`), so the flusher allocates no more
+/// for them either.
 #[tokio::test]
 async fn a_group_of_small_commits_allocates_a_constant_number_of_times() {
+	if tfs::skip_listed() {
+		return;
+	}
 	const PER_GROUP: u64 = 4;
 	// Long enough to run `retire` twice, which is every 16 groups.
 	const GROUPS: usize = 34;
@@ -1572,15 +1590,10 @@ async fn a_group_of_small_commits_allocates_a_constant_number_of_times() {
 				size, entries, sync, false, GROUPS,
 			))
 			.await;
-			let bound = (size * entries) as u64 + PER_GROUP;
 			assert!(
-				counts.iter().all(|count| *count <= bound),
+				counts.iter().all(|count| *count <= PER_GROUP),
 				"{size} commits of {entries} entries, sync {sync}, values without room: more \
-				 than {bound} allocations a group: {counts:?}"
-			);
-			assert!(
-				counts.iter().all(|count| *count >= (size * entries) as u64),
-				"control: the reallocation of every value is counted: {counts:?}"
+				 than {PER_GROUP} allocations a group: {counts:?}"
 			);
 		}
 	}

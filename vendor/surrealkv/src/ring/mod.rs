@@ -1,8 +1,9 @@
-mod bloom;
+pub(crate) mod bench;
 mod commit_ring;
+mod index;
 mod pipeline;
 mod queue;
-mod sync;
+pub(crate) mod sync;
 
 pub(crate) use pipeline::CommitPipeline;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -10,6 +11,8 @@ pub(crate) use pipeline::{
 	CommitStage,
 	FreeStats,
 	PipelineHook,
+	BUSY_COMMITS,
+	BUSY_STEPS_PER_YIELD,
 	MAX_GROUP_BYTES,
 	RETIRED_FREE_CHUNK,
 	RETIRE_EVERY_ENTRIES,

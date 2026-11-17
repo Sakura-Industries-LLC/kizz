@@ -6,7 +6,6 @@
 //! nothing may move them to a table. The two must not meet: the recovery of a flush ends the
 //! error of the flush only, and a stopped database refuses every flush, the retried one included.
 
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,15 +22,19 @@ use super::manifest_write_failure_tests::{
 	Healed,
 	GRACE,
 };
-use crate::error::BackgroundErrorReason;
+use super::{sfs as fs, tfs};
+use crate::error::{BackgroundErrorReason, ErrorSeverity};
 use crate::levels::{fail_replacements, ReplaceFailure};
 use crate::{Durability, Error, Mode, Options, Result, Tree};
 
 /// A memtable that holds about 21 small commits.
 const SMALL: usize = 4096;
+/// The length of the value of an ordinary commit. A memtable counts its values towards its size,
+/// so the values are short enough that a group of such commits fills a `SMALL` memtable part-way.
+const FILL: usize = 4;
 
 fn open(path: &Path, max_memtable_size: usize) -> Arc<Tree> {
-	Arc::new(
+	let tree = Arc::new(
 		Tree::new(Arc::new(Options {
 			path: path.to_path_buf(),
 			max_memtable_size,
@@ -40,7 +43,12 @@ fn open(path: &Path, max_memtable_size: usize) -> Arc<Tree> {
 			..Default::default()
 		}))
 		.unwrap(),
-	)
+	);
+	// These tests form groups that hold an oversized batch with others, or rotate the memtable more
+	// than once, to exercise what the pipeline does then: a group is only bounded by its estimates
+	// at the sizes where it cannot, see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
+	tree
 }
 
 async fn commit_one(tree: Arc<Tree>, key: String, value: Vec<u8>) -> Result<()> {
@@ -65,7 +73,7 @@ async fn commit_group(tree: &Arc<Tree>, entries: &[(String, Vec<u8>)]) -> Vec<Re
 }
 
 fn base() -> Vec<(String, Vec<u8>)> {
-	(0..10).map(|i| (format!("base{i}"), vec![b'b'; 40])).collect()
+	(0..10).map(|i| (format!("base{i}"), vec![b'b'; FILL])).collect()
 }
 
 /// Twenty commits with an oversized one in the middle: it bypasses the memtable, and the memtable
@@ -74,7 +82,7 @@ fn group_with_oversized() -> Vec<(String, Vec<u8>)> {
 	(0..20)
 		.map(|i| match i {
 			10 => ("big10".to_string(), vec![b'g'; SMALL + 1000]),
-			_ => (format!("group{i}"), vec![b'g'; 40]),
+			_ => (format!("group{i}"), vec![b'g'; FILL]),
 		})
 		.collect()
 }
@@ -98,7 +106,13 @@ fn files_with_extension(path: &Path, dir: &str, extension: &str) -> Vec<String> 
 fn assert_stopped(tree: &Tree, what: &str) {
 	let handler = &tree.core.inner.error_handler;
 	assert!(handler.is_db_stopped(), "{what}: the database is stopped");
-	assert!(matches!(handler.check_error(), Err(Error::DatabaseStopped(_))), "{what}");
+	assert!(
+		matches!(
+			handler.check_error().as_ref().map_err(Error::poisoned_by),
+			Err(Error::DatabaseStopped(_))
+		),
+		"{what}"
+	);
 	assert!(handler.commit_group_error().is_some(), "{what}");
 	assert_eq!(handler.get_error().unwrap().reason, BackgroundErrorReason::CommitGroup, "{what}");
 }
@@ -108,6 +122,9 @@ fn assert_stopped(tree: &Tree, what: &str) {
 /// of the group, and the flushes and the checkpoints that come after are refused.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_the_stop() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_stop_in_flight").unwrap();
 	let tree = open(dir.path(), 16 * 1024 * 1024);
 	for result in commit_group(&tree, &base()).await {
@@ -122,7 +139,7 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 	fail_replacements(&manifest, ReplaceFailure::BeforeRename, 0, 1);
 	tree.core.inner.rotate_memtable().unwrap();
 	// What is committed after the rotation stays in the active memtable, to be queued later.
-	commit_one(Arc::clone(&tree), "later".into(), vec![b'l'; 40]).await.unwrap();
+	commit_one(Arc::clone(&tree), "later".into(), vec![b'l'; FILL]).await.unwrap();
 	tree.core.task_manager.lock().unwrap().as_ref().unwrap().wake_up_memtable();
 	assert!(retry.is_reached(), "the failed flush is retried");
 	let flush_error = tree.core.inner.error_handler.get_error().unwrap();
@@ -146,16 +163,22 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 		"the task ended the error of the flush"
 	);
 	assert_stopped(&tree, "after the flush");
-	let commit = commit_one(Arc::clone(&tree), "after".into(), vec![b'a'; 40]).await;
-	assert!(matches!(commit, Err(Error::DatabaseStopped(_))), "{commit:?}");
+	let commit = commit_one(Arc::clone(&tree), "after".into(), vec![b'a'; FILL]).await;
+	assert!(
+		matches!(commit.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
+		"{commit:?}"
+	);
 
 	// A memtable queued now is not flushed, by the caller or by the task.
 	tree.core.inner.rotate_memtable().unwrap();
 	assert_eq!(immutables(&tree), 1);
-	assert!(matches!(tree.flush(), Err(Error::DatabaseStopped(_))));
+	assert!(matches!(
+		tree.flush().as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
 	let checkpoint = TempDir::new("manifest_stop_in_flight_checkpoint").unwrap();
 	assert!(matches!(
-		tree.create_checkpoint(checkpoint.path().join("cp")),
+		tree.create_checkpoint(checkpoint.path().join("cp")).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(table_ids(&tree), vec![1], "no flush ran after the stop");
@@ -170,6 +193,9 @@ async fn a_flush_that_succeeds_after_a_group_stopped_the_database_does_not_end_t
 /// table is written however the manifest recovers, and a crash image recovers the group whole.
 #[test(tokio::test)]
 async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_stop_group").unwrap();
 	let tree = open(dir.path(), SMALL);
 	for result in commit_group(&tree, &base()).await {
@@ -180,6 +206,7 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	fail_replacements(&manifest, ReplaceFailure::BeforeRename, 0, usize::MAX);
 
 	let group = group_with_oversized();
+	// Every commit of the group is told that recovery decides its outcome.
 	for (i, result) in commit_group(&tree, &group).await.iter().enumerate() {
 		match result {
 			Err(Error::DatabaseStopped(message)) => {
@@ -189,6 +216,17 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 		}
 	}
 	assert_stopped(&tree, "after the group");
+
+	// The group poisoned the database: a commit after it does not start, and recovery does not
+	// find it.
+	let later = commit_one(Arc::clone(&tree), "later".to_string(), vec![b'l'; FILL]).await;
+	match &later {
+		Err(Error::DatabasePoisoned(cause)) => {
+			assert!(matches!(**cause, Error::DatabaseStopped(_)), "{later:?}")
+		}
+		other => panic!("a commit after the group: expected a poisoned database, got {other:?}"),
+	}
+	assert!(later.unwrap_err().is_poisoned());
 	assert_eq!(immutables(&tree), 1, "the memtable that holds part of the group is queued");
 
 	// The disk is back, and the background task is woken: whatever it would retry is refused.
@@ -206,7 +244,10 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	assert_eq!(immutables(&tree), 1, "the memtable is still queued");
 	assert!(table_ids(&tree).is_empty(), "no table was written");
 	assert_eq!(files_with_extension(dir.path(), "wal", ".wal"), segments, "no segment is removed");
-	assert!(matches!(tree.flush(), Err(Error::DatabaseStopped(_))));
+	assert!(matches!(
+		tree.flush().as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
 	let seen = keys(&tree);
 	assert_eq!(seen.len(), 10, "readers see what they saw before the group: {seen:?}");
 
@@ -217,6 +258,60 @@ async fn a_failed_manifest_write_in_the_flush_before_a_direct_write_stops_the_da
 	let mut expected: Vec<String> = base().into_iter().chain(group).map(|(key, _)| key).collect();
 	expected.sort();
 	assert_eq!(keys(&reopened), expected);
+	reopened.close().await.unwrap();
+}
+
+/// A commit to a database that an uncertain manifest write poisoned does not start, however
+/// uncertain that write was: it is told so, with the failure as the cause, and the database opened
+/// again does not hold it.
+#[test(tokio::test)]
+async fn a_commit_to_a_database_poisoned_by_an_uncertain_manifest_write_does_not_start() {
+	if tfs::skip_listed() {
+		return;
+	}
+	let dir = TempDir::new("manifest_stop_poisoned").unwrap();
+	let tree = open(dir.path(), 16 * 1024 * 1024);
+	for result in commit_group(&tree, &base()).await {
+		result.unwrap();
+	}
+	let severity = tree.core.inner.error_handler.set_error(
+		Error::ManifestWriteUncertain("replacing the manifest: injected".to_string()),
+		BackgroundErrorReason::ManifestWrite,
+	);
+	assert!(severity >= ErrorSeverity::FatalError, "{severity:?}");
+
+	let poisoned = commit_one(Arc::clone(&tree), "after".to_string(), vec![b'r'; FILL])
+		.await
+		.expect_err("a poisoned database fails a commit");
+	assert!(
+		matches!(&poisoned, Error::DatabasePoisoned(cause) if matches!(**cause, Error::ManifestWriteUncertain(_))),
+		"{poisoned:?}"
+	);
+	assert!(poisoned.is_poisoned());
+	assert!(
+		matches!(poisoned.poisoned_by(), Error::ManifestWriteUncertain(_)),
+		"{:?}",
+		poisoned.poisoned_by()
+	);
+	assert!(
+		poisoned.to_string().starts_with("Database stopped: Manifest write outcome unknown"),
+		"{poisoned}"
+	);
+	assert!(
+		!keys(&tree).contains(&"after".to_string()),
+		"a commit to a poisoned database is visible"
+	);
+
+	tree.close().await.unwrap();
+	drop(tree);
+	let reopened = open(dir.path(), 16 * 1024 * 1024);
+	let mut expected: Vec<String> = base().into_iter().map(|(key, _)| key).collect();
+	expected.sort();
+	assert_eq!(
+		keys(&reopened),
+		expected,
+		"the database opened again holds the commit it did not start"
+	);
 	reopened.close().await.unwrap();
 }
 

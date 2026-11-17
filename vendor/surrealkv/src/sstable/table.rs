@@ -73,14 +73,23 @@
 use std::cmp::Ordering;
 use std::io::Write;
 use std::ops::Bound;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use snap::raw::max_compress_len;
 
+use crate::cache::BlockCache;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
-use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::block::{
+	Block,
+	BlockData,
+	BlockHandle,
+	BlockIterator,
+	BlockValue,
+	BlockWriter,
+	SmallKeyBuf,
+};
 #[cfg(test)]
 use crate::sstable::block_io::Protection;
 use crate::sstable::block_io::{BlockKind, BlockSink, BlockSource};
@@ -669,16 +678,7 @@ impl<W: Write> TableWriter<W> {
 	/// Finalizes the SSTable by writing all remaining blocks and the footer.
 	pub(crate) fn finish(mut self) -> Result<usize> {
 		// Set creation timestamp
-		self.meta.properties.created_at = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.map_err(|e| {
-				let err = Error::from(SSTableError::FailedToGetSystemTime {
-					source: e.to_string(),
-				});
-				tracing::error!("[TABLE_WRITER] {}", err);
-				err
-			})?
-			.as_nanos();
+		self.meta.properties.created_at = u128::from(crate::rt::now_unix_ns());
 
 		self.meta.properties.seqnos =
 			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
@@ -926,6 +926,9 @@ pub(crate) struct Table {
 	/// The key of this instance's blocks in the block cache: unlike `id`, never given to another
 	/// table, see `BlockSource::cache_id`.
 	cache_id: u64,
+	/// Drops the instance's entries from the block cache when the last clone of a retired table
+	/// goes, see `Table::retire`.
+	cache_release: Arc<CacheRelease>,
 	/// Reads the footer and the blocks of the table's file.
 	pub(crate) source: BlockSource,
 	pub file_size: u64,
@@ -949,6 +952,22 @@ pub(crate) struct Table {
 	/// of `LSMV2`, which every writer of this engine produces, has the property right: 0 means
 	/// that it points into no file. See `LevelManifest::load_table`.
 	pub(crate) vlog_pointers_unknown: bool,
+}
+
+/// Removes the entries of a retired table from the block cache when the last clone of the table
+/// is dropped, see `Table::retire`.
+struct CacheRelease {
+	cache_id: u64,
+	cache: Arc<BlockCache>,
+	retired: AtomicBool,
+}
+
+impl Drop for CacheRelease {
+	fn drop(&mut self) {
+		if *self.retired.get_mut() {
+			self.cache.remove_tables(&[self.cache_id]);
+		}
+	}
 }
 
 /// Per-file bloom filter reader, dispatched on which meta-index entry the
@@ -1068,6 +1087,11 @@ impl Table {
 		Ok(Table {
 			id,
 			cache_id,
+			cache_release: Arc::new(CacheRelease {
+				cache_id,
+				cache: Arc::clone(&opts.block_cache),
+				retired: AtomicBool::new(false),
+			}),
 			source,
 			file_size,
 			opts,
@@ -1131,6 +1155,20 @@ impl Table {
 		}
 	}
 
+	/// The identity under which the table keeps its entries in the block cache, see
+	/// `BlockCache::remove_tables`.
+	pub(crate) fn cache_id(&self) -> u64 {
+		self.cache_id
+	}
+
+	/// Marks the table as merged away by a compaction: when the last reader that still holds it
+	/// lets it go, its entries leave the block cache. A reader that began before the compaction
+	/// can put blocks of the table into the cache after the compaction removed the ones that were
+	/// there, and nothing would read those again.
+	pub(crate) fn retire(&self) {
+		self.cache_release.retired.store(true, std::sync::atomic::Ordering::Release);
+	}
+
 	/// Reads a data block, using cache if available.
 	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
@@ -1156,6 +1194,26 @@ impl Table {
 		);
 
 		Ok(b)
+	}
+
+	/// Reads a data block, from the cache if it holds it, but does not put a block it reads from
+	/// disk into the cache.
+	///
+	/// For a read that passes over the whole table once, as a compaction does: the tables it
+	/// reads are deleted when it finishes, so their blocks would fill the cache with entries that
+	/// nothing reads again, and evict the blocks that readers use.
+	pub(crate) fn read_block_no_fill(&self, location: &BlockHandle) -> Result<Arc<Block>> {
+		if let Some(block) =
+			self.opts.block_cache.get_data_block(self.cache_id, location.offset() as u64)
+		{
+			return Ok(block);
+		}
+		let b = self.source.read_block(
+			BlockKind::Data,
+			location,
+			Arc::clone(&self.opts.internal_comparator),
+		)?;
+		Ok(Arc::new(b))
 	}
 
 	/// Reads a data block with a custom comparator, using the history cache.
@@ -1215,25 +1273,45 @@ impl Table {
 	}
 
 	/// Asynchronous point lookup for a single key.
+	#[cfg(test)]
 	pub(crate) async fn get_async(
 		&self,
 		key: &InternalKey,
 	) -> Result<Option<(InternalKey, Value)>> {
+		let key_encoded =
+			SmallKeyBuf::from_internal_parts(&key.user_key, key.seq_num(), key.kind());
+		match self.get_encoded_async(&key.user_key, key_encoded.as_slice()).await? {
+			Some((trailer, value)) => Ok(Some((
+				InternalKey {
+					user_key: key.user_key.clone(),
+					trailer,
+				},
+				value,
+			))),
+			None => Ok(None),
+		}
+	}
+
+	/// Asynchronous point lookup using pre-encoded internal key bytes, returning `(trailer, value)`
+	/// without allocating a copy of `user_key`.
+	pub(crate) async fn get_encoded_async(
+		&self,
+		user_key: &[u8],
+		key_encoded: &[u8],
+	) -> Result<Option<(u64, Value)>> {
 		if self.holds_only_range_deletions() {
 			return Ok(None);
 		}
 
-		let key_encoded = key.encode();
-
 		// Step 1: Bloom filter for early rejection
 		match &self.filter {
 			TableFilter::Legacy(filters) => {
-				if !filters.may_contain(key.user_key.as_slice(), 0) {
+				if !filters.may_contain(user_key, 0) {
 					return Ok(None);
 				}
 			}
 			TableFilter::Partitioned(filters) => {
-				if !filters.may_contain(&key_encoded, key.user_key.as_slice())? {
+				if !filters.may_contain(key_encoded, user_key)? {
 					return Ok(None);
 				}
 			}
@@ -1244,35 +1322,36 @@ impl Table {
 
 		// Step 2: Find partition that could contain this key
 		let Some((_, partition_handle)) =
-			partitioned_index.find_block_handle_by_key(&key_encoded)?
+			partitioned_index.find_block_handle_by_key(key_encoded)?
 		else {
 			return Ok(None);
 		};
 
 		// Step 3: Load partition block and seek
 		let partition_block = partitioned_index.load_block(partition_handle)?;
-		let mut partition_iter = partition_block.iter()?;
-		partition_iter.seek_internal(&key_encoded)?;
-
-		if !partition_iter.is_valid() {
+		let mut key_buf = SmallKeyBuf::new();
+		let Some((_, partition_val)) = partition_block.seek_with_buf(key_encoded, &mut key_buf)?
+		else {
 			return Ok(None);
-		}
+		};
 
 		// Decode data block handle from partition entry
-		let (data_handle, _) = BlockHandle::decode(partition_iter.value_bytes()).map_err(|e| {
+		let (data_handle, _) = BlockHandle::decode(partition_val).map_err(|e| {
 			Error::from(SSTableError::FailedToDecodeBlockHandle {
-				value_bytes: partition_iter.value_bytes().to_vec(),
+				value_bytes: partition_val.to_vec(),
 				context: format!("Failed to decode BlockHandle in get_async(): {e}"),
 			})
 		})?;
 
 		// Step 4: Read data block asynchronously and search
 		let data_block = self.read_block_async(&data_handle).await?;
-		let mut iter = data_block.iter()?;
-		iter.seek_internal(&key_encoded)?;
+		let Some((found_key, value_bytes)) = data_block.seek_with_buf(key_encoded, &mut key_buf)?
+		else {
+			return Ok(None);
+		};
 
-		if iter.is_valid() && iter.user_key() == key.user_key.as_slice() {
-			Ok(Some((iter.key().to_owned(), iter.value_encoded()?.to_vec())))
+		if InternalKey::user_key_from_encoded(found_key) == user_key {
+			Ok(Some((InternalKey::trailer_from_encoded(found_key), value_bytes.to_vec())))
 		} else {
 			Ok(None)
 		}
@@ -1338,22 +1417,54 @@ impl Table {
 			&& self.opts.comparator.compare(key, largest.user_key.as_slice()) <= Ordering::Equal
 	}
 
+	#[cfg(test)]
 	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
+		let key_encoded =
+			SmallKeyBuf::from_internal_parts(&key.user_key, key.seq_num(), key.kind());
+		match self.get_encoded(&key.user_key, key_encoded.as_slice())? {
+			Some((trailer, value)) => Ok(Some((
+				InternalKey {
+					user_key: key.user_key.clone(),
+					trailer,
+				},
+				value,
+			))),
+			None => Ok(None),
+		}
+	}
+
+	/// Point lookup using pre-encoded internal key bytes, returning `(trailer, value)` without
+	/// allocating a copy of `user_key`.
+	pub(crate) fn get_encoded(
+		&self,
+		user_key: &[u8],
+		key_encoded: &[u8],
+	) -> Result<Option<(u64, Value)>> {
+		Ok(self
+			.get_encoded_ref(user_key, key_encoded)?
+			.map(|(trailer, value)| (trailer, value.as_slice().to_vec())))
+	}
+
+	/// [`Table::get_encoded`] that hands back the value where the block holds it, held by the
+	/// block, instead of a copy.
+	pub(crate) fn get_encoded_ref(
+		&self,
+		user_key: &[u8],
+		key_encoded: &[u8],
+	) -> Result<Option<(u64, BlockValue)>> {
 		if self.holds_only_range_deletions() {
 			return Ok(None);
 		}
 
-		let key_encoded = key.encode();
-
 		// Step 1: Bloom filter for early rejection
 		match &self.filter {
 			TableFilter::Legacy(filters) => {
-				if !filters.may_contain(key.user_key.as_slice(), 0) {
+				if !filters.may_contain(user_key, 0) {
 					return Ok(None);
 				}
 			}
 			TableFilter::Partitioned(filters) => {
-				if !filters.may_contain(&key_encoded, key.user_key.as_slice())? {
+				if !filters.may_contain(key_encoded, user_key)? {
 					return Ok(None);
 				}
 			}
@@ -1364,35 +1475,38 @@ impl Table {
 
 		// Step 2: Find partition that could contain this key
 		let Some((_, partition_handle)) =
-			partitioned_index.find_block_handle_by_key(&key_encoded)?
+			partitioned_index.find_block_handle_by_key(key_encoded)?
 		else {
 			return Ok(None);
 		};
 
 		// Step 3: Load partition block and seek
 		let partition_block = partitioned_index.load_block(partition_handle)?;
-		let mut partition_iter = partition_block.iter()?;
-		partition_iter.seek_internal(&key_encoded)?;
-
-		if !partition_iter.is_valid() {
+		let mut key_buf = SmallKeyBuf::new();
+		let Some((_, partition_val)) = partition_block.seek_with_buf(key_encoded, &mut key_buf)?
+		else {
 			return Ok(None);
-		}
+		};
 
 		// Decode data block handle from partition entry
-		let (data_handle, _) = BlockHandle::decode(partition_iter.value_bytes()).map_err(|e| {
+		let (data_handle, _) = BlockHandle::decode(partition_val).map_err(|e| {
 			Error::from(SSTableError::FailedToDecodeBlockHandle {
-				value_bytes: partition_iter.value_bytes().to_vec(),
+				value_bytes: partition_val.to_vec(),
 				context: format!("Failed to decode BlockHandle in get(): {e}"),
 			})
 		})?;
 
 		// Step 4: Read data block and search
 		let data_block = self.read_block(&data_handle)?;
-		let mut iter = data_block.iter()?;
-		iter.seek_internal(&key_encoded)?;
+		let Some((found_key, value_bytes)) = data_block.seek_with_buf(key_encoded, &mut key_buf)?
+		else {
+			return Ok(None);
+		};
 
-		if iter.is_valid() && iter.user_key() == key.user_key.as_slice() {
-			Ok(Some((iter.key().to_owned(), iter.value_encoded()?.to_vec())))
+		if InternalKey::user_key_from_encoded(found_key) == user_key {
+			let trailer = InternalKey::trailer_from_encoded(found_key);
+			let range = BlockValue::range_in(&data_block, value_bytes);
+			Ok(Some((trailer, BlockValue::new(data_block, range))))
 		} else {
 			Ok(None)
 		}
@@ -1603,6 +1717,15 @@ pub(crate) struct TableIterator<'a> {
 	/// When set, blocks are read with this comparator instead of the default.
 	/// Used for specialized iteration patterns like history queries.
 	custom_comparator: Option<Arc<dyn Comparator>>,
+
+	/// Whether every point key of the table satisfies the range's upper bound, and its lower
+	/// bound: then a step needs no check of that bound.
+	upper_holds: bool,
+	lower_holds: bool,
+
+	/// Whether the data blocks that the iterator reads from disk go into the block cache, see
+	/// `without_cache_fill`.
+	fill_cache: bool,
 }
 
 impl<'a> TableIterator<'a> {
@@ -1616,7 +1739,11 @@ impl<'a> TableIterator<'a> {
 			range,
 			exhausted: false,
 			custom_comparator: None,
-		})
+			upper_holds: false,
+			lower_holds: false,
+			fill_cache: true,
+		}
+		.with_bounds_checked())
 	}
 
 	/// Creates a new TableIterator with a custom comparator.
@@ -1637,7 +1764,29 @@ impl<'a> TableIterator<'a> {
 			range,
 			exhausted: false,
 			custom_comparator: Some(comparator),
-		})
+			upper_holds: false,
+			lower_holds: false,
+			fill_cache: true,
+		}
+		.with_bounds_checked())
+	}
+
+	/// Reads the data blocks that the cache does not hold from disk without putting them into the
+	/// cache, see `Table::read_block_no_fill`. Blocks that the cache holds are still read from it.
+	pub(crate) fn without_cache_fill(mut self) -> Self {
+		self.fill_cache = false;
+		self
+	}
+
+	/// Notes which bounds of the range every point key of the table satisfies: those between its
+	/// smallest and largest point keys.
+	fn with_bounds_checked(mut self) -> Self {
+		let meta = &self.table.meta;
+		self.upper_holds =
+			meta.largest_point.as_ref().is_some_and(|k| self.satisfies_upper_bound(&k.user_key));
+		self.lower_holds =
+			meta.smallest_point.as_ref().is_some_and(|k| self.satisfies_lower_bound(&k.user_key));
+		self
 	}
 
 	fn is_valid(&self) -> bool {
@@ -1646,7 +1795,9 @@ impl<'a> TableIterator<'a> {
 
 	fn mark_exhausted(&mut self) {
 		self.exhausted = true;
-		self.second_level = None;
+		if let Some(ref mut iter) = self.second_level {
+			iter.reset();
+		}
 	}
 
 	/// Loads the data block pointed to by the current first-level position.
@@ -1655,24 +1806,30 @@ impl<'a> TableIterator<'a> {
 	///
 	/// 1. Get block handle from current first_level entry
 	/// 2. Read the data block (with caching)
-	/// 3. Create a BlockIterator for it
+	/// 3. Create or rebind a BlockIterator for it
 	fn init_data_block(&mut self) -> Result<()> {
 		if !self.first_level.valid() {
-			self.second_level = None;
+			if let Some(ref mut iter) = self.second_level {
+				iter.reset();
+			}
 			return Ok(());
 		}
 
 		let handle = self.first_level.block_handle()?;
 
 		// Load data block - use custom comparator if set, otherwise use cached version
-		let iter = if let Some(ref comparator) = self.custom_comparator {
-			let block = self.table.read_block_with_comparator(&handle, Arc::clone(comparator))?;
-			block.iter()?
+		let block = if let Some(ref comparator) = self.custom_comparator {
+			self.table.read_block_with_comparator(&handle, Arc::clone(comparator))?
+		} else if self.fill_cache {
+			self.table.read_block(&handle)?
 		} else {
-			let block = self.table.read_block(&handle)?;
-			block.iter()?
+			self.table.read_block_no_fill(&handle)?
 		};
-		self.second_level = Some(iter);
+		if let Some(ref mut iter) = self.second_level {
+			iter.reset_with_block(&block, self.custom_comparator.as_ref())?;
+		} else {
+			self.second_level = Some(block.iter()?);
+		}
 		Ok(())
 	}
 
@@ -1727,11 +1884,19 @@ impl<'a> TableIterator<'a> {
 
 			// Move to next index entry
 			if !self.first_level.valid() {
-				self.second_level = None;
+				if let Some(ref mut iter) = self.second_level {
+					iter.reset();
+				}
 				return Ok(());
 			}
 
 			self.first_level.next()?;
+			if !self.first_level.valid() {
+				if let Some(ref mut iter) = self.second_level {
+					iter.reset();
+				}
+				return Ok(());
+			}
 			self.init_data_block()?;
 
 			// Position at first entry of new block
@@ -1751,11 +1916,19 @@ impl<'a> TableIterator<'a> {
 			}
 
 			if !self.first_level.valid() {
-				self.second_level = None;
+				if let Some(ref mut iter) = self.second_level {
+					iter.reset();
+				}
 				return Ok(());
 			}
 
 			self.first_level.prev()?;
+			if !self.first_level.valid() {
+				if let Some(ref mut iter) = self.second_level {
+					iter.reset();
+				}
+				return Ok(());
+			}
 			self.init_data_block()?;
 
 			if let Some(ref mut iter) = self.second_level {
@@ -1880,42 +2053,58 @@ impl<'a> TableIterator<'a> {
 		}
 		self.exhausted = false;
 
-		let lower_bound = self.range.0.clone();
+		enum LowerSeek {
+			Unbounded,
+			Included(SmallKeyBuf),
+			Excluded(SmallKeyBuf),
+		}
 
-		match lower_bound {
-			Bound::Unbounded => {
+		let lower_seek = match &self.range.0 {
+			Bound::Unbounded => LowerSeek::Unbounded,
+			Bound::Included(internal_key) => LowerSeek::Included(SmallKeyBuf::from_internal_parts(
+				&internal_key.user_key,
+				internal_key.seq_num(),
+				internal_key.kind(),
+			)),
+			Bound::Excluded(internal_key) => LowerSeek::Excluded(SmallKeyBuf::from_internal_parts(
+				&internal_key.user_key,
+				0,
+				InternalKeyKind::Set,
+			)),
+		};
+
+		match lower_seek {
+			LowerSeek::Unbounded => {
 				// No lower bound: seek to absolute first
 				self.first_level.seek_to_first()?;
 				self.init_data_block()?;
-				if let Some(ref mut iter) = self.second_level {
-					iter.seek_to_first()?;
+				if self.first_level.valid() {
+					if let Some(ref mut iter) = self.second_level {
+						iter.seek_to_first()?;
+					}
 				}
 				self.advance_to_valid_entry()?;
 			}
-			Bound::Included(ref internal_key) => {
+			LowerSeek::Included(seek_key) => {
 				// internal_key has seq_num=MAX_SEQ (smallest for this user_key)
 				// Seeking to it finds the first version of this user_key
-				self.seek_internal(&internal_key.encode())?;
+				self.seek_internal(seek_key.as_slice())?;
 			}
-			Bound::Excluded(ref internal_key) => {
+			LowerSeek::Excluded(seek_key) => {
 				// Create seek key with seq_num=0 (LARGEST for this user_key)
 				// This seeks PAST all versions of the excluded key
-				let seek_key = InternalKey::new(
-					internal_key.user_key.clone(),
-					0, // Largest internal key for this user_key
-					InternalKeyKind::Set,
-				);
-				self.seek_internal(&seek_key.encode())?;
+				self.seek_internal(seek_key.as_slice())?;
 
 				// Edge case: if we somehow landed on exactly (user_key, 0), advance past it
-				if self.is_valid() && self.current_user_key() == internal_key.user_key.as_slice() {
+				let excluded_user_key = InternalKey::user_key_from_encoded(seek_key.as_slice());
+				if self.is_valid() && self.current_user_key() == excluded_user_key {
 					self.advance_internal()?;
 				}
 			}
 		}
 
 		// Verify we didn't overshoot the upper bound
-		if self.is_valid() && !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(())
@@ -1976,36 +2165,51 @@ impl<'a> TableIterator<'a> {
 		}
 		self.exhausted = false;
 
-		let upper_bound = self.range.1.clone();
+		enum UpperSeek {
+			Unbounded,
+			Included(SmallKeyBuf),
+			Excluded(SmallKeyBuf),
+		}
 
-		match upper_bound {
-			Bound::Unbounded => {
+		let upper_seek = match &self.range.1 {
+			Bound::Unbounded => UpperSeek::Unbounded,
+			Bound::Included(internal_key) => UpperSeek::Included(SmallKeyBuf::from_internal_parts(
+				&internal_key.user_key,
+				0,
+				InternalKeyKind::Set,
+			)),
+			Bound::Excluded(internal_key) => UpperSeek::Excluded(SmallKeyBuf::from_internal_parts(
+				&internal_key.user_key,
+				INTERNAL_KEY_SEQ_NUM_MAX,
+				InternalKeyKind::Max,
+			)),
+		};
+
+		match upper_seek {
+			UpperSeek::Unbounded => {
 				// No upper bound: seek to absolute last
 				self.first_level.seek_to_last()?;
 				self.init_data_block()?;
-				if let Some(ref mut iter) = self.second_level {
-					iter.seek_to_last()?;
+				if self.first_level.valid() {
+					if let Some(ref mut iter) = self.second_level {
+						iter.seek_to_last()?;
+					}
 				}
 				self.retreat_to_valid_entry()?;
 			}
-			Bound::Included(ref internal_key) => {
+			UpperSeek::Included(seek_key) => {
 				// Seek to (user_key, 0) = LARGEST internal key for this user_key
 				// This positions past all versions, then we back up
-				let bound_user_key = internal_key.user_key.clone();
-				let seek_key =
-					InternalKey::new(internal_key.user_key.clone(), 0, InternalKeyKind::Set);
-				self.seek_internal(&seek_key.encode())?;
+				self.seek_internal(seek_key.as_slice())?;
 
 				if !self.is_valid() {
 					// Seek went past end of table, position at absolute last
 					self.position_to_absolute_last()?;
 				} else {
+					let bound_user_key = InternalKey::user_key_from_encoded(seek_key.as_slice());
 					// Check if we landed past the bound (on a later user_key)
-					let cmp = self
-						.table
-						.opts
-						.comparator
-						.compare(self.current_user_key(), bound_user_key.as_slice());
+					let cmp =
+						self.table.opts.comparator.compare(self.current_user_key(), bound_user_key);
 					if cmp == Ordering::Greater {
 						// We're past the bound, back up one entry
 						self.prev_internal()?;
@@ -2014,16 +2218,10 @@ impl<'a> TableIterator<'a> {
 					// (this can happen if (user_key, 0) exists or we landed on earlier key)
 				}
 			}
-			Bound::Excluded(ref internal_key) => {
+			UpperSeek::Excluded(seek_key) => {
 				// Seek to (user_key, MAX_SEQ) = SMALLEST internal key for this user_key
 				// This positions at first version of excluded key, then we back up
-				let bound_user_key = internal_key.user_key.clone();
-				let seek_key = InternalKey::new(
-					internal_key.user_key.clone(),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-				);
-				self.seek_internal(&seek_key.encode())?;
+				self.seek_internal(seek_key.as_slice())?;
 
 				if !self.is_valid() {
 					// Seek went past end, position at absolute last
@@ -2033,11 +2231,9 @@ impl<'a> TableIterator<'a> {
 				// For Excluded: back up if we're AT or PAST the bound
 				// (we need to be strictly BEFORE it)
 				if self.is_valid() {
-					let cmp = self
-						.table
-						.opts
-						.comparator
-						.compare(self.current_user_key(), bound_user_key.as_slice());
+					let bound_user_key = InternalKey::user_key_from_encoded(seek_key.as_slice());
+					let cmp =
+						self.table.opts.comparator.compare(self.current_user_key(), bound_user_key);
 					if cmp != Ordering::Less {
 						// We're on the excluded key or past it, back up
 						self.prev_internal()?;
@@ -2047,7 +2243,7 @@ impl<'a> TableIterator<'a> {
 		}
 
 		// Verify we didn't back up past the lower bound
-		if self.is_valid() && !self.satisfies_lower_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_lower_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(())
@@ -2076,6 +2272,12 @@ impl<'a> TableIterator<'a> {
 	fn seek_internal(&mut self, target: &[u8]) -> Result<()> {
 		// Step 1: Position first_level at the right index entry
 		self.first_level.seek(target)?;
+		if !self.first_level.valid() {
+			if let Some(ref mut iter) = self.second_level {
+				iter.reset();
+			}
+			return Ok(());
+		}
 
 		// Step 2: Load the data block it points to
 		self.init_data_block()?;
@@ -2095,8 +2297,10 @@ impl<'a> TableIterator<'a> {
 		self.first_level.seek_to_last()?;
 		self.init_data_block()?;
 
-		if let Some(ref mut iter) = self.second_level {
-			iter.seek_to_last()?;
+		if self.first_level.valid() {
+			if let Some(ref mut iter) = self.second_level {
+				iter.seek_to_last()?;
+			}
 		}
 
 		self.retreat_to_valid_entry()?;
@@ -2105,7 +2309,7 @@ impl<'a> TableIterator<'a> {
 
 	fn advance_internal(&mut self) -> Result<bool> {
 		if let Some(ref mut iter) = self.second_level {
-			if iter.advance()? {
+			if iter.is_valid() && iter.advance()? {
 				return Ok(true);
 			}
 		}
@@ -2115,7 +2319,7 @@ impl<'a> TableIterator<'a> {
 
 	fn prev_internal(&mut self) -> Result<bool> {
 		if let Some(ref mut iter) = self.second_level {
-			if iter.prev_internal()? {
+			if iter.is_valid() && iter.prev_internal()? {
 				return Ok(true);
 			}
 		}
@@ -2133,7 +2337,7 @@ impl LSMIterator for TableIterator<'_> {
 		self.exhausted = false;
 		self.seek_internal(target)?;
 
-		if self.is_valid() && !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
@@ -2161,7 +2365,9 @@ impl LSMIterator for TableIterator<'_> {
 
 		self.advance_internal()?;
 
-		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid()
+			|| (!self.upper_holds && !self.satisfies_upper_bound(self.current_user_key()))
+		{
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
@@ -2179,7 +2385,9 @@ impl LSMIterator for TableIterator<'_> {
 
 		self.prev_internal()?;
 
-		if !self.is_valid() || !self.satisfies_lower_bound(self.current_user_key()) {
+		if !self.is_valid()
+			|| (!self.lower_holds && !self.satisfies_lower_bound(self.current_user_key()))
+		{
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())

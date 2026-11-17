@@ -1,4 +1,4 @@
-//! The on-disk format markers: `TableFormat::LSMV2`, manifest version 2, and the gate that keeps
+//! The on-disk format markers: `TableFormat::LSMV2`, the manifest version, and the gate that keeps
 //! this engine from reading a table of LSMV1, the format of SurrealKV up to v0.21.4 (16-byte key
 //! suffix), as if it were its own (8-byte suffix). A table of LSMV1 is converted by `Tree::new`,
 //! with the help of `surrealkv-compat-v1`, and refused everywhere else.
@@ -7,7 +7,6 @@
 //! `tests/fixtures/legacy`), because a hand-built table would only prove that the gate agrees with
 //! its own idea of the format.
 
-use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,10 +14,12 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::sfs as fs;
 use crate::levels::{
 	MANIFEST_FORMAT_VERSION,
 	MANIFEST_FORMAT_VERSION_V1,
 	MANIFEST_FORMAT_VERSION_V2,
+	MANIFEST_FORMAT_VERSION_V3,
 };
 use crate::sstable::table::{refuse_legacy_table, Table, TableFormat, TABLE_FULL_FOOTER_LENGTH};
 use crate::vfs::File;
@@ -71,7 +72,7 @@ fn sstables(opts: &Options) -> Vec<PathBuf> {
 }
 
 fn open_file(path: &Path) -> (Arc<dyn File>, usize) {
-	let file = std::fs::File::open(path).unwrap();
+	let file = fs::File::open(path).unwrap();
 	let size = file.metadata().unwrap().len() as usize;
 	(Arc::new(file), size)
 }
@@ -90,14 +91,14 @@ fn set_footer_format_byte(path: &Path, format: u8) {
 	file.sync_all().unwrap();
 }
 
-fn manifest_version(opts: &Options) -> u16 {
+pub(super) fn manifest_version(opts: &Options) -> u16 {
 	let bytes = fs::read(opts.manifest_file_path(0)).unwrap();
 	u16::from_be_bytes([bytes[0], bytes[1]])
 }
 
 /// Writes `version` into the manifest, and the checksum trailer again if it has one: the version
 /// is part of what the checksum covers.
-fn set_manifest_version(opts: &Options, version: u16) {
+pub(super) fn set_manifest_version(opts: &Options, version: u16) {
 	use crate::levels::{calculate_manifest_crc, MANIFEST_TRAILER_LEN, MANIFEST_TRAILER_MAGIC};
 
 	let path = opts.manifest_file_path(0);
@@ -118,14 +119,15 @@ fn set_manifest_version(opts: &Options, version: u16) {
 	fs::write(&path, bytes).unwrap();
 }
 
+/// Copies a directory of the disk (a fixture) into the file system of the test.
 fn copy_dir(from: &Path, to: &Path) {
 	fs::create_dir_all(to).unwrap();
-	for entry in fs::read_dir(from).unwrap().flatten() {
+	for entry in std::fs::read_dir(from).unwrap().flatten() {
 		let target = to.join(entry.file_name());
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &target);
 		} else {
-			fs::copy(entry.path(), target).unwrap();
+			fs::write(target, std::fs::read(entry.path()).unwrap()).unwrap();
 		}
 	}
 }
@@ -143,7 +145,7 @@ fn legacy_database(name: &str) -> (TempDir, Arc<Options>) {
 }
 
 #[test(tokio::test)]
-async fn a_new_database_is_stamped_lsmv2_with_flat_keys_and_a_v2_manifest() {
+async fn a_new_database_is_stamped_lsmv2_with_flat_keys_and_a_v3_manifest() {
 	let dir = TempDir::new().unwrap();
 	let opts = options(dir.path());
 	write_database(&opts).await;
@@ -157,8 +159,8 @@ async fn a_new_database_is_stamped_lsmv2_with_flat_keys_and_a_v2_manifest() {
 		let table = Table::new(id as u64 + 1, Arc::clone(&opts), file, size as u64).unwrap();
 		assert_eq!(table.format, TableFormat::LSMV2);
 	}
-	assert_eq!(manifest_version(&opts), MANIFEST_FORMAT_VERSION_V2);
-	assert_eq!(MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V2);
+	assert_eq!(manifest_version(&opts), MANIFEST_FORMAT_VERSION_V3);
+	assert_eq!(MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V3);
 }
 
 /// What is refused is the layout of the keys, which is what makes a table LSMV1: a table with flat
@@ -181,24 +183,27 @@ async fn a_flat_table_stamped_lsmv1_by_a_development_build_still_opens() {
 	tree.close().await.unwrap();
 }
 
+/// The WAL segments of an open may hold sync marks, which a binary that only knows V1 or V2 takes
+/// for damage: the open makes the manifest V3, which such a binary refuses, before it writes one.
 #[test(tokio::test)]
-async fn the_next_write_upgrades_a_v1_manifest_to_v2() {
-	let dir = TempDir::new().unwrap();
-	let opts = options(dir.path());
-	write_database(&opts).await;
-	set_manifest_version(&opts, MANIFEST_FORMAT_VERSION_V1);
-	assert_eq!(manifest_version(&opts), MANIFEST_FORMAT_VERSION_V1);
+async fn opening_upgrades_an_older_manifest_to_v3() {
+	for older in [MANIFEST_FORMAT_VERSION_V1, MANIFEST_FORMAT_VERSION_V2] {
+		let dir = TempDir::new().unwrap();
+		let opts = options(dir.path());
+		write_database(&opts).await;
+		set_manifest_version(&opts, older);
+		assert_eq!(manifest_version(&opts), older);
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-	// Opening only reads: the file still says V1.
-	assert_eq!(manifest_version(&opts), MANIFEST_FORMAT_VERSION_V1);
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"another".to_vec(), b"value".to_vec()).unwrap();
-	txn.commit().await.unwrap();
-	tree.flush().unwrap();
-	assert_eq!(manifest_version(&opts), MANIFEST_FORMAT_VERSION_V2);
-	assert_all_keys(&tree);
-	tree.close().await.unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		assert_eq!(manifest_version(&opts), MANIFEST_FORMAT_VERSION_V3, "from {older}");
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"another".to_vec(), b"value".to_vec()).unwrap();
+		txn.commit().await.unwrap();
+		tree.flush().unwrap();
+		assert_eq!(manifest_version(&opts), MANIFEST_FORMAT_VERSION_V3, "from {older}");
+		assert_all_keys(&tree);
+		tree.close().await.unwrap();
+	}
 }
 
 #[test(tokio::test)]
@@ -206,10 +211,10 @@ async fn a_manifest_version_from_the_future_is_refused() {
 	let dir = TempDir::new().unwrap();
 	let opts = options(dir.path());
 	write_database(&opts).await;
-	set_manifest_version(&opts, 3);
+	set_manifest_version(&opts, MANIFEST_FORMAT_VERSION + 1);
 	let before = fs::read(opts.manifest_file_path(0)).unwrap();
 
-	let err = Tree::new(Arc::clone(&opts)).err().expect("version 3 must be refused");
+	let err = Tree::new(Arc::clone(&opts)).err().expect("a later version must be refused");
 	assert!(matches!(err, Error::ManifestCorruption(_)), "got {err:?}");
 	assert_eq!(fs::read(opts.manifest_file_path(0)).unwrap(), before);
 }

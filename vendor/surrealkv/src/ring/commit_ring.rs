@@ -139,9 +139,12 @@ impl<T: RingEntry> CommitRing<T> {
 	}
 
 	/// Atomically claims the next sequential slot in O(1).
+	///
+	/// An acquire and release of the counter: what a claimer did before it claimed (recorded its
+	/// write keys) happens before whatever a later claimer does after it claims (looks them up).
 	#[inline(always)]
 	pub(crate) fn claim(&self) -> u64 {
-		self.next.fetch_add(1, Ordering::Relaxed)
+		self.next.fetch_add(1, Ordering::AcqRel)
 	}
 
 	/// Accesses the slot for the given sequence number in O(1).

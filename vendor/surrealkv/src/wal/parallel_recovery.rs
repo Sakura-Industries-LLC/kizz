@@ -4,7 +4,6 @@
 //! WAL segments and record batches across disjoint sequence numbers can be decoded
 //! and prepared concurrently across available CPU cores via thread pools.
 
-use std::fs::File;
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,14 +27,26 @@ pub(crate) fn decode_segment_batches(
 	decode_segment_batches_with(&WalContext::plaintext(), file_path, segment_id)
 }
 
-/// Decodes a single WAL segment file, read as `context` says, into batches and the segment's
-/// maximum sequence number.
+/// [`decode_segment_ending_with`] without the offset where the reader stopped.
+#[cfg(test)]
 pub(crate) fn decode_segment_batches_with(
 	context: &WalContext,
 	file_path: &Path,
 	segment_id: u64,
 ) -> Result<(u64, Vec<Batch>)> {
-	let file = File::open(file_path)?;
+	let (max_seq, batches, _) = decode_segment_ending_with(context, file_path, segment_id)?;
+	Ok((max_seq, batches))
+}
+
+/// Decodes a single WAL segment file, read as `context` says, into batches, the segment's maximum
+/// sequence number, and the offset where the last complete record ends. The reader stops at the
+/// end of the records, which is not the end of the file when the file holds zeros after them.
+pub(crate) fn decode_segment_ending_with(
+	context: &WalContext,
+	file_path: &Path,
+	segment_id: u64,
+) -> Result<(u64, Vec<Batch>, u64)> {
+	let file = context.fs.open_read(file_path)?;
 	let reporter = Box::new(DefaultReporter::new(segment_id));
 	let mut reader = Reader::with_context(file, Some(reporter), segment_id, context);
 
@@ -68,7 +79,7 @@ pub(crate) fn decode_segment_batches_with(
 		}
 	}
 
-	Ok((max_seq, batches))
+	Ok((max_seq, batches, last_valid_offset as u64))
 }
 
 /// Decodes the sealed segments of `segments`, in order: in parallel on the workers of the pool if
@@ -140,7 +151,10 @@ async fn decode_sealed_segments_parallel(
 	Ok(decoded)
 }
 
-pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize);
+/// The newest segment of the log, as the replay read it: its number, and the offset where its
+/// last complete record ends. See `ReplayInnerResult`.
+pub(crate) type ParallelReplayResult =
+	(Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize, Option<(u64, u64)>);
 
 /// Synchronous entry point for parallel segment replay.
 pub(crate) fn replay_segments_sync(
@@ -150,33 +164,7 @@ pub(crate) fn replay_segments_sync(
 ) -> Result<ParallelReplayResult> {
 	#[cfg(target_arch = "wasm32")]
 	{
-		let mut memtables = Vec::new();
-		let mut max_seq: Option<u64> = None;
-		let mut total_batches = 0;
-		let mut segments_processed = 0;
-		for seg in segments {
-			let (seg_max, batches) = decode_segment_batches_with(context, &seg.file_path, seg.id)?;
-			if batches.is_empty() {
-				continue;
-			}
-			if seg_max > 0 {
-				max_seq = Some(max_seq.map_or(seg_max, |m| m.max(seg_max)));
-			}
-			segments_processed += 1;
-			total_batches += batches.len();
-			let mut current_memtable = Arc::new(MemTable::new(arena_size));
-			for batch in batches {
-				current_memtable = apply_batch_with_oversized_fallback(
-					current_memtable,
-					&batch,
-					arena_size,
-					seg.id,
-					&mut memtables,
-				)?;
-			}
-			memtables.push((current_memtable, false, seg.id));
-		}
-		Ok((max_seq, memtables, total_batches, segments_processed))
+		replay_segments_serial(context, segments, arena_size)
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]
@@ -203,24 +191,55 @@ pub(crate) fn replay_segments_sync(
 				.join()
 				.map_err(|_| Error::Other("WAL parallel recovery thread panicked".to_string()))?,
 			// Without the thread, replay the segments on this thread, in order
-			Err(_) => replay_segments_in_order(context, segments, arena_size),
+			Err(_) => replay_segments_serial(context, segments, arena_size),
 		}
 	}
 }
 
-/// Replays a slice of segments on the calling thread, in order, with the result of
-/// `replay_segments_parallel`: for when no thread can be started to run it.
-#[cfg(not(target_arch = "wasm32"))]
-fn replay_segments_in_order(
+/// Replays `segments` one after the other on the calling thread: the replay of a target that has
+/// no threads to decode on, and of a native target when no thread can be started to run
+/// `replay_segments_parallel`. It is the same replay as `replay_segments_parallel`, a memtable for
+/// each segment that has batches and none for a segment whose last batch was an oversized one
+/// that took a memtable of its own. The native tests hold it to the parallel replay.
+fn replay_segments_serial(
 	context: &WalContext,
 	segments: &[SegmentRef],
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
-	let decoded_segments = segments
-		.iter()
-		.map(|seg| decode_segment_batches_with(context, &seg.file_path, seg.id))
-		.collect::<Result<Vec<_>>>()?;
-	populate_memtables(segments, decoded_segments, arena_size)
+	let mut memtables = Vec::new();
+	let mut max_seq: Option<u64> = None;
+	let mut total_batches = 0;
+	let mut segments_processed = 0;
+	let mut newest_end = None;
+	for seg in segments {
+		let (seg_max, batches, end) = decode_segment_ending_with(context, &seg.file_path, seg.id)?;
+		// The segments are in order, so the last one that is read is the newest.
+		newest_end = Some((seg.id, end));
+		if batches.is_empty() {
+			continue;
+		}
+		if seg_max > 0 {
+			max_seq = Some(max_seq.map_or(seg_max, |m| m.max(seg_max)));
+		}
+		segments_processed += 1;
+		total_batches += batches.len();
+		let mut current_memtable = Arc::new(MemTable::new(arena_size));
+		for batch in batches {
+			current_memtable = apply_batch_with_oversized_fallback(
+				current_memtable,
+				&batch,
+				arena_size,
+				seg.id,
+				&mut memtables,
+			)?;
+		}
+		// A memtable that an oversized batch left empty is not replayed: a flush of it would
+		// write a table with no entries.
+		if !current_memtable.is_empty() {
+			memtables.push((current_memtable, false, seg.id));
+		}
+	}
+	Ok((max_seq, memtables, total_batches, segments_processed, newest_end))
 }
 
 /// Replays a slice of segments in parallel using affinitypool, applying batches
@@ -232,7 +251,7 @@ pub(crate) async fn replay_segments_parallel(
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
 	if segments.is_empty() {
-		return Ok((None, Vec::new(), 0, 0));
+		return Ok((None, Vec::new(), 0, 0, None));
 	}
 
 	// 1. Concurrently decode all WAL segments in parallel on worker threads
@@ -241,7 +260,7 @@ pub(crate) async fn replay_segments_parallel(
 		let path = seg.file_path.clone();
 		let id = seg.id;
 		let context = context.clone();
-		let task = affinitypool::spawn(move || decode_segment_batches_with(&context, &path, id));
+		let task = affinitypool::spawn(move || decode_segment_ending_with(&context, &path, id));
 		decode_tasks.push(task);
 	}
 
@@ -250,24 +269,18 @@ pub(crate) async fn replay_segments_parallel(
 		let res = task.await;
 		decoded_segments.push(res?);
 	}
-	populate_memtables(segments, decoded_segments, arena_size)
-}
 
-/// Populates memtables from the decoded segments, sequentially, in segment order.
-#[cfg(not(target_arch = "wasm32"))]
-fn populate_memtables(
-	segments: &[SegmentRef],
-	decoded_segments: Vec<(u64, Vec<Batch>)>,
-	arena_size: usize,
-) -> Result<ParallelReplayResult> {
 	// 2. Sequentially populate memtables from ordered segments
 	let global_max_seq = AtomicU64::new(0);
 	let mut memtables = Vec::new();
 	let mut total_batches = 0;
 	let mut segments_processed = 0;
 
-	for (seg_idx, (seg_max_seq, batches)) in decoded_segments.into_iter().enumerate() {
+	let mut newest_end = None;
+	for (seg_idx, (seg_max_seq, batches, end)) in decoded_segments.into_iter().enumerate() {
 		let segment_id = segments[seg_idx].id;
+		// The segments are in order, so the last one that is read is the newest.
+		newest_end = Some((segment_id, end));
 		if batches.is_empty() {
 			continue;
 		}
@@ -299,11 +312,13 @@ fn populate_memtables(
 		None
 	};
 
-	Ok((res_seq, memtables, total_batches, segments_processed))
+	Ok((res_seq, memtables, total_batches, segments_processed, newest_end))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+	use std::fs::File;
+
 	use tempfile::TempDir;
 
 	use super::*;
@@ -338,7 +353,7 @@ mod tests {
 			file_path: wal_path,
 		};
 
-		let (max_seq, memtables, total_batches, segments_processed) =
+		let (max_seq, memtables, total_batches, segments_processed, _) =
 			replay_segments_parallel(&WalContext::plaintext(), &[seg], 1024 * 1024).await.unwrap();
 		assert_eq!(max_seq, Some(10));
 		assert_eq!(memtables.len(), 1);
@@ -347,5 +362,73 @@ mod tests {
 
 		let val = memtables[0].0.get(b"k1", None).unwrap();
 		assert_eq!(val.1, b"v1");
+	}
+
+	/// Writes a segment with a normal batch, rotates, writes one that is larger than `arena_size`
+	/// and so takes a memtable of its own, rotates, and writes another normal batch. The segment
+	/// of the oversized batch ends on a fresh, empty memtable.
+	fn write_segments_with_an_oversized_batch(dir: &Path, arena_size: usize) -> Vec<SegmentRef> {
+		let mut wal = crate::wal::manager::Wal::open(dir, crate::wal::Options::default()).unwrap();
+		let mut small = Batch::new(100);
+		small.set(b"key0".to_vec(), b"value0".to_vec(), 0).unwrap();
+		wal.append(&small.encode().unwrap()).unwrap();
+		wal.rotate().unwrap();
+
+		let mut big = Batch::new(200);
+		big.set(b"key1".to_vec(), vec![0xEF; arena_size * 2], 0).unwrap();
+		wal.append(&big.encode().unwrap()).unwrap();
+		wal.rotate().unwrap();
+
+		let mut last = Batch::new(300);
+		last.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		wal.append(&last.encode().unwrap()).unwrap();
+		wal.close().unwrap();
+
+		SegmentRef::read_segments_from_directory(dir, Some("wal"))
+			.unwrap()
+			.into_iter()
+			.filter(|segment| {
+				decode_segment_batches(&segment.file_path, segment.id)
+					.map(|(_, batches)| !batches.is_empty())
+					.unwrap_or(false)
+			})
+			.collect()
+	}
+
+	/// The replay of a target without threads is the replay of the others: a segment whose last
+	/// batch was an oversized one does not leave an empty memtable behind, which a flush would
+	/// write as a table with no entries.
+	#[tokio::test]
+	async fn the_serial_replay_matches_the_parallel_replay() {
+		let arena_size = 4096;
+		let temp_dir = TempDir::new().unwrap();
+		let segments = write_segments_with_an_oversized_batch(temp_dir.path(), arena_size);
+		assert_eq!(segments.len(), 3, "three segments with batches");
+		let context = WalContext::plaintext();
+
+		let parallel = replay_segments_parallel(&context, &segments, arena_size).await.unwrap();
+		let serial = replay_segments_serial(&context, &segments, arena_size).unwrap();
+
+		assert_eq!((parallel.0, parallel.2, parallel.3), (Some(300), 3, 3));
+		assert_eq!((serial.0, serial.2, serial.3), (parallel.0, parallel.2, parallel.3));
+		assert_eq!(
+			serial.1.len(),
+			parallel.1.len(),
+			"one memtable per segment, and the oversized one is not followed by an empty one"
+		);
+		assert_eq!(serial.1.len(), 3);
+		for ((serial_table, serial_oversized, serial_segment), (table, oversized, segment)) in
+			serial.1.iter().zip(parallel.1.iter())
+		{
+			assert_eq!((serial_oversized, serial_segment), (oversized, segment));
+			assert!(!serial_table.is_empty());
+			assert_eq!(serial_table.is_empty(), table.is_empty());
+		}
+		for key in [&b"key0"[..], b"key1", b"key2"] {
+			assert!(
+				serial.1.iter().any(|(table, _, _)| table.get(key, None).is_some()),
+				"{key:?} is replayed"
+			);
+		}
 	}
 }

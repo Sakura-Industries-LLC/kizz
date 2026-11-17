@@ -8,6 +8,8 @@ use crate::snapshot::SnapshotIterator;
 use crate::vlog::ValueLocation;
 use crate::{InternalKey, LSMIterator, Result};
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod abandoned_session_tests;
 #[cfg(test)]
 pub mod alloc_limits_tests;
 #[cfg(test)]
@@ -39,6 +41,10 @@ pub mod commit_pipeline_gate_tests;
 #[cfg(test)]
 pub mod commit_pipeline_tests;
 #[cfg(test)]
+pub mod compact_range_tests;
+#[cfg(test)]
+pub mod compaction_cache_fill_tests;
+#[cfg(test)]
 pub mod compaction_crash_tests;
 #[cfg(test)]
 pub mod compaction_failure_recovery_tests;
@@ -62,6 +68,8 @@ pub mod direct_l0_group_tests;
 pub mod direct_l0_manifest_failure_tests;
 #[cfg(test)]
 pub mod direct_l0_read_order_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod direct_l0_wal_cleanup_tests;
 #[cfg(test)]
 pub mod encryption_background_tests;
 #[cfg(test)]
@@ -87,15 +95,39 @@ pub mod encryption_typed_errors_tests;
 #[cfg(test)]
 pub mod failed_open_tests;
 #[cfg(test)]
+pub mod flush_race_tests;
+#[cfg(test)]
 pub mod flusher_alloc_diet_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod format_gate_tests;
+#[cfg(test)]
+pub mod fs_conformance_crash_tests;
+#[cfg(test)]
+pub mod fs_engine_crash_tests;
+#[cfg(test)]
+pub mod fs_engine_exhaustion_tests;
+#[cfg(test)]
+pub mod fs_engine_followup_tests;
+#[cfg(test)]
+pub mod fs_engine_tests;
+#[cfg(test)]
+pub mod fs_error_tests;
+#[cfg(test)]
+pub mod fs_pool_crash_tests;
+#[cfg(test)]
+pub mod fs_probe;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod fs_std_tests;
+#[cfg(test)]
+pub mod get_many_tests;
 #[cfg(test)]
 pub mod group_fail_stop_edge_tests;
 #[cfg(test)]
 pub mod group_fail_stop_tests;
 #[cfg(test)]
 pub mod index_block_tests;
+#[cfg(test)]
+pub mod indexeddb_migration_tests;
 #[cfg(test)]
 pub mod inspect_encryption_tests;
 #[cfg(test)]
@@ -106,6 +138,8 @@ pub mod iterator_tests;
 pub mod legacy_migration_tests;
 #[cfg(test)]
 pub mod level_order_crash_tests;
+#[cfg(test)]
+pub mod level_scan_tests;
 #[cfg(test)]
 pub mod level_tests;
 #[cfg(test)]
@@ -121,9 +155,12 @@ pub mod manifest_tests;
 #[cfg(test)]
 pub mod manifest_write_failure_tests;
 #[cfg(test)]
+pub mod manifest_write_readers_tests;
 pub mod manifest_write_retry_tests;
 #[cfg(test)]
 pub mod manifest_write_stop_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod memtable_memory_tests;
 #[cfg(test)]
 pub mod memtable_tests;
 #[cfg(test)]
@@ -143,6 +180,8 @@ pub mod retire_free_tests;
 #[cfg(test)]
 pub mod retire_isolation_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod rewrite_at_open_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod rocksdb_migration_tests;
 #[cfg(test)]
 pub mod rotate_vlog_order_tests;
@@ -150,6 +189,8 @@ pub mod rotate_vlog_order_tests;
 pub mod rotate_vlog_race_tests;
 #[cfg(test)]
 pub mod scrub_encryption_tests;
+#[cfg(test)]
+pub mod sfs;
 #[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
@@ -165,6 +206,10 @@ pub mod stall_tests;
 #[cfg(test)]
 pub mod tde_tests;
 #[cfg(test)]
+pub mod tfs;
+#[cfg(test)]
+mod tfs_excluded;
+#[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
 pub mod tree_builder_encryption_tests;
@@ -172,6 +217,8 @@ pub mod tree_builder_encryption_tests;
 pub mod value_location_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod versioning_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod vlog_check_entry_tests;
 #[cfg(test)]
 pub mod vlog_floor_tests;
 #[cfg(test)]
@@ -180,6 +227,8 @@ pub mod vlog_gc_tests;
 pub mod vlog_sealed_tests;
 #[cfg(test)]
 pub mod vlog_sealed_tree_tests;
+#[cfg(test)]
+pub mod vlog_sync_poison_tests;
 #[cfg(test)]
 pub mod vlog_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -199,7 +248,13 @@ pub mod wal_group_commit_tests;
 #[cfg(test)]
 pub mod wal_group_crash_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_group_rotation_bound_tests;
+#[cfg(test)]
+pub mod wal_prealloc_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod wal_replace_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_replay_durability_tests;
 #[cfg(test)]
 pub mod wal_rotation_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -212,6 +267,16 @@ pub mod wal_sealed_tree_tests;
 pub mod wal_sealed_writer_tests;
 #[cfg(test)]
 pub mod wal_stale_rounds_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_sync_mark_tests;
+#[cfg(test)]
+pub mod wal_tail_check_crash_tests;
+#[cfg(test)]
+pub mod wal_tail_check_replay_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_tail_check_sealed_tests;
+#[cfg(test)]
+pub mod wal_tail_check_tests;
 #[cfg(test)]
 pub mod wal_tests;
 #[cfg(test)]

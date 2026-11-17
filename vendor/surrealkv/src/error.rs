@@ -1,10 +1,11 @@
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 use std::{fmt, io};
 
 use parking_lot::RwLock;
+
+use crate::rt::Instant;
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;
@@ -59,12 +60,18 @@ pub enum Error {
 	PipelineStall,
 	/// A commit group failed after part of it was applied, and the database stopped. Whether the
 	/// commits of that group took effect is decided by recovery when the database is opened
-	/// again, so a commit of that group that fails with this error has an unknown outcome. A
-	/// commit that was refused because the database had stopped did not start. Reads of data that
-	/// was already visible keep working, including after a compaction that ran while the group was
-	/// applied: a compaction keeps every version above the visible sequence number, and the newest
-	/// one at or below it.
+	/// again, so a commit of that group that fails with this error has an unknown outcome. The
+	/// database is poisoned by it: a later commit does not start, and fails with
+	/// [`Error::DatabasePoisoned`] holding this error. Reads of data that was already visible keep
+	/// working, including after a compaction that ran while the group was applied: a compaction
+	/// keeps every version above the visible sequence number, and the newest one at or below it.
 	DatabaseStopped(String),
+	/// The database is poisoned: a failure it cannot recover from in place stopped it for good,
+	/// and the operation did not start. A commit that fails with this error took no effect,
+	/// whatever the failure that poisoned the database says of its own outcome. The cause is that
+	/// failure, with its type. Nothing works again until the database is opened again, which
+	/// recovers what the failure left.
+	DatabasePoisoned(Box<Error>),
 	Other(String), // Other errors
 	NoSnapshot,
 	CommitFail(String),
@@ -94,6 +101,12 @@ pub enum Error {
 	/// Encryption at rest failed: a key problem, an authentication failure or an unreadable
 	/// encryption header. None of these is ever repaired by dropping data.
 	Encryption(EncryptionError),
+	/// A file system that keeps a fixed pool of files had none free for a file that was to be
+	/// created. This passes: the pool is refilled in the background and the work that asked can be
+	/// done again, so a flush or a compaction that fails with it waits and retries, and a build
+	/// that fails with it is built again once the pool has more. A database that was open is not
+	/// stopped by it.
+	FilePoolExhausted,
 }
 
 // Implementation of Display trait for Error
@@ -134,6 +147,10 @@ impl fmt::Display for Error {
 			Self::TableNotFound(id) => write!(f, "Table not found: {id}"),
 			Self::PipelineStall => write!(f, "Pipeline stall"),
 			Self::DatabaseStopped(err) => write!(f, "Database stopped: {err}"),
+			Self::DatabasePoisoned(cause) => match &**cause {
+				Self::DatabaseStopped(_) => write!(f, "{cause}"),
+				cause => write!(f, "Database stopped: {cause}"),
+			},
             Self::Other(err) => write!(f, "Other error: {err}"),
             Self::NoSnapshot => write!(f, "No snapshot available"),
             Self::CommitFail(err) => write!(f, "Commit failed: {err}"),
@@ -153,6 +170,7 @@ impl fmt::Display for Error {
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
             Self::Encryption(err) => write!(f, "Encryption error: {err}"),
+            Self::FilePoolExhausted => write!(f, "The file pool has no free file for a new file"),
         }
 	}
 }
@@ -161,6 +179,46 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
+	/// Whether the database is poisoned, stopped for good: this error poisoned it
+	/// ([`Error::DatabaseStopped`]), or the operation did not start because it was
+	/// ([`Error::DatabasePoisoned`]). Nothing works again until the database is opened again.
+	pub fn is_poisoned(&self) -> bool {
+		matches!(self, Self::DatabaseStopped(_) | Self::DatabasePoisoned(_))
+	}
+
+	/// The failure that poisoned the database, if this error is an operation it stopped
+	/// ([`Error::DatabasePoisoned`]); this error itself otherwise.
+	pub fn poisoned_by(&self) -> &Error {
+		match self {
+			Self::DatabasePoisoned(cause) => cause,
+			other => other,
+		}
+	}
+
+	/// Whether this is an I/O error that a pool raised for holding as many files as it may: the
+	/// one that does not pass by waiting for a refill (see `vfs::PoolFull`). It is an `Error::Io`
+	/// and keeps that shape, so that the layers that read an I/O error as fatal go on doing so,
+	/// and the layers that turn an error into text must let it through to keep it typed.
+	pub(crate) fn is_pool_full(&self) -> bool {
+		matches!(self, Error::Io(e) if crate::vfs::is_pool_full(e))
+	}
+
+	/// Whether this is an I/O error of a file system that ran out of room: the pool at its limit
+	/// of files (`is_pool_full`), or the quota of a browser (`QuotaExceededError`, which the OPFS
+	/// backend gives the kind `StorageFull`). It passes when files are released or space is freed,
+	/// which a page does at any time, so it is a soft error and not a fatal one, and it keeps its
+	/// type through the layers that turn an error into text.
+	///
+	/// The disk of a native file system is not one of these: its error carries an OS error code
+	/// (`raw_os_error`), which none of the file systems of a pool or a browser make, and it is
+	/// treated as it always was.
+	pub(crate) fn is_storage_full(&self) -> bool {
+		matches!(
+			self,
+			Error::Io(e) if e.kind() == std::io::ErrorKind::StorageFull && e.raw_os_error().is_none()
+		)
+	}
+
 	/// Creates a WalCorruption error with the given segment ID, offset, and
 	/// message
 	pub fn wal_corruption(segment_id: usize, offset: usize, message: impl Into<String>) -> Self {
@@ -175,7 +233,14 @@ impl Error {
 // Implementation to convert io::Error into Error
 impl From<io::Error> for Error {
 	fn from(e: io::Error) -> Error {
-		Error::Io(Arc::new(e))
+		// A pool that had no free file says so in the payload of its error, and the type keeps it
+		// through the layers that wrap an I/O error: it is what tells a failure that passes from
+		// one that does not.
+		if crate::vfs::is_pool_exhausted(&e) {
+			Error::FilePoolExhausted
+		} else {
+			Error::Io(Arc::new(e))
+		}
 	}
 }
 
@@ -184,6 +249,12 @@ impl From<crate::wal::Error> for Error {
 		match err {
 			// Keeps its type: whoever handles it must tell a key from damage.
 			crate::wal::Error::Encryption(err) => Error::Encryption(err),
+			// And this one a pool that has no free file from a log that cannot be written.
+			crate::wal::Error::PoolExhausted => Error::FilePoolExhausted,
+			// A browser that is out of quota keeps its type: it passes once there is room.
+			crate::wal::Error::StorageFull(message) => {
+				Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::StorageFull, message)))
+			}
 			err => Error::Wal(err.to_string()),
 		}
 	}
@@ -408,6 +479,9 @@ pub enum BackgroundErrorReason {
 	ManifestWrite,
 	/// A commit group failed after part of it was applied to a memtable or an L0 table.
 	CommitGroup,
+	/// An fsync of the value log failed: the values it was to make durable may be lost, and no
+	/// later fsync can make them durable.
+	ValueLogSync,
 }
 
 /// Reason for write stall - used for logging and metrics.
@@ -481,6 +555,25 @@ impl BackgroundErrorHandler {
 			// A memtable or a table holds batches that were never published: the process
 			// cannot go on
 			(BackgroundErrorReason::CommitGroup, _) => ErrorSeverity::Unrecoverable,
+
+			// The value log refuses every sync after a failed one, so no write can be made
+			// durable until the database is opened again. Whatever the fsync failed with (a full
+			// disk included, which has lost the pages all the same), the error recorded under this
+			// reason is fatal.
+			(BackgroundErrorReason::ValueLogSync, _) => ErrorSeverity::FatalError,
+
+			// A pool of files that has none free for now: a flush, a compaction or a manifest write
+			// that met it did not fail, it has to wait, and nothing it wrote is wrong. It must
+			// stay below the commit-group arm, which wins over every error, and above the default.
+			(_, Error::FilePoolExhausted) => ErrorSeverity::SoftError,
+
+			// A pool at its limit of files, or a quota that the browser enforces: nothing that was
+			// written is wrong, and the page can release files or free space at any time. The
+			// work is tried again with a back-off, and commits meanwhile fail with the typed error
+			// (never a stopped database). This is above the I/O arms of a flush and a manifest
+			// write, which are fatal; a full disk of a native file system has an OS error code and
+			// still falls through to them.
+			(_, e) if e.is_storage_full() => ErrorSeverity::SoftError,
 
 			(_, Error::Encryption(err)) => match err.class() {
 				EncryptionClass::Retryable => ErrorSeverity::SoftError,
@@ -565,6 +658,61 @@ impl BackgroundErrorHandler {
 	/// the more severe one it did not replace.
 	pub fn set_error(&self, error: Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		let severity = Self::classify_error(&error, reason);
+		self.record_error(error, reason, severity)
+	}
+
+	/// The severity that a background failure has when a pool of files refused a creation during
+	/// the unit of work that failed (`exhausted`), whatever shape the failure has now. It is the
+	/// rewrap-proof second net of the typed `Error::FilePoolExhausted`: an error that went through
+	/// a layer that turned it into text is classified as the unrelated failure it looks like, and
+	/// would stop the database, where the pool is a moment away from having a file.
+	///
+	/// A failure is `SoftError` then, the work is run again, and nothing stops. Left as it is: what
+	/// is `Unrecoverable` (corruption, a commit group), what leaves the manifest on disk in doubt
+	/// (`ManifestWriteUncertain`, which is not a missing file whatever else happened in the unit),
+	/// and the error of a pool that is at its limit (`is_pool_full`), which is soft in itself
+	/// whatever happened in the unit.
+	pub(crate) fn classify_after_exhaustion(
+		error: &Error,
+		reason: BackgroundErrorReason,
+		exhausted: bool,
+	) -> ErrorSeverity {
+		let severity = Self::classify_error(error, reason);
+		if exhausted
+			&& severity < ErrorSeverity::Unrecoverable
+			&& !matches!(error, Error::ManifestWriteUncertain(_))
+			&& !error.is_pool_full()
+		{
+			if severity > ErrorSeverity::SoftError {
+				tracing::debug!(
+					"A pool of files refused a creation during the unit that failed with {error}: \
+					 the failure is taken as one that passes, not as {severity:?}"
+				);
+			}
+			return ErrorSeverity::SoftError;
+		}
+		severity
+	}
+
+	/// [`set_error`](Self::set_error) for a unit of work during which a pool may have refused a
+	/// creation: see [`classify_after_exhaustion`](Self::classify_after_exhaustion).
+	pub(crate) fn set_error_after_exhaustion(
+		&self,
+		error: Error,
+		reason: BackgroundErrorReason,
+		exhausted: bool,
+	) -> ErrorSeverity {
+		let severity = Self::classify_after_exhaustion(&error, reason, exhausted);
+		self.record_error(error, reason, severity)
+	}
+
+	/// Records `error` as the error of `reason` with `severity`.
+	fn record_error(
+		&self,
+		error: Error,
+		reason: BackgroundErrorReason,
+		severity: ErrorSeverity,
+	) -> ErrorSeverity {
 		let bg_error = BackgroundError {
 			error: error.clone(),
 			severity,
@@ -651,6 +799,13 @@ impl BackgroundErrorHandler {
 	/// Check if the database is stopped due to a background error.
 	/// Returns the error if stopped, Ok(()) otherwise.
 	/// This is the fast path check used before user operations.
+	///
+	/// An error that stops writes until it passes ([`ErrorSeverity::HardError`]) is returned as
+	/// it is. One that stopped the database for good ([`ErrorSeverity::FatalError`] and above)
+	/// poisoned it, and is returned as [`Error::DatabasePoisoned`] holding it, so that a caller can
+	/// tell an operation that a poisoned database did not start from one that failed itself: such
+	/// a commit took no effect even where the failure that poisoned the database was an uncertain
+	/// one.
 	pub fn check_error(&self) -> Result<()> {
 		// Fast path: check atomic flag first
 		if !self.is_db_stopped.load(Ordering::Acquire) {
@@ -660,6 +815,9 @@ impl BackgroundErrorHandler {
 		// Slow path: get the actual error
 		let errors = self.bg_errors.read();
 		if let Some(error) = Self::most_severe(&errors) {
+			if error.severity >= ErrorSeverity::FatalError {
+				return Err(Error::DatabasePoisoned(Box::new(error.error.clone())));
+			}
 			if error.severity >= ErrorSeverity::HardError {
 				return Err(error.error.clone());
 			}
@@ -905,7 +1063,10 @@ mod tests {
 			assert!(!handler.recover(BackgroundErrorReason::CommitGroup), "{flush_first}");
 			assert!(handler.is_db_stopped(), "{flush_first}");
 			assert!(
-				matches!(handler.check_error(), Err(Error::DatabaseStopped(_))),
+				matches!(
+					handler.check_error().as_ref().map_err(Error::poisoned_by),
+					Err(Error::DatabaseStopped(_))
+				),
 				"{flush_first}"
 			);
 			assert!(handler.commit_group_error().is_some(), "{flush_first}");
@@ -926,7 +1087,10 @@ mod tests {
 		assert_eq!(severity, ErrorSeverity::FatalError);
 
 		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "a fatal one stays");
-		assert!(matches!(handler.check_error(), Err(Error::DatabaseStopped(_))));
+		assert!(matches!(
+			handler.check_error().as_ref().map_err(Error::poisoned_by),
+			Err(Error::DatabaseStopped(_))
+		));
 		assert!(handler.commit_group_error().is_some());
 	}
 
@@ -1222,6 +1386,51 @@ mod tests {
 	}
 
 	#[test]
+	fn a_pool_at_its_limit_or_a_quota_is_soft_and_a_full_disk_is_as_it_was() {
+		let pool_full = Error::Io(Arc::new(crate::vfs::pool_full(2048)));
+		let quota = Error::Io(Arc::new(std::io::Error::new(
+			std::io::ErrorKind::StorageFull,
+			"QuotaExceededError",
+		)));
+		// ENOSPC of a native file system: an OS error code, so it keeps the rule it had.
+		let disk = Error::Io(Arc::new(std::io::Error::from_raw_os_error(28)));
+		for reason in [
+			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
+			BackgroundErrorReason::ManifestWrite,
+		] {
+			for error in [&pool_full, &quota] {
+				let severity = BackgroundErrorHandler::classify_error(error, reason);
+				assert_eq!(severity, ErrorSeverity::SoftError, "{reason:?} {error:?}");
+				assert!(error.is_storage_full());
+			}
+		}
+		assert!(pool_full.is_pool_full() && !quota.is_pool_full());
+		assert!(!disk.is_storage_full());
+		assert_eq!(
+			BackgroundErrorHandler::classify_error(&disk, BackgroundErrorReason::MemtablaFlush),
+			ErrorSeverity::FatalError
+		);
+		assert_eq!(
+			BackgroundErrorHandler::classify_error(&disk, BackgroundErrorReason::ManifestWrite),
+			ErrorSeverity::FatalError
+		);
+		// A commit group stays unrecoverable whatever the error.
+		for error in [&pool_full, &quota] {
+			assert_eq!(
+				BackgroundErrorHandler::classify_error(error, BackgroundErrorReason::CommitGroup),
+				ErrorSeverity::Unrecoverable
+			);
+		}
+		// A flush that met one is tried again.
+		assert!(BackgroundErrorHandler::retries(
+			&pool_full,
+			ErrorSeverity::SoftError,
+			BackgroundErrorReason::MemtablaFlush
+		));
+	}
+
+	#[test]
 	fn a_flush_is_tried_again_unless_the_error_says_that_trying_again_is_no_use() {
 		let reason = BackgroundErrorReason::MemtablaFlush;
 		for err in every_encryption_error() {
@@ -1312,7 +1521,10 @@ mod tests {
 					assert!(handler.is_db_stopped(), "{err:?}");
 					assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "{err:?}");
 					assert!(
-						matches!(handler.check_error(), Err(Error::Encryption(ref got)) if *got == err),
+						matches!(
+							handler.check_error().as_ref().map_err(Error::poisoned_by),
+							Err(Error::Encryption(got)) if *got == err
+						),
 						"{err:?}"
 					);
 				}

@@ -7,6 +7,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::vlog::{
 	VLog,
 	VLogFileHeader,
@@ -32,7 +33,7 @@ fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 	opts.path = temp_dir.path().to_path_buf();
 
 	// Create vlog subdirectory
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 	let opts_clone = Arc::clone(&opts);
@@ -472,6 +473,9 @@ async fn test_vlog_with_file_header() {
 
 #[test(tokio::test)]
 async fn test_vlog_restart_continues_last_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = TempDir::new().unwrap();
 	let vlog_max_file_size = 2048;
 	let opts = Options {
@@ -482,7 +486,7 @@ async fn test_vlog_restart_continues_last_file() {
 	};
 
 	// Create vlog subdirectory
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 
@@ -622,7 +626,7 @@ async fn test_vlog_restart_with_multiple_files() {
 	};
 
 	// Create vlog subdirectory
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 
@@ -763,6 +767,9 @@ async fn test_vlog_restart_with_multiple_files() {
 
 #[test(tokio::test)]
 async fn test_vlog_writer_reopen_append_only_behavior() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = TempDir::new().unwrap();
 	let vlog_max_file_size = 2048;
 	let opts = Arc::new(Options {
@@ -1230,6 +1237,9 @@ async fn a_sync_leaves_a_file_that_rolled_over_while_it_ran_queued() {
 /// window as a restore that runs in the middle of the fsync.
 #[test(tokio::test)]
 async fn a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it_fsynced() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, dir, _) = create_test_vlog(Some(Options {
 		vlog_max_file_size: 1024,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -1293,6 +1303,9 @@ async fn a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it
 /// must fsync them instead of returning because a sync that ran across the reload completed.
 #[test(tokio::test)]
 async fn a_sync_that_outlasts_a_reload_does_not_settle_what_came_after_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, dir, _) = create_test_vlog(Some(Options {
 		vlog_max_file_size: 1024,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -1341,6 +1354,9 @@ async fn a_sync_that_outlasts_a_reload_does_not_settle_what_came_after_it() {
 /// are not used for it.
 #[test(tokio::test)]
 async fn a_reload_makes_the_reads_of_a_file_id_go_to_the_restored_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, _dir, _) = create_test_vlog(None);
 	let old = vlog.append(b"key", &value_of(1, 300)).unwrap();
 	vlog.sync().unwrap();
@@ -1411,19 +1427,21 @@ async fn a_deleted_file_is_not_fsynced_by_the_next_sync() {
 	assert_eq!(synced_under(dir.path()), vec![new]);
 }
 
-/// A sync that fails leaves the file the writer rolled over from queued, so the next one
-/// fsyncs it.
+/// A sync that fails ends the log: the pages the failed fsync could not write are gone, and a
+/// later fsync would report them durable. Every later sync fails without fsyncing anything, the
+/// file the writer rolled over from and the active one included.
 #[test(tokio::test)]
-async fn a_failed_sync_leaves_the_rolled_over_file_queued() {
-	let (vlog, dir, entries) = vlog_across_a_rollover();
+async fn a_failed_sync_fails_every_later_sync() {
+	let (vlog, dir, _) = vlog_across_a_rollover();
 	vlog.fail_next_sync();
 	assert!(vlog.sync().is_err());
 	assert!(synced_under(dir.path()).is_empty());
+	assert!(vlog.sync_failed());
 
-	vlog.sync().unwrap();
-	let synced = synced_under(dir.path());
-	assert!(synced.contains(&vlog.vlog_file_path(entries[0].0.file_id)), "{synced:?}");
-	assert!(synced.contains(&vlog.vlog_file_path(2)), "{synced:?}");
+	assert!(vlog.sync().is_err(), "a sync after a failed one succeeded");
+	vlog.append(b"later", &value_of(9, 100)).unwrap();
+	assert!(vlog.sync().is_err(), "a sync of a value appended after the failure succeeded");
+	assert!(synced_under(dir.path()).is_empty(), "a file was fsynced after the failure");
 }
 
 /// `sync_dirty` fsyncs what an append or a rollover left unsynced, once, and nothing when there is
@@ -1476,22 +1494,18 @@ async fn a_sync_dirty_fsyncs_only_what_is_unsynced() {
 	assert_eq!(synced_under(dir.path()).len(), after_sync);
 }
 
-/// A sync that fails covers nothing: the next `sync_dirty` fsyncs everything the failed one was
-/// meant to, the files it did not reach included.
+/// A sync that fails covers nothing, and no later `sync_dirty` covers it either: the log stays
+/// dirty, and each one fails.
 #[test(tokio::test)]
-async fn a_failed_sync_leaves_the_log_dirty() {
-	let (vlog, dir, entries) = vlog_across_a_rollover();
+async fn a_failed_sync_leaves_the_log_dirty_for_good() {
+	let (vlog, dir, _) = vlog_across_a_rollover();
 	vlog.fail_next_sync();
 	assert!(vlog.sync_dirty().is_err());
 	assert!(synced_under(dir.path()).is_empty());
 
-	vlog.sync_dirty().unwrap();
-	let synced = synced_under(dir.path());
-	assert!(synced.contains(&vlog.vlog_file_path(entries[0].0.file_id)), "{synced:?}");
-	assert!(synced.contains(&vlog.vlog_file_path(2)), "{synced:?}");
-	let count = synced.len();
-	vlog.sync_dirty().unwrap();
-	assert_eq!(synced_under(dir.path()).len(), count);
+	assert!(vlog.sync_dirty().is_err(), "a sync_dirty after a failed sync succeeded");
+	assert!(vlog.sync_dirty().is_err());
+	assert!(synced_under(dir.path()).is_empty());
 }
 
 /// A `sync_dirty` that arrives while a sync has its fds and has not fsynced yet fsyncs itself: the
@@ -1547,9 +1561,12 @@ async fn a_reopened_log_fsyncs_its_active_file_once() {
 
 /// The directory is fsynced by the sync that follows the creation of a file, once, and by no
 /// append or rollover: those fsync nothing. A sync that fails before it gets to the directory
-/// leaves it for the next one.
+/// ends the log, and the directory is not fsynced by any sync after it.
 #[test(tokio::test)]
 async fn a_sync_fsyncs_the_directory_once_for_the_files_created_since_the_last() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (vlog, _dir, _) = create_test_vlog(Some(Options {
 		vlog_max_file_size: 1024,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -1561,9 +1578,6 @@ async fn a_sync_fsyncs_the_directory_once_for_the_files_created_since_the_last()
 	}
 	assert_eq!(vlog.dir_syncs() - base, 0, "appends and rollovers do not fsync the directory");
 
-	vlog.fail_next_sync();
-	assert!(vlog.sync().is_err());
-	assert_eq!(vlog.dir_syncs() - base, 0, "the directory is synced after the files");
 	vlog.sync().unwrap();
 	assert_eq!(vlog.dir_syncs() - base, 1);
 	vlog.sync().unwrap();
@@ -1577,6 +1591,15 @@ async fn a_sync_fsyncs_the_directory_once_for_the_files_created_since_the_last()
 	vlog.append(b"key-4", &value_of(4, 600)).unwrap();
 	vlog.sync_dirty().unwrap();
 	assert_eq!(vlog.dir_syncs() - base, 2, "the third file's name is made durable");
+
+	// A sixth entry rolls over to a fourth file, and the sync of it fails before the directory.
+	vlog.append(b"key-5", &value_of(5, 600)).unwrap();
+	vlog.append(b"key-6", &value_of(6, 600)).unwrap();
+	vlog.fail_next_sync();
+	assert!(vlog.sync().is_err());
+	assert_eq!(vlog.dir_syncs() - base, 2, "the directory is synced after the files");
+	assert!(vlog.sync().is_err());
+	assert_eq!(vlog.dir_syncs() - base, 2, "the directory was synced after a failed fsync");
 }
 
 /// A rollover whose flush of the old file fails is an error, and the old file's entries are not
@@ -1627,9 +1650,13 @@ impl Rng {
 /// * every file is its header followed by exactly the entries whose append returned `Ok`, each at
 ///   the offset its pointer names, and every value reads back;
 /// * a sync that returns `Ok` has fsynced every file that was written to since the last one that
-///   did.
+///   did;
+/// * once an fsync has failed, no sync returns `Ok`.
 #[test]
 fn a_random_sequence_of_appends_failures_rollovers_and_syncs_matches_the_model() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let sizes = [0usize, 1, 40, 40, 300, 700, 700, 2_000, 4_000, 8_180, 8_192, 9_000, 15_000];
 	let (mut failed_appends, mut failed_syncs, mut rollovers) = (0, 0, 0);
 	for seed in 1..=4u64 {
@@ -1721,11 +1748,19 @@ fn a_random_sequence_of_appends_failures_rollovers_and_syncs_matches_the_model()
 			}
 		}
 
-		// Whatever failpoint is still armed fires at most once more: retry until a sync takes.
-		assert!(
-			(0..8).any(|_| sync(&mut dirty)),
-			"seed {seed}: no sync succeeded once the failpoints were spent"
-		);
+		// Whatever failpoint is still armed fires at most once more: retry until a sync takes, or,
+		// once an fsync has failed, until the writer's buffer is in the files, as every sync
+		// flushes it before it fsyncs; none of those syncs succeeds.
+		if vlog.sync_failed() {
+			for _ in 0..8 {
+				assert!(vlog.sync().is_err(), "seed {seed}: a sync succeeded after a failed fsync");
+			}
+		} else {
+			assert!(
+				(0..8).any(|_| sync(&mut dirty)),
+				"seed {seed}: no sync succeeded once the failpoints were spent"
+			);
+		}
 
 		rollovers += files.len().saturating_sub(1);
 		for (id, expected) in &files {
@@ -1832,6 +1867,9 @@ fn names_in(dir: &Path) -> Vec<String> {
 /// new file.
 #[test]
 fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let header = VLogFileHeader::new(2, 1 << 20, 0).encode();
 	let torn: [(&str, Vec<u8>); 5] = [
 		("a byte of the magic", header[..1].to_vec()),
@@ -1847,7 +1885,7 @@ fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
 			vlog_max_file_size: 1 << 20,
 			..Default::default()
 		});
-		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 		let pointer = {
 			let vlog = VLog::new(Arc::clone(&opts)).unwrap();
 			let pointer = vlog.append(b"key", &value_of(1, 100)).unwrap();
@@ -1885,6 +1923,9 @@ fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
 /// the directory as it is.
 #[test]
 fn a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let header = VLogFileHeader::new(2, 1 << 20, 0).encode();
 	let other = VLogFileHeader::new(7, 1 << 20, 0).encode();
 	let mut flipped = header[..20].to_vec();
@@ -1901,7 +1942,7 @@ fn a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header() {
 			vlog_max_file_size: 1 << 20,
 			..Default::default()
 		});
-		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 		// A file 1 with an entry, or a file 3 when file 1 is the one under test.
 		let whole = if file_id == 1 {
 			3

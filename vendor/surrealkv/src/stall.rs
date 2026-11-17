@@ -1,12 +1,16 @@
 //! Write stall controller for backpressure management.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use crate::error::{Error, Result, WriteStallReason};
+use crate::rt::{pace, Instant};
+
+/// Asks the background tasks for the work that ends a stall of the given reason.
+type Rearm = Box<dyn Fn(WriteStallReason) + Send + Sync>;
 
 /// Current counts of resources that can trigger write stalls.
 #[derive(Debug, Clone, Copy)]
@@ -39,27 +43,6 @@ impl StallThresholds {
 			l0_file_soft_limit: l0_file_limit.saturating_sub(4).max(1),
 		}
 	}
-}
-
-/// Waits for a pacing delay, which is a few hundred microseconds at most.
-///
-/// The wait yields to the runtime until the delay has passed, instead of waiting on a tokio
-/// timer, so that a runtime that was built without the time driver, which is what
-/// `tokio::runtime::Builder` gives unless `enable_time` or `enable_all` is called, does not
-/// panic in the commit path. It starts no thread, so it cannot fail when the system cannot
-/// start one, and it lets other tasks of the runtime run meanwhile.
-#[cfg(not(target_arch = "wasm32"))]
-async fn pace(delay: Duration) {
-	let start = Instant::now();
-	while start.elapsed() < delay {
-		tokio::task::yield_now().await;
-	}
-}
-
-/// There are no threads to block on wasm32, so the delay is a timer there, as it was.
-#[cfg(target_arch = "wasm32")]
-async fn pace(delay: Duration) {
-	tokio::time::sleep(delay).await;
 }
 
 /// Trait for getting current stall condition counts.
@@ -105,6 +88,9 @@ pub struct WriteStallController {
 
 	/// Static thresholds configured at startup
 	thresholds: StallThresholds,
+
+	/// Asks for a flush or a compaction for a stalled writer, once the tasks exist
+	rearm: OnceLock<Rearm>,
 }
 
 impl WriteStallController {
@@ -116,7 +102,15 @@ impl WriteStallController {
 			failures: AtomicU64::new(0),
 			provider,
 			thresholds,
+			rearm: OnceLock::new(),
 		}
+	}
+
+	/// Sets what a stalled writer calls to ask for the work that ends its stall, such as the
+	/// compaction of level 0. A writer asks each time it begins to wait, so a stall never depends
+	/// on a wakeup that came, or was lost, before it.
+	pub fn set_rearm(&self, rearm: impl Fn(WriteStallReason) + Send + Sync + 'static) {
+		let _ = self.rearm.set(Box::new(rearm));
 	}
 
 	/// Check stall conditions and wait if stalled. Called before each write.
@@ -215,7 +209,13 @@ impl WriteStallController {
 				tracing::warn!("Write stall: {:?} ({} >= {})", reason, value, threshold);
 			}
 
-			// Wait
+			// Ask for the work that ends the stall, then wait for a sign of it. Every flush and
+			// compaction gives one, after which the writer looks again and, still stalled, asks
+			// again. The wait needs no timer, so that a runtime built without the time driver does
+			// not panic in the commit path.
+			if let Some(rearm) = self.rearm.get() {
+				rearm(reason);
+			}
 			notified.await;
 		}
 	}

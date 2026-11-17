@@ -25,14 +25,15 @@
 //! `VLog::dir_syncs`, and the failpoints `VLog::fail_writes_after`, `VLog::fail_next_sync` and
 //! `VLog::set_sync_gap`.
 
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use sfs::{self as fs, File};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::ring::PipelineHook;
 use crate::vlog::ValueLocation;
@@ -43,12 +44,11 @@ use crate::wal::{
 	BufferedFileWriter,
 	CompressionType,
 	Error as WalError,
-	Options as WalOptions,
 	WritableFile,
 	BLOCK_SIZE,
 	HEADER_SIZE,
 };
-use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
+use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -119,7 +119,8 @@ fn read_records(path: &Path) -> Vec<Vec<u8>> {
 
 /// Every record of a segment with the offset it ends at, decoded as a batch.
 fn records_with_ends(path: &Path) -> Vec<(u64, Batch)> {
-	let mut reader = Reader::new(File::open(path).unwrap());
+	let path = sfs::after_open(path);
+	let mut reader = Reader::new(File::open(&path).unwrap());
 	let mut out = Vec::new();
 	loop {
 		match reader.read() {
@@ -185,6 +186,8 @@ fn opts(path: &Path, max_memtable_size: usize) -> Arc<Options> {
 		memtable_stall_threshold: 100_000,
 		level0_max_files: 10_000,
 		l0_stall_threshold: 10_000,
+		// The framing under test is of groups; a sync mark in front of one would move it.
+		wal_sync_marks: false,
 		..Default::default()
 	})
 }
@@ -222,6 +225,19 @@ async fn put(tree: &Tree, key: &str, value: &[u8], durability: Durability) {
 	txn.set_durability(durability);
 	txn.set(key.as_bytes(), value).unwrap();
 	txn.commit().await.unwrap();
+}
+
+/// A commit after a failed fsync of the value log, which is refused: the database is stopped.
+async fn assert_refused(tree: &Tree, key: &str, value: &[u8], durability: Durability) {
+	let mut txn = tree.begin().unwrap();
+	txn.set_durability(durability);
+	txn.set(key.as_bytes(), value).unwrap();
+	match txn.commit().await.as_ref().map_err(Error::poisoned_by) {
+		Err(Error::DatabaseStopped(message)) => {
+			assert!(message.contains("value log"), "the cause is the value log: {message}")
+		}
+		other => panic!("{key}: expected the database to be stopped, got {other:?}"),
+	}
 }
 
 /// One single-key transaction per entry, all spawned before the flusher is polled: on the
@@ -522,7 +538,7 @@ fn random_groups_are_byte_identical_to_one_append_per_record() {
 #[test]
 fn wal_append_group_lands_in_one_segment_and_a_bad_group_neither_writes_nor_poisons() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	let seg0 = dir.path().join("00000000000000000000.wal");
 	let seg1 = dir.path().join("00000000000000000001.wal");
 	let buf: Vec<u8> = payload(7, 100);
@@ -626,6 +642,9 @@ mod short_write {
 	/// that `add_records` cuts exactly that back.
 	#[test]
 	fn short_write_child_writer() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -666,6 +685,9 @@ mod short_write {
 	/// middle of its append.
 	#[test(tokio::test)]
 	async fn short_write_child_tree() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -702,7 +724,7 @@ mod short_write {
 		assert!(later[0].is_ok(), "the next commit replaces the segment");
 		// The segment that failed is not written to again; the background flush of its memtable
 		// removes it.
-		assert!(!segment.exists() || fs::read(&segment).unwrap() == acked_bytes);
+		assert!(!sfs::exists(&segment) || fs::read(&segment).unwrap() == acked_bytes);
 
 		let tree = Arc::try_unwrap(tree).ok().expect("the writers are done");
 		crash(tree);
@@ -712,6 +734,9 @@ mod short_write {
 	/// then space comes back and a commit is acknowledged. That commit's value must read back.
 	#[test(tokio::test)]
 	async fn short_write_child_vlog() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -775,6 +800,9 @@ mod short_write {
 	/// entry started at, would point into the failed value. Run with a real short write.
 	#[test(tokio::test)]
 	async fn a_transient_vlog_write_failure_does_not_corrupt_the_next_acknowledged_value() {
+		if tfs::skip_listed() {
+			return;
+		}
 		if std::env::var_os(CHILD_DIR).is_some() {
 			return;
 		}
@@ -798,6 +826,9 @@ mod short_write {
 	/// disk is full when the next append has to write it out.
 	#[test]
 	fn short_write_child_vlog_full_buffer() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -807,7 +838,7 @@ mod short_write {
 			vlog_checksum_verification: crate::VLogChecksumLevel::Full,
 			..Default::default()
 		};
-		fs::create_dir_all(opts.vlog_dir()).unwrap();
+		tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 		let vlog = crate::vlog::VLog::new(Arc::new(opts)).unwrap();
 		let seed = vlog.append(b"seed", b"seed").unwrap();
 		vlog.flush().unwrap();
@@ -833,6 +864,9 @@ mod short_write {
 	/// disk is full. Run with a real write failure.
 	#[test(tokio::test)]
 	async fn a_failed_append_behind_a_full_vlog_buffer_keeps_the_entry_in_it() {
+		if tfs::skip_listed() {
+			return;
+		}
 		if std::env::var_os(CHILD_DIR).is_some() {
 			return;
 		}
@@ -857,6 +891,9 @@ mod short_write {
 	/// killed child left, with no limit.
 	#[test(tokio::test)]
 	async fn a_real_short_write_in_the_middle_of_a_group_is_cut_back_and_recovered() {
+		if tfs::skip_listed() {
+			return;
+		}
 		if std::env::var_os(CHILD_DIR).is_some() {
 			return;
 		}
@@ -1026,7 +1063,7 @@ async fn torn_group_sweep(left: usize, group_lens: &[usize], cuts: Cuts, damage:
 
 	let work = base.path().join("work");
 	for &cut in &offsets {
-		if work.exists() {
+		if sfs::exists(&work) {
 			fs::remove_dir_all(&work).unwrap();
 		}
 		copy_dir(&image, &work);
@@ -1080,6 +1117,8 @@ async fn torn_group_sweep(left: usize, group_lens: &[usize], cuts: Cuts, damage:
 		// for another one, and recovery continues in a fresh segment.
 		let fresh = active_segment(&tree);
 		assert!(fresh > first, "{at}: commits must not go to the damaged segment");
+		// What the segment that recovery starts or moves to holds before the commits after it.
+		let fresh_before = records_with_ends(&seg_path(&work, fresh)).len();
 		assert_eq!(
 			records_with_ends(&seg_path(&work, first)).len(),
 			3 + 1 + whole.len(),
@@ -1104,14 +1143,17 @@ async fn torn_group_sweep(left: usize, group_lens: &[usize], cuts: Cuts, damage:
 
 		assert_eq!(
 			records_with_ends(&seg_path(&work, fresh)).len(),
-			3 + 3,
-			"{at}: the new commits are in the fresh segment"
+			fresh_before + 3 + 3,
+			"{at}: the new commits are in the segment that recovery starts or moves to"
 		);
-		assert_eq!(
-			records_with_ends(&seg_path(&work, first)).len(),
-			3 + 1 + whole.len(),
-			"{at}: the damaged segment was not appended to"
-		);
+		// A damaged segment that stays is not appended to.
+		if sfs::exists(seg_path(&work, first)) {
+			assert_eq!(
+				records_with_ends(&seg_path(&work, first)).len(),
+				3 + 1 + whole.len(),
+				"{at}: the damaged segment was not appended to"
+			);
+		}
 		let tree = Tree::new(opts(&work, BIG)).unwrap();
 		for (k, v) in whole.iter().map(|g| (&g.0, &g.1)).chain(more.iter().map(|g| (&g.0, &g.1))) {
 			assert_eq!(get(&tree, k).as_deref(), Some(v.as_slice()), "{at}: {k} after 2nd crash");
@@ -1394,6 +1436,9 @@ async fn flusher_buffers_never_leak_bytes_between_groups_and_the_segment_is_the_
 /// and so is appended once and its tail appended again after the rotation.
 async fn straddling_setup(path: &Path) -> (Arc<Tree>, Vec<(String, Vec<u8>)>, u64) {
 	let tree = Arc::new(Tree::new(opts(path, 4096)).unwrap());
+	// The group fills the arena part-way: the bound on a group's estimates (see
+	// `group_est_budget`) would cut it in several, so it is lifted.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background_tasks(&tree).await;
 	let prefill: Vec<(String, Vec<u8>)> =
 		(0..10).map(|i| (format!("pre{i:03}"), payload(i, 100))).collect();
@@ -1956,7 +2001,8 @@ async fn a_vlog_write_failure_in_the_middle_of_a_group_fails_it_and_logs_nothing
 
 /// A vlog that fails to fsync fails an Immediate group before it writes to the WAL, so a
 /// record that was reported failed cannot be replayed after a crash, and a record that is in
-/// the WAL never points at a value that is not on disk.
+/// the WAL never points at a value that is not on disk. The failed fsync ends the value log, so
+/// the commit after it is refused too.
 #[test(tokio::test)]
 async fn a_failed_vlog_fsync_fails_the_group_before_the_wal_is_written() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
@@ -1975,10 +2021,11 @@ async fn a_failed_vlog_fsync_fails_the_group_before_the_wal_is_written() {
 	}
 	assert_eq!(fs::read(&segment).unwrap(), logged, "a group that failed logged nothing");
 
-	let later = ("later".to_string(), payload(99, 10_000));
-	put(&tree, &later.0, &later.1, Durability::Immediate).await;
-	let absent: Vec<String> = group.iter().map(|(key, _)| key.clone()).collect();
-	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &[first, later], &absent);
+	assert_refused(&tree, "later", &payload(99, 10_000), Durability::Immediate).await;
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a refused commit logged something");
+	let absent: Vec<String> =
+		group.iter().map(|(key, _)| key.clone()).chain(["later".to_string()]).collect();
+	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &[first], &absent);
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
 
@@ -2227,10 +2274,10 @@ async fn a_failed_flush_of_a_buffered_vlog_value_fails_the_commit_and_the_next_o
 }
 
 /// The first fsync of a sync is the one of the file the writer rolled over from. When it fails,
-/// the Immediate group fails before it logs anything, and the commit after it fsyncs that file
-/// again.
+/// the Immediate group fails before it logs anything. The fsync lost the pages it could not
+/// write, so it is not tried again: the commit after it is refused, and nothing fsyncs the file.
 #[test(tokio::test)]
-async fn a_failed_fsync_of_the_vlog_file_rolled_over_from_is_retried_by_the_next_commit() {
+async fn a_failed_fsync_of_the_vlog_file_rolled_over_from_is_not_retried() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
 	let live = dir.path().join("live");
 	let tree = eventual_commits_across_a_rollover(&live).await;
@@ -2245,16 +2292,15 @@ async fn a_failed_fsync_of_the_vlog_file_rolled_over_from_is_retried_by_the_next
 	assert_eq!(fs::read(&segment).unwrap(), logged, "a failed fsync logs nothing");
 	assert!(!fsynced_vlog_files(&live).contains(&files[0]), "the old file's fsync failed");
 
-	put(&tree, "later", &payload(61, 10_000), Durability::Immediate).await;
-	assert_both_vlog_files_fsynced(&live, "by the commit after the failed one");
-	let present: Vec<_> =
-		present.into_iter().chain([("later".to_string(), payload(61, 10_000))]).collect();
+	assert_refused(&tree, "later", &payload(61, 10_000), Durability::Immediate).await;
+	assert!(fsynced_vlog_files(&live).is_empty(), "a vlog file was fsynced after the failure");
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a refused commit logged something");
 	assert_crash_image(
 		vlog_opts,
 		&live,
 		&dir.path().join("image"),
 		&present,
-		&["failed".to_string()],
+		&["failed".to_string(), "later".to_string()],
 	);
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
@@ -2400,6 +2446,9 @@ async fn a_rotation_by_the_flusher_fsyncs_the_vlog_before_the_segment() {
 /// A checkpoint flushes the memtable, which rotates the WAL first.
 #[test(tokio::test)]
 async fn a_checkpoint_fsyncs_the_vlog_before_the_segment_it_seals() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("wal_group_crash").unwrap();
 	let live = dir.path().join("live");
 	let (tree, seen) = rolled_over_and_watched(&live).await;
@@ -2486,10 +2535,11 @@ async fn a_power_loss_after_an_eventual_commit_and_a_rotation_leaves_no_dangling
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
 
-/// A vlog fsync that fails during a rotation fails the rotation and nothing else: the WAL has the
-/// same segment, the same bytes, nothing fsynced and no poison, the memtable has the same
-/// segment and its commits, and nothing was created. The rotation after it fsyncs the vlog
-/// again, fsyncs the segment, and succeeds, and the commits in between survive a power loss.
+/// A vlog fsync that fails during a rotation fails the rotation: the WAL has the same segment,
+/// the same bytes, nothing fsynced and no poison, the memtable has the same segment and its
+/// commits, and nothing was created. The failed fsync ends the value log, so the commits and
+/// the rotation after it are refused, and the segment is never sealed over values that a crash
+/// may have lost.
 #[test(tokio::test)]
 async fn a_failed_vlog_fsync_fails_the_rotation_and_leaves_the_wal_as_it_was() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
@@ -2517,20 +2567,21 @@ async fn a_failed_vlog_fsync_fails_the_rotation_and_leaves_the_wal_as_it_was() {
 	}
 	assert!(inner.immutable_memtables.read().unwrap().is_empty());
 
-	// Commits go on in the same segment, and the next rotation succeeds.
-	put(&tree, "after", &payload(11, 40_000), Durability::Eventual).await;
-	inner.rotate_memtable().unwrap();
-	assert_vlog_fsynced_before_wal(&seen, "the rotation after the failed one");
-	assert_eq!(inner.wal.read().get_active_log_number(), first + 1);
-	let mut sealed_and_new = segments.clone();
-	sealed_and_new.push(first + 1);
-	assert_eq!(segment_ids(&live), sealed_and_new);
+	assert_refused(&tree, "after", &payload(11, 40_000), Durability::Eventual).await;
+	assert!(inner.rotate_memtable().is_err(), "a rotation after the failed fsync");
+	assert!(seen.lock().unwrap().is_empty(), "the segment was fsynced after the vlog failed");
+	assert_eq!(inner.wal.read().get_active_log_number(), first);
+	assert_eq!(segment_ids(&live), segments, "a segment was created after the failure");
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a refused commit logged something");
 
-	let present: Vec<_> = (0..3)
-		.map(|i| (format!("e{i}"), payload(i, 40_000)))
-		.chain([("after".to_string(), payload(11, 40_000))])
-		.collect();
-	assert_power_loss_image(&live, &dir.path().join("image"), &present);
+	let present: Vec<_> = (0..3).map(|i| (format!("e{i}"), payload(i, 40_000))).collect();
+	assert_crash_image(
+		vlog_opts,
+		&live,
+		&dir.path().join("image"),
+		&present,
+		&["after".to_string()],
+	);
 	drop(inner);
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
@@ -2563,6 +2614,9 @@ async fn a_rotation_replacing_a_poisoned_segment_does_not_need_the_vlog() {
 /// once, and not by the Eventual commits that created the file, which fsync nothing.
 #[test(tokio::test)]
 async fn the_vlog_directory_is_fsynced_with_the_files_created_since_it_was_last() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("wal_group_crash").unwrap();
 	let live = dir.path().join("live");
 	let tree = eventual_commits_across_a_rollover(&live).await;

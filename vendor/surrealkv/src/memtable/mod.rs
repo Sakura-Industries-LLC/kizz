@@ -1,4 +1,4 @@
-use std::fs::File as SysFile;
+use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -7,7 +7,8 @@ use artmap::arena::{ArenaVersionedArtMap, ArenaVersionedEntryRef, ArenaVersioned
 
 /// Upper bound on what one entry costs a memtable: the worst-case arena bytes
 /// of one insert (as reported by artmap) plus the value length. Keys and
-/// values live on the heap, so the value term is not arena space; it keeps
+/// values live on the heap: the value term is not arena space, but a memtable
+/// counts its values towards its bound (`MemTable::used`), and the term keeps
 /// the estimate proportional to the logical batch size, which is what the
 /// direct-to-L0 cutoff for oversized batches compares against.
 #[inline]
@@ -15,10 +16,28 @@ pub(crate) const fn max_entry_bytes(key_len: usize, value_len: usize) -> u64 {
 	ArenaVersionedArtMap::<Key, Value>::max_insert_bytes(key_len) as u64 + value_len as u64
 }
 
+/// The bytes at the start of an arena that no entry can use: artmap's null region.
+const ARENA_NULL_REGION: usize = 64;
+
+/// The bytes of arena that a memtable created with `max_memtable_size` has to give, empty: the size
+/// artmap rounds the arena to (a multiple of 64 bytes, within 64 and `MAX_ARENA_SIZE`) less its
+/// null region. A batch whose estimate is at most this fits a fresh memtable, and one that is not
+/// fits no memtable at all.
+pub(crate) const fn fresh_room(max_memtable_size: usize) -> u64 {
+	let mut capacity = max_memtable_size;
+	if capacity < ARENA_NULL_REGION {
+		capacity = ARENA_NULL_REGION;
+	}
+	if capacity > artmap::arena::MAX_ARENA_SIZE {
+		capacity = artmap::arena::MAX_ARENA_SIZE;
+	}
+	((capacity & !(ARENA_NULL_REGION - 1)) - ARENA_NULL_REGION) as u64
+}
+
 use crate::batch::Batch;
 use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};
-use crate::vfs::File;
+use crate::vfs::{CreateOpts, File, FsWriter};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{
 	InternalKey,
@@ -73,9 +92,9 @@ impl ImmutableMemtables {
 		self.0.iter()
 	}
 
-	/// Returns the total memory size of all immutable memtables.
+	/// Returns the bytes all immutable memtables hold: arena and values, see [`MemTable::used`].
 	pub(crate) fn total_size(&self) -> usize {
-		self.0.iter().map(|e| e.memtable.size()).sum()
+		self.0.iter().map(|e| e.memtable.used() as usize).sum()
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
@@ -120,6 +139,15 @@ pub(crate) struct MemTable {
 	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
 	/// succeeds) or the memtable is left unchanged (reservation fails with ArenaFull).
 	reserved: AtomicU64,
+	/// The bytes of the values inserted. Values live on the heap, outside the arena, and count
+	/// towards the size the memtable is bounded by ([`MemTable::used`]), so a memtable of large
+	/// values is full once it holds `max_memtable_size` of them, not only once their index fills
+	/// the arena.
+	value_bytes: AtomicU64,
+	/// Whether the values count towards the bound. Only a test that needs the arena to be what
+	/// runs out turns it off.
+	#[cfg(test)]
+	values_counted: std::sync::atomic::AtomicBool,
 	/// Tracked range tombstones: (start_key, end_key, seq_num)
 	pub(crate) range_deletions: parking_lot::RwLock<Vec<(Key, Key, u64)>>,
 	pub(crate) has_range_deletions: std::sync::atomic::AtomicBool,
@@ -155,6 +183,9 @@ impl MemTable {
 			wal_number: AtomicU64::new(0),
 			min_vlog_file_id: AtomicU32::new(u32::MAX),
 			reserved: AtomicU64::new(0),
+			value_bytes: AtomicU64::new(0),
+			#[cfg(test)]
+			values_counted: std::sync::atomic::AtomicBool::new(true),
 			range_deletions: parking_lot::RwLock::new(Vec::new()),
 			has_range_deletions: std::sync::atomic::AtomicBool::new(false),
 		}
@@ -186,7 +217,28 @@ impl MemTable {
 		self.has_range_deletions.load(Ordering::Relaxed)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
+		self.get_raw(key, seq_no).map(|(trailer, val)| {
+			(
+				InternalKey {
+					user_key: key.to_vec(),
+					trailer,
+				},
+				val,
+			)
+		})
+	}
+
+	/// Looks up `key` at or below `seq_no`, returning `(trailer, value)` without allocating
+	/// a copy of `key`.
+	pub(crate) fn get_raw(&self, key: &[u8], seq_no: Option<u64>) -> Option<(u64, Value)> {
+		self.get_raw_ref(key, seq_no).map(|(trailer, value)| (trailer, value.to_vec()))
+	}
+
+	/// [`MemTable::get_raw`] that borrows the value from the arena, valid as long as the
+	/// memtable is.
+	pub(crate) fn get_raw_ref(&self, key: &[u8], seq_no: Option<u64>) -> Option<(u64, &[u8])> {
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let max_trailer = (max_seq << 8) | 0xFF;
 
@@ -200,18 +252,15 @@ impl MemTable {
 			}
 		}
 
-		let mut point_res: Option<(InternalKey, Value)> = None;
-		if let Some((found_trailer, val)) = self.map.get_version_le(key, max_trailer) {
-			let internal_key = InternalKey {
-				user_key: key.to_vec(),
-				trailer: found_trailer,
-			};
-			point_res = Some((internal_key, val));
-		}
+		let point_res = self
+			.map
+			.get_entry(key)
+			.and_then(|entry| entry.get_version_le(max_trailer))
+			.map(|(trailer, value)| (trailer, value.as_slice()));
 
 		if let Some(rseq) = range_tombstone_seq {
-			if let Some(ref res) = point_res {
-				if res.0.seq_num() > rseq {
+			if let Some((trailer, _)) = &point_res {
+				if crate::trailer_to_seq_num(*trailer) > rseq {
 					return point_res;
 				}
 			}
@@ -225,8 +274,32 @@ impl MemTable {
 		self.map.is_empty()
 	}
 
+	/// The bytes of arena allocated.
 	pub(crate) fn size(&self) -> usize {
 		self.map.arena().size()
+	}
+
+	/// The bytes the memtable holds towards its bound: the arena allocated and the values
+	/// inserted. [`max_entry_bytes`] bounds what one entry adds to it.
+	pub(crate) fn used(&self) -> u64 {
+		#[cfg(test)]
+		if !self.values_counted.load(Ordering::Acquire) {
+			return self.size() as u64;
+		}
+		self.size() as u64 + self.value_bytes.load(Ordering::Acquire)
+	}
+
+	/// Bounds the memtable by its arena alone, as a memtable whose estimates fall short of the
+	/// arena is.
+	#[cfg(test)]
+	pub(crate) fn count_arena_only(&self) {
+		self.values_counted.store(false, Ordering::Release);
+	}
+
+	/// The bytes a batch may still add, next to no reservation.
+	#[cfg(test)]
+	pub(crate) fn room(&self) -> u64 {
+		(self.arena_capacity() as u64).saturating_sub(self.used())
 	}
 
 	/// Arena capacity in bytes (total, including artmap's 64-byte null region).
@@ -234,10 +307,11 @@ impl MemTable {
 		self.map.arena().capacity()
 	}
 
-	/// Whether `bytes` more fit in the arena next to the `reserved` bytes already
-	/// claimed by in-flight inserts.
+	/// Whether `bytes` more fit next to the `reserved` bytes already claimed by in-flight
+	/// inserts. The values count as well as the arena, so a batch that fits also fits the arena
+	/// alone: what an entry adds to either is bounded by its [`max_entry_bytes`].
 	fn fits(&self, bytes: u64, reserved: u64) -> bool {
-		let used = self.size() as u64;
+		let used = self.used();
 		let avail = (self.arena_capacity() as u64).saturating_sub(used).saturating_sub(reserved);
 		bytes <= avail
 	}
@@ -328,6 +402,7 @@ impl MemTable {
 		};
 		self.note_vlog_pointers(batch);
 		let start_seq_num = batch.starting_seq_num;
+		let mut value_bytes = 0u64;
 		for (i, entry) in batch.entries.iter_mut().enumerate() {
 			let seq_num = start_seq_num + i as u64;
 			if entry.kind == InternalKeyKind::RangeDelete {
@@ -339,6 +414,7 @@ impl MemTable {
 			let trailer = (seq_num << 8) | (entry.kind as u64);
 			let value = entry.value.take();
 			let has_value = value.is_some();
+			let value_len = value.as_ref().map_or(0, Vec::len) as u64;
 			// A delete stores an empty value.
 			let inserted = self.map.try_insert(
 				std::mem::take(&mut entry.key),
@@ -349,9 +425,13 @@ impl MemTable {
 				entry.key = full.key;
 				entry.value = has_value.then_some(full.value);
 				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
+				self.value_bytes.fetch_add(value_bytes, Ordering::AcqRel);
 				return Err(crate::Error::Other("memtable size estimate drift".to_string()));
 			}
+			value_bytes += value_len;
 		}
+		// Counted before the reservation is released, so the bytes are never missing from both.
+		self.value_bytes.fetch_add(value_bytes, Ordering::AcqRel);
 		self.update_latest_sequence_number(batch.get_highest_seq_num());
 		Ok(())
 	}
@@ -423,7 +503,10 @@ impl MemTable {
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 		match self.map.try_insert(key.user_key.clone(), trailer, value.clone()) {
-			Ok(()) => Ok(()),
+			Ok(()) => {
+				self.value_bytes.fetch_add(value.len() as u64, Ordering::AcqRel);
+				Ok(())
+			}
 			Err(_) => {
 				debug_assert!(
 					false,
@@ -478,9 +561,16 @@ impl MemTable {
 				.fetch_min(vlog.active_writer_id.load(Ordering::SeqCst), Ordering::Release);
 		}
 
+		// The table goes through the file system of the options: created empty, written through the
+		// handle that is dropped when the writer finishes, made durable by path, and opened again
+		// for reading, which on a native file system is the `create`, `write`, `fsync` and `open`
+		// of a table, one call each. The handle is the file system's: a pool serves the reopen
+		// with a view of the slot that was just written.
+		let fs = &*lsm_opts.fs;
 		{
-			let file = SysFile::create(&table_file_path)?;
-			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
+			let file = fs.create_truncate(&table_file_path, CreateOpts::default())?;
+			let mut table_writer =
+				TableWriter::new(FsWriter(file), table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
 			let mut iter = self.iter();
 			iter.seek_first()?;
@@ -515,9 +605,9 @@ impl MemTable {
 
 		// Durability fix: the SST's data and its directory entry must be
 		// durable before the manifest references this table.
-		crate::vfs::fsync_file(&table_file_path)?;
-		crate::lsm::fsync_directory(lsm_opts.sstable_dir())?;
-		let file: Arc<dyn File> = Arc::new(SysFile::open(&table_file_path)?);
+		fs.sync_file(&table_file_path)?;
+		fs.sync_dir(&lsm_opts.sstable_dir())?;
+		let file: Arc<dyn File> = fs.open_read(&table_file_path)?;
 		let file_size = file.size()?;
 
 		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
@@ -555,6 +645,7 @@ impl MemTable {
 			current_versions: Vec::new(),
 			version_idx: 0,
 			encoded_key_buf: Vec::new(),
+			ahead: VecDeque::with_capacity(LOOKAHEAD + 1),
 		};
 
 		let _ = miter.seek_first();
@@ -578,7 +669,7 @@ pub(crate) fn maybe_separate_to_vlog(
 		return Ok(encoded_value.to_vec());
 	}
 
-	let location = ValueLocation::decode(encoded_value)?;
+	let location = ValueLocation::decode_ref(encoded_value)?;
 
 	// Already a VLog pointer (e.g. from pre-upgrade WAL recovery) — pass through
 	if location.is_value_pointer() {
@@ -586,7 +677,7 @@ pub(crate) fn maybe_separate_to_vlog(
 	}
 
 	// Separate large values to VLog
-	let value = &location.value;
+	let value = location.value;
 	if let Some(vlog) = vlog {
 		if value.len() > vlog_threshold {
 			let encoded_key = key.encode();
@@ -634,6 +725,27 @@ pub(crate) struct MemTableIterator<'a> {
 	current_versions: Vec<(u64, &'a Value)>,
 	version_idx: usize,
 	encoded_key_buf: Vec<u8>,
+	/// The entries the range has yielded past the one the cursor is on, in the direction of
+	/// iteration: see [`LOOKAHEAD`]. Emptied whenever the range is rebuilt.
+	ahead: VecDeque<ArenaVersionedEntryRef<'a, Key, Value>>,
+}
+
+/// How many entries a memtable cursor reads ahead of the one it is on. A memtable entry is a leaf,
+/// a version node, and a key and a value on the heap, each a likely cache miss in a scan: an entry
+/// read ahead has its key and value fetched while the entries before it are read, so a scan waits
+/// on the misses of several entries at once rather than on each in turn.
+const LOOKAHEAD: usize = 4;
+
+/// Asks the processor to bring the cache line at `p` in, without waiting for it.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+	#[cfg(target_arch = "x86_64")]
+	// SAFETY: a prefetch is a hint: it reads nothing and faults on no address.
+	unsafe {
+		std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast());
+	}
+	#[cfg(not(target_arch = "x86_64"))]
+	let _ = p;
 }
 
 impl<'a> MemTableIterator<'a> {
@@ -658,11 +770,32 @@ impl<'a> MemTableIterator<'a> {
 		self.valid()
 	}
 
+	/// The next entry of the range in the cursor's direction, reading up to [`LOOKAHEAD`] entries
+	/// past it and fetching their keys and values into the cache.
+	fn pull(&mut self) -> Option<ArenaVersionedEntryRef<'a, Key, Value>> {
+		while self.ahead.len() <= LOOKAHEAD {
+			let entry = match self.direction {
+				IterDirection::Forward => self.range.next(),
+				IterDirection::Backward => self.range.next_back(),
+			};
+			let Some(entry) = entry else {
+				break;
+			};
+			prefetch(entry.key().as_ptr());
+			let value = entry.value();
+			prefetch(value.as_ptr());
+			prefetch(value.as_ptr().wrapping_add(64));
+			self.ahead.push_back(entry);
+		}
+		self.ahead.pop_front()
+	}
+
 	fn populate_encoded_key(&mut self) {
 		self.encoded_key_buf.clear();
 		if let (Some(key), Some(&(trailer, _))) =
 			(self.current_key, self.current_versions.get(self.version_idx))
 		{
+			self.encoded_key_buf.reserve(key.len() + 8);
 			self.encoded_key_buf.extend_from_slice(key);
 			self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		}
@@ -691,8 +824,9 @@ impl LSMIterator for MemTableIterator<'_> {
 		};
 		self.range = self.map.range::<_, [u8]>((Bound::Included(start), upper_bound(&self.upper)));
 		self.direction = IterDirection::Forward;
+		self.ahead.clear();
 
-		while let Some(entry) = self.range.next() {
+		while let Some(entry) = self.pull() {
 			self.position(Some(entry));
 			if entry.key().as_slice() != target_user_key {
 				return Ok(true);
@@ -714,7 +848,8 @@ impl LSMIterator for MemTableIterator<'_> {
 		self.range =
 			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
 		self.direction = IterDirection::Forward;
-		let entry = self.range.next();
+		self.ahead.clear();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 
@@ -722,7 +857,8 @@ impl LSMIterator for MemTableIterator<'_> {
 		self.range =
 			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
 		self.direction = IterDirection::Backward;
-		let entry = self.range.next_back();
+		self.ahead.clear();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 
@@ -743,9 +879,10 @@ impl LSMIterator for MemTableIterator<'_> {
 				.map
 				.range::<_, [u8]>((Bound::Excluded(cur.as_slice()), upper_bound(&self.upper)));
 			self.direction = IterDirection::Forward;
+			self.ahead.clear();
 		}
 
-		let entry = self.range.next();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 
@@ -766,9 +903,10 @@ impl LSMIterator for MemTableIterator<'_> {
 				.map
 				.range::<_, [u8]>((lower_bound(&self.lower), Bound::Excluded(cur.as_slice())));
 			self.direction = IterDirection::Backward;
+			self.ahead.clear();
 		}
 
-		let entry = self.range.next_back();
+		let entry = self.pull();
 		Ok(self.position(entry))
 	}
 

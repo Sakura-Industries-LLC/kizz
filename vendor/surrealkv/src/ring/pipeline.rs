@@ -1,30 +1,24 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 
-use super::bloom::BloomFilter;
 use super::commit_ring::{CommitRing, SlotRead, DEFAULT_COMMIT_RING_CAPACITY};
+use super::index::{key_hash, WriteIndex};
 use super::queue::{CommitEntry, EntryState, Payload};
-use super::sync::backoff;
-use crate::batch::Batch;
+use crate::batch::{wrap_inline, Batch};
 use crate::error::{Error, Result};
-use crate::lsm::CoreInner;
+use crate::lsm::{CoreInner, GroupShape};
 use crate::memtable::MemTable;
+use crate::rt::{self, Instant};
 use crate::stall::WriteStallController;
 use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::{TaskManager, FLUSH_RETRY_MAX, FLUSH_RETRY_MIN};
 use crate::varint::varint_len_u64;
-use crate::vlog::{
-	VLog,
-	ValueLocation,
-	BIT_HAS_TIMESTAMP,
-	VALUE_LOCATION_VERSION,
-	VALUE_TIMESTAMP_SIZE,
-};
+use crate::vlog::{VLog, ValueLocation};
 use crate::{InternalKey, InternalKeyKind, Key};
 
 /// Observation points inside `flush_group`, so tests can act at an exact step
@@ -162,11 +156,134 @@ fn recycle<T>(buffer: &mut Vec<T>, max_capacity: usize) {
 /// reaches the bound.
 pub(crate) const MAX_GROUP_BYTES: usize = 4 << 20;
 
-/// Whether the next entry, of `bytes`, joins a group that holds `entries` entries of
-/// `group_bytes` bytes between them. A group takes at least one entry, and after that entries
-/// only while it stays within `MAX_GROUP_BYTES`.
-fn group_has_room(entries: usize, group_bytes: usize, bytes: usize) -> bool {
-	entries == 0 || group_bytes.saturating_add(bytes) <= MAX_GROUP_BYTES
+/// The most memtable estimate (`Batch::gather_estimate`) the flusher gathers into one group, for
+/// a memtable of `max_memtable_size`, unless the first entry alone is bigger: that entry is a group
+/// of its own.
+///
+/// A batch is applied to a memtable only if its estimate, a worst case of some 2 KiB for every
+/// entry however small, fits what is left of the arena. A group whose estimates add up to more than
+/// a fresh arena takes rotates the memtable more than once, and logs the rest of the group again
+/// into the new segment every time: a pile-up of small commits rotated once per commit, wrote some
+/// 40 times its size to the WAL, and left a recovery with hundreds of segments to turn into tables.
+/// A group whose estimates add up to no more than a fresh arena rotates at most once, because
+/// what is left of it after a rotation fits the memtable it rotated to, and is logged at most
+/// twice.
+///
+/// Up to a memtable of 32 MiB that is exactly one fresh arena. A bigger memtable takes a multiple
+/// of it, up to six, so that at the default 100 MiB the bound is far over what `MAX_GROUP_BYTES`
+/// lets through, see the assertion below: the estimate never closes a group there.
+/// Between 32 and 96 MiB a group rotates at most twice per multiple, and with more than one, a
+/// batch over the memtable (`write_direct_to_l0`) can share a group with others.
+pub(crate) const fn group_est_budget(max_memtable_size: usize) -> u64 {
+	let room = crate::memtable::fresh_room(max_memtable_size);
+	let mut multiple = room / GROUP_EST_STEP;
+	if multiple < 1 {
+		multiple = 1;
+	}
+	if multiple > GROUP_EST_MAX_MULTIPLE {
+		multiple = GROUP_EST_MAX_MULTIPLE;
+	}
+	let budget = room.saturating_mul(multiple);
+	// The estimate of an entry is held in 32 bits, see `CommitEntry::cost`.
+	if budget > u32::MAX as u64 {
+		u32::MAX as u64
+	} else {
+		budget
+	}
+}
+
+/// The most queued memtables that `group_need_of` counts.
+const MAX_QUEUE_IN_NEED: usize = 32;
+
+/// The spare files that one commit group may create, as an upper bound that is derived from the
+/// options and never measured, and that only a pool uses.
+///
+/// A group takes a bounded number of files, because the flusher bounds it (see
+/// `group_est_budget`): its memtable estimates add up to at most `multiple` fresh memtables, so it
+/// rotates the memtable (one new log segment) at most `multiple` times while it is applied and
+/// once before, and it logs a batch at most twice. Of the files below, `rotations` is that count.
+/// - the log segments of the rotations;
+/// - a batch bigger than a memtable goes to a table of its own, which seals the log (one segment)
+///   and flushes the whole queue first, `stall_threshold` memtables and the ones this group
+///   rotated, each a table and a manifest, and then writes its own table and a manifest;
+/// - a failed log segment is replaced, and the memtables of a group that failed are flushed and
+///   `log_number` moved past them, before the group logs anything (the heal): the same as the
+///   rotation and the queue above.
+///
+/// Every table is counted with its manifest, which is more than it costs once the old manifest is
+/// clean, so that the sum stays above the files that one window can have open at the same time. A
+/// commit group that finds fewer than this is a failure that stops the database, so the
+/// strict-mode tests with a tiny memtable are the check of this number, and the value log's rolls
+/// (`vlog_term`) are added per group, from its bytes.
+pub(crate) fn group_need_of(opts: &crate::Options) -> usize {
+	let room = crate::memtable::fresh_room(opts.max_memtable_size).max(1);
+	let budget = group_est_budget(opts.max_memtable_size);
+	let multiple = usize::try_from(budget / room).unwrap_or(usize::MAX).clamp(1, 16);
+	let rotations = multiple + 1;
+	// A stall threshold that is far beyond what a pool can hold is clamped: no number of files
+	// answers it, and the pool's own limit (`PoolConfig::max_files`) is what bounds the queue then.
+	let queued = opts.memtable_stall_threshold.min(MAX_QUEUE_IN_NEED) + rotations;
+	6 + 2 * queued + rotations + usize::from(opts.enable_vlog)
+}
+
+/// The spare files that a commit group needs in a pool whose cap is too low for `group_need_of`
+/// (see `CoreInner::commit_group_need`), if none of its batches is bigger than a memtable and the
+/// log is healthy: one segment of the log for each time that `group_estimate` bytes of estimates
+/// can fill the memtable and rotate it, one for the rotation before the group, and a margin, and
+/// one for the value log's first roll if there is one.
+fn small_group_need_of(opts: &crate::Options, group_estimate: u64) -> usize {
+	let room = crate::memtable::fresh_room(opts.max_memtable_size).max(1);
+	let rotations = usize::try_from(group_estimate / room).unwrap_or(usize::MAX).min(16) + 2;
+	rotations + 1 + usize::from(opts.enable_vlog)
+}
+
+/// The most that `small_group_need_of` is for a group that the flusher forms, with the value log's
+/// rolls of the largest of them.
+pub(crate) fn small_group_need_max(opts: &crate::Options) -> usize {
+	small_group_need_of(opts, group_est_budget(opts.max_memtable_size))
+		+ vlog_term(opts, MAX_GROUP_BYTES)
+}
+
+/// The files that a group of `group_bytes` bytes of batches rolls the value log into, which is one
+/// more file for every `vlog_max_file_size` bytes of values that it holds, and the one that is
+/// open now may be full.
+pub(crate) fn vlog_term(opts: &crate::Options, group_bytes: usize) -> usize {
+	if !opts.enable_vlog {
+		return 0;
+	}
+	let file = usize::try_from(opts.vlog_max_file_size).unwrap_or(usize::MAX).max(1);
+	group_bytes / file
+}
+
+/// How much more memtable than one fresh arena a group may fill, per this many bytes of arena.
+const GROUP_EST_STEP: u64 = 16 << 20;
+const GROUP_EST_MAX_MULTIPLE: u64 = 6;
+
+/// At the default memtable of 100 MiB the budget is over what any group the byte rule forms can
+/// add up to: an entry costs at least 14 bytes of `Batch::encoded_len_hint` (11 of `Batch::size`
+/// and 3 of slack) and at most `GATHER_ENTRY_BYTES` of estimate, and one of more bytes costs
+/// a little more of both, so `MAX_GROUP_BYTES` of hint is at most `MAX_GROUP_BYTES / 14` entries.
+/// A change of artmap that makes an arena entry dearer fails this build, and the answer is a bigger
+/// multiple, not a group rule that silently changes what typical workloads do.
+const _: () = assert!(
+	(MAX_GROUP_BYTES as u64 / 14 + 1) * crate::batch::GATHER_ENTRY_BYTES
+		<= group_est_budget(100 * 1024 * 1024)
+);
+
+/// Whether the next entry, of `bytes` and `estimate`, joins a group that holds `entries` entries
+/// of `group_bytes` bytes and `group_estimate` between them. A group takes at least one entry, and
+/// after that entries only while it stays within `MAX_GROUP_BYTES` and `est_budget`.
+fn group_has_room(
+	entries: usize,
+	group_bytes: usize,
+	bytes: usize,
+	group_estimate: u64,
+	estimate: u64,
+	est_budget: u64,
+) -> bool {
+	entries == 0
+		|| (group_bytes.saturating_add(bytes) <= MAX_GROUP_BYTES
+			&& group_estimate.saturating_add(estimate) <= est_budget)
 }
 
 /// Reserves room for `additional` more bytes in `buf`, and fails when the allocator refuses,
@@ -205,8 +322,17 @@ pub(super) const ADMISSION_PERMITS: u32 = (DEFAULT_COMMIT_RING_CAPACITY / 2) as 
 /// How many times in a row a group may find its records in a segment other than the active
 /// memtable's tag, with nothing applied in between, and log them again off the memtable's lock.
 /// One pass past a rotation fixes it. If rotations keep overtaking the group, the next pass is
-/// fenced: see `CommitPipeline::apply_fenced`.
+/// fenced: see `CommitPipeline::apply_fenced`. The rotations of the group's own apply do not come
+/// in a row without a batch applied in between: the bound of `group_est_budget` is what makes the
+/// rest of a group fit the memtable it rotated to.
 pub(crate) const UNFENCED_STALE_ROUNDS: u32 = 2;
+
+/// How long a group waits for the files of a pool once the pipeline is shut down.
+const SHUTDOWN_SPARES_WAIT: Duration = if cfg!(test) {
+	Duration::from_millis(300)
+} else {
+	Duration::from_secs(5)
+};
 
 /// How many groups the flusher drains between two calls to `retire`.
 pub(crate) const RETIRE_EVERY_GROUPS: u32 = 16;
@@ -229,6 +355,31 @@ fn retire_due(groups: u32, entries: u64) -> bool {
 /// would stall every commit behind the flusher for as long as they are many. They go in chunks
 /// instead, and the flusher keeps going while it has nothing else to do.
 pub(crate) const RETIRED_FREE_CHUNK: usize = 256;
+
+/// How many commits in flight tell the flusher that it has landed in a gap between two groups
+/// under load, and not in a quiet moment.
+///
+/// A commit is in flight from its admission until the flusher has completed it. With this many,
+/// commits are about to be decided, so the gap is over soon. With fewer, nothing is waiting for
+/// the flusher.
+pub(crate) const BUSY_COMMITS: usize = 16;
+
+/// How many ring slots the flusher releases in one step while it has nothing to flush and
+/// commits are in flight, see `BUSY_COMMITS`.
+///
+/// Small, because a commit that is decided during a step is not taken up until the step is over.
+const BUSY_FREE_SLOTS: u64 = 64;
+
+/// How many steps of `BUSY_FREE_SLOTS` the flusher takes while it has nothing to flush and commits
+/// are in flight before it yields to the runtime.
+///
+/// A yield puts the flusher at the back of the run queue, behind every task that is ready to run,
+/// and a commit that is decided meanwhile is not taken up until the flusher runs again. With
+/// commits in flight the flusher is in a gap between two groups again and again, so it yields only
+/// every this many steps. With no commit in flight nothing is waiting for it, and it yields after
+/// every step, as it always did: on a runtime with few threads that is what gives the other tasks
+/// their turn while it frees what a long transaction left behind.
+pub(crate) const BUSY_STEPS_PER_YIELD: u32 = 64;
 
 /// How many ring slots the flusher releases after a group that drained `entries` entries. A
 /// retire passes as many slots as the groups since the last one drained, so releasing a fixed
@@ -378,7 +529,8 @@ impl ReplaceBackoff {
 /// cost is parallel in the number of commits in flight.
 ///
 /// The flusher drains accepted entries in ring order, in groups of at most
-/// `MAX_GROUP_BYTES` (a group always takes its first entry), assigns their LSM
+/// `MAX_GROUP_BYTES` and of memtable estimates that add up to at most `group_est_budget` (a group
+/// always takes its first entry), assigns their LSM
 /// sequence numbers in that same order, writes and syncs the WAL, applies the
 /// memtable, advances `visible_seq_num`, and only then marks the entries
 /// visible and advances the ring's completed prefix. A transaction that reads
@@ -386,12 +538,22 @@ impl ReplaceBackoff {
 /// at or below the prefix in its snapshot, and validates against the rest.
 pub(crate) struct CommitPipeline {
 	pub(crate) ring: CommitRing<CommitEntry>,
+	/// The most memtable estimate the flusher gathers into one group, see `group_est_budget`.
+	group_est_budget: u64,
+	/// Test-only: lifts the estimate bound of a group, for the tests whose subject is a group
+	/// that holds an oversized batch with others, which the bound only lets a bigger memtable
+	/// form.
+	#[cfg(test)]
+	est_cap_lifted: AtomicBool,
 	/// Entries that a lap of the ring overwrote while a live conflict window
 	/// could still reach them, keyed by ring sequence. Only long-lived
 	/// transactions, whose window spans more than a lap, ever read it. Entries
 	/// at or below the retired watermark are garbage, which `free_retired`
 	/// removes a chunk at a time.
 	overflow: Mutex<BTreeMap<u64, Arc<CommitEntry>>>,
+	/// The write keys of the commits that live or future windows can still reach, which
+	/// validation looks a committer's keys up in, see `validate`.
+	index: WriteIndex,
 	/// Admission permits, one per claimed entry, released only once the
 	/// completed prefix has passed it. At most half the ring's capacity of
 	/// entries therefore sit above the completed prefix, so the previous
@@ -404,6 +566,10 @@ pub(crate) struct CommitPipeline {
 	pub(crate) task_manager: Option<Arc<TaskManager>>,
 	pub(crate) notify_flusher: Arc<Notify>,
 	pub(crate) shutdown: AtomicBool,
+	/// Set by `abandon`: the flusher is gone, and no commit that is accepted from now on will be
+	/// drained. Read only by a commit on a pool (a plain bool decides that), so the commit of a
+	/// database on `std` is what it was.
+	abandoned: AtomicBool,
 	/// Sequence number allocator for batch entries, advanced only by the
 	/// flusher (and restore), in ring order.
 	pub(crate) log_seq_num: AtomicU64,
@@ -486,16 +652,26 @@ impl CommitPipeline {
 		let notify_flusher = Arc::new(Notify::new());
 		let seq = start_seq.max(1);
 		let log_store = Arc::new(AffinityLogStore::new(Arc::clone(&inner.wal.inner)));
+		if inner.pooled {
+			// The files one group may create, which the flusher waits for before a group and the
+			// pool keeps back from the outputs of a compaction.
+			inner.set_group_need(group_need_of(&inner.opts), small_group_need_max(&inner.opts));
+		}
 
 		Self {
 			ring,
+			group_est_budget: group_est_budget(inner.opts.max_memtable_size),
+			#[cfg(test)]
+			est_cap_lifted: AtomicBool::new(false),
 			overflow: Mutex::new(BTreeMap::new()),
+			index: WriteIndex::new(),
 			admission,
 			inner,
 			write_stall,
 			task_manager,
 			notify_flusher,
 			shutdown: AtomicBool::new(false),
+			abandoned: AtomicBool::new(false),
 			log_seq_num: AtomicU64::new(seq),
 			restoring: Arc::new(AtomicBool::new(false)),
 			restore_epoch: Arc::new(AtomicU64::new(0)),
@@ -539,6 +715,18 @@ impl CommitPipeline {
 				matches!(self.ring.get(*seq), SlotRead::Ready(e) if matches!(e.state(), EntryState::Accepted))
 			})
 			.count()
+	}
+
+	/// How many commits are in flight: admitted, and not yet completed by the flusher.
+	fn commits_in_flight(&self) -> usize {
+		(ADMISSION_PERMITS as usize).saturating_sub(self.admission.available_permits())
+	}
+
+	/// Test helper: takes `n` admission permits, which makes `n` commits count as in flight until
+	/// the permits are dropped.
+	#[cfg(test)]
+	pub(crate) fn hold_admission(&self, n: u32) -> OwnedSemaphorePermit {
+		Arc::clone(&self.admission).try_acquire_many_owned(n).expect("admission has the room")
 	}
 
 	/// Test observer: the admission permits not held by a claimed entry.
@@ -634,6 +822,14 @@ impl CommitPipeline {
 		*self.hook.lock() = hook;
 	}
 
+	/// Test observer: lets the flusher gather groups whose estimates add up to more than a
+	/// fresh memtable takes, as it did before it bounded them. For the tests of what happens to
+	/// a group that holds an oversized batch together with others.
+	#[cfg(test)]
+	pub(crate) fn lift_group_estimate_cap(&self) {
+		self.est_cap_lifted.store(true, Ordering::Relaxed);
+	}
+
 	#[cfg(test)]
 	fn fire(&self, point: PipelineHook) {
 		// Clone out of the mutex first: the observer may block or call back in.
@@ -664,14 +860,14 @@ impl CommitPipeline {
 	}
 
 	/// Starts the background flusher task.
-	pub(crate) fn start_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+	pub(crate) fn start_flusher(self: &Arc<Self>) -> rt::JoinHandle<()> {
 		let pipeline = Arc::clone(self);
 		// The flusher's position is read here, not when the task is first polled. A commit that
 		// fails before then has its entry aborted, and its own guard advances the completed
 		// prefix over it. A flusher that started past that entry would never take its permit,
 		// and `close` waits for every permit.
 		let drained = self.ring.completed();
-		tokio::spawn(async move {
+		rt::spawn(async move {
 			pipeline.run_flusher(drained).await;
 		})
 	}
@@ -718,7 +914,6 @@ impl CommitPipeline {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
-		let read_bloom = bloom_of(read_keys);
 		let permit =
 			Arc::clone(&self.admission).acquire_owned().await.map_err(|_| Error::PipelineStall)?;
 		// The claimed sequence bounds the window; the entry publishes nothing, so the guard
@@ -729,13 +924,13 @@ impl CommitPipeline {
 			pipeline: self,
 			entry: &entry,
 		};
-		self.validate(&entry, seq, start_seq, window, read_keys, &read_bloom)
+		self.validate(&entry, seq, start_seq, window, read_keys)
 	}
 
 	/// Commits a batch through the commit ring and the group-commit flusher.
 	pub(crate) async fn commit(
 		&self,
-		batch: Batch,
+		mut batch: Batch,
 		sync: bool,
 		start_seq: u64,
 		window: u64,
@@ -753,6 +948,13 @@ impl CommitPipeline {
 			return self.check_conflicts(read_set, start_seq, window).await;
 		}
 
+		// The committer wraps the values and encodes the batch, so the flusher, which runs the
+		// groups one after another, only copies it. Before admission: a batch that is refused
+		// holds no permit.
+		let opts = &self.inner.opts;
+		let vlog_threshold = self.inner.vlog.is_some().then_some(opts.vlog_value_threshold);
+		batch.prepare_inline(vlog_threshold, opts.enable_versioning)?;
+
 		// Write stall backpressure
 		self.write_stall.check().await?;
 
@@ -769,11 +971,15 @@ impl CommitPipeline {
 		if self.restoring.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
+		// The permit may have been handed to this commit while the tree was being abandoned, with
+		// the semaphore closed after it: nobody is left to decide what it accepts.
+		if self.inner.pooled && self.abandoned.load(Ordering::SeqCst) {
+			return Err(Error::PipelineStall);
+		}
 		#[cfg(test)]
 		self.fire_commit(CommitStage::Admitted);
 
 		let write_keys: Vec<Key> = batch.entries.iter().map(|e| e.key.clone()).collect();
-		let read_bloom = bloom_of(read_set);
 		let entry = Arc::new(CommitEntry::new(write_keys, permit));
 		let seq = self.publish(&entry);
 
@@ -782,7 +988,7 @@ impl CommitPipeline {
 			pipeline: self,
 			entry: &entry,
 		};
-		self.validate(&entry, seq, start_seq, window, read_set, &read_bloom)?;
+		self.validate(&entry, seq, start_seq, window, read_set)?;
 
 		#[cfg(test)]
 		self.fire_commit(CommitStage::Validated);
@@ -796,6 +1002,12 @@ impl CommitPipeline {
 		// The entry is decided, and the flusher takes it from here.
 		drop(claim);
 		self.notify_flusher.notify_one();
+		// Unless the tree was abandoned: its flusher is gone, and `abandon` has looked at the
+		// ring already. The payload is taken from the entry by whichever comes first, this or the
+		// scan of `abandon`, and the one that takes it tells the committer.
+		if self.inner.pooled && self.abandoned.load(Ordering::SeqCst) {
+			self.fail_accepted_entries();
+		}
 		#[cfg(test)]
 		self.fire_commit(CommitStage::Accepted);
 
@@ -803,9 +1015,15 @@ impl CommitPipeline {
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
 
-	/// Claims the next ring sequence and publishes `entry` into it.
+	/// Records the write keys of `entry` in the index, claims the next ring sequence, stores it
+	/// in the entry and publishes it. The keys are recorded before the sequence is claimed, so a
+	/// committer that claims a later one finds them without waiting for this one to publish (see
+	/// `WriteIndex`). Nothing is awaited from the record to the store, so a committer that finds
+	/// the keys before the sequence waits only for the claim.
 	fn publish(&self, entry: &Arc<CommitEntry>) -> u64 {
+		self.index.insert(entry, self.ring.taken());
 		let seq = self.ring.claim();
+		entry.set_seq(seq);
 		self.ring.publish_with(seq, Arc::clone(entry), |prev_seq, prev| {
 			// A live window may still reach an entry above the retired
 			// watermark: keep it where validation looks once its slot is gone.
@@ -820,6 +1038,11 @@ impl CommitPipeline {
 	/// Checks `entry`, published at `seq`, against every commit in
 	/// `(window, seq)` that its snapshot at `start_seq` does not already see.
 	/// Entries still in flight count as conflicts: they may yet commit.
+	///
+	/// Every such commit recorded its write keys in the index before it claimed its sequence, and
+	/// so before this one claimed `seq`: looking up the committer's own write keys and locked reads
+	/// finds each one that wrote any of them, at a cost that does not grow with the window, and
+	/// without waiting for the commits below `seq` that wrote none of them.
 	fn validate(
 		&self,
 		entry: &CommitEntry,
@@ -827,35 +1050,11 @@ impl CommitPipeline {
 		start_seq: u64,
 		window: u64,
 		read_set: &[Key],
-		read_bloom: &BloomFilter,
 	) -> Result<()> {
-		let conflicts = |other: &CommitEntry| -> bool {
-			if other.is_ignorable_at(start_seq) {
-				return false;
-			}
-			!other.is_disjoint_writeset(entry.keys(), entry.bloom())
-				|| (!read_set.is_empty() && !other.is_disjoint_readset(read_set, read_bloom))
-		};
-		for s in (window + 1)..seq {
-			let mut spins = 0;
-			let conflict = loop {
-				match self.ring.read(s, |other| conflicts(other)) {
-					SlotRead::Ready(conflict) => break conflict,
-					// Claimed before us but not yet published: the claimer
-					// publishes without awaiting, so this is brief.
-					SlotRead::Pending => {
-						backoff(spins);
-						spins += 1;
-					}
-					// Lapped while our window was open: it was kept in the
-					// overflow. Retired entries sit below every live window,
-					// so if it is missing, treat it conservatively.
-					SlotRead::Gone => {
-						break self.overflow.lock().get(&s).is_none_or(|other| conflicts(other));
-					}
-				}
-			};
-			if conflict {
+		let writes = entry.keys().iter().zip(entry.hashes().iter().copied());
+		let reads = read_set.iter().map(|k| (k, key_hash(k)));
+		for (key, hash) in writes.chain(reads) {
+			if self.index.conflicts(key, hash, seq, start_seq, window) {
 				return Err(Error::TransactionWriteConflict);
 			}
 		}
@@ -881,25 +1080,45 @@ impl CommitPipeline {
 			std::pin::pin!(Arc::clone(&self.admission).acquire_many_owned(ADMISSION_PERMITS));
 		// Whether retired entries may still be waiting in the overflow map.
 		let mut retired_pending = false;
+		// Steps of freeing the flusher took in a gap under load since the last group.
+		let mut busy_steps = 0u32;
 		loop {
 			// Gather the contiguous decided entries after `drained`, with the permits to
 			// release once the completed prefix passes them, as one. The group stops before
-			// the entry that would take it past `MAX_GROUP_BYTES`. That entry is still accepted
+			// the entry that would take it past `MAX_GROUP_BYTES`, or past what its memtable
+			// estimates may add up to (`group_est_budget`). That entry is still accepted
 			// and in the ring, and starts the next group: the flusher parks only when a pass
 			// finds nothing, and a group always takes its first entry.
 			let mut permits: Option<OwnedSemaphorePermit> = None;
 			let mut group_bytes = 0usize;
+			let mut group_estimate = 0u64;
+			#[cfg(test)]
+			let est_budget = if self.est_cap_lifted.load(Ordering::Relaxed) {
+				u64::MAX
+			} else {
+				self.group_est_budget
+			};
+			#[cfg(not(test))]
+			let est_budget = self.group_est_budget;
 			let mut next = drained + 1;
 			loop {
 				match self.ring.get(next) {
 					SlotRead::Ready(entry) => match entry.state() {
 						EntryState::InFlight => break,
 						EntryState::Accepted => {
-							let bytes = entry.payload_bytes();
-							if !group_has_room(scratch.group.len(), group_bytes, bytes) {
+							let (bytes, estimate) = entry.payload_cost();
+							if !group_has_room(
+								scratch.group.len(),
+								group_bytes,
+								bytes,
+								group_estimate,
+								estimate,
+								est_budget,
+							) {
 								break;
 							}
 							group_bytes = group_bytes.saturating_add(bytes);
+							group_estimate = group_estimate.saturating_add(estimate);
 							let payload =
 								entry.take_payload().expect("accepted entries carry a payload");
 							merge_permit(&mut permits, entry.take_permit());
@@ -936,9 +1155,20 @@ impl CommitPipeline {
 				}
 				if retired_pending {
 					// Nothing to flush: carry on freeing instead of parking with the
-					// memory held, yielding so that the committers get to run.
-					retired_pending = self.free_retired(&mut scratch.retired, 0);
-					tokio::task::yield_now().await;
+					// memory held, yielding so that the committers get to run. Not after
+					// every step if commits are in flight, which makes this a gap between
+					// two groups: see `BUSY_COMMITS`.
+					if self.commits_in_flight() >= BUSY_COMMITS {
+						retired_pending = self.free_retired(&mut scratch.retired, BUSY_FREE_SLOTS);
+						busy_steps += 1;
+						if busy_steps % BUSY_STEPS_PER_YIELD == 0 {
+							rt::yield_now().await;
+						}
+					} else {
+						retired_pending =
+							self.free_retired(&mut scratch.retired, retired_slots_per_step(0));
+						rt::yield_now().await;
+					}
 					continue;
 				}
 				// Wait for new published or decided entries
@@ -948,9 +1178,23 @@ impl CommitPipeline {
 			let entries = next - (drained + 1);
 			entries_since_retire += entries;
 			drained = next - 1;
+			busy_steps = 0;
 
 			if !scratch.group.is_empty() {
-				self.flush_entries(&mut scratch).await;
+				// A pool has a fixed number of files to create from: the group waits until it has
+				// as many as the group may need, before it logs or applies anything of it. Nothing
+				// is awaited between this and the end of the group that is not a file system call
+				// that answers at once, so what was found here is there when the group needs it.
+				let spares = if self.inner.pooled {
+					let shape = self.group_shape(&scratch.group, group_estimate);
+					self.wait_for_spares(group_bytes, shape).await
+				} else {
+					Ok(())
+				};
+				match spares {
+					Ok(()) => self.flush_entries(&mut scratch).await,
+					Err(error) => self.fail_unstarted_group(&mut scratch, &error),
+				}
 				scratch.recycle();
 			}
 			// Every drained entry is now complete, so the completed prefix
@@ -973,8 +1217,71 @@ impl CommitPipeline {
 			// One chunk per group, so that the entries a long-lived transaction left behind
 			// do not stall the commits that follow it.
 			if retired_pending {
-				retired_pending = self.free_retired(&mut scratch.retired, entries);
+				retired_pending =
+					self.free_retired(&mut scratch.retired, retired_slots_per_step(entries));
 			}
+		}
+	}
+
+	/// What the group that was gathered is, for the files it needs: see `GroupShape`. Looked at
+	/// only for a pool whose cap is below the full bound, since it is the only one that tells
+	/// groups apart.
+	fn group_shape(&self, group: &[(Arc<CommitEntry>, Payload)], estimate: u64) -> GroupShape {
+		if !self.inner.is_cap_limited() {
+			return GroupShape::default();
+		}
+		let room = crate::memtable::fresh_room(self.inner.opts.max_memtable_size);
+		GroupShape {
+			usual: small_group_need_of(&self.inner.opts, estimate),
+			delete_only: group.iter().all(|(_, payload)| {
+				payload.batch.entries.iter().all(|entry| {
+					matches!(
+						entry.kind,
+						crate::InternalKeyKind::Delete
+							| crate::InternalKeyKind::SoftDelete
+							| crate::InternalKeyKind::RangeDelete
+					)
+				})
+			}),
+			oversized: group.iter().any(|(entry, _)| entry.payload_cost().1 > room),
+		}
+	}
+
+	/// Waits until the pool has the files that a group of `group_bytes` bytes may create (see
+	/// `group_need_of`). Nothing of the group is logged or applied yet, so a wait that fails fails
+	/// the group cleanly: see `fail_unstarted_group`.
+	///
+	/// Once the pipeline is shut down the wait is bounded: a refill that never answers must not
+	/// keep `close` from ending.
+	async fn wait_for_spares(&self, group_bytes: usize, shape: GroupShape) -> Result<()> {
+		let need = self.inner.commit_group_need(shape, vlog_term(&self.inner.opts, group_bytes));
+		let Some(mut wait) = self.inner.opts.fs.ensure_spares(need) else {
+			return Ok(());
+		};
+		while !self.shutdown.load(Ordering::Acquire) {
+			tokio::select! {
+				done = &mut wait => return done.map_err(Error::from),
+				() = self.notify_flusher.notified() => {}
+			}
+		}
+		match rt::timeout(SHUTDOWN_SPARES_WAIT, wait).await {
+			Ok(done) => done.map_err(Error::from),
+			Err(_) => Err(Error::Other(
+				"the pool did not make the files for the last commits while the tree was closing"
+					.to_string(),
+			)),
+		}
+	}
+
+	/// Fails every entry of the group that was gathered and has not been started, with `error` as
+	/// it is: the committers hear whether to try again (`Error::FilePoolExhausted`) or not. No
+	/// sequence number was taken and nothing was logged, so there is nothing to undo, and the
+	/// database does not stop.
+	fn fail_unstarted_group(&self, scratch: &mut FlushScratch, error: &Error) {
+		tracing::warn!("A commit group was failed before it began: {error}");
+		for (entry, payload) in scratch.group.drain(..) {
+			entry.abort();
+			let _ = payload.complete_tx.send(Err(error.clone()));
 		}
 	}
 
@@ -1104,7 +1411,8 @@ impl CommitPipeline {
 				// A key that could not be had, or a seal that was refused, is told to every
 				// committer of the group as it is: whether to try the commit again depends on
 				// which.
-				Err(e @ Error::Encryption(_)) => Err(e.clone()),
+				Err(e @ (Error::Encryption(_) | Error::FilePoolExhausted)) => Err(e.clone()),
+				Err(e) if e.is_storage_full() => Err(e.clone()),
 				Err(e) => Err(Error::Io(
 					std::io::Error::other(format!("Group commit failed: {e}")).into(),
 				)),
@@ -1165,14 +1473,13 @@ impl CommitPipeline {
 		self.ring.raise_taken(bound);
 	}
 
-	/// Frees one chunk of the ring slots and one chunk of the overflow entries that the retired
-	/// watermark has passed, and reports whether more of either are left. `entries` is how many
-	/// ring entries the group before it drained, which scales the ring's chunk, and `freed` is
-	/// the buffer the overflow entries go through, empty on entry.
+	/// Frees up to `slots` of the ring slots and one chunk of the overflow entries that the retired
+	/// watermark has passed, and reports whether more of either are left. `freed` is the buffer
+	/// the overflow entries go through, empty on entry.
 	///
 	/// What validation reads is above the watermark, so which of the entries at or below it are
 	/// still held does not matter to it, and the rest can wait for the next call.
-	fn free_retired(&self, freed: &mut Vec<Arc<CommitEntry>>, entries: u64) -> bool {
+	fn free_retired(&self, freed: &mut Vec<Arc<CommitEntry>>, slots: u64) -> bool {
 		#[cfg(test)]
 		{
 			let hook = self.free_hook.lock().clone();
@@ -1180,7 +1487,7 @@ impl CommitPipeline {
 				hook();
 			}
 		}
-		let more_slots = self.ring.release_retired(retired_slots_per_step(entries));
+		let more_slots = self.ring.release_retired(slots);
 		#[cfg_attr(not(test), allow(unused_variables))]
 		let (count, more) =
 			free_retired_from(&self.overflow, self.ring.taken(), RETIRED_FREE_CHUNK, freed);
@@ -1258,7 +1565,9 @@ impl CommitPipeline {
 		// failed sync fails the group before the WAL has been touched.
 		if let Some(vlog_inst) = vlog {
 			if sync {
-				vlog_inst.sync()?;
+				// A group of inline values appended nothing to the value log, which then needs no
+				// fsync of its own, and each group would otherwise pay for one.
+				vlog_inst.sync_dirty()?;
 			} else {
 				vlog_inst.flush()?;
 			}
@@ -1310,7 +1619,12 @@ impl CommitPipeline {
 		// This is only an optimisation for the common case (a lone writer then never
 		// logs a record twice): every other case is repaired in step 3, because the
 		// estimate is a worst case, so how far a group gets into a memtable is only
-		// known by applying it.
+		// known by applying it. The gather bounds what the repair can cost: the estimates
+		// of a group add up to no more than a fresh memtable takes (`group_est_budget`), so
+		// the rest of a group fits the memtable it rotated to. Below 32 MiB a group
+		// rotates at most once, before its append or during its apply, and a batch is
+		// logged at most twice; a rotation by someone else (a checkpoint, a seal, a heal)
+		// can still overtake a group, and it is repaired the same way.
 		if oversized.first() == Some(&false) && self.needs_rotation_for(estimates[0])? {
 			self.inner.rotate_memtable()?;
 			if let Some(ref tm) = self.task_manager {
@@ -1539,7 +1853,7 @@ impl CommitPipeline {
 		}
 		let inner = Arc::clone(&self.inner);
 		let current = Arc::clone(&self.restore_epoch);
-		let dropped = affinitypool::spawn(move || {
+		let dropped = rt::run_blocking(move || {
 			inner.drop_unapplied_group(below, || current.load(Ordering::SeqCst) == epoch)
 		})
 		.await;
@@ -1549,7 +1863,8 @@ impl CommitPipeline {
 			}
 			return Err(match e {
 				// Whether the group may be tried again depends on the key error.
-				Error::Encryption(_) | Error::PipelineStall => e,
+				Error::Encryption(_) | Error::FilePoolExhausted | Error::PipelineStall => e,
+				e if e.is_storage_full() => e,
 				e => Error::Other(format!(
 					"Failed to drop the records of a failed commit group from the WAL: {e}"
 				)),
@@ -1592,14 +1907,15 @@ impl CommitPipeline {
 
 		if !self.inner.try_release_wal_hold()? {
 			let inner = Arc::clone(&self.inner);
-			let flushed = affinitypool::spawn(move || inner.flush_all_immutables_sync()).await;
+			let flushed = rt::run_blocking(move || inner.flush_all_immutables_sync()).await;
 			if let Err(e) = flushed {
 				if let Some(ref tm) = self.task_manager {
 					tm.wake_up_memtable();
 				}
 				return Err(match e {
 					// Whether the group may be tried again depends on the key error.
-					Error::Encryption(_) => e,
+					Error::Encryption(_) | Error::FilePoolExhausted => e,
+					e if e.is_storage_full() => e,
 					e => Error::Other(format!(
 						"Failed to flush the memtables of the failed WAL segment: {e}"
 					)),
@@ -1782,6 +2098,13 @@ impl CommitPipeline {
 	/// A record already in that segment is never appended a second time. The value
 	/// log needs no second pass: its entries were synced with the first.
 	///
+	/// A group is logged again once for every rotation that overtakes it, and the gather
+	/// bounds those: a group whose memtable estimates fit a fresh memtable (see
+	/// `group_est_budget`) is overtaken by its own rotation once at most, so a batch is in
+	/// the WAL twice at most, the second copy in the segment of the memtable that applies it.
+	/// Recovery replays both, which is harmless: the copies have the same keys, sequence
+	/// numbers and values, and the replay is not deduplicated.
+	///
 	/// The stale batches go to the WAL as one group, so they land in one segment. They are
 	/// encoded into the group's own buffers, which the first append gave back with room for the
 	/// whole group. Nothing is reserved for them, because part of the group is already applied.
@@ -1888,6 +2211,10 @@ impl CommitPipeline {
 				sealed_wal_number,
 				rest_wal_number,
 			)?;
+			// The segments the manifest is past are obsolete now, and nothing else would remove
+			// them until the next flush or the close: a run of oversized commits has no flush, and
+			// would leave one segment each.
+			self.inner.remove_obsolete_wal_segments();
 		}
 
 		if let Some(ref tm) = self.task_manager {
@@ -1917,6 +2244,47 @@ impl CommitPipeline {
 	pub(crate) fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
 		self.notify_flusher.notify_one();
+	}
+
+	/// Ends the pipeline the way a crash does, for a tree that is abandoned and whose flusher is
+	/// aborted: every commit that is not decided is told `Error::PipelineStall`, and none waits for
+	/// a flusher that is not there.
+	///
+	/// - A commit that queues for admission is let go (`admission` is closed).
+	/// - A commit that was accepted and not drained is failed here, from the ring.
+	/// - A commit that the flusher had gathered fails when its task is dropped (its sender goes
+	///   with it).
+	/// - A commit that is not accepted yet, whether it is validating, or has been given its permit
+	///   and has not run, finds `abandoned` set when it accepts, or when it wakes, and fails
+	///   itself: the flag is stored before the ring is read here, and read after the entry is
+	///   accepted there, both with `SeqCst`, so one of the two sees the other. On a database that
+	///   is not in a pool that last check is not made (a commit on `std` is not given an atomic
+	///   load more), and such a commit may be left pending: abandoning a tree is a test of crashes
+	///   there, which does not commit while it abandons.
+	pub(crate) fn abandon(&self) {
+		self.abandoned.store(true, Ordering::SeqCst);
+		self.shutdown();
+		self.admission.close();
+		self.fail_accepted_entries();
+	}
+
+	/// Tells `Error::PipelineStall` to every commit that is accepted and not taken by a flusher.
+	fn fail_accepted_entries(&self) {
+		// Admission keeps at most `ADMISSION_PERMITS` entries above the completed prefix. A slot
+		// that is not published (yet) is skipped: its committer finds `abandoned` when it accepts.
+		let from = self.ring.completed() + 1;
+		for seq in from..from + u64::from(ADMISSION_PERMITS) {
+			let SlotRead::Ready(entry) = self.ring.get(seq) else {
+				continue;
+			};
+			if !matches!(entry.state(), EntryState::Accepted) {
+				continue;
+			}
+			if let Some(payload) = entry.take_payload() {
+				entry.abort();
+				let _ = payload.complete_tx.send(Err(Error::PipelineStall));
+			}
+		}
 	}
 
 	/// Locks writes for database restore.
@@ -2021,71 +2389,38 @@ fn encode_values(
 	vlog_threshold: usize,
 	stamp: bool,
 ) -> Result<()> {
+	// A batch its committer prepared has its values wrapped already, and was held to the limit.
+	if batch.prepared.is_some() {
+		return Ok(());
+	}
 	// What a value adds to `Batch::size`: its length, and the varint that gives it.
 	let value_size = |len: usize| varint_len_u64(len as u64) as u64 + len as u64;
 	let starting_seq_num = batch.starting_seq_num;
 	for (i, entry) in batch.entries.iter_mut().enumerate() {
-		if entry.kind == InternalKeyKind::RangeDelete {
-			continue;
-		}
-		let timestamp = stamp.then_some(entry.timestamp);
-		if entry.value.is_none() {
-			if let (Some(timestamp), InternalKeyKind::SoftDelete) = (timestamp, entry.kind) {
-				let mut value = Vec::new();
-				try_reserve_bytes(&mut value, 2 + VALUE_TIMESTAMP_SIZE)?;
-				value.extend_from_slice(&[BIT_HAS_TIMESTAMP, VALUE_LOCATION_VERSION]);
-				value.extend_from_slice(&timestamp.to_be_bytes());
-				batch.size = batch.size - value_size(0) + value_size(value.len());
-				entry.value = Some(value);
-			}
-			continue;
-		}
-		let value = entry.value.as_mut().expect("checked above");
-		let size_before = value_size(value.len());
-		match vlog {
-			Some(vlog) if value.len() > vlog_threshold => {
+		match (vlog, entry.value.as_mut()) {
+			(Some(vlog), Some(value))
+				if entry.kind != InternalKeyKind::RangeDelete && value.len() > vlog_threshold =>
+			{
+				let size_before = value_size(value.len());
+				let timestamp = stamp.then_some(entry.timestamp);
 				let ikey =
 					InternalKey::new(entry.key.clone(), starting_seq_num + i as u64, entry.kind);
 				let pointer = vlog.append(&ikey.encode(), value)?;
 				*value = ValueLocation::with_pointer(pointer).with_timestamp(timestamp).encode();
+				batch.size = batch.size - size_before + value_size(value.len());
 			}
 			_ => {
-				// `ValueLocation::with_inline_value(value).with_timestamp(timestamp).encode()`,
-				// without the copies.
-				let len = value.len();
-				let header = if timestamp.is_some() {
-					2 + VALUE_TIMESTAMP_SIZE
-				} else {
-					2
-				};
-				try_reserve_bytes(value, header)?;
-				value.resize(len + header, 0);
-				value.copy_within(0..len, header);
-				value[1] = VALUE_LOCATION_VERSION;
-				match timestamp {
-					Some(timestamp) => {
-						value[0] = BIT_HAS_TIMESTAMP;
-						value[2..header].copy_from_slice(&timestamp.to_be_bytes());
-					}
-					None => value[0] = 0,
+				if let Some(grown) = wrap_inline(entry, stamp)? {
+					batch.size += grown;
 				}
 			}
 		}
-		batch.size = batch.size - size_before + value_size(value.len());
 	}
 	// The bytes of every wrapped value count against the limit `add_record` enforces.
 	if batch.exceeds_max_size() {
 		return Err(Error::BatchTooLarge);
 	}
 	Ok(())
-}
-
-fn bloom_of(keys: &[Key]) -> BloomFilter {
-	let mut bloom = BloomFilter::new();
-	for k in keys {
-		bloom.insert(k);
-	}
-	bloom
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -2169,6 +2504,39 @@ mod encode_values_tests {
 					let expected = copying_reference(&batch, stamp);
 					let mut expected_bytes = Vec::new();
 					expected.encode_into(&mut expected_bytes).unwrap();
+
+					// What a committer prepares is what the flusher would log, with no value
+					// log, and with one that none of the values reaches.
+					for threshold in [None, Some(70_000)] {
+						let mut prepared = batch.clone();
+						prepared.set_starting_seq_num(0);
+						prepared.prepare_inline(threshold, stamp).unwrap();
+						assert!(prepared.prepared.is_some());
+						prepared.set_starting_seq_num(41);
+						encode_values(&mut prepared, None, usize::MAX, stamp).unwrap();
+						let mut prepared_bytes = Vec::new();
+						prepared.encode_into(&mut prepared_bytes).unwrap();
+						let what = format!(
+							"prepared stamp={stamp} entries={entries} value_len={value_len} \
+							 {kind_offset} {threshold:?}"
+						);
+						assert_eq!(prepared_bytes, expected_bytes, "{what}");
+						assert_eq!(prepared.size, expected.size, "{what}");
+						assert!(prepared.encoded_len_hint() >= prepared_bytes.len(), "{what}");
+						assert_eq!(
+							prepared.memtable_size_estimate(),
+							expected.memtable_size_estimate(),
+							"{what}"
+						);
+					}
+					// A value for the value log leaves the batch to the flusher.
+					if value_len > 8 && (0..entries).any(|i| matches!((i + kind_offset) % 6, 0 | 4))
+					{
+						let mut left = batch.clone();
+						left.prepare_inline(Some(8), stamp).unwrap();
+						assert!(left.prepared.is_none());
+						assert_eq!(left.size, batch.size);
+					}
 
 					encode_values(&mut batch, None, usize::MAX, stamp).unwrap();
 					let mut actual_bytes = Vec::new();
@@ -2516,21 +2884,139 @@ mod retire_due_tests {
 mod group_budget_tests {
 	use super::*;
 
+	/// A budget that no estimate reaches, for the tests of the byte rule.
+	const FAR: u64 = u64::MAX;
+
 	#[test]
 	fn a_group_always_takes_its_first_entry_and_then_only_what_fits_the_budget() {
 		// An entry over the budget is a group of its own: it is taken by an empty group, and
 		// nothing is taken after it.
-		assert!(group_has_room(0, 0, MAX_GROUP_BYTES + 1));
-		assert!(group_has_room(0, 0, usize::MAX));
-		assert!(!group_has_room(1, MAX_GROUP_BYTES + 1, 1));
+		assert!(group_has_room(0, 0, MAX_GROUP_BYTES + 1, 0, 0, FAR));
+		assert!(group_has_room(0, 0, usize::MAX, 0, 0, FAR));
+		assert!(!group_has_room(1, MAX_GROUP_BYTES + 1, 1, 0, 0, FAR));
 		// Within the budget, up to and including the byte that fills it.
-		assert!(group_has_room(1, 100, MAX_GROUP_BYTES - 100));
-		assert!(!group_has_room(1, 100, MAX_GROUP_BYTES - 100 + 1));
-		assert!(group_has_room(3, MAX_GROUP_BYTES - 1, 1));
-		assert!(!group_has_room(3, MAX_GROUP_BYTES, 1));
+		assert!(group_has_room(1, 100, MAX_GROUP_BYTES - 100, 0, 0, FAR));
+		assert!(!group_has_room(1, 100, MAX_GROUP_BYTES - 100 + 1, 0, 0, FAR));
+		assert!(group_has_room(3, MAX_GROUP_BYTES - 1, 1, 0, 0, FAR));
+		assert!(!group_has_room(3, MAX_GROUP_BYTES, 1, 0, 0, FAR));
 		// A size that overflows the sum is over the budget, not wrapped back under it.
-		assert!(!group_has_room(1, 10, usize::MAX));
-		assert!(!group_has_room(1, usize::MAX, usize::MAX));
+		assert!(!group_has_room(1, 10, usize::MAX, 0, 0, FAR));
+		assert!(!group_has_room(1, usize::MAX, usize::MAX, 0, 0, FAR));
+	}
+
+	#[test]
+	fn a_group_also_stops_at_the_memtable_estimate_it_may_add_up_to() {
+		// The first entry is taken whatever it estimates, and nothing joins it then.
+		assert!(group_has_room(0, 0, 1, 0, 1_000_000, 1000));
+		assert!(!group_has_room(1, 1, 1, 1_000_000, 1, 1000));
+		assert!(!group_has_room(1, 1, 1, 1, 1_000_000, 1000));
+		// Up to and including the estimate that fills the budget, and not one over.
+		assert!(group_has_room(2, 10, 10, 600, 400, 1000));
+		assert!(!group_has_room(2, 10, 10, 600, 401, 1000));
+		// Either bound closes the group.
+		assert!(!group_has_room(2, MAX_GROUP_BYTES, 1, 0, 1, 1000));
+		assert!(!group_has_room(2, 1, 1, 1000, 1, 1000));
+		// A sum that overflows is over the budget.
+		assert!(!group_has_room(1, 1, 1, u64::MAX, u64::MAX, u64::MAX - 1));
+	}
+
+	#[test]
+	fn the_budget_is_a_fresh_arena_up_to_32_mib_and_a_multiple_of_it_after() {
+		let mib = 1usize << 20;
+		for size in [0, 63, 64, 100, 4096, 64 * 1024, mib, 4 * mib, 16 * mib, 31 * mib] {
+			assert_eq!(group_est_budget(size), crate::memtable::fresh_room(size), "{size}");
+		}
+		assert_eq!(group_est_budget(32 * mib), crate::memtable::fresh_room(32 * mib));
+		assert_eq!(group_est_budget(32 * mib + 64), 2 * crate::memtable::fresh_room(32 * mib + 64));
+		assert_eq!(
+			group_est_budget(100 * mib),
+			6 * crate::memtable::fresh_room(100 * mib),
+			"the default memtable"
+		);
+		assert_eq!(
+			group_est_budget(usize::MAX),
+			u64::from(u32::MAX),
+			"a budget is held in the 32 bits of an entry's cost"
+		);
+		let default = crate::Options::default();
+		assert!(
+			(MAX_GROUP_BYTES as u64 / 14 + 1) * crate::batch::GATHER_ENTRY_BYTES
+				<= group_est_budget(default.max_memtable_size),
+			"the default options never close a group at the estimate"
+		);
+	}
+
+	#[test]
+	fn the_room_of_a_fresh_arena_is_what_a_real_memtable_has() {
+		for size in [
+			0,
+			1,
+			63,
+			64,
+			65,
+			127,
+			128,
+			1000,
+			4096,
+			64 * 1024,
+			64 * 1024 + 63,
+			1 << 20,
+			(1 << 20) + 1,
+			16 << 20,
+		] {
+			let memtable = crate::memtable::MemTable::new(size);
+			assert_eq!(
+				crate::memtable::fresh_room(size),
+				(memtable.arena_capacity() - memtable.size()) as u64,
+				"a memtable of {size}"
+			);
+		}
+		// Past the biggest arena, and the sizes that artmap clamps, without allocating them.
+		let max = artmap::arena::MAX_ARENA_SIZE;
+		assert_eq!(crate::memtable::fresh_room(max), (max - 64) as u64);
+		assert_eq!(crate::memtable::fresh_room(usize::MAX), (max - 64) as u64);
+	}
+
+	#[test]
+	fn a_cost_is_packed_and_saturates_in_each_half() {
+		use tokio::sync::Semaphore;
+
+		let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+		let entry = CommitEntry::new(Vec::new(), permit());
+		let (tx, _rx) = oneshot::channel();
+		let mut batch = Batch::new(1);
+		batch
+			.add_record(InternalKeyKind::Set, b"key".to_vec(), Some(b"value".to_vec()), 1)
+			.unwrap();
+		let (hint, estimate) = (batch.encoded_len_hint(), batch.gather_estimate());
+		entry.accept(Payload {
+			batch,
+			sync: false,
+			complete_tx: tx,
+			epoch: 0,
+		});
+		assert_eq!(entry.payload_cost(), (hint, estimate));
+
+		// A batch whose estimate does not fit 32 bits: the half that overflows saturates and
+		// leaves the other alone.
+		let entry = CommitEntry::new(Vec::new(), permit());
+		let (tx, _rx) = oneshot::channel();
+		let mut big = Batch::new(1);
+		big.add_record(InternalKeyKind::Set, b"k".to_vec(), Some(b"v".to_vec()), 1).unwrap();
+		big.size = u64::from(u32::MAX) * 4;
+		entry.accept(Payload {
+			batch: big,
+			sync: false,
+			complete_tx: tx,
+			epoch: 0,
+		});
+		let (bytes, estimate) = entry.payload_cost();
+		assert_eq!(bytes, u32::MAX as usize);
+		assert_eq!(estimate, u64::from(u32::MAX));
+		assert!(
+			!group_has_room(1, 0, bytes, 0, estimate, group_est_budget(usize::MAX)),
+			"a saturated entry does not share a group"
+		);
 	}
 
 	#[test]
@@ -2557,6 +3043,74 @@ mod scratch_tests {
 
 	use super::*;
 	use crate::{Options, Tree};
+
+	/// The estimate that closes a commit group is an upper bound on the one that the memtable
+	/// reserves: the flusher encodes the values (wraps them, or replaces them by pointers) before
+	/// the memtable sees the batch, and the bound is read before that, from two numbers.
+	#[tokio::test]
+	async fn the_gather_estimate_is_never_under_the_estimate_of_the_encoded_batch() {
+		let mut x = 0x9E37_79B9_7F4A_7C15u64;
+		let mut next = move |n: usize| {
+			x ^= x << 13;
+			x ^= x >> 7;
+			x ^= x << 17;
+			(x % n as u64) as usize
+		};
+		let dir = TempDir::new("gather_estimate").unwrap();
+		for (name, vlog) in [("without", false), ("with", true)] {
+			let tree = Tree::new(Arc::new(Options {
+				path: dir.path().join(name),
+				enable_vlog: vlog,
+				..Default::default()
+			}))
+			.unwrap();
+			let vlog = tree.core.inner.vlog.as_ref();
+			assert_eq!(vlog.is_some(), name == "with");
+			let kinds = [
+				InternalKeyKind::Set,
+				InternalKeyKind::Delete,
+				InternalKeyKind::SoftDelete,
+				InternalKeyKind::RangeDelete,
+			];
+			let mut worst = 0f64;
+			for case in 0..3000 {
+				let mut batch = Batch::new(1);
+				for _ in 0..1 + next(8) {
+					// Key lengths cover every step of artmap's prefix chain, and 0 and 1.
+					let key = vec![
+						b'k';
+						if next(4) == 0 {
+							next(3)
+						} else {
+							next(301)
+						}
+					];
+					let value_len = [0, 1, 7, 8, 30, 100, 1000, 3000][next(8)];
+					let (kind, value) = match kinds[next(4)] {
+						InternalKeyKind::Set => (InternalKeyKind::Set, Some(vec![b'v'; value_len])),
+						InternalKeyKind::RangeDelete => {
+							(InternalKeyKind::RangeDelete, Some(vec![b'z'; next(301)]))
+						}
+						kind => (kind, None),
+					};
+					batch.add_record(kind, key, value, 1 + next(1 << 40) as u64).unwrap();
+				}
+				let (stamp, threshold) = (next(2) == 1, [8, 64, 1024, 2048][next(4)]);
+				let bound = batch.gather_estimate();
+				encode_values(&mut batch, vlog, threshold, stamp).unwrap();
+				let estimate = batch.memtable_size_estimate();
+				assert!(
+					bound >= estimate,
+					"case {case} (vlog {vlog:?}, stamp {stamp}, threshold {threshold}): bound {bound} \
+					 is under the estimate {estimate}",
+					vlog = vlog.is_some()
+				);
+				worst = worst.max(bound as f64 / estimate.max(1) as f64);
+			}
+			println!("gather estimate {name} a value log: loosest {worst:.2}x");
+			tree.close().await.unwrap();
+		}
+	}
 
 	#[test]
 	fn recycle_empties_a_buffer_and_gives_back_one_that_grew_too_big() {

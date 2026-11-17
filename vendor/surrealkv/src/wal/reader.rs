@@ -1,12 +1,12 @@
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
 use crate::error::EncryptionError;
 use crate::tde::{FileCipher, HEADER_MAGIC};
-use crate::vfs::File as VfsFile;
+use crate::vfs::{File as VfsFile, FsCursor, IntoFsFile};
 use crate::wal::{
 	calculate_crc32,
+	parse_sync_mark,
 	sealed,
 	validate_record_type,
 	CompressionType,
@@ -18,6 +18,7 @@ use crate::wal::{
 	WalContext,
 	BLOCK_SIZE,
 	HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
+	SYNC_MARK_LEN,
 };
 
 /// Reporter interface for WAL corruption and errors.
@@ -60,8 +61,9 @@ fn physical(what: &str) -> Error {
 /// remain, the remainder is discarded (it's padding) and the next block is
 /// read.
 pub(crate) struct Reader {
-	/// The underlying file handle
-	file: File,
+	/// The underlying file, read through a cursor of the reader's own: the file may be shared
+	/// (a pool has one handle of a file), so nothing here depends on where it is positioned.
+	file: FsCursor,
 
 	/// Buffer holding the current block's data
 	buffer: Box<[u8; BLOCK_SIZE]>,
@@ -118,14 +120,14 @@ pub(crate) struct Reader {
 impl Reader {
 	/// Creates a new Reader of a plaintext segment from a File with default settings.
 	#[cfg(test)]
-	pub(crate) fn new(file: File) -> Self {
+	pub(crate) fn new(file: impl IntoFsFile) -> Self {
 		Self::with_context(file, None, 0, &WalContext::plaintext())
 	}
 
 	/// Creates a reader of the segment `log_number` for a WAL whose segments are as `context`
 	/// says.
 	pub(crate) fn with_context(
-		file: File,
+		file: impl IntoFsFile,
 		reporter: Option<Box<dyn Reporter>>,
 		log_number: u64,
 		context: &WalContext,
@@ -135,7 +137,7 @@ impl Reader {
 			sealed: None,
 			record_start: 0,
 			parsed_length: None,
-			file,
+			file: FsCursor::new(file.into_fs_file()),
 			buffer: Box::new([0; BLOCK_SIZE]),
 			buffer_offset: 0,
 			buffer_end: 0,
@@ -420,6 +422,29 @@ impl Reader {
 				continue; // Don't return this as a data record
 			}
 
+			// A sync mark is for recovery to read, see `classify_wal_damage_in`. It stands between
+			// records, never between the fragments of one, and is checked like a fragment is.
+			if self.cur_rec_type == RecordType::SyncMark {
+				if fragment_index != 0 {
+					return Err(Error::IO(IOError::new(
+						io::ErrorKind::Other,
+						"sync mark inside a record",
+					)));
+				}
+				if (length as usize) > self.buffer_remaining() {
+					return Err(Error::IO(IOError::new(
+						io::ErrorKind::Other,
+						"bad record length - exceeds block boundary",
+					)));
+				}
+				let rest = &self.buffer[self.buffer_offset..self.buffer_end];
+				if parse_sync_mark(crc, length, type_byte, rest).is_none() {
+					return Err(Error::IO(IOError::new(io::ErrorKind::Other, "checksum mismatch")));
+				}
+				self.buffer_offset += SYNC_MARK_LEN;
+				continue;
+			}
+
 			// Validate the record type for fragment sequencing
 			validate_record_type(self.cur_rec_type, fragment_index)?;
 
@@ -653,7 +678,7 @@ impl Reader {
 				return Err(physical("zeros where the header of the segment should be"));
 			}
 			// The first record of a plaintext segment, or the record of its compression.
-			1..=4 | 9 => return Err(EncryptionError::PlaintextInEncryptedDb.into()),
+			1..=4 | 9 | 11 => return Err(EncryptionError::PlaintextInEncryptedDb.into()),
 			_ => return Err(EncryptionError::UnsupportedVersion.into()),
 		}
 		if length > self.buffer_remaining() {
@@ -943,7 +968,11 @@ mod tests {
 	#[test]
 	fn reader_offset_from_first_read() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
-		let opts = Options::default();
+		// Without sync marks, which are records of their own between the ones read here.
+		let opts = Options {
+			sync_marks: false,
+			..Options::default()
+		};
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 		// Write a small record (7 byte header + 3 bytes data = 10 bytes)
@@ -972,7 +1001,11 @@ mod tests {
 	#[test]
 	fn reader_offsets_increasing() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
-		let opts = Options::default();
+		// Without sync marks, which are records of their own between the ones read here.
+		let opts = Options {
+			sync_marks: false,
+			..Options::default()
+		};
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 		// Write multiple records
@@ -1005,7 +1038,11 @@ mod tests {
 	#[test]
 	fn reader_offset_partial_block() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
-		let opts = Options::default();
+		// Without sync marks, which are records of their own between the ones read here.
+		let opts = Options {
+			sync_marks: false,
+			..Options::default()
+		};
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 		// Write records that don't fill a complete block

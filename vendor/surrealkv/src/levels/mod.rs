@@ -4,7 +4,6 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher;
 use iter::LevelManifestIterator;
@@ -20,9 +19,9 @@ use crate::tde::{
 	seal_manifest,
 	EncryptionContext,
 };
-use crate::vfs::File;
-use crate::wal::list_segment_ids;
-use crate::{Options, Result};
+use crate::vfs::{default_fs, File, Fs, FsKind};
+use crate::wal::{parse_segment_name, should_include_file};
+use crate::{rt, Options, Result};
 
 /// Makes the key that the table `table_id`, whose file is `file`, was sealed under available from
 /// the key manager, which may wait on a provider, and which a database that has only ever used the
@@ -58,10 +57,44 @@ fn prepare_key_of_table(
 	Ok(context.prepare(&[identity.key_id])?)
 }
 
+/// The ids of the write-ahead log segments in `dir` that have the extension `allowed_extension`,
+/// sorted, as `wal::list_segment_ids` lists them but through `fs`. `None` where that is an
+/// error: a directory that cannot be listed, and a name that is not a segment's, which makes the
+/// whole listing an error there and so skips the check that asks for it.
+fn segment_ids_in(fs: &dyn Fs, dir: &Path, allowed_extension: &str) -> Option<Vec<u64>> {
+	let mut ids = Vec::new();
+	for entry in fs.read_dir(dir).ok()? {
+		// A link is followed, and one that points to nothing fails the listing: as the
+		// `wal::list_segment_ids` that this stands for did.
+		if entry.resolved_kind(fs, dir).ok()? != crate::vfs::EntryKind::File {
+			continue;
+		}
+		let (index, extension) = parse_segment_name(&entry.name.to_string_lossy()).ok()?;
+		if should_include_file(Some(allowed_extension), extension) {
+			ids.push(index);
+		}
+	}
+	ids.sort_unstable();
+	Some(ids)
+}
+
 /// Validates that the manifest's log_number doesn't exceed actual WAL segments on disk.
 /// This detects manifest corruption that could cause silent data loss.
+///
+/// On the file system that is `std`: only the tests of the check call this form, and every caller
+/// that has options calls [`validate_wal_log_number_in`] with theirs.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64) -> Result<()> {
-	if let Ok(segment_ids) = list_segment_ids(wal_path, Some("wal")) {
+	validate_wal_log_number_in(&*default_fs(), wal_path, manifest_log_number)
+}
+
+/// [`validate_wal_log_number`] over `fs`.
+pub(crate) fn validate_wal_log_number_in(
+	fs: &dyn Fs,
+	wal_path: &Path,
+	manifest_log_number: u64,
+) -> Result<()> {
+	if let Some(segment_ids) = segment_ids_in(fs, wal_path, "wal") {
 		if !segment_ids.is_empty() {
 			let last_wal = *segment_ids.last().unwrap();
 			if manifest_log_number > last_wal + 1 {
@@ -89,15 +122,25 @@ pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64)
 ///
 /// Reads only. Must run before anything else in `Tree::new` touches the directory.
 pub(crate) fn check_manifest_before_open(opts: &Options) -> Result<()> {
+	check_manifest_before_open_in(&*opts.fs, opts)
+}
+
+/// [`check_manifest_before_open`] over `fs`, which is where the open path asks every question
+/// about the directory. Whether the manifest is there is the three-way answer of `try_exists`: a
+/// file system that cannot tell is an error, and never "no manifest".
+pub(crate) fn check_manifest_before_open_in(fs: &dyn Fs, opts: &Options) -> Result<()> {
 	let manifest_path = opts.manifest_file_path(0);
 
-	if manifest_path.try_exists()? {
-		let data = std::fs::read(&manifest_path)?;
+	if fs.try_exists(&manifest_path)? {
+		let data = fs.read(&manifest_path)?;
 		let body = unseal_manifest(data, opts.encryption_context().map(Arc::as_ref));
 		return body.and_then(DecodedManifest::decode).map(drop).map_err(|e| match e {
 			// A key, a database or a manifest of the other kind is not damage, and is not
 			// reported as damage: the files are as they should be and the configuration is not.
 			Error::Encryption(_) => e,
+			// A pool that has no file for a read is not damage either: it is a moment away from
+			// having one, and the error stays the typed one that the tasks retry.
+			Error::FilePoolExhausted => e,
 			e => Error::ManifestCorruption(format!(
 				"{} cannot be decoded: {e}. Restore it from a backup; the data files have not been touched.",
 				manifest_path.display()
@@ -105,9 +148,9 @@ pub(crate) fn check_manifest_before_open(opts: &Options) -> Result<()> {
 		});
 	}
 
-	let sstables = count_files_with_extension(&opts.sstable_dir(), "sst")?;
-	let wal_segments = count_files_with_extension(&opts.wal_dir(), "wal")?;
-	let vlog_files = count_files_with_extension(&opts.vlog_dir(), "vlog")?;
+	let sstables = count_files_with_extension_in(fs, &opts.sstable_dir(), "sst")?;
+	let wal_segments = count_files_with_extension_in(fs, &opts.wal_dir(), "wal")?;
+	let vlog_files = count_files_with_extension_in(fs, &opts.vlog_dir(), "vlog")?;
 	if sstables + wal_segments + vlog_files == 0 {
 		return Ok(());
 	}
@@ -195,22 +238,19 @@ pub(crate) fn refuse_unsealed_manifest(kind: ManifestKind) -> Error {
 	}
 }
 
-/// Counts the files in `dir` with the given extension. A missing directory
-/// holds none.
-fn count_files_with_extension(dir: &Path, extension: &str) -> Result<usize> {
-	let entries = match std::fs::read_dir(dir) {
+/// Counts the entries in `dir` with the given extension, as the names say and whatever they are.
+/// A missing directory holds none.
+fn count_files_with_extension_in(fs: &dyn Fs, dir: &Path, extension: &str) -> Result<usize> {
+	let entries = match fs.read_dir(dir) {
 		Ok(entries) => entries,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
 		Err(e) => return Err(e.into()),
 	};
 
-	let mut count = 0;
-	for entry in entries {
-		if entry?.path().extension().is_some_and(|ext| ext == extension) {
-			count += 1;
-		}
-	}
-	Ok(count)
+	Ok(entries
+		.iter()
+		.filter(|entry| Path::new(&entry.name).extension().is_some_and(|ext| ext == extension))
+		.count())
 }
 
 /// The manifest format written up to SurrealKV v0.21.x, and by development builds of the current
@@ -222,8 +262,16 @@ pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 /// misread the flat-key tables a V2 manifest lists, refuses the directory instead.
 pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
 
+/// The manifest format written since the WAL segments of SurrealKV may hold sync marks
+/// (`RecordType::SyncMark`). The byte layout is the same as V2; the version exists so that a binary
+/// that only knows V2, which would take a mark for damage and cut or refuse the segment, refuses
+/// the directory instead. An open (and a restore) makes the manifest of this version once the WAL
+/// is replayed and before the first segment of its own is started, see
+/// [`LevelManifest::upgrade_format_in`].
+pub const MANIFEST_FORMAT_VERSION_V3: u16 = 3;
+
 /// The manifest format version this code writes.
-pub const MANIFEST_FORMAT_VERSION: u16 = MANIFEST_FORMAT_VERSION_V2;
+pub const MANIFEST_FORMAT_VERSION: u16 = MANIFEST_FORMAT_VERSION_V3;
 
 /// Snapshot information stored in the manifest
 #[derive(Debug, Clone)]
@@ -281,7 +329,10 @@ pub(crate) struct ManifestChangeSet {
 	pub log_number: Option<u64>,
 }
 
-/// Data needed to revert an applied changeset
+/// Data needed to revert an applied changeset. Only tests revert one: a writer applies a
+/// changeset to the manifest in memory once it is on disk (see
+/// [`LevelManifest::encode_with_changeset`]), so it has nothing to undo.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChangeSetRollback {
 	/// Tables that were deleted (need to be re-added on revert)
 	pub deleted_tables: Vec<(u8, Arc<Table>)>,
@@ -304,8 +355,20 @@ mod level;
 mod mode;
 mod orphans;
 
-pub(crate) use mode::{check_manifest_mode, resolve_encryption};
-pub(crate) use orphans::plan_cleanup as plan_orphan_cleanup;
+// The `_in` forms are what the engine calls once its open path goes through the file system of its
+// options (M8): until then only tests and the forms without the suffix use them.
+#[allow(unused_imports)]
+pub(crate) use mode::{
+	check_manifest_mode,
+	check_manifest_mode_in,
+	resolve_encryption,
+	resolve_encryption_in,
+};
+#[allow(unused_imports)]
+pub(crate) use orphans::{
+	plan_cleanup as plan_orphan_cleanup,
+	plan_cleanup_in as plan_orphan_cleanup_in,
+};
 
 pub type HiddenSet = HashSet<u64>;
 
@@ -405,10 +468,13 @@ impl DecodedManifest {
 		let mut u16_buf = [0u8; 2];
 		level_manifest.read_exact(&mut u16_buf)?;
 		let version = u16::from_be_bytes(u16_buf);
-		if version != MANIFEST_FORMAT_VERSION_V1 && version != MANIFEST_FORMAT_VERSION_V2 {
+		if !matches!(
+			version,
+			MANIFEST_FORMAT_VERSION_V1 | MANIFEST_FORMAT_VERSION_V2 | MANIFEST_FORMAT_VERSION_V3
+		) {
 			return Err(Error::LoadManifestFail(format!(
 				"Unsupported manifest format version: {version}. Expected: \
-				 {MANIFEST_FORMAT_VERSION_V1} or {MANIFEST_FORMAT_VERSION_V2}"
+				 {MANIFEST_FORMAT_VERSION_V1} to {MANIFEST_FORMAT_VERSION_V3}"
 			)));
 		}
 
@@ -497,14 +563,21 @@ impl DecodedManifest {
 
 impl LevelManifest {
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		let fs = Arc::clone(&opts.fs);
+		Self::new_in(&*fs, opts)
+	}
+
+	/// [`Self::new`] over `fs`: the manifest is looked for, read and, if there is none, written
+	/// there.
+	pub(crate) fn new_in(fs: &dyn Fs, opts: Arc<Options>) -> Result<Self> {
 		assert!(opts.level_count > 0, "level_count should be >= 1");
 
 		let manifest_file_path = opts.manifest_file_path(0);
 
 		// Check if the manifest file already exists
-		if manifest_file_path.exists() {
+		if fs.exists(&manifest_file_path) {
 			// Load existing manifest from file
-			return Self::load_from_file(&manifest_file_path, opts);
+			return Self::load_from_file_in(fs, &manifest_file_path, opts);
 		}
 
 		// If no manifest exists, create a new one
@@ -528,17 +601,34 @@ impl LevelManifest {
 		};
 
 		// Write levels to disk with the counter
-		write_manifest_to_disk(&manifest)?;
+		write_manifest_to_disk_in(fs, &manifest)?;
 
 		// The manifest of an encrypted database names the database and its suite, and nothing
 		// that is sealed under them may exist before it is on disk: the file and the directory
 		// that holds it are synced by the write, and the directory above it, which only now has
 		// the entry that names that one, is synced here.
 		if manifest.encryption.is_some() {
-			crate::lsm::fsync_directory(&opts.path)?;
+			fs.sync_dir(&opts.path)?;
 		}
 
 		Ok(manifest)
+	}
+
+	/// Makes the manifest on disk of [`MANIFEST_FORMAT_VERSION`] if it is of an older one, so that
+	/// a binary that only knows the older one refuses the directory before anything of the newer
+	/// format is in it. Called by an open, and a restore, before it starts a WAL segment of its
+	/// own, which is the first one that can hold a mark.
+	pub(crate) fn upgrade_format_in(&mut self, fs: &dyn Fs) -> Result<()> {
+		if self.manifest_format_version >= MANIFEST_FORMAT_VERSION {
+			return Ok(());
+		}
+		let previous = self.manifest_format_version;
+		self.manifest_format_version = MANIFEST_FORMAT_VERSION;
+		if let Err(e) = write_manifest_to_disk_in(fs, self) {
+			self.manifest_format_version = previous;
+			return Err(e);
+		}
+		Ok(())
 	}
 
 	/// Returns the minimum WAL number that contains unflushed data
@@ -563,11 +653,21 @@ impl LevelManifest {
 		manifest_path: P,
 		opts: Arc<Options>,
 	) -> Result<Self> {
+		let fs = Arc::clone(&opts.fs);
+		Self::load_from_file_in(&*fs, manifest_path, opts)
+	}
+
+	/// [`Self::load_from_file`] over `fs`: the manifest and every table it lists are read there.
+	pub(crate) fn load_from_file_in<P: AsRef<Path>>(
+		fs: &dyn Fs,
+		manifest_path: P,
+		opts: Arc<Options>,
+	) -> Result<Self> {
 		tracing::debug!("Loading manifest from {:?}", manifest_path.as_ref());
 
 		// Read and parse the manifest file, opening it first if the database is encrypted
 		let encryption = opts.encryption_context().cloned();
-		let data = std::fs::read(&manifest_path)?;
+		let data = fs.read(manifest_path.as_ref())?;
 		let data = unseal_manifest(data, encryption.as_deref())?;
 		let DecodedManifest {
 			version,
@@ -579,15 +679,16 @@ impl LevelManifest {
 		} = DecodedManifest::decode(data)?;
 
 		// Sweep stale temporary manifest files left behind by uncompleted writes. An encrypted
-		// database never deletes what it did not write: such a file may hold a sealed manifest.
-		if encryption.is_none() {
+		// database never deletes what it did not write: such a file may hold a sealed manifest. A
+		// pool replaces a manifest without a temporary name, so there is nothing for it to sweep.
+		if encryption.is_none() && fs.kind() == FsKind::Std {
 			if let Some(parent) = manifest_path.as_ref().parent() {
-				sweep_stale_manifest_temp_files(parent);
+				sweep_stale_manifest_temp_files_in(fs, parent);
 			}
 		}
 
 		// Validate log_number against actual WAL segments BEFORE proceeding
-		validate_wal_log_number(&opts.wal_dir(), log_number)?;
+		validate_wal_log_number_in(fs, &opts.wal_dir(), log_number)?;
 
 		// Now convert the level data into actual Level objects with Table instances
 		// Use the actual number of levels from the manifest, not the configured level
@@ -600,7 +701,7 @@ impl LevelManifest {
 
 			for &table_id in table_ids {
 				// Load the actual table from disk
-				match Self::load_table(table_id, Arc::clone(&opts)) {
+				match Self::load_table_in(fs, table_id, Arc::clone(&opts)) {
 					Ok(table) => tables.push(table),
 					// A table that cannot be opened with the key is not a damaged manifest,
 					// and says so to the caller.
@@ -700,13 +801,12 @@ impl LevelManifest {
 		Ok(())
 	}
 
-	/// Helper to load a single table by ID
-	fn load_table(table_id: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
+	/// Helper to load a single table by ID, from `fs`.
+	fn load_table_in(fs: &dyn Fs, table_id: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
 		let table_file_path = opts.sstable_file_path(table_id);
 
 		// Open the table file
-		let file = SysFile::open(&table_file_path)?;
-		let file: Arc<dyn File> = Arc::new(file);
+		let file: Arc<dyn File> = fs.open_read(&table_file_path)?;
 		let file_size = file.size()?;
 
 		// The key of a table written under an older key than the one that is active is made
@@ -893,7 +993,33 @@ impl LevelManifest {
 		Ok(rollback)
 	}
 
+	/// The bytes of this manifest with `changeset` applied, which [`write_encoded_manifest_in`]
+	/// writes, leaving this manifest as it is.
+	///
+	/// A writer makes a change durable before anything can read it: it encodes the change here
+	/// under the read lock, writes it with no lock of the manifest held, and applies the same
+	/// changeset to this manifest only once the write succeeded. The manifest in memory then never
+	/// lists a table, or a `log_number`, that the one on disk does not, and readers are not held
+	/// up by the fsync. Every writer holds the tree's `manifest_io` from this call until it has
+	/// applied the changeset, so no other change lands in between.
+	pub(crate) fn encode_with_changeset(&self, changeset: &ManifestChangeSet) -> Result<Vec<u8>> {
+		let mut staged = Self {
+			path: self.path.clone(),
+			levels: self.levels.clone(),
+			hidden_set: HiddenSet::new(),
+			next_table_id: Arc::clone(&self.next_table_id),
+			manifest_format_version: self.manifest_format_version,
+			snapshots: self.snapshots.clone(),
+			log_number: self.log_number,
+			last_sequence: self.last_sequence,
+			encryption: self.encryption.clone(),
+		};
+		staged.apply_changeset(changeset)?;
+		encode_manifest(&staged)
+	}
+
 	/// Revert a previously applied changeset using rollback data
+	#[cfg(test)]
 	pub(crate) fn revert_changeset(&mut self, rollback: ChangeSetRollback) {
 		// Restore last_sequence
 		self.last_sequence = rollback.prev_last_sequence;
@@ -1044,6 +1170,10 @@ fn injected_failure(path: &Path) -> Option<ReplaceFailure> {
 }
 
 /// Writes `content` to the temporary file `path`, syncs it and gives it `permissions`.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "called only by replace_file_content, which only StdFs and the std-only migrators call"
+)]
 fn write_temp_file(
 	path: &Path,
 	content: &[u8],
@@ -1067,6 +1197,10 @@ fn write_temp_file(
 /// A failure before the rename is an `Error::Io` and leaves the file as it was. A failure from
 /// the rename on is an `Error::ManifestWriteUncertain`: the new content may be in place, and
 /// until the directory is synced a crash may bring the old content back.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "this is the body of StdFs::replace and of the std-only migrators; no other file system calls it"
+)]
 pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[u8]) -> Result<()> {
 	let target_path = file_path.as_ref();
 	#[cfg(test)]
@@ -1076,7 +1210,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[
 		.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
 
 	// Generate a unique temporary filename
-	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+	let timestamp = rt::now_unix_ns();
 	let temp_filename = format!(".tmp_{}_{}", timestamp, rand::rng().random::<u64>());
 	let temp_path = directory.join(temp_filename);
 
@@ -1124,8 +1258,34 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[
 	Ok(())
 }
 
-/// Write the full versioned manifest to disk, sealed if the database is encrypted
+/// Write the full versioned manifest to disk, sealed if the database is encrypted.
+///
+/// On the file system that is `std`: this is the form that has no options to take a file system
+/// from, and every caller that has them calls [`write_manifest_to_disk_in`] with theirs.
 pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
+	write_manifest_to_disk_in(&*default_fs(), manifest)
+}
+
+/// [`write_manifest_to_disk`] through `fs`, which replaces the manifest all or nothing
+/// ([`Fs::replace_atomic`]; on `std` that is `replace_file_content`, failpoints included).
+pub(crate) fn write_manifest_to_disk_in(fs: &dyn Fs, manifest: &LevelManifest) -> Result<()> {
+	let content = encode_manifest(manifest)?;
+	write_encoded_manifest_in(fs, &manifest.path, &content)
+}
+
+/// Replaces the manifest at `path` with `content`, which [`encode_manifest`] made, all or nothing
+/// ([`Fs::replace_atomic`]). It takes no lock: a writer holds the tree's `manifest_io` across the
+/// encode and this write, and only the bytes and the path, so that readers of the manifest in
+/// memory are not held up by the write and its fsync.
+pub(crate) fn write_encoded_manifest_in(fs: &dyn Fs, path: &Path, content: &[u8]) -> Result<()> {
+	fs.replace_atomic(path, content)?;
+	tracing::debug!("Manifest written successfully to {:?}", path);
+	Ok(())
+}
+
+/// The bytes [`write_manifest_to_disk_in`] writes for `manifest`, sealed if the database is
+/// encrypted.
+pub(crate) fn encode_manifest(manifest: &LevelManifest) -> Result<Vec<u8>> {
 	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
 	let total_tables: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
 
@@ -1169,23 +1329,18 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	// An encrypted database's manifest is sealed here, on every write and under a salt drawn
 	// by this write: a failed write that is tried again seals again, and never reuses a key.
 	// Failing to seal writes nothing.
-	let content = match &manifest.encryption {
-		Some(context) => seal_manifest(context, &buf)?,
-		None => buf,
-	};
-	replace_file_content(&manifest.path, &content)?;
-	tracing::debug!("Manifest written successfully to {:?}", manifest.path);
-	Ok(())
+	match &manifest.encryption {
+		Some(context) => seal_manifest(context, &buf),
+		None => Ok(buf),
+	}
 }
 
-/// Sweeps any temporary manifest files (`.tmp_*`) left behind in the manifest directory.
-pub(crate) fn sweep_stale_manifest_temp_files(dir: &Path) {
-	if let Ok(entries) = std::fs::read_dir(dir) {
-		for entry in entries.flatten() {
-			let name = entry.file_name();
-			let name_str = name.to_string_lossy();
-			if name_str.starts_with(".tmp_") {
-				let _ = std::fs::remove_file(entry.path());
+/// Sweeps any temporary manifest files (`.tmp_*`) left behind in the manifest directory of `fs`.
+pub(crate) fn sweep_stale_manifest_temp_files_in(fs: &dyn Fs, dir: &Path) {
+	if let Ok(entries) = fs.read_dir(dir) {
+		for entry in entries {
+			if entry.name.to_string_lossy().starts_with(".tmp_") {
+				let _ = fs.remove_file(&dir.join(&entry.name));
 			}
 		}
 	}
@@ -1204,6 +1359,9 @@ pub(crate) fn manifest_write_error(
 			manifest_uncertain.store(true, Ordering::Release);
 			error
 		}
+		// A pool that had no file for the manifest, which is the typed error that the tasks retry
+		// once the pool is refilled, and not a failure of the disk.
+		Error::FilePoolExhausted => error,
 		// A manifest that could not be sealed was not written: the key was not to be had, and
 		// whether it may be asked for again is what its type says, which text does not.
 		Error::Encryption(_) => error,

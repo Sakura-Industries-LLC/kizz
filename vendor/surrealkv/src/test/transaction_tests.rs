@@ -1849,7 +1849,11 @@ mod get_for_update_tests {
 		txn2.commit().await.unwrap();
 	}
 
-	#[test(tokio::test)]
+	#[allow(
+		clippy::await_holding_lock,
+		reason = "the flush lock is held across the commit on purpose, to stall it"
+	)]
+	#[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 	async fn cancelled_commit_success_on_retry() {
 		let temp_dir = create_temp_directory();
 		let store = TreeBuilder::new()
@@ -1857,7 +1861,10 @@ mod get_for_update_tests {
 			.with_memtable_stall_threshold(2)
 			.build()
 			.unwrap();
-		// Force commit to wait before writing.
+		// Force commit to wait before writing. A stalled writer wakes the flush task,
+		// which would drop these empty memtables and let the commit through. The flush
+		// lock is held so that task cannot clear the stall until the commit is cancelled.
+		// Two workers: the flush blocks one of them on the lock.
 		{
 			let mut immutables = store.core.inner.immutable_memtables.write().unwrap();
 			immutables.add(1, 0, Arc::new(crate::memtable::MemTable::new(1024)));
@@ -1871,7 +1878,9 @@ mod get_for_update_tests {
 		assert!(txn.get_for_update(&locked).unwrap().is_none());
 		txn.set(&written, b"value").unwrap();
 
+		let flush = store.core.inner.flush_lock.lock();
 		let result = tokio::time::timeout(std::time::Duration::from_millis(20), txn.commit()).await;
+		drop(flush);
 		assert!(result.is_err(), "the deliberately stalled commit should time out");
 
 		// A cancelled commit must close the transaction.
@@ -2706,4 +2715,85 @@ async fn test_transaction_iter_and_scan_api() {
 	let collected =
 		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
 	assert_eq!(collected, expect(&[b"k2", b"k3"]));
+}
+
+/// Many concurrent committers with disjoint keys, as single-record creates are: none conflicts,
+/// however many share a conflict window, and every write lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn concurrent_disjoint_writers_never_conflict() {
+	let (store, _temp_dir) = create_store();
+	let store = Arc::new(store);
+	let (tasks, per_task) = (256u32, 64u32);
+	let handles: Vec<_> = (0..tasks)
+		.map(|t| {
+			let store = Arc::clone(&store);
+			tokio::spawn(async move {
+				for i in 0..per_task {
+					let mut txn = store.begin().unwrap();
+					txn.set(format!("k{t:05}-{i:05}").as_str(), b"v").unwrap();
+					txn.commit().await.unwrap();
+				}
+			})
+		})
+		.collect();
+	for h in handles {
+		h.await.unwrap();
+	}
+	let txn = store.begin().unwrap();
+	let mut it = txn.scan("k".."l").unwrap();
+	assert_eq!(collect_transaction_all(&mut it).unwrap().len(), (tasks * per_task) as usize);
+}
+
+/// Concurrent read-modify-write increments of one counter, among many disjoint writes that keep
+/// the conflict windows wide: every lost update is caught as a conflict, so after retrying each,
+/// the counter holds every increment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn concurrent_increments_among_disjoint_writers_lose_no_update() {
+	let (store, _temp_dir) = create_store();
+	let store = Arc::new(store);
+	let (incrementers, increments) = (16u64, 50u64);
+	let mut handles = Vec::new();
+	for t in 0..incrementers {
+		let store = Arc::clone(&store);
+		handles.push(tokio::spawn(async move {
+			let mut conflicts = 0u64;
+			for i in 0..increments {
+				loop {
+					let mut txn = store.begin().unwrap();
+					let n = txn
+						.get(b"counter")
+						.unwrap()
+						.map_or(0, |v| u64::from_be_bytes(v[..8].try_into().unwrap()));
+					txn.set(b"counter", &(n + 1).to_be_bytes()[..]).unwrap();
+					// A disjoint key in the same commit
+					txn.set(format!("inc{t:03}-{i:05}").as_str(), b"v").unwrap();
+					match txn.commit().await {
+						Ok(()) => break,
+						Err(Error::TransactionWriteConflict) => conflicts += 1,
+						Err(e) => panic!("{e}"),
+					}
+				}
+			}
+			conflicts
+		}));
+	}
+	for t in 0..64u32 {
+		let store = Arc::clone(&store);
+		handles.push(tokio::spawn(async move {
+			for i in 0..100u32 {
+				let mut txn = store.begin().unwrap();
+				txn.set(format!("d{t:03}-{i:05}").as_str(), b"v").unwrap();
+				txn.commit().await.unwrap();
+			}
+			0
+		}));
+	}
+	let mut conflicts = 0;
+	for h in handles {
+		conflicts += h.await.unwrap();
+	}
+	let txn = store.begin().unwrap();
+	let n = u64::from_be_bytes(txn.get(b"counter").unwrap().unwrap()[..8].try_into().unwrap());
+	assert_eq!(n, incrementers * increments, "{conflicts} conflicts");
+	assert!(conflicts > 0, "the increments never overlapped, so nothing was tested");
 }

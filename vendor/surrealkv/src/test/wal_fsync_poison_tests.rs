@@ -15,27 +15,22 @@
 //! bytes stay in the file the way the page cache keeps them.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sfs::{self as fs, File};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::ring::PipelineHook;
 use crate::wal::manager::{SyncHandle, Wal};
 use crate::wal::reader::Reader;
 use crate::wal::writer::Writer;
-use crate::wal::{
-	BufferedFileWriter,
-	CompressionType,
-	Error as WalError,
-	Options as WalOptions,
-	BLOCK_SIZE,
-};
+use crate::wal::{BufferedFileWriter, CompressionType, Error as WalError, BLOCK_SIZE};
 use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree, WalRecoveryMode};
 
 // ---------------------------------------------------------------------------
@@ -115,6 +110,10 @@ async fn open_tree(dir: &Path) -> Arc<Tree> {
 
 async fn open_tree_with(dir: &Path, max_memtable_size: usize) -> Arc<Tree> {
 	let tree = Arc::new(Tree::new(options(dir, max_memtable_size, false)).unwrap());
+	// These tests form groups that hold an oversized batch with others, or rotate the memtable more
+	// than once, to exercise what the pipeline does then: a group is only bounded by its estimates
+	// at the sizes where it cannot, see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background_tasks(&tree).await;
 	mark_closed(&tree);
 	tree
@@ -185,7 +184,10 @@ fn all_failed(results: &[crate::Result<()>]) -> Vec<String> {
 /// error that says so.
 fn all_stopped(results: &[crate::Result<()>]) {
 	for result in results {
-		assert!(matches!(result, Err(Error::DatabaseStopped(_))), "{result:?}");
+		assert!(
+			matches!(result.as_ref().map_err(Error::poisoned_by), Err(Error::DatabaseStopped(_))),
+			"{result:?}"
+		);
 	}
 }
 
@@ -327,7 +329,7 @@ fn a_writer_whose_fsync_failed_refuses_every_append_and_sync() {
 #[test]
 fn a_poisoned_writer_with_nothing_pending_still_refuses_to_sync() {
 	let dir = TempDir::new("wal_fsync").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "a")).unwrap();
 	wal.sync().unwrap();
 	assert!(!wal.pending_sync());
@@ -349,7 +351,7 @@ fn a_poisoned_writer_with_nothing_pending_still_refuses_to_sync() {
 #[test]
 fn a_rotation_replaces_a_writer_poisoned_by_a_failed_fsync() {
 	let dir = TempDir::new("wal_fsync").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "acked")).unwrap();
 	wal.sync().unwrap();
 	wal.append(&wal_record(2, "unsynced")).unwrap();
@@ -381,14 +383,14 @@ fn a_rotation_replaces_a_writer_poisoned_by_a_failed_fsync() {
 #[test]
 fn a_failed_fsync_of_the_old_segment_fails_the_rotation_once() {
 	let dir = TempDir::new("wal_fsync").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "a")).unwrap();
 
 	wal.fail_syncs_after(0);
 	let err = wal.rotate().unwrap_err();
 	assert!(err.to_string().contains("injected fsync failure"), "{err}");
 	assert_eq!(wal.get_active_log_number(), 0, "a failed rotation changes nothing");
-	assert!(!dir.path().join("00000000000000000001.wal").exists(), "and creates nothing");
+	assert!(!sfs::exists(dir.path().join("00000000000000000001.wal")), "and creates nothing");
 	assert!(wal.sync_failed());
 	assert!(wal.append(&wal_record(2, "b")).is_err(), "the segment is poisoned now");
 
@@ -405,7 +407,7 @@ fn a_failed_fsync_of_the_old_segment_fails_the_rotation_once() {
 #[test]
 fn a_failed_fsync_of_the_cut_after_a_failed_append_poisons_the_segment() {
 	let dir = TempDir::new("wal_fsync").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "acked")).unwrap();
 	wal.sync().unwrap();
 
@@ -431,7 +433,7 @@ fn a_failed_fsync_of_the_cut_after_a_failed_append_poisons_the_segment() {
 fn close_fails_on_a_segment_whose_fsync_failed() {
 	for before_close in [true, false] {
 		let dir = TempDir::new("wal_fsync").unwrap();
-		let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+		let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 		wal.append(&wal_record(1, "a")).unwrap();
 		wal.fail_syncs_after(0);
 		if before_close {
@@ -456,7 +458,7 @@ fn close_fails_on_a_segment_whose_fsync_failed() {
 #[test]
 fn a_late_failing_fsync_of_a_rotated_segment_does_not_poison_the_new_one() {
 	let dir = TempDir::new("wal_fsync").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "a")).unwrap();
 
 	let handle = wal.sync_handle();
@@ -535,7 +537,10 @@ async fn later_commits_replace_the_segment_instead_of_retrying_the_fsync() {
 		assert_eq!(get(&tree, &key), Some(vec![b'l'; 40]));
 	}
 	assert_eq!(active(&tree), first + 1);
-	assert!(!segment.exists(), "its memtable is in a table, so the segment that failed is removed");
+	assert!(
+		!sfs::exists(&segment),
+		"its memtable is in a table, so the segment that failed is removed"
+	);
 	for (key, value) in pairs("acked", 2, b'a') {
 		assert_eq!(get(&tree, &key), Some(value), "{key}");
 	}
@@ -696,6 +701,9 @@ async fn a_commit_that_does_not_fit_the_memtable_replaces_the_poisoned_segment()
 /// work afterwards.
 #[test(tokio::test)]
 async fn a_checkpoint_replaces_a_poisoned_segment_and_leaves_out_the_failed_group() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("wal_fsync").unwrap();
 	let tree = open_tree(&dir.path().join("db")).await;
 	let acked = pairs("acked", 3, b'a');
@@ -865,11 +873,11 @@ async fn close_on_a_poisoned_wal_reports_it_after_the_rest_of_the_shutdown() {
 	arm(&tree, 0);
 	let doomed = pairs("doomed", 2, b'd');
 	all_failed(&commit_group(&tree, &doomed, Durability::Immediate).await);
-	assert!(segment.exists(), "the commits are logged in the segment");
+	assert!(sfs::exists(&segment), "the commits are logged in the segment");
 
 	let err = tree.close().await.unwrap_err();
 	assert!(err.to_string().contains("poisoned by an earlier failed sync"), "{err}");
-	assert!(!segment.exists(), "the segment is in tables and was cleaned up");
+	assert!(!sfs::exists(&segment), "the segment is in tables and was cleaned up");
 
 	let reopened = reopen(dir.path());
 	for (key, value) in acked.iter().chain(&eventual) {
@@ -1076,7 +1084,7 @@ async fn a_damaged_segment_that_is_not_the_last_is_repaired_once_and_stays_repai
 	let again = pairs("again", 3, b'g');
 	commit_ok(&tree, &again, Durability::Immediate).await;
 	assert_eq!(active(&tree), damaged_id + 1);
-	assert!(segment.exists(), "nothing was flushed, so the segment that failed stays");
+	assert!(sfs::exists(&segment), "nothing was flushed, so the segment that failed stays");
 	// An Eventual commit and an Immediate one in the new segment, behind the damaged one.
 	commit_ok(&tree, &pairs("tail", 2, b't'), Durability::Eventual).await;
 	let last = pairs("last", 1, b'z');
@@ -1761,7 +1769,10 @@ async fn nothing_of_a_group_that_failed_while_being_logged_again_becomes_readabl
 	// database took it.
 	tree.core.inner.seal_active_wal_segment().unwrap();
 	assert!(matches!(
-		commit_one(&tree, "later", Durability::Immediate).await,
+		commit_one(&tree, "later", Durability::Immediate)
+			.await
+			.as_ref()
+			.map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "after a later commit");
@@ -1783,7 +1794,10 @@ async fn nothing_of_a_group_whose_mid_group_rotation_failed_becomes_readable() {
 	// The next rotation goes ahead without fsyncing the segment that failed.
 	tree.core.inner.rotate_memtable().unwrap();
 	assert!(matches!(
-		commit_one(&tree, "later", Durability::Immediate).await,
+		commit_one(&tree, "later", Durability::Immediate)
+			.await
+			.as_ref()
+			.map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "after a later commit");

@@ -12,6 +12,7 @@ chdir
 CLICOLOR
 CLOEXEC
 cmark
+codegen
 cowextsize
 cpus
 creat

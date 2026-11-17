@@ -67,5 +67,10 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/Sakura-Industries-LLC/kizz"
 rust-version = "1.96.0"
 
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
 [patch.crates-io]
 surrealkv = { path = "vendor/surrealkv" }

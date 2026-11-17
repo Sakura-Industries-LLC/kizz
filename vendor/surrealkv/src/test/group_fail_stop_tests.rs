@@ -7,8 +7,9 @@
 //! that was reported as failed would take effect, and be written to a table.
 //!
 //! A group that fails once any of it is applied therefore stops the database. Every committer of
-//! the group gets `Error::DatabaseStopped`, so does every commit that comes after and every one
-//! that was accepted behind the group, and nothing is published past it: the batches that were
+//! the group gets `Error::DatabaseStopped`, which poisons the database: every commit that comes
+//! after and every one that was accepted behind the group fails with `Error::DatabasePoisoned`
+//! holding it, and nothing is published past it: the batches that were
 //! applied stay out of sight of every reader of the process. What readers could see before still
 //! reads. Nothing moves from the memtables to a table and nothing is compacted either, and `close`
 //! leaves the memtables to the WAL, so that recovery finds the whole group in its records.
@@ -19,7 +20,6 @@
 //! `close` see, and what a crash image recovers.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,7 +30,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use super::compaction_memory_proofs::RefuseAllocations;
-use super::{collect_transaction_all, collect_transaction_reverse};
+use super::{collect_transaction_all, collect_transaction_reverse, sfs, sfs as fs, tfs};
 use crate::compaction::leveled::Strategy;
 use crate::lsm::{CompactionOperations, FlushHook};
 use crate::ring::{CommitStage, PipelineHook, UNFENCED_STALE_ROUNDS};
@@ -39,6 +39,9 @@ use crate::{BackgroundErrorReason, Durability, Error, ErrorSeverity, Mode, Optio
 
 /// A memtable that holds about 21 small commits, so that a group of 30 fills it part-way.
 const SMALL: usize = 4096;
+/// The length of the value of an ordinary commit. A memtable counts its values towards its size,
+/// so the values are short enough that a group of such commits fills a `SMALL` memtable part-way.
+const FILL: usize = 4;
 
 /// How long a scenario may take before it is declared stuck.
 const DEADLINE: Duration = Duration::from_secs(90);
@@ -90,6 +93,10 @@ fn opts(path: &Path, flush_on_close: bool) -> Arc<Options> {
 /// `close()` to stop the task manager a second time.
 async fn open(opts: Arc<Options>) -> Arc<Tree> {
 	let tree = Arc::new(Tree::new(opts).unwrap());
+	// These tests form groups that hold an oversized batch with others, or rotate the memtable more
+	// than once, to exercise what the pipeline does then: a group is only bounded by its estimates
+	// at the sizes where it cannot, see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	let tm = tree.core.task_manager.lock().unwrap().clone().unwrap();
 	tm.stop().await;
 	tree.core.is_closed.store(true, Ordering::SeqCst);
@@ -152,7 +159,7 @@ type Entries = Vec<(String, Vec<u8>)>;
 
 /// Ten keys that are committed, and acknowledged, before the group.
 fn base() -> Entries {
-	(0..10).map(|i| (format!("base{i}"), vec![OLD; 40])).collect()
+	(0..10).map(|i| (format!("base{i}"), vec![OLD; FILL])).collect()
 }
 
 /// `count` commits that overwrite the first three keys of `base` and add the others.
@@ -164,7 +171,7 @@ fn numbered(count: usize) -> Entries {
 			} else {
 				format!("group{i}")
 			};
-			(key, vec![NEW; 40])
+			(key, vec![NEW; FILL])
 		})
 		.collect()
 }
@@ -279,7 +286,7 @@ fn fresh(entries: &Entries) -> Vec<String> {
 
 /// The error every commit of the stopped database gets.
 fn stop_error(result: &Result<()>, what: &str) -> String {
-	match result {
+	match result.as_ref().map_err(Error::poisoned_by) {
 		Err(Error::DatabaseStopped(message)) => {
 			assert!(message.contains("decided by recovery"), "{what}: {message}");
 			result.as_ref().unwrap_err().to_string()
@@ -612,11 +619,13 @@ async fn run(failure: Failure, mix: Mix) {
 	// Every later commit fails with the same error, and so does one in a segment of its own, which
 	// would have published a sequence number above the group's.
 	for durability in [Durability::Eventual, Durability::Immediate] {
-		let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], durability).await;
+		let later =
+			commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], durability).await;
 		assert_eq!(stop_error(&later, &what), errors[0], "{what} {durability:?}");
 	}
 	let _ = tree.core.inner.seal_active_wal_segment();
-	let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate);
+	let later =
+		commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate);
 	assert_eq!(stop_error(&later.await, &what), errors[0], "{what}");
 	assert_eq!(get(&tree, "later"), None, "{what}");
 	assert_unchanged("after later commits");
@@ -747,7 +756,7 @@ async fn deletes_of_a_failed_group_hide_nothing() {
 			match i {
 				5 => txn.delete_range(&b"base3"[..], &b"base8"[..]).unwrap(),
 				6 => txn.delete(&b"base9"[..]).unwrap(),
-				_ => txn.set(format!("group{i}").as_bytes(), &[NEW; 40]).unwrap(),
+				_ => txn.set(format!("group{i}").as_bytes(), &[NEW; FILL]).unwrap(),
 			}
 			txn.commit().await
 		}));
@@ -766,7 +775,8 @@ async fn deletes_of_a_failed_group_hide_nothing() {
 		.iter()
 		.any(|e| e.memtable.has_range_deletions() && e.memtable.get(b"base9", None).is_some());
 	assert!(tombstones_applied, "the deletes were applied before the failure");
-	let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate);
+	let later =
+		commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate);
 	stop_error(&later.await, "a later commit");
 	assert_eq!(scan(&tree), before, "a delete of the group hides a key readers see");
 	for (key, value) in &before {
@@ -775,9 +785,9 @@ async fn deletes_of_a_failed_group_hide_nothing() {
 
 	// The range delete covers `base3` up to, and not including, `base8`.
 	let mut expected: BTreeMap<String, Vec<u8>> =
-		[0, 1, 2, 8].iter().map(|i| (format!("base{i}"), vec![OLD; 40])).collect();
+		[0, 1, 2, 8].iter().map(|i| (format!("base{i}"), vec![OLD; FILL])).collect();
 	expected.extend(
-		(0..30).filter(|i| ![5, 6].contains(i)).map(|i| (format!("group{i}"), vec![NEW; 40])),
+		(0..30).filter(|i| ![5, 6].contains(i)).map(|i| (format!("group{i}"), vec![NEW; FILL])),
 	);
 	assert_eq!(recover_image(dir.path()), expected, "the group, deletes included, recovered whole");
 	crash(&tree);
@@ -818,10 +828,10 @@ async fn a_group_that_fails_before_anything_is_applied_does_not_stop_the_databas
 	assert!(tree.core.inner.error_handler.check_error().is_ok());
 
 	// Commits go on once the WAL rotated.
-	commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate)
+	commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate)
 		.await
 		.unwrap();
-	assert_eq!(get(&tree, "later"), Some(vec![NEW; 40]));
+	assert_eq!(get(&tree, "later"), Some(vec![NEW; FILL]));
 	assert_eq!(get(&tree, "big0"), None);
 	crash(&tree);
 }
@@ -883,7 +893,7 @@ fn committers_accepted_behind_a_failing_group_all_get_the_stop_error() {
 							queued.lock().unwrap().push(handle.spawn(commit_one(
 								tree,
 								format!("queued{i}"),
-								vec![NEW; 40],
+								vec![NEW; FILL],
 								Durability::Immediate,
 							)));
 						}
@@ -971,7 +981,7 @@ fn a_writer_stalled_when_the_group_fails_is_woken_with_an_error() {
 						*writer.lock().unwrap() = Some(handle.spawn(commit_one(
 							Arc::clone(&tree),
 							"stalled".into(),
-							vec![NEW; 40],
+							vec![NEW; FILL],
 							Durability::Immediate,
 						)));
 						let started = Instant::now();
@@ -1029,6 +1039,9 @@ async fn stopped_tree(dir: &Path) -> (Arc<Tree>, Entries) {
 /// flushed. So no flush, no checkpoint and no compaction runs, and recovery finds the group whole.
 #[test(tokio::test)]
 async fn a_stopped_database_flushes_compacts_and_checkpoints_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("group_fail_stop").unwrap();
 	let (tree, group) = stopped_tree(dir.path()).await;
 	let queued = tree.core.inner.immutable_count();
@@ -1038,16 +1051,24 @@ async fn a_stopped_database_flushes_compacts_and_checkpoints_nothing() {
 	assert!(!logged.is_empty(), "the group's records are in a segment");
 	let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
-	assert!(matches!(tree.flush(), Err(Error::DatabaseStopped(_))));
 	assert!(matches!(
-		CompactionOperations::compact_memtable(&*tree.core.inner),
+		tree.flush().as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
+	assert!(matches!(
+		CompactionOperations::compact_memtable(&*tree.core.inner)
+			.as_ref()
+			.map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 	let strategy = Arc::new(Strategy::from_options(Arc::clone(&tree.core.inner.opts)));
-	assert!(matches!(tree.compact(strategy), Err(Error::DatabaseStopped(_))));
+	assert!(matches!(
+		tree.compact(strategy).as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
 	let checkpoint = TempDir::new("group_fail_stop_checkpoint").unwrap();
 	assert!(matches!(
-		tree.create_checkpoint(checkpoint.path().join("cp")),
+		tree.create_checkpoint(checkpoint.path().join("cp")).as_ref().map_err(Error::poisoned_by),
 		Err(Error::DatabaseStopped(_))
 	));
 
@@ -1067,6 +1088,9 @@ async fn a_stopped_database_flushes_compacts_and_checkpoints_nothing() {
 /// it.
 #[test(tokio::test)]
 async fn a_stopped_database_does_not_checkpoint_a_table_that_holds_part_of_the_group() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("group_fail_stop").unwrap();
 	let tree = open(opts(dir.path(), false)).await;
 	let injected = inject(&tree, Failure::SecondDirectL0);
@@ -1080,8 +1104,11 @@ async fn a_stopped_database_does_not_checkpoint_a_table_that_holds_part_of_the_g
 
 	let checkpoint = TempDir::new("group_fail_stop_checkpoint").unwrap();
 	let cp = checkpoint.path().join("cp");
-	assert!(matches!(tree.create_checkpoint(&cp), Err(Error::DatabaseStopped(_))));
-	assert!(!cp.exists(), "nothing was copied");
+	assert!(matches!(
+		tree.create_checkpoint(&cp).as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
+	assert!(!sfs::exists(&cp), "nothing was copied");
 	crash(&tree);
 }
 
@@ -1100,7 +1127,7 @@ async fn a_compaction_cannot_replace_what_readers_see_with_what_was_never_publis
 	let tree = open(Arc::clone(&options)).await;
 
 	// The version readers see of "big10" is in a table already.
-	let old = vec![OLD; 40];
+	let old = vec![OLD; FILL];
 	commit_one(Arc::clone(&tree), "big10".into(), old.clone(), Durability::Immediate)
 		.await
 		.unwrap();
@@ -1122,7 +1149,10 @@ async fn a_compaction_cannot_replace_what_readers_see_with_what_was_never_publis
 	assert_eq!(get(&tree, "big10"), Some(old.clone()));
 
 	let strategy = Arc::new(Strategy::from_options(options));
-	assert!(matches!(tree.compact(strategy), Err(Error::DatabaseStopped(_))));
+	assert!(matches!(
+		tree.compact(strategy).as_ref().map_err(Error::poisoned_by),
+		Err(Error::DatabaseStopped(_))
+	));
 	assert_eq!(tree.core.inner.l0_file_count(), 3, "nothing was compacted");
 	assert_eq!(get(&tree, "big10"), Some(old), "the version readers see is still there");
 	crash(&tree);
@@ -1167,6 +1197,9 @@ async fn close_of_a_stopped_database_leaves_the_group_to_the_wal() {
 /// a reopen.
 #[test(tokio::test)]
 async fn a_restore_discards_what_a_failed_group_applied() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("group_fail_stop").unwrap();
 	let checkpoint = TempDir::new("group_fail_stop_checkpoint").unwrap();
 	let tree = open(opts(dir.path(), false)).await;
@@ -1185,7 +1218,8 @@ async fn a_restore_discards_what_a_failed_group_applied() {
 	tree.restore_from_checkpoint(&cp).unwrap();
 	assert!(in_memtables(&tree, &group).is_empty());
 	assert_eq!(scan(&tree), base().into_iter().collect());
-	let later = commit_one(Arc::clone(&tree), "later".into(), vec![NEW; 40], Durability::Immediate);
+	let later =
+		commit_one(Arc::clone(&tree), "later".into(), vec![NEW; FILL], Durability::Immediate);
 	stop_error(&later.await, "a commit after the restore");
 	crash(&tree);
 }
