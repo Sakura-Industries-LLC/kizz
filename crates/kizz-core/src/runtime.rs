@@ -909,6 +909,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
         #[starlark(require = named, default = "split")] capture: &str,
         #[starlark(require = named, default = false)] stream: bool,
         #[starlark(require = named, default = false)] always: bool,
+        #[starlark(require = named, default = false)] untraced: bool,
         #[starlark(require = named, default = UnpackListOrTuple::default())]
         ignore: UnpackListOrTuple<String>,
         #[starlark(require = named, default = UnpackListOrTuple::default())]
@@ -972,6 +973,7 @@ fn kizz_globals(builder: &mut GlobalsBuilder) {
             capture,
             stream,
             always,
+            untraced,
             ignore: ignore.items,
             track: track.items,
             timestamps,
@@ -2745,6 +2747,7 @@ mod names_tests {
             "capture",
             "stream",
             "always",
+            "untraced",
             "ignore",
             "track",
             "timestamps",

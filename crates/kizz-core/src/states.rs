@@ -116,6 +116,11 @@ impl FileStates {
         self.pool.install(|| hash_file(path, &self.hashed))
     }
 
+    /// Forget all cached file hashes after a command whose writes were not observed.
+    pub fn clear(&self) {
+        self.entries.clear();
+    }
+
     /// Drop the entry of every path that `accesses` records a write to.
     pub fn forget_written(
         &self,

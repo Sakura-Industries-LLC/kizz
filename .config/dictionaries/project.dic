@@ -209,6 +209,7 @@ getguardsize
 gethostname
 getpgrp
 getpid
+getppid
 getpwuid
 GETREGS
 getrlimit
@@ -288,6 +289,7 @@ opendir
 openpt
 osrelease
 pagable
+PDEATHSIG
 permalink
 phentsize
 phnum
@@ -413,6 +415,7 @@ uncacheable
 uninit
 unlinkat
 unlockpt
+unreaped
 unrunnable
 untrackable
 uprobe

@@ -254,6 +254,8 @@ By default, kizz records what each command touched, and replays the command's re
 
 In a `run()` call:
 
+* [`untraced = True`](@/reference/starlark.md#untraced) disables dependency tracing and runs once per build,
+  never from an earlier build.
 * [`always = True`](@/reference/starlark.md#always) runs the command once in each build that reaches it, without a cache check.
 * [`timestamps = True`](@/reference/starlark.md#timestamps) makes a new modification or change time of a used path a change.
 * [`machine = [...]`](@/reference/starlark.md#machine) makes named parts of the machine state inputs of the step.

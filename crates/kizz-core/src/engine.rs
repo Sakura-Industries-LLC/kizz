@@ -1620,7 +1620,7 @@ impl TaskSteps<'_> {
         &self,
         step: &StepSpec,
     ) -> bool {
-        step.always || self.cache_never || self.engine.no_cache
+        step.untraced || step.always || self.cache_never || self.engine.no_cache
     }
 
     /// Decide whether the step `step`, whose key is `key`, runs; `marks` gains
@@ -1645,7 +1645,9 @@ impl TaskSteps<'_> {
                 return Ok(Decision::Replay(first));
             }
             marks.always = true;
-            let reason = if !known {
+            let reason = if step.untraced {
+                RunReason::Untraced
+            } else if !known {
                 RunReason::NeverRun
             } else if self.cache_never {
                 RunReason::TaskCacheNever
@@ -1796,6 +1798,7 @@ impl TaskSteps<'_> {
             RunReason::Always => vec![Reason::Always],
             RunReason::TaskCacheNever => vec![Reason::TaskCacheNever],
             RunReason::RunNoCache => vec![Reason::RunNoCache],
+            RunReason::Untraced => vec![Reason::Untraced],
             RunReason::InputsChanged {
                 differences,
                 machine,
@@ -1967,6 +1970,32 @@ impl TaskSteps<'_> {
         replay(record)
     }
 
+    /// Select traced or explicit untraced execution and invalidate unknown writes.
+    fn run_command(
+        &self,
+        step: &StepSpec,
+        request: &RunRequest,
+    ) -> Result<RunResult, TraceError> {
+        if step.untraced {
+            let result =
+                self.engine
+                    .tracer
+                    .run_untraced(request, self.engine.echo, &self.engine.cancel);
+            // The command may have written any path, including on failure.
+            self.engine.states.clear();
+            result.map(|mut result| {
+                result.incomplete = Some(kizz_trace::IncompleteReason::Other {
+                    detail: "dependency tracing explicitly disabled with untraced=True".to_owned(),
+                });
+                result
+            })
+        } else {
+            self.engine
+                .tracer
+                .run(request, self.engine.echo, &self.engine.cancel)
+        }
+    }
+
     /// Run `step` with the found program `program`; `checked` holds the locations
     /// the lookup checked, `lookup` the same locations with their outcomes when the
     /// engine writes a report, and `machine` the machine state the command starts
@@ -1986,10 +2015,7 @@ impl TaskSteps<'_> {
         let request = run_request(step, program.clone(), self.engine.live_output, tree);
         let ran_at = SystemTime::now();
         let started = Instant::now();
-        let result = self
-            .engine
-            .tracer
-            .run(&request, self.engine.echo, &self.engine.cancel);
+        let result = self.run_command(step, &request);
         let duration = started.elapsed();
         let lookup_checked = (!checked.is_empty()).then(|| checked_list(&checked));
         self.keep_run(
@@ -2277,6 +2303,7 @@ impl TaskSteps<'_> {
             capture: capture(step.capture),
             stream: step.stream,
             always: step.always,
+            untraced: step.untraced,
             ignore: step.ignore.clone(),
             track: step.track.clone(),
             timestamps: step.timestamps,

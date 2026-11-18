@@ -4337,6 +4337,7 @@ fn incomplete_step(
             capture: Capture::Merged,
             stream: false,
             always: false,
+            untraced: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,
@@ -4657,7 +4658,6 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         Capture, ContentHash, FileMeta, Observation, Owner, RunReason, StepSpecRecord,
     };
 
-    let owner = Owner { uid: 1, gid: 1 };
     let meta = FileMeta {
         size: 1,
         mtime_nanos: 0,
@@ -4665,7 +4665,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
         inode: 1,
         device: 1,
         mode: 0o100_644,
-        owner,
+        owner: Owner { uid: 1, gid: 1 },
     };
     let observation = |path: &str, access: u8, state: PathState| {
         Observation {
@@ -4699,6 +4699,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
             capture: Capture::Merged,
             stream: false,
             always: false,
+            untraced: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,
@@ -4714,7 +4715,7 @@ fn recorded_observations_are_taken_relative_to_the_task_directory() {
             }),
             observation("/t", AccessBits::PROBE, PathState::Directory {
                 mode: 0o040_755,
-                owner,
+                owner: meta.owner,
                 listing: None,
                 times: meta.times(),
             }),

@@ -109,7 +109,7 @@ The banner is the name kizz in large letters, a line that says what kizz is, and
 |   <| |/ / / /
 |_|\_\_/___/___|
 Traced, cached builds from kizz.md files
-v0.0.1 (d5186af) - Copyright (c) 2026, Sakura Industries LLC - AGPLv3 Only
+v0.0.2 (d5186af) - Copyright (c) 2026, Sakura Industries LLC - AGPLv3 Only
 
 ```
 
@@ -131,7 +131,7 @@ Each command also has its own `-h` and `--help`, such as `kizz build --help`.
 
 ### `-V`, `--version`
 
-Prints kizz's version, such as `Version: 0.0.1`, to standard output, and exits with 0; no command runs.
+Prints kizz's version, such as `Version: 0.0.2`, to standard output, and exits with 0; no command runs.
 It works only before a command.
 
 ## `kizz build`

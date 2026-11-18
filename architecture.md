@@ -265,7 +265,8 @@ result = run(
     cwd = None,         # directory relative to the task directory; None means the task directory
     capture = "split",  # "split": stdout and stderr separately; "merged": one stream in exact order
     stream = False,     # also echo output live to the terminal
-    always = False,     # run on every build, even when cached
+    always = False,
+    untraced = False,     # run on every build, even when cached
     ignore = [],        # user exceptions: paths not recorded as dependencies of this step
     track = [],         # /proc and /sys files whose content counts as an input of this step
     timestamps = False, # also compare the timestamps of what the step read, ran, listed or checked
@@ -333,6 +334,29 @@ as environment variables, or through a file the program writes.
 Arguments, `stdin` and the environment are part of the later step's cache key, and written files are recorded inputs,
 so the captured output becomes a dependency of the step that consumes it.
 When it changes, exactly the consuming steps run again.
+
+### Explicit untraced execution
+
+`run(..., untraced = True)` is an explicit exception for commands that must use ptrace themselves,
+including kizz's own tracer and end-to-end tests.
+Linux permits only one ptrace tracer per process.
+It runs without ptrace or kizz's seccomp filter, once per build, without a cache check even if `always` is false.
+Later passes return that build's result, but another build always runs the command again.
+The stored result is marked incomplete and cannot be reused as a cache hit.
+Only the engine's program lookup is observed; command dependencies and writes are not learned.
+The engine clears its file hash cache afterwards, including after a failed command, because its writes are unknown.
+The `untraced` flag is part of the step key and recorded specification.
+
+The platform runner preserves the exact environment, working directory, input, captured output, live echo and exit status.
+An observation report explicitly says tracing was disabled and does not invent child observations.
+The direct child's exit determines the result.
+It leads a private process group, which receives forwarded signals, a cancellation interrupt,
+and a kill after the cancellation grace period.
+Remaining group members are killed when the child exits.
+The group leader is kept unreaped until cleanup, so a reused ID cannot be signalled.
+The direct child dies if kizz dies; escaped descendants cannot be supervised or guaranteed to die with kizz in this mode.
+Commands must keep their descendants in the group and wait for the work whose status matters.
+This mode is for explicit exceptions, not build commands whose dependencies need caching or automatic ordering.
 
 ### Environment
 
@@ -767,6 +791,7 @@ A step's key is a BLAKE3 hash, derived with a versioned context string, of a CBO
 * the `track` patterns
 * whether `timestamps` is set
 * the `machine` names
+* whether `untraced` is set
 * the occurrence number, which counts identical commands earlier in the same task run,
   so a command repeated in a task gets one cache entry per repetition
 

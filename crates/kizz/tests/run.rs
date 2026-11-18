@@ -1107,3 +1107,67 @@ fn equivalent_forms_share_one_cache_record() -> TestResult {
     assert_eq!(records.len(), 1, "{records:?}");
     Ok(())
 }
+
+/// Explicit untraced commands execute once in each build, including builds with
+/// later passes, and retain their nonzero exit, split output and incomplete record.
+#[test]
+fn untraced_commands_run_once_per_build_and_never_reuse_an_earlier_build() -> TestResult {
+    let project = Project::new()?;
+    project.task(
+        "kizz.md",
+        "Untraced",
+        "ci name=untraced",
+        r#"
+result = run("sh", "-c", "printf x >> counter; cat; printf error >&2; exit 7",
+    stdin = "input", untraced = True, expect = [7])
+if result.stdout != "input" or result.stderr != "error" or result.rc != 7:
+    fail("untraced result lost its streams or status")
+"#,
+    )?;
+    for expected in ["x", "xx"] {
+        let run = project.run("", &["build", "ci"])?;
+        assert_eq!(run.status, Some(0), "{run:?}");
+        assert_eq!(fs::read_to_string(project.root.join("counter"))?, expected);
+    }
+    let records = project.step_records()?;
+    let [record] = records.as_slice() else {
+        return Err("expected one untraced step record".into());
+    };
+    assert!(record.spec.untraced);
+    assert_eq!(record.reason, RunReason::Untraced);
+    assert!(record.not_cached.is_some());
+    Ok(())
+}
+
+/// The explicit escape hatch allows a nested kizz to trace its own child, while
+/// the outer observation report honestly records that it did not observe accesses.
+#[test]
+fn an_untraced_command_can_use_ptrace_and_reports_incomplete_observation() -> TestResult {
+    let project = Project::new()?;
+    let nested_cache = tempfile::tempdir()?;
+    project.write("input", "nested tracing works\n")?;
+    project.task(
+        "kizz.md",
+        "Nested",
+        "name=nested",
+        &format!(
+            "run({}, \"execute\", \"--output=nested.txt\", \"--\", \"/bin/cat\", \"input\", \
+         env = {{\"KIZZ_CACHE_DIR\": {}}}, untraced = True, expect = [0])",
+            serde_json::to_string(env!("CARGO_BIN_EXE_kizz"))?,
+            serde_json::to_string(&nested_cache.path())?,
+        ),
+    )?;
+    let run = project.run("", &["run", "--json", "--output=outer.json", "nested"])?;
+    assert_eq!(run.status, Some(0), "{run:?}");
+    assert!(run.stdout.contains("nested tracing works"), "{run:?}");
+    let nested = fs::read_to_string(project.root.join("nested.txt"))?;
+    assert!(nested.contains("trace: complete"), "{nested}");
+    let outer: Value = serde_json::from_str(&fs::read_to_string(project.root.join("outer.json"))?)?;
+    assert_eq!(outer["complete"], false, "{outer}");
+    assert!(
+        outer
+            .to_string()
+            .contains("dependency tracing explicitly disabled")
+    );
+    Ok(())
+}

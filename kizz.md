@@ -5,14 +5,9 @@ It needs Rust 1.100 or later and forwards arguments to `cargo install`, such as 
 Put the installation's `bin` directory on `PATH` before running these tasks.
 The bootstrap only installs kizz; it does not install the other development tools.
 
-`kizz build fix+ci` selects the same fixes, checks, tests, documentation builds, license checks and release build as `just fix-ci`.
+`kizz build fix+ci` runs the same fixes, checks, tests, documentation builds, license checks and release build as `just fix-ci`.
 The Justfile remains available.
 Each task is named so it can also be run directly with `kizz run <name>`.
-
-The test task currently needs an engine change: Linux cannot attach two ptrace tracers to one process,
-so the tracer and end-to-end tests fail when kizz traces them.
-Until an explicit untraced test mode is available, use `just fix-ci` for the complete quality gate.
-The other tasks can be run with kizz already.
 
 | Target | Work |
 | --- | --- |
@@ -128,31 +123,40 @@ run("cargo", "+nightly", "fmt", "--all", "--", "--check", stream = True, expect 
 
 ## Lint Rust
 
+The Cargo compilation tasks ignore only `.rustc_info.json` in the target directory, respecting `CARGO_TARGET_DIR`.
+Clippy and rustdoc rewrite that disposable compiler probe cache with different values;
+tracking it makes them repeatedly invalidate each other.
+Source files and build artifacts remain tracked.
+
 ```starlark check ci name=clippy
-load("build/common.star", "setup")
+load("build/common.star", "cargo_ignores", "setup")
 setup()
 run("cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings",
-    stream = True, expect = [0])
+    ignore = cargo_ignores(), stream = True, expect = [0])
 ```
 
 ## Test the workspace
 
 Tests always use temporary kizz caches and explicit child environments.
 The tracer and end-to-end tests need permission to use ptrace and seccomp.
+They run with `untraced = True` because Linux permits only one ptrace tracer per process.
+This command runs once per build and is never reused from another build; no test dependencies are inferred.
+Kizz still captures output, checks the exit status, and cancels the command's process group.
+The report explicitly records that dependency tracing was disabled.
 
 ```starlark test check ci name=test
 load("build/common.star", "setup")
 setup()
-run("cargo", "test", "--workspace", "--all-features", stream = True, expect = [0])
+run("cargo", "test", "--workspace", "--all-features", untraced = True, stream = True, expect = [0])
 ```
 
 ## Build Rust documentation
 
 ```starlark docs check ci name=rustdoc
-load("build/common.star", "setup")
+load("build/common.star", "cargo_ignores", "setup")
 setup()
 env.set("RUSTDOCFLAGS", "-D warnings")
-run("cargo", "doc", "--workspace", "--no-deps", "--all-features", stream = True, expect = [0])
+run("cargo", "doc", "--workspace", "--no-deps", "--all-features", ignore = cargo_ignores(), stream = True, expect = [0])
 ```
 
 ## Check Markdown
@@ -212,7 +216,7 @@ Build all workspace release binaries into Cargo's target directory.
 To install the resulting kizz, run `./bootstrap.sh` again.
 
 ```starlark build ci name=release
-load("build/common.star", "setup")
+load("build/common.star", "cargo_ignores", "setup")
 setup()
-run("cargo", "build", "--workspace", "--release", stream = True, expect = [0])
+run("cargo", "build", "--workspace", "--release", ignore = cargo_ignores(), stream = True, expect = [0])
 ```

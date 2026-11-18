@@ -62,6 +62,7 @@ result = run(
     capture = "split",
     stream = False,
     always = False,
+    untraced = False,
     ignore = [],
     track = [],
     timestamps = False,
@@ -86,7 +87,7 @@ Each call goes through these stages:
 4. It checks the cache.
    A step whose record holds a cached result, and whose recorded paths and named machine state are unchanged, is a cache hit:
    `run()` returns the recorded exit status and output, and nothing runs.
-   An `always` step, every step of a `cache=never` task and every step under `kizz run --no-cache` get no cache check,
+   An `untraced` or `always` step, every step of a `cache=never` task and every step under `kizz run --no-cache` get no cache check,
    so each runs again in every build or `kizz run` that reaches it.
 5. Otherwise it looks the program up, runs it through the tracer, and records every path that the command's process tree touched,
    with the state of each path when the command finished.
@@ -249,6 +250,30 @@ Whether the command runs in every build that reaches it, even when its cache ent
 
 A task marked [`cache=never`](@/reference/kizz-md.md#cache-never) runs every command as if it had `always = True`,
 and so does `kizz run --no-cache`.
+
+### `untraced`
+
+Run a command that needs to use ptrace itself, such as kizz's own tracer tests.
+Linux permits only one ptrace tracer per process.
+
+* Type and default: a bool, `False` by default.
+* What it does: with `True`, disables ptrace and kizz's seccomp filter and runs once in every build that reaches it.
+  Later passes reuse only that build's result.
+  Another build always runs it again, regardless of other cache options.
+  Output capture, `stdin`, the exact environment, working directory, live echo and `expect` still work.
+* Step key: part of it, so traced and untraced commands cannot share a cache entry.
+* Tracks: only the engine's program lookup.
+  No command inputs, writes or child dependencies are learned.
+  The stored result is marked incomplete, reports say tracing was explicitly disabled, and the file hash cache is cleared.
+* Side effects: those of the command, once per build.
+  There is no dependency-based ordering for its effects.
+
+The direct child determines the exit status and leads a private process group.
+Forwarded signals and cancellation reach that group; cancellation escalates to a kill after the normal grace period.
+Remaining group members are killed when the direct child ends.
+Commands must keep descendants in that group and wait for their work before exiting.
+The direct child dies if kizz dies, but descendants that escape the group cannot be supervised or guaranteed to die with kizz.
+Use this explicit exception only when tracing prevents a command from working.
 
 ### `ignore`
 

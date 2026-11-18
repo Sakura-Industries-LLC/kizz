@@ -27,6 +27,10 @@ def version_parts(version):
         fail("Expected a three-part tool version; got " + version)
     return [int(part) for part in parts]
 
+def cargo_ignores():
+    """Ignore Cargo's disposable compiler probe cache, not build inputs or outputs."""
+    return [env.get("CARGO_TARGET_DIR", "target") + "/.rustc_info.json"]
+
 def require_tool(tool, minimum):
     """Fail before using an old tool, with the command that installs its pin."""
     result = run(tool, "--version", expect = [0])

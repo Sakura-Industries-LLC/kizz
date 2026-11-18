@@ -1,6 +1,6 @@
 [package]
 name = "kizz-trace"
-version = "0.0.1"
+version = "0.0.2"
 description = "The kizz tracer interface: run requests, results, access kinds, and the tracer trait."
 edition.workspace = true
 rust-version.workspace = true

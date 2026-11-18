@@ -331,6 +331,7 @@ impl Fixture {
             capture: CaptureMode::Split,
             stream: false,
             always: false,
+            untraced: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,

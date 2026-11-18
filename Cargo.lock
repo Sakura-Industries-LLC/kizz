@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "kizz"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bpaf",
  "build-info",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "kizz-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "allocative",
  "blake3",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "kizz-store"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "kizz-threads",
  "libc",
@@ -1417,14 +1417,14 @@ dependencies = [
 
 [[package]]
 name = "kizz-trace"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "kizz-trace-linux"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "kizz-threads",
  "kizz-trace",

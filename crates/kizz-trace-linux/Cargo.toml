@@ -1,6 +1,6 @@
 [package]
 name = "kizz-trace-linux"
-version = "0.0.1"
+version = "0.0.2"
 description = "The kizz tracer for Linux, built on ptrace and a seccomp-bpf filter."
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 kizz-threads = { path = "../kizz-threads", version = "0.0.1" }
-kizz-trace = { path = "../kizz-trace", version = "0.0.1" }
+kizz-trace = { path = "../kizz-trace", version = "0.0.2" }
 libc = "0.2.191"
 
 [dev-dependencies]

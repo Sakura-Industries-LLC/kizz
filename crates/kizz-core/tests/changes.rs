@@ -250,6 +250,7 @@ impl Fixture {
             capture: CaptureMode::Split,
             stream: false,
             always: false,
+            untraced: false,
             ignore: ignore.iter().map(|&pattern| pattern.to_owned()).collect(),
             track: Vec::new(),
             timestamps: false,

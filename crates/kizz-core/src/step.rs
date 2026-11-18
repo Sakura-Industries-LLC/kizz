@@ -16,6 +16,10 @@ use kizz_trace::{AbsolutePath, CaptureMode, CapturedOutput, Termination};
 
 /// One step, as a `run()` call in a task program specifies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent command options mirror the Starlark API"
+)]
 pub struct StepSpec {
     /// The argument vector: the program, then its arguments, each string exactly as
     /// written, after `run()` expanded the lists and tuples among its arguments.
@@ -34,6 +38,8 @@ pub struct StepSpec {
     pub stream: bool,
     /// Whether the command runs on every build, even when cached.
     pub always: bool,
+    /// Run without observing dependencies; implies one uncached execution per build.
+    pub untraced: bool,
     /// The user exceptions: patterns of paths not recorded as dependencies.
     pub ignore: Vec<String>,
     /// The `/proc` and `/sys` files whose content counts as an input.

@@ -256,6 +256,7 @@ impl Fixture {
             capture: CaptureMode::Split,
             stream: false,
             always: false,
+            untraced: false,
             ignore: vec!["*.tmp".to_owned()],
             track: Vec::new(),
             timestamps: false,

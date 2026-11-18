@@ -12,6 +12,8 @@ A command runs anyway when kizz has no record for it, or when something it recor
 It also runs in every build that reaches it when its `run()` has `always = True`, when its task is marked `cache=never`,
 or under `kizz run --no-cache`.
 And a command whose previous result could not be cached, such as one that a signal killed, runs again.
+An explicit [`untraced = True`](@/reference/starlark.md#untraced) command also runs once per build,
+but its dependencies are not observed and its result is never reused across builds.
 Every time a command runs, kizz says why.
 
 ## What kizz records

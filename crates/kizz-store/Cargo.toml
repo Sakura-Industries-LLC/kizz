@@ -1,6 +1,6 @@
 [package]
 name = "kizz-store"
-version = "0.0.1"
+version = "0.0.2"
 description = "The kizz cache location, lock file, and record store."
 edition.workspace = true
 rust-version.workspace = true

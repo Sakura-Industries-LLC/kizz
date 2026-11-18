@@ -60,6 +60,7 @@ fn step_record(n: u8) -> StepRecord {
             capture: Capture::Split,
             stream: false,
             always: false,
+            untraced: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: n % 2 == 1,
