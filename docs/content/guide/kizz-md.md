@@ -175,7 +175,7 @@ and an optional argument can be a variable that holds `[]` when it is not wanted
 ```starlark
 env.inherit("PATH", "HOME")
 verbose = ["--verbose"] if "verbose" in task.args else []
-run("cargo", "test", verbose, "--locked", expect = [0])
+run("cargo", "test", verbose, "--locked", expect=[0])
 ```
 
 `run("cargo", "test", task.args)` passes the arguments of `kizz run` through, each as one argument.

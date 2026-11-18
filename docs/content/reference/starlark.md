@@ -55,19 +55,21 @@ The program runs again in every pass, so its own reads always see current data.
 
 ```starlark
 result = run(
-    "cargo", "build", "--release",
-    stdin = None,
-    env = None,
-    cwd = None,
-    capture = "split",
-    stream = False,
-    always = False,
-    untraced = False,
-    ignore = [],
-    track = [],
-    timestamps = False,
-    machine = [],
-    expect = None,
+    "cargo",
+    "build",
+    "--release",
+    stdin=None,
+    env=None,
+    cwd=None,
+    capture="split",
+    stream=False,
+    always=False,
+    untraced=False,
+    ignore=[],
+    track=[],
+    timestamps=False,
+    machine=[],
+    expect=None,
 )
 ```
 
@@ -137,7 +139,7 @@ An optional argument can be a variable that holds the argument in a list when it
 
 ```starlark
 release = ["--release"] if "release" in task.args else []
-run("cargo", "build", "--locked", release, expect = [0])
+run("cargo", "build", "--locked", release, expect=[0])
 ```
 
 Under `kizz run` with the argument `release`, this runs `cargo build --locked --release`, and otherwise `cargo build --locked`.
@@ -312,7 +314,7 @@ Starlark variables make reusable sets of patterns:
 ```starlark
 GO_CACHE = ["~/.cache/go-build/**"]
 
-run("go", "build", "./...", ignore = GO_CACHE, expect = [0])
+run("go", "build", "./...", ignore=GO_CACHE, expect=[0])
 ```
 
 ### `track`
@@ -339,7 +341,7 @@ Paths under `/proc` and `/sys`, or that symbolic links lead there, whose content
 * Errors: as for `ignore`.
 
 ```starlark
-run("./configure", track = ["/proc/cpuinfo"], expect = [0])
+run("./configure", track=["/proc/cpuinfo"], expect=[0])
 ```
 
 ### `timestamps`
@@ -567,9 +569,9 @@ Reads the caller environment and dotenv files, and changes the task environment.
 
 ```starlark
 env.inherit("PATH", "HOME")
-env.load_file(".env", defaults = {"GOFLAGS": "-trimpath"}, required = False)
+env.load_file(".env", defaults={"GOFLAGS": "-trimpath"}, required=False)
 env.set("CGO_ENABLED", "0")
-run("go", "build", "./...", env = {"GOFLAGS": None}, expect = [0])
+run("go", "build", "./...", env={"GOFLAGS": None}, expect=[0])
 ```
 
 ### `env.caller()`
@@ -879,7 +881,7 @@ It takes no parameters, tracks nothing and has no side effect.
 
 ```starlark
 who = task.args[0] if task.args else "world"
-run("echo", "hello,", who, expect = [0])
+run("echo", "hello,", who, expect=[0])
 ```
 
 Because `run()` expands a list in place, `run("cargo", "test", task.args)` passes every argument to the command,
@@ -984,7 +986,7 @@ It is a statement of the language, which the [Starlark specification][starlark-l
 load("../build/common.star", "go_build")
 
 env.inherit("PATH", "HOME")
-go_build("./cmd/server", output = "dist/server", version = "1.0.0")
+go_build("./cmd/server", output="dist/server", version="1.0.0")
 ```
 
 [starlark-spec]: https://github.com/bazelbuild/starlark/blob/master/spec.md "The Starlark language specification"

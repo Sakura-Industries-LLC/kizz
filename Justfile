@@ -14,11 +14,13 @@ sort-dictionary:
 # Run every automated fixer: formatters and anything else that can be fixed automatically.
 fix: sort-dictionary
     cargo +nightly fmt --all
+    ruff format .
     rumdl check --fix .
 
 # Check formatting, lints, tests, docs, Markdown, spelling and the documentation site. Changes no tracked file.
 check:
     cargo +nightly fmt --all -- --check
+    ruff format --check .
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace --all-features
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
@@ -29,6 +31,7 @@ check:
 # CI: sort the dictionary, run the checks, check licenses, then build.
 check-ci: sort-dictionary
     cargo +nightly fmt --all -- --check
+    ruff format --check .
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace --all-features
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features

@@ -259,19 +259,21 @@ A task program runs commands, captures their output, inspects their exit codes, 
 
 ```starlark
 result = run(
-    "cargo", "build", "--release",  # argv: the program, then its arguments
-    stdin = None,       # text for standard input; None connects /dev/null
-    env = None,         # extra variables for this run only; a None value removes a variable
-    cwd = None,         # directory relative to the task directory; None means the task directory
-    capture = "split",  # "split": stdout and stderr separately; "merged": one stream in exact order
-    stream = False,     # also echo output live to the terminal
-    always = False,     # run on every build, even when cached
-    untraced = False,   # disable dependency tracing; run once per build
-    ignore = [],        # user exceptions: paths not recorded as dependencies of this step
-    track = [],         # /proc and /sys files whose content counts as an input of this step
-    timestamps = False, # also compare the timestamps of what the step read, ran, listed or checked
-    machine = [],       # machine and process state that counts as an input; see Machine state
-    expect = None,      # None: never fail the task on exit status; or a list of acceptable exit codes
+    "cargo",
+    "build",
+    "--release",  # argv: the program, then its arguments
+    stdin=None,  # text for standard input; None connects /dev/null
+    env=None,  # extra variables for this run only; a None value removes a variable
+    cwd=None,  # directory relative to the task directory; None means the task directory
+    capture="split",  # "split": stdout and stderr separately; "merged": one stream in exact order
+    stream=False,  # also echo output live to the terminal
+    always=False,  # run on every build, even when cached
+    untraced=False,  # disable dependency tracing; run once per build
+    ignore=[],  # user exceptions: paths not recorded as dependencies of this step
+    track=[],  # /proc and /sys files whose content counts as an input of this step
+    timestamps=False,  # also compare the timestamps of what the step read, ran, listed or checked
+    machine=[],  # machine and process state that counts as an input; see Machine state
+    expect=None,  # None: never fail the task on exit status; or a list of acceptable exit codes
 )
 ```
 
@@ -459,10 +461,14 @@ The shared module, `build/common.star`:
 ```starlark
 def go_build(package, output, version):
     return run(
-        "go", "build", "-o", output,
-        "-ldflags", "-X main.version=" + version,
+        "go",
+        "build",
+        "-o",
+        output,
+        "-ldflags",
+        "-X main.version=" + version,
         package,
-        expect = [0],
+        expect=[0],
     )
 ```
 
@@ -1230,7 +1236,14 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
 
 * Cargo builds the workspace.
   A Justfile holds the commands, written out directly.
-  Moon is not used, because kizz will eventually build itself.
+  Kizz also builds itself with the documented tasks in `kizz.md`; the Justfile remains available.
+  `mise.toml` pins cspell, rumdl and Ruff, installed with `mise install`.
+  Tool version checks read the mise pins as minimums; normal kizz targets never install tools.
+  Ruff formats `*.star` recursively through `ruff.toml`, excluding build output and vendored code.
+  Rumdl delegates Starlark fenced blocks to Ruff for formatting and checks through `.rumdl.toml`.
+  Only formatting is applied; Python lint rules do not apply to Starlark.
+  Each task declares its environment names; only matching `.env` values override them.
+  Moon is not used.
 * These settings are copied from cbork:
     * the `[workspace.lints]` tables in `Cargo.toml`: Clippy pedantic as errors; errors for `unwrap`, `expect`, `panic`,
       indexing, unchecked arithmetic and missing documentation, private items included; and the rustdoc lints
@@ -1278,11 +1291,13 @@ sort-dictionary:
 # Run every automated fixer: formatters and anything else that can be fixed automatically.
 fix: sort-dictionary
     cargo +nightly fmt --all
+    ruff format .
     rumdl check --fix .
 
 # Check formatting, lints, tests, docs, Markdown, spelling and the documentation site. Changes no tracked file.
 check:
     cargo +nightly fmt --all -- --check
+    ruff format --check .
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace --all-features
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
@@ -1293,6 +1308,7 @@ check:
 # CI: sort the dictionary, run the checks, check licenses, then build.
 check-ci: sort-dictionary
     cargo +nightly fmt --all -- --check
+    ruff format --check .
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace --all-features
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features

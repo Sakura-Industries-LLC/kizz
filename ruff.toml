@@ -1,0 +1,5 @@
+# Starlark uses Python-compatible syntax; use formatting without Python lint rules.
+include = ["**/*.star"]
+extension = { star = "python" }
+exclude = [".git", "target", "vendor"]
+line-length = 132

@@ -35,7 +35,7 @@ Inherit the variables that the commands need, by name, instead of copying the wh
 
 ```starlark
 env.inherit("PATH", "HOME")
-env.load_file(".env", defaults = {"GOFLAGS": "-trimpath"}, required = False)
+env.load_file(".env", defaults={"GOFLAGS": "-trimpath"}, required=False)
 ```
 
 Each command's environment is part of its cache key, so an unrelated variable that changes between shells,
@@ -68,7 +68,7 @@ Put build sequences that several tasks use into a Starlark module, and load them
 load("../build/common.star", "go_build")
 
 env.inherit("PATH", "HOME")
-go_build("./cmd/server", output = "dist/server", version = "1.0.0")
+go_build("./cmd/server", output="dist/server", version="1.0.0")
 ```
 
 `build/common.star`:
@@ -76,10 +76,14 @@ go_build("./cmd/server", output = "dist/server", version = "1.0.0")
 ```starlark
 def go_build(package, output, version):
     return run(
-        "go", "build", "-o", output,
-        "-ldflags", "-X main.version=" + version,
+        "go",
+        "build",
+        "-o",
+        output,
+        "-ldflags",
+        "-X main.version=" + version,
         package,
-        expect = [0],
+        expect=[0],
     )
 ```
 
@@ -108,7 +112,7 @@ and `kizz run test -- release` runs `cargo test --locked --release`.
 To pass every argument of `kizz run` through, give `task.args` itself, which adds nothing when it is empty:
 
 ```starlark
-run("cargo", "test", task.args, expect = [0])
+run("cargo", "test", task.args, expect=[0])
 ```
 
 Each string stays one argument, never split on spaces, so an optional pair of words goes in one list,
@@ -122,7 +126,7 @@ A cache hit does not repeat a command, so an upload, a database update, a notifi
 Mark such a command with `always = True`: it then runs in every build that reaches it, and its dependencies are still recorded.
 
 ```starlark
-run("rsync", "-a", "dist/", "server:/srv/app/", always = True, expect = [0])
+run("rsync", "-a", "dist/", "server:/srv/app/", always=True, expect=[0])
 ```
 
 ## Ignore the caches of tools
@@ -135,7 +139,7 @@ Then leave that cache out with an `ignore` pattern, kept in a variable that ever
 ```starlark
 GO_CACHE = ["~/.cache/go-build/**"]
 
-run("go", "build", "./...", ignore = GO_CACHE, expect = [0])
+run("go", "build", "./...", ignore=GO_CACHE, expect=[0])
 ```
 
 Ignore only what a tool can rebuild by itself: an ignored path is never a reason to run the command again.
@@ -146,7 +150,7 @@ Tools such as `tar` and `zip` store the timestamps of what they pack.
 Give them `timestamps = True`, so that a file with a new time but the same content still rebuilds the archive:
 
 ```starlark
-run("tar", "-cf", "dist/site.tar", "public", timestamps = True, expect = [0])
+run("tar", "-cf", "dist/site.tar", "public", timestamps=True, expect=[0])
 ```
 
 ## Name the tasks that people run by hand

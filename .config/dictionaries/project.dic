@@ -258,6 +258,7 @@ memlock
 memtable
 minicbor
 MINSIGSTKSZ
+mise
 mkdirat
 mkfifo
 mknod

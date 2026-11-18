@@ -2,21 +2,18 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Environment and tool version checks for kizz's own build tasks."""
+"""Explicit task environment overrides and tool version checks for kizz's build."""
 
-def setup():
-    """Load caller settings, then let .env override them intentionally."""
-    env.inherit(
-        "PATH", "HOME", "TMPDIR", "TERM", "NO_COLOR",
-        "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR",
-        "CARGO_BUILD_JOBS", "CARGO_NET_OFFLINE", "RUSTFLAGS", "RUSTDOCFLAGS",
-        "CC", "CXX", "AR", "PKG_CONFIG_PATH",
-        "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
-        "NPM_CONFIG_PREFIX", "npm_config_prefix",
-        "KIZZ_TEST_SKIP_BLOCKED_SYSCALLS",
-    )
-    env.load_file(".env", required = False)
-    return env.read(".config/build.env")
+
+def task_env(*names):
+    """Inherit only named variables, with matching .env entries taking precedence."""
+    env.inherit(*names)
+    if fs.exists(".env"):
+        overrides = env.read(".env")
+        for name in names:
+            if name in overrides:
+                env.set(name, overrides[name])
+
 
 def version_parts(version):
     """Parse the three numeric components of a stable semantic version."""
@@ -27,15 +24,31 @@ def version_parts(version):
         fail("Expected a three-part tool version; got " + version)
     return [int(part) for part in parts]
 
+
 def cargo_ignores():
     """Ignore Cargo's disposable compiler probe cache, not build inputs or outputs."""
     return [env.get("CARGO_TARGET_DIR", "target") + "/.rustc_info.json"]
 
-def require_tool(tool, minimum):
-    """Fail before using an old tool, with the command that installs its pin."""
-    result = run(tool, "--version", expect = [0])
+
+def require_tool(tool):
+    """Use mise.toml as the single source of minimum and installation versions."""
+    minimum = run(
+        "mise",
+        "config",
+        "get",
+        "--file",
+        "mise.toml",
+        "tools." + tool,
+        expect=[0],
+    ).stdout.strip()
+    result = run(tool, "--version", expect=[0])
     installed = result.stdout.strip().split()[-1]
     if version_parts(installed) < version_parts(minimum):
-        fail("{} {} is too old; need at least {}. Run `kizz run install-{}`.".format(
-            tool, installed, minimum, tool,
-        ))
+        fail(
+            "{} {} is too old; need at least {}. Run `mise install {}` and activate mise.".format(
+                tool,
+                installed,
+                minimum,
+                tool,
+            )
+        )
