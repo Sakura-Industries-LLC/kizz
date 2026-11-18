@@ -1171,7 +1171,7 @@ crates/
 
 ## Technology
 
-Kizz is written in Rust, edition 2024, with a minimum Rust version of 1.96, the same as cbork.
+Kizz is written in Rust, edition 2024, with a minimum Rust version of 1.100.
 The command line and output use the same libraries as the cbork CLI: `bpaf` with derive, `console`, `anyhow` and `build-info`.
 
 | Purpose | Crate | Version when planned |
@@ -1204,7 +1204,7 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
 * These settings are copied from cbork:
     * the `[workspace.lints]` tables in `Cargo.toml`: Clippy pedantic as errors; errors for `unwrap`, `expect`, `panic`,
       indexing, unchecked arithmetic and missing documentation, private items included; and the rustdoc lints
-    * `clippy.toml`, with its allowances for tests and `msrv = "1.96"`
+    * `clippy.toml`, with its allowances for tests and `msrv = "1.100"`
     * `rustfmt.toml`, which uses nightly rustfmt options
     * `.rumdl.toml`, adding `starlark` to the custom code-block languages
     * `cspell.json` and `.config/dictionaries/project.dic`

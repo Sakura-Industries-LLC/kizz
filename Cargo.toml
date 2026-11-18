@@ -62,10 +62,9 @@ unescaped_backticks = "deny"
 [workspace.package]
 authors = ["Sakura Industries LLC"]
 edition = "2024"
-homepage = "https://github.com/Sakura-Industries-LLC/kizz"
 license = "AGPL-3.0-only"
 repository = "https://github.com/Sakura-Industries-LLC/kizz"
-rust-version = "1.96.0"
+rust-version = "1.100.0"
 
 [profile.release]
 codegen-units = 1

@@ -21,7 +21,7 @@ so a set-user-ID program such as `sudo` does not gain privileges under kizz.
 
 ## Building kizz
 
-Kizz is written in Rust and needs Rust 1.96 or later.
+Kizz is written in Rust and needs Rust 1.100 or later.
 Build it with Cargo from a checkout of its repository:
 
 ```sh

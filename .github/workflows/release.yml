@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUST_TOOLCHAIN: "1.99.1"
+  RUST_TOOLCHAIN: "1.100.0"
   TARGET: x86_64-unknown-linux-gnu
   ZOLA_VERSION: "v0.23.6"
   ZOLA_SHA256: "8f5132b3522412d04e395e0b25f6d68613ad272a873e54a2b3ebf664873024a4"

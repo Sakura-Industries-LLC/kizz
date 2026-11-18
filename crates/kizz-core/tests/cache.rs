@@ -1221,8 +1221,7 @@ fn a_hit_replays_the_exit_status_and_output_exactly() -> TestResult {
             built
                 .outcome(2)
                 .err()
-                .map(|error| error.to_string())
-                .unwrap_or_default()
+                .map_or_default(|error| error.to_string())
         })
         .collect();
     assert!(

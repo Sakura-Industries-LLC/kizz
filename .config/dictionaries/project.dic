@@ -12,6 +12,7 @@ chdir
 CLICOLOR
 CLOEXEC
 cmark
+cmdline
 codegen
 cowextsize
 cpus
@@ -330,6 +331,7 @@ rtprio
 rttime
 rumdl
 RUSTDOCFLAGS
+RUSTFLAGS
 Ryzen
 Sakura
 sccache
@@ -373,6 +375,7 @@ SIGTTIN
 SIGTTOU
 SIGURG
 SIGUSR
+sjbox
 sockaddr
 Starlark
 startswith

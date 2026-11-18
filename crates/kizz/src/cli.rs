@@ -66,7 +66,6 @@ pub struct Cli {
 
 impl Cli {
     /// Run the selected command and return the process exit status.
-    #[must_use]
     pub fn exec(self) -> ExitCode {
         self.color.apply();
         let execute = matches!(self.command, Command::Execute { .. });
@@ -198,7 +197,6 @@ fn stub(
 /// exits with [`USAGE_ERROR`]. Their message is written through the `ui` module,
 /// which drops a write that fails, such as one to a closed pipe, where `bpaf`'s
 /// `ParseFailure::print_message` would panic in the `print!` macros.
-#[must_use]
 pub fn run() -> ExitCode {
     match cli().run_inner(Args::current_args()) {
         Ok(parsed) => parsed.exec(),

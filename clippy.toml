@@ -3,7 +3,7 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-print-in-tests = true
-msrv = "1.96"
+msrv = "1.100"
 
 # Kizz never panics ("Kizz never panics" in architecture.md): these library calls panic
 # when the system refuses them. Every thread starts through kizz_threads instead.

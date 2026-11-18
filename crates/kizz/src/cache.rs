@@ -126,8 +126,7 @@ fn reset_all(
     let differences = inventory
         .identity
         .as_ref()
-        .map(|stored| stored.differences(&CacheIdentity::current()))
-        .unwrap_or_default();
+        .map_or_default(|stored| stored.differences(&CacheIdentity::current()));
     let missing_identity =
         inventory.schema_version == Some(SCHEMA_VERSION) && inventory.identity.is_none();
     if inventory.entries.is_empty()
