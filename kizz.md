@@ -195,10 +195,10 @@ run(
 
 ## Lint Rust
 
-The Cargo compilation tasks ignore only `.rustc_info.json` in the target directory, respecting `CARGO_TARGET_DIR`.
-Clippy and rustdoc rewrite that disposable compiler probe cache with different values;
-tracking it makes them repeatedly invalidate each other.
-Source files and build artifacts remain tracked.
+The traced Cargo tasks share `cargo_ignores()` for compiler probe caches, build fingerprints, incremental state,
+build-script bookkeeping, lock markers and profile dependency files under `CARGO_TARGET_DIR`.
+They also ignore Cargo's global cache database under `CARGO_HOME`, which Cargo updates as it uses dependencies.
+Source files, manifests, `Cargo.lock`, and final build artifacts remain tracked.
 
 ```starlark ci name=clippy
 load("build/common.star", "cargo_ignores", "task_env")
@@ -317,9 +317,10 @@ Advisory findings are informational and do not fail the build.
 Always fetch current advisories, since network responses are not tracked file dependencies.
 
 ```starlark ci name=advisories
-load("build/common.star", "mise_task_env", "mise_tool")
+load("build/common.star", "cargo_ignores", "mise_task_env", "mise_tool")
 mise_task_env(
     "CARGO_HOME",
+    "CARGO_TARGET_DIR",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "HTTPS_PROXY",
@@ -327,7 +328,7 @@ mise_task_env(
     "ALL_PROXY",
     "NO_PROXY",
 )
-result = run(mise_tool("cargo-deny"), "check", "advisories", always=True, network=True, stream=True)
+result = run(mise_tool("cargo-deny"), "check", "advisories", ignore=cargo_ignores(), always=True, network=True, stream=True)
 if result.rc != 0:
     print("Advisory check did not succeed. Continuing with the required checks.")
 ```
@@ -337,13 +338,14 @@ if result.rc != 0:
 License, source and dependency bans are required checks.
 
 ```starlark ci name=licenses
-load("build/common.star", "mise_task_env", "mise_tool")
+load("build/common.star", "cargo_ignores", "mise_task_env", "mise_tool")
 mise_task_env(
     "CARGO_HOME",
+    "CARGO_TARGET_DIR",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
 )
-run(mise_tool("cargo-deny"), "check", "bans", "licenses", "sources", stream=True, expect=[0])
+run(mise_tool("cargo-deny"), "check", "bans", "licenses", "sources", ignore=cargo_ignores(), stream=True, expect=[0])
 ```
 
 ## Build release binaries

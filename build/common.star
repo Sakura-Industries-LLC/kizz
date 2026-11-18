@@ -41,8 +41,27 @@ def version_parts(version):
 
 
 def cargo_ignores():
-    """Ignore Cargo's disposable compiler probe cache, not build inputs or outputs."""
-    return [env.get("CARGO_TARGET_DIR", "target") + "/.rustc_info.json"]
+    """Ignore Cargo's mutable bookkeeping and compiler intermediates."""
+    target_dir = env.get("CARGO_TARGET_DIR", "target")
+    patterns = [
+        target_dir + suffix
+        for suffix in [
+            "/.rustc_info.json",
+            "/.rustdoc_fingerprint.json",
+            "/**/{.cargo-lock,.cargo-artifact-lock,.cargo-build-lock}",
+            "/**/{.fingerprint,incremental}",
+            "/**/{.fingerprint,incremental}/**",
+            "/**/build/*/*/{fingerprint,run}",
+            "/**/build/*/*/{fingerprint,run}/**",
+            "/**/{debug,release}/*.d",
+        ]
+    ]
+    cargo_home = env.get("CARGO_HOME")
+    if not cargo_home and env.get("HOME"):
+        cargo_home = env.get("HOME") + "/.cargo"
+    if cargo_home:
+        patterns.extend([cargo_home + "/.global-cache" + suffix for suffix in ["", "-journal", "-shm", "-wal"]])
+    return patterns
 
 
 def mise_tool(tool):
