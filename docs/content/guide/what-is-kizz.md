@@ -82,12 +82,12 @@ It is not:
 Kizz belongs to a known family of tracing build systems.
 These are the closest:
 
-* [Riker](https://www.usenix.org/conference/atc22/presentation/curtsinger) traces plain build scripts with `ptrace` and
-  seccomp-BPF, as kizz does; its tracer design and system-call coverage are the reference for kizz's tracer.
+* [Riker](https://www.usenix.org/conference/atc22/presentation/curtsinger) traces plain build scripts with `ptrace` and seccomp-BPF,
+  as kizz does; its tracer design and system-call coverage are the reference for kizz's tracer.
 * [Rattle](https://arxiv.org/abs/2007.12737) runs traced commands speculatively and detects ordering hazards.
   It informs kizz's learned order and its passes.
-* [BuildXL's two-phase cache lookup][buildxl]
-  matches kizz's cache check: a key built from what is known before running, followed by the recorded inputs.
+* [BuildXL's two-phase cache lookup][buildxl] matches kizz's cache check: a key built from what is known before running,
+  followed by the recorded inputs.
 
 [buildxl]: https://github.com/microsoft/BuildXL/blob/master/Documentation/Wiki/Advanced-Features/Two-Phase-Cache-Lookup.md
 [starlark-spec]: https://github.com/bazelbuild/starlark/blob/master/spec.md "The Starlark language specification"

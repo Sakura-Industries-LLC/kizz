@@ -451,6 +451,14 @@ impl Render {
             },
             Reason::Always => "marked `always`".to_owned(),
             Reason::TaskCacheNever => "its task is marked `cache=never`".to_owned(),
+            Reason::Untraced => "dependency tracing is disabled; runs on every build".to_owned(),
+            Reason::TracingChanged { old, new } => {
+                format!(
+                    "the `untraced` option changed from {} to {}",
+                    starlark_bool(*old),
+                    starlark_bool(*new)
+                )
+            },
             Reason::RunNoCache => "`kizz run --no-cache` was given".to_owned(),
             Reason::NotCached { why, inputs } => {
                 let why = self.not_cached(why);
@@ -527,6 +535,8 @@ impl Render {
             | Reason::MachineNamesChanged { .. }
             | Reason::Always
             | Reason::TaskCacheNever
+            | Reason::Untraced
+            | Reason::TracingChanged { .. }
             | Reason::RunNoCache => vec![self.reason_line(reason)],
         }
     }

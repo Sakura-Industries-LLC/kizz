@@ -439,6 +439,50 @@ fn split_capture_keeps_standard_output_and_standard_error_apart() {
     );
 }
 
+/// Input and interleaved output must not deadlock when a command is untraced.
+#[test]
+fn untraced_capture_preserves_input_merged_output_and_live_echo() -> Outcome<()> {
+    let mut request = shell("cat; printf error >&2; exit 7", &[])?;
+    let input = "input".repeat(200_000);
+    request.stdin = Some(input.as_bytes().to_vec());
+    request.capture = CaptureMode::Merged;
+    request.echo = true;
+    let echo = Recorder::default();
+    let result = LinuxTracer::new().run_untraced(&request, &echo, &Cancellation::new())?;
+    assert_eq!(result.termination, Termination::Exited(7));
+    let expected = format!("{input}error");
+    assert_eq!(merged(&result.output)?, expected);
+    assert_eq!(echo.echoed(OutputStream::Merged), expected.as_bytes());
+    assert!(!result.is_complete());
+    assert!(result.accesses.is_empty());
+    Ok(())
+}
+
+/// Cancellation kills a command that ignores SIGINT and its child in the group.
+#[test]
+fn untraced_cancellation_escalates_and_cleans_up_the_process_group() -> Outcome<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().canonicalize()?;
+    let request = shell(
+        "trap '' INT; sleep 60 & echo $! > \"$1/child\"; echo $$ > \"$1/ready\"; wait",
+        &[path.to_str().ok_or("non-UTF-8 temporary directory")?],
+    )?;
+    let cancel = Cancellation::new();
+    let result = thread::scope(|scope| {
+        let worker = scope
+            .spawn(|| LinuxTracer::new().run_untraced(&request, &Recorder::default(), &cancel));
+        let ready = read_pid(&path.join("ready"));
+        cancel.cancel();
+        let result = worker.join().map_err(|_| "untraced runner panicked")?;
+        ready?;
+        Ok::<_, Box<dyn Error>>(result?)
+    })?;
+    assert_eq!(result.termination, Termination::Signaled(libc::SIGKILL));
+    let child = read_pid(&path.join("child"))?;
+    assert!(has_exited(child), "untraced child {child} was left running");
+    Ok(())
+}
+
 #[test]
 fn exit_codes_are_reported() {
     for code in [0, 1, 3, 255] {

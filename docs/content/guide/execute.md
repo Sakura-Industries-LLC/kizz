@@ -129,8 +129,8 @@ command 1: sh -c 'cat notes.txt | wc -w'
 * Under each program, its paths are grouped by access kind: `read`, `probe`, `list`, `write`, `exec`, `xattr`,
   and its `connections`.
   A path appears once in each group, followed by its outcomes.
-* An outcome is `ok`, the name of the error that a failed call returned, such as `ENOENT`, or `unknown` when the call
-  never returned; an error number without a name reads as `errno` and the number.
+* An outcome is `ok`, the name of the error that a failed call returned, such as `ENOENT`,
+  or `unknown` when the call never returned; an error number without a name reads as `errno` and the number.
 
 Here `sh` looked up `cat` and `wc` in `PATH`, and kizz itself looked up `sh` before starting it,
 which is attributed to `sh`'s program.

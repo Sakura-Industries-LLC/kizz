@@ -268,6 +268,12 @@ pub fn spec_reasons(
             new: new.timestamps,
         });
     }
+    if old.untraced != new.untraced {
+        reasons.push(Reason::TracingChanged {
+            old: old.untraced,
+            new: new.untraced,
+        });
+    }
     if old.machine != new.machine {
         reasons.push(Reason::MachineNamesChanged {
             old: old.machine.clone(),
@@ -538,6 +544,7 @@ mod tests {
             capture: Capture::Split,
             stream: false,
             always: false,
+            untraced: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,

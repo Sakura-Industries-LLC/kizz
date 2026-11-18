@@ -2690,7 +2690,7 @@ fn check_sidebars(pages: &[BuiltPage]) -> Vec<String> {
             Some(_) => {},
         }
     }
-    let links = first.map(sidebar_links).unwrap_or_default();
+    let links = first.map_or_default(sidebar_links);
     for page in pages.iter().filter(|page| page.url != "/") {
         if !links
             .iter()
@@ -2717,7 +2717,7 @@ fn check_every_sidebar(
         }
     }
     for page in pages {
-        let links = sidebar(&page.html).map(sidebar_links).unwrap_or_default();
+        let links = sidebar(&page.html).map_or_default(sidebar_links);
         problems.extend(check_links(&page.url, &links, &wanted));
     }
     problems

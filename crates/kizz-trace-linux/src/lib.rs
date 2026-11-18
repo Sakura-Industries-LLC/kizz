@@ -142,6 +142,7 @@ mod follow;
 mod processes;
 mod spawn;
 mod sys;
+mod untraced;
 
 use std::{
     collections::BTreeSet,
@@ -632,6 +633,15 @@ impl Tracer for LinuxTracer {
             connections: outcome.connections,
             tree: outcome.tree,
         })
+    }
+
+    fn run_untraced(
+        &self,
+        request: &RunRequest,
+        echo: &dyn EchoSink,
+        cancel: &Cancellation,
+    ) -> Result<RunResult, TraceError> {
+        untraced::run(request, echo, cancel)
     }
 
     fn extended_attributes(

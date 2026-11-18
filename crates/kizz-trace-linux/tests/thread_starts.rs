@@ -42,7 +42,7 @@ type Outcome<T> = Result<T, Box<dyn Error>>;
 
 /// How long a run may take: far less than the retries' waits, which are recorded
 /// instead of slept.
-const PATIENCE: Duration = Duration::from_secs(60);
+const PATIENCE: Duration = Duration::from_mins(1);
 
 /// Each thread of a run with split capture: its name and what its error calls it.
 const SPLIT_THREADS: [(&str, &str); 5] = [

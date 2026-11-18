@@ -142,6 +142,10 @@ pub enum Capture {
 /// The full specification of a step, as its `run()` call gave it, with the values
 /// that place it in its task: the task program hash and the occurrence number.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent command options mirror the Starlark API"
+)]
 pub struct StepSpecRecord {
     /// The hash of the task program: its block and every module it loads.
     #[n(0)]
@@ -189,6 +193,10 @@ pub struct StepSpecRecord {
     /// step, as `run(..., machine = [...])` gave them, sorted and without repeats.
     #[n(13)]
     pub machine: Vec<String>,
+    /// Whether dependency tracing was explicitly disabled. Such steps are never cache
+    /// hits.
+    #[n(14)]
+    pub untraced: bool,
 }
 
 /// The combined kinds of access a step made to one path, one bit per kind.
@@ -1159,6 +1167,9 @@ pub enum RunReason {
     /// have been a cache hit, and this was its one run in the run of the task.
     #[n(5)]
     RunNoCache,
+    /// Tracing is disabled, so this command runs once per build and is never reused.
+    #[n(6)]
+    Untraced,
 }
 
 /// What is recorded about one run of a step, by step key, and the tasks that own
@@ -1390,6 +1401,7 @@ mod tests {
                 capture: Capture::Merged,
                 stream: true,
                 always: false,
+                untraced: false,
                 ignore: vec!["re:x".to_owned()],
                 track: vec!["/proc/cpuinfo".to_owned()],
                 timestamps: true,
@@ -1819,8 +1831,8 @@ mod tests {
     fn records_use_definite_lengths() {
         let bytes = minicbor::to_vec(record()).unwrap();
         // A definite-length array of sixteen fields, then the specification as a
-        // definite-length array of fourteen.
-        assert_eq!(bytes.get(..2), Some(&[0x90, 0x8E][..]));
+        // definite-length array of fifteen.
+        assert_eq!(bytes.get(..2), Some(&[0x90, 0x8F][..]));
         // The environment is a definite-length map of two entries, sorted by name
         // whatever the insertion order.
         let encoded_env = minicbor::to_vec(&record().spec.env).unwrap();
@@ -1988,8 +2000,8 @@ mod tests {
         assert_eq!(PERMISSION_BITS, 0o7777);
     }
 
-    /// The `timestamps` option comes right before the `machine` names, the last
-    /// field of the specification's encoding, and both values round-trip.
+    /// The `timestamps` option precedes the `machine` names and untraced flag;
+    /// both timestamp option values round-trip.
     #[test]
     fn the_timestamps_option_encodes_deterministically_and_round_trips() {
         for timestamps in [false, true] {
@@ -1998,17 +2010,17 @@ mod tests {
             spec.machine = Vec::new();
             let first = minicbor::to_vec(&spec).unwrap();
             assert_eq!(first, minicbor::to_vec(&spec).unwrap());
-            let expected = [if timestamps { 0xF5 } else { 0xF4 }, 0x80];
+            let expected = [if timestamps { 0xF5 } else { 0xF4 }, 0x80, 0xF4];
             assert_eq!(
-                first.get(first.len().saturating_sub(2)..),
+                first.get(first.len().saturating_sub(3)..),
                 Some(&expected[..])
             );
             assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
         }
     }
 
-    /// The `machine` names are the last field of the specification's encoding, an
-    /// array of text strings; and the machine state is the last field of the
+    /// The `machine` names precede the untraced flag in the specification encoding,
+    /// as an array of text strings; and the machine state is the last field of the
     /// record. Both encode deterministically and round-trip, a state whose parts
     /// could not be read included.
     #[test]
@@ -2016,11 +2028,14 @@ mod tests {
         let mut spec = record().spec;
         let first = minicbor::to_vec(&spec).unwrap();
         assert_eq!(first, minicbor::to_vec(&spec).unwrap());
-        assert!(first.ends_with(b"\x82\x66kernel\x66memory"), "{first:x?}");
+        assert!(
+            first.ends_with(b"\x82\x66kernel\x66memory\xF4"),
+            "{first:x?}"
+        );
         assert_eq!(minicbor::decode::<StepSpecRecord>(&first).unwrap(), spec);
         spec.machine = vec!["disk".to_owned()];
         let other = minicbor::to_vec(&spec).unwrap();
-        assert!(other.ends_with(b"\x81\x64disk"), "{other:x?}");
+        assert!(other.ends_with(b"\x81\x64disk\xF4"), "{other:x?}");
 
         let state = minicbor::to_vec(machine_state()).unwrap();
         let mut record = record();

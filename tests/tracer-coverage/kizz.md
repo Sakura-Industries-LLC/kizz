@@ -12,7 +12,7 @@ one of them with `--cache-unknown-syscalls`.
 
 ```starlark coverage-build
 env.inherit("PATH")
-run("cc", "-std=gnu11", "-Wall", "-Wextra", "-pthread", "-o", "coverage", "coverage.c", expect = [0])
+run("cc", "-std=gnu11", "-Wall", "-Wextra", "-pthread", "-o", "coverage", "coverage.c", expect=[0])
 ```
 
 ## Run the program
@@ -21,7 +21,7 @@ The program runs with an empty environment, and its name has a `/`, so kizz look
 Its result is cached, and every access it makes is recorded.
 
 ```starlark coverage-test
-run("./coverage", capture = "merged", expect = [0])
+run("./coverage", capture="merged", expect=[0])
 ```
 
 ## Rewrite what the program read
@@ -33,7 +33,7 @@ The `control` mode writes its file under `out/changes` before it reads it, so it
 ```starlark coverage-changes
 modes = ["open", "openat", "openat2", "fopen", "execve", "execveat", "execv", "interpreter", "control"]
 for mode in modes:
-    run("./coverage", "change-" + mode, capture = "merged", expect = [0])
+    run("./coverage", "change-" + mode, capture="merged", expect=[0])
 ```
 
 ## Make calls that kizz cannot trace
@@ -73,7 +73,7 @@ calls = [
     "swapoff",
 ]
 for call in calls:
-    run("./coverage", "incomplete-" + call, capture = "merged", expect = [0])
+    run("./coverage", "incomplete-" + call, capture="merged", expect=[0])
 for number in ["400", "1000000"]:
-    run("./coverage", "unknown-" + number, capture = "merged", expect = [0])
+    run("./coverage", "unknown-" + number, capture="merged", expect=[0])
 ```

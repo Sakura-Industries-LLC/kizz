@@ -299,20 +299,14 @@ pub fn default_order(
 ) -> Ordering {
     /// The directory components of `path`, as bytes, and its file name.
     fn key(path: &Path) -> (Vec<&[u8]>, &[u8]) {
-        let directories = path
-            .parent()
-            .map(|parent| {
-                parent
-                    .components()
-                    .filter(|component| matches!(component, Component::Normal(_)))
-                    .map(|component| component.as_os_str().as_encoded_bytes())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let name = path
-            .file_name()
-            .map(OsStr::as_encoded_bytes)
-            .unwrap_or_default();
+        let directories = path.parent().map_or_default(|parent| {
+            parent
+                .components()
+                .filter(|component| matches!(component, Component::Normal(_)))
+                .map(|component| component.as_os_str().as_encoded_bytes())
+                .collect()
+        });
+        let name = path.file_name().map_or_default(OsStr::as_encoded_bytes);
         (directories, name)
     }
     key(a).cmp(&key(b))

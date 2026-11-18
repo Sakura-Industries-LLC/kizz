@@ -29,7 +29,7 @@ It ends with the defect the measurements found and fixed, and the follow-up work
 * Machine: AMD Ryzen 9 5950X, 16 cores and 32 threads, 126 GiB of memory.
 * Kernel: Linux 7.2.11-1-cachyos, x86_64, with `kernel.yama.ptrace_scope` set to 1.
 * File system of every copy, tree, and cache: ZFS, under `/tmp`.
-* Kizz: the release binary `target/release/kizz` that `just fix-ci` built in the task worktree,
+* Kizz: the release binary `target/release/kizz` that `kizz build fix+ci` built in the task worktree,
   from commit `e9e00bd69ee258d4a4c527ef101755e7dd75951f` plus the fix described below.
 * The build tools are those on the caller's `PATH`; their versions were not inspected.
 * Every run of `kizz` used `KIZZ_CACHE_DIR` set to a fresh temporary directory, never the user's cache.
@@ -304,15 +304,15 @@ Retargeting, removing, or replacing such a link runs the step again.
 The regression tests are:
 
 * `observe::tests::kernel_paths_and_the_standard_links_into_them_reach_the_kernel`,
-  `observe::tests::links_that_lead_into_proc_or_sys_reach_the_kernel`,
-  `observe::tests::other_paths_do_not_reach_the_kernel`, and
-  `observe::tests::the_links_that_lead_into_proc_or_sys_are_listed` in `kizz-core`;
+  `observe::tests::links_that_lead_into_proc_or_sys_reach_the_kernel`, `observe::tests::other_paths_do_not_reach_the_kernel`,
+  and `observe::tests::the_links_that_lead_into_proc_or_sys_are_listed` in `kizz-core`;
 * `paths_that_links_lead_into_proc_or_sys_keep_only_their_links` in `crates/kizz-core/tests/engine.rs`;
-* `a_final_link_into_proc_stays_a_dependency` and `a_directory_link_into_proc_stays_a_dependency`
-  in `crates/kizz-core/tests/cache.rs`, with a fake tracer: a hit while a final link and a directory link into `/proc`
-  are unchanged, then a new run for each retarget, removal, and replacement;
-* `a_command_that_reads_dev_fd_paths_is_cached_on_the_next_build` and
-  `retargeting_or_replacing_a_link_into_proc_runs_the_command_again` in `crates/kizz/tests/build.rs`,
+* `a_final_link_into_proc_stays_a_dependency`
+  and `a_directory_link_into_proc_stays_a_dependency` in `crates/kizz-core/tests/cache.rs`, with a fake tracer:
+  a hit while a final link and a directory link into `/proc` are unchanged, then a new run for each retarget, removal,
+  and replacement;
+* `a_command_that_reads_dev_fd_paths_is_cached_on_the_next_build`
+  and `retargeting_or_replacing_a_link_into_proc_runs_the_command_again` in `crates/kizz/tests/build.rs`,
   which run the binary with the real tracer.
 
 With the fix, the second build of the Rust binding is a cache hit,

@@ -1757,8 +1757,8 @@ fn a_file_changed_by_something_else_during_a_run_is_a_loud_warning() -> TestResu
 /// A command that connects to a loopback address, here `bash` through `/dev/tcp`
 /// to a listener that the test opens, is cached, and the build warns once, naming
 /// the command and the address, that kizz cannot see what came back, that the
-/// result is still cached, and that `always = True` runs a command on every build;
-/// the summary repeats the warning. The record lists the connection, the next build
+/// result is still cached, and how to acknowledge it. The record lists the connection,
+/// the next build
 /// is a cache hit without the warning, and `kizz why` lists the connection.
 #[test]
 fn a_command_that_connects_warns_and_is_still_cached() -> TestResult {
@@ -1782,14 +1782,10 @@ fn a_command_that_connects_warns_and_is_still_cached() -> TestResult {
         "{first:?}"
     );
     let message = format!(
-        "`{command}` in . connected to 127.0.0.1:{port}; kizz cannot see what came back, and \
-         its result is still cached; `always = True` runs a command on every build"
+        "`{command}` in . made socket calls targeting 127.0.0.1:{port}; kizz cannot see what came back, and \
+         its result is still cached; set `network = True` if this is expected"
     );
-    assert_eq!(
-        first.stderr,
-        format!("warning: {message}\n1 warning:\n  {message}\n"),
-        "{first:?}"
-    );
+    assert_eq!(first.stderr, format!("warning: {message}\n"), "{first:?}");
     let records = project.step_records()?;
     let [record] = records.as_slice() else {
         return Err(format!("expected one record, found {records:?}").into());
@@ -1814,6 +1810,37 @@ fn a_command_that_connects_warns_and_is_still_cached() -> TestResult {
         "{why:?}"
     );
     drop(listener);
+    Ok(())
+}
+
+/// Acknowledged socket activity stays in the record and does not affect caching.
+#[test]
+fn expected_network_activity_is_recorded_without_a_warning() -> TestResult {
+    let project = Project::new()?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let port = listener.local_addr()?.port();
+    project.kizz_md("", &[(
+        "Connect",
+        &format!(
+            "run(\"bash\", \"-c\", \"exec 3<>/dev/tcp/127.0.0.1/{port}\", network = True, expect = [0])"
+        ),
+    )])?;
+
+    let first = project.run("", &["build", "ci"])?;
+    assert_eq!(first.status, Some(0), "{first:?}");
+    assert!(first.stderr.is_empty(), "{first:?}");
+    let records = project.step_records()?;
+    let [record] = records.as_slice() else {
+        return Err("expected one step record".into());
+    };
+    assert_eq!(record.not_cached, None);
+    assert_eq!(record.connections, [Connection::Ipv4 {
+        address: [127, 0, 0, 1],
+        port,
+    }]);
+    let second = project.run("", &["build", "ci"])?;
+    assert_eq!(second.status, Some(0), "{second:?}");
+    assert!(second.stdout.contains(", 1 cached"), "{second:?}");
     Ok(())
 }
 

@@ -1,23 +1,22 @@
 [package]
 name = "kizz"
-version = "0.0.1"
+version = "0.0.2"
 description = "A Linux build engine that traces the commands of kizz.md tasks and caches their results."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-homepage.workspace = true
 repository.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
-kizz-core = { path = "../kizz-core", version = "0.0.1" }
-kizz-store = { path = "../kizz-store", version = "0.0.1" }
+kizz-core = { path = "../kizz-core", version = "0.0.2" }
+kizz-store = { path = "../kizz-store", version = "0.0.2" }
 kizz-threads = { path = "../kizz-threads", version = "0.0.1" }
-kizz-trace = { path = "../kizz-trace", version = "0.0.1" }
-kizz-trace-linux = { path = "../kizz-trace-linux", version = "0.0.1" }
+kizz-trace = { path = "../kizz-trace", version = "0.0.2" }
+kizz-trace-linux = { path = "../kizz-trace-linux", version = "0.0.2" }
 bpaf = { version = "0.9.29", features = ["derive"] }
 build-info = "0.0.47"
 console = "0.16.6"

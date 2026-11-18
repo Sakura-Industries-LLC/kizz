@@ -102,10 +102,10 @@ Each command block starts with `command`, the command's number from 1, and its a
 
 * `program:` and the absolute path of the program, or `not found` when the lookup found none;
 * `directory:` and the working directory;
-* `outcome:` and how it ended: `exited with` and the code, `signaled with` and the signal, or `not found:`,
-  `not executable:`, `start failed:` or `failed:` and the error;
-* `trace:` and `complete`, `incomplete` or `cached, not traced`, with each reason on a line of its own below it:
-  its kind, in a hierarchical report its process, and its detail.
+* `outcome:` and how it ended: `exited with` and the code, `signaled with` and the signal, or `not found:`, `not executable:`,
+  `start failed:` or `failed:` and the error;
+* `trace:` and `complete`, `incomplete` or `cached, not traced`, with each reason on a line of its own below it: its kind,
+  in a hierarchical report its process, and its detail.
 
 Arguments are separated by spaces and quoted as a POSIX shell would read them: an argument that is empty,
 or holds a character other than a letter, a digit or one of `-_./=:,+@%^`, is put in single quotes,
@@ -121,8 +121,7 @@ in the order they started:
   `signaled with` and the signal, or `end not seen`.
   A process with neither a process ID nor an exit, such as the placeholder of a command that kizz never started, reads `process`,
   its number and `not started`.
-* Under it, each program: `program`, its path, `inherited` when the process runs it because its creator ran it,
-  and its arguments.
+* Under it, each program: `program`, its path, `inherited` when the process runs it because its creator ran it, and its arguments.
 * Under each program, its paths grouped by access kind: a line with the kind, then each path with its outcomes,
   and last a `connections:` group with each connection: `ip` and the address, `unix` and the path, or `abstract` and the name.
   A group with nothing in it is left out.

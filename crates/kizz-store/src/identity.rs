@@ -99,8 +99,7 @@ impl CacheIdentity {
                 .and_then(|status| umask_of_status(&status)),
             machine: machine(),
             cpu_models: fs::read_to_string(CPU_INFO_FILE)
-                .map(|info| cpu_models_of_info(&info))
-                .unwrap_or_default(),
+                .map_or_default(|info| cpu_models_of_info(&info)),
         }
     }
 

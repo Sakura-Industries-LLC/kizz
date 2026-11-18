@@ -21,18 +21,20 @@ use std::{
 };
 
 use kizz_core::{Render, why};
-use kizz_store::{CacheLock, LockDetails, Store, cache_dir_from_env};
+use kizz_store::{CacheLock, LockDetails, Store, Verdict, cache_dir_from_env};
 
 use crate::{cli::USAGE_ERROR, ui};
 
 /// Print the reasons stored by the most recent build for the tasks under `path`,
 /// relative to the current directory, or under the current directory without it,
-/// showing environment values when `verbose` is set; return the exit status.
+/// filtering by task cache status when `cached` is set and showing environment
+/// values when `verbose` is set. Return the exit status.
 ///
 /// A cache that cannot be located, locked, opened, or read exits with
 /// [`USAGE_ERROR`].
 pub(crate) fn run(
     path: Option<&Path>,
+    cached: Option<bool>,
     verbose: bool,
 ) -> ExitCode {
     let cwd = match env::current_dir() {
@@ -58,10 +60,19 @@ pub(crate) fn run(
         Ok(store) => store,
         Err(error) => return failure(&error.to_string()),
     };
-    let report = match why(&store, &target) {
+    let mut report = match why(&store, &target) {
         Ok(report) => report,
         Err(error) => return failure(&format!("cannot read the cache: {error}")),
     };
+    if let Some(cached) = cached {
+        report.tasks.retain(|task| {
+            let fully_cached = task
+                .steps
+                .iter()
+                .all(|step| matches!(step.verdict, Verdict::Cached));
+            !task.steps.is_empty() && fully_cached == cached
+        });
+    }
     let render = Render {
         base: cwd,
         home: env::var_os(kizz_store::location::HOME)

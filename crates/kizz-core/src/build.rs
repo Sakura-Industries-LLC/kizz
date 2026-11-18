@@ -350,15 +350,12 @@ impl BuildReport {
     pub fn unchecked(&self) -> Vec<UncheckedStep> {
         match self.outcome {
             BuildOutcome::Succeeded | BuildOutcome::Failed { .. } => {
-                self.passes
-                    .last()
-                    .map(|pass| {
-                        pass.tasks
-                            .iter()
-                            .flat_map(|result| result.unchecked.iter().cloned())
-                            .collect()
-                    })
-                    .unwrap_or_default()
+                self.passes.last().map_or_default(|pass| {
+                    pass.tasks
+                        .iter()
+                        .flat_map(|result| result.unchecked.iter().cloned())
+                        .collect()
+                })
             },
             BuildOutcome::NotSettled { .. } | BuildOutcome::Interrupted => Vec::new(),
         }
@@ -788,8 +785,7 @@ pub fn learned_order(producers: &[Vec<usize>]) -> Vec<usize> {
         }
         let before: BTreeSet<usize> = producers
             .get(task)
-            .map(|before| before.iter().copied().collect())
-            .unwrap_or_default();
+            .map_or_default(|before| before.iter().copied().collect());
         for producer in before {
             if producer < producers.len() {
                 place(producer, producers, visiting, order);
@@ -822,16 +818,13 @@ fn stored_order(
     let txn = store.read()?;
     let mut producers = Vec::with_capacity(ids.len());
     for id in &ids {
-        let before: Vec<usize> = txn
-            .get::<LearnedOrder>(id)?
-            .map(|order| {
-                order
-                    .producers
-                    .iter()
-                    .filter_map(|producer| index.get(producer).copied())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let before: Vec<usize> = txn.get::<LearnedOrder>(id)?.map_or_default(|order| {
+            order
+                .producers
+                .iter()
+                .filter_map(|producer| index.get(producer).copied())
+                .collect()
+        });
         producers.push(before);
     }
     Ok(learned_order(&producers))

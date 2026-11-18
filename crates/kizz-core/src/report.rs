@@ -486,7 +486,7 @@ impl ReportProgram {
     /// The placeholder program of a command that started no process: the name
     /// that kizz looked up, `argv[0]`, with the arguments.
     fn looked_up(argv: &[OsString]) -> Self {
-        let name = argv.first().map(PathBuf::from).unwrap_or_default();
+        let name = argv.first().map_or_default(PathBuf::from);
         Self::named(name, argv.to_vec())
     }
 }

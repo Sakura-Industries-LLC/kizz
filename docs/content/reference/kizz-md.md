@@ -83,8 +83,8 @@ A task can have any number of targets, and many tasks in many `kizz.md` files ca
 * A target name is one or more ASCII letters, digits, `_`, `.` and `-`.
   Any other character in a target word is a [configuration error](#configuration-errors).
 * Names are compared as written, so `CI` and `ci` are different targets.
-* A target repeated on one block counts once; [`task.targets`](@/reference/starlark.md#task-targets) lists the targets
-  in the order written, without repeats.
+* A target repeated on one block counts once;
+  [`task.targets`](@/reference/starlark.md#task-targets) lists the targets in the order written, without repeats.
 * Targets are not part of the task program, so changing them changes no step key.
 
 The command line selects tasks by a *target expression*: one target, or several joined with `+`, such as `ci+check`.
@@ -124,10 +124,8 @@ kizz.md:12 (Deploy) [] name=deploy cache=never
 
 These are the problems of a task option, each a [configuration error](#configuration-errors) with its own message:
 
-* a word that starts with `=`, which has no key:
-  "task option `=x` has no key: a task option is a `key=value` word";
-* a key other than `name` and `cache`:
-  "unknown task option `color=red`: the task options are `name=<name>` and `cache=never`";
+* a word that starts with `=`, which has no key: "task option `=x` has no key: a task option is a `key=value` word";
+* a key other than `name` and `cache`: "unknown task option `color=red`: the task options are `name=<name>` and `cache=never`";
 * a key that the block already gave: "task option `name=b` gives the key `name` again, which a block gives once";
 * nothing after `=`: "task option `name=` has an empty value".
 
@@ -217,8 +215,8 @@ warning: kizz.md:3 (Notes): this starlark block has neither targets nor a name, 
 ```
 
 * Its content is not run.
-* Its task options are still checked, so a block with only `cache=never` warns, and one with `cache=sometimes` is a
-  configuration error.
+* Its task options are still checked, so a block with only `cache=never` warns,
+  and one with `cache=sometimes` is a configuration error.
 * It takes no position among the tasks of its file.
 
 ## Configuration errors
@@ -254,17 +252,19 @@ By default, kizz records what each command touched, and replays the command's re
 
 In a `run()` call:
 
+* [`untraced = True`](@/reference/starlark.md#untraced) disables dependency tracing and runs once per build,
+  never from an earlier build.
 * [`always = True`](@/reference/starlark.md#always) runs the command once in each build that reaches it, without a cache check.
 * [`timestamps = True`](@/reference/starlark.md#timestamps) makes a new modification or change time of a used path a change.
 * [`machine = [...]`](@/reference/starlark.md#machine) makes named parts of the machine state inputs of the step.
 * [`track = [...]`](@/reference/starlark.md#track) makes the content of `/proc` and `/sys` files inputs of the step.
 * [`ignore = [...]`](@/reference/starlark.md#ignore) leaves paths out of the step's record, so they never run it again.
 * The program and its arguments ([`argv`](@/reference/starlark.md#argv)), [`stdin`](@/reference/starlark.md#stdin),
-  the command's environment ([`env`](@/reference/starlark.md#env)), the working directory
-  ([`cwd`](@/reference/starlark.md#cwd)) and [`capture`](@/reference/starlark.md#capture) are part of the step key,
-  so a change to any of them gives another step key, and the record under that key decides:
-  a key without a record runs, and a key that an earlier value left a valid record under, such as after an edit is undone,
-  is a cache hit again.
+  the command's environment ([`env`](@/reference/starlark.md#env)),
+  the working directory ([`cwd`](@/reference/starlark.md#cwd))
+  and [`capture`](@/reference/starlark.md#capture) are part of the step key, so a change to any of them gives another step key,
+  and the record under that key decides: a key without a record runs, and a key that an earlier value left a valid record under,
+  such as after an edit is undone, is a cache hit again.
 * [`stream`](@/reference/starlark.md#stream) and [`expect`](@/reference/starlark.md#expect) are not part of the step key
   and change no caching.
 * The task program's hash, which covers the block and every module that it [loads](@/reference/starlark.md#load),
@@ -279,11 +279,12 @@ In the info string:
 On the command line:
 
 * [`kizz run --no-cache`](@/reference/command-line.md#no-cache) runs every command of its task, and still records each result.
-* [`--cache-unknown-syscalls`](@/reference/command-line.md#cache-unknown-syscalls) of `kizz build` and `kizz run`
-  caches the results of commands that made a system call that the tracer does not know, which are not cached by default.
+* [`--cache-unknown-syscalls`](@/reference/command-line.md#cache-unknown-syscalls) of `kizz build`
+  and `kizz run` caches the results of commands that made a system call that the tracer does not know,
+  which are not cached by default.
 * [`kizz cache reset`](@/reference/command-line.md#kizz-cache-reset) wipes the entries of the tasks under a path,
-  so their commands run again, and [`kizz cache clean`](@/reference/command-line.md#kizz-cache-clean) removes the entries
-  about files that no longer exist.
+  so their commands run again, and [`kizz cache clean`](@/reference/command-line.md#kizz-cache-clean) removes the entries about
+  files that no longer exist.
 
 No option forces caching: a command marked `always`, or of a task marked `cache=never`, runs whatever else is given.
 Some results are never a cache hit in a later build, such as that of a command killed by a signal.

@@ -329,6 +329,19 @@ pub enum Reason {
     /// build.
     #[n(16)]
     RunNoCache,
+    /// Dependency tracing is disabled; the command runs once per build.
+    #[n(17)]
+    Untraced,
+    /// The dependency tracing mode changed.
+    #[n(18)]
+    TracingChanged {
+        /// The previous value of the untraced option.
+        #[n(0)]
+        old: bool,
+        /// The current value of the untraced option.
+        #[n(1)]
+        new: bool,
+    },
 }
 
 impl Reason {
@@ -377,11 +390,13 @@ impl Explanation {
     #[must_use]
     pub fn runs_every_build(&self) -> bool {
         self.reasons.iter().any(|reason| {
-            matches!(reason, Reason::Always | Reason::TaskCacheNever)
-                || reason
-                    .inputs()
-                    .iter()
-                    .any(|input| input.self_inflicted.is_some())
+            matches!(
+                reason,
+                Reason::Always | Reason::TaskCacheNever | Reason::Untraced
+            ) || reason
+                .inputs()
+                .iter()
+                .any(|input| input.self_inflicted.is_some())
         })
     }
 }

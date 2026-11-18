@@ -256,6 +256,8 @@ impl Fixture {
             capture: CaptureMode::Split,
             stream: false,
             always: false,
+            untraced: false,
+            network: false,
             ignore: vec!["*.tmp".to_owned()],
             track: Vec::new(),
             timestamps: false,
@@ -270,18 +272,14 @@ impl Fixture {
         &self,
         env: &[(&str, &str)],
     ) -> TestResult {
-        let identity = TaskIdentity {
-            id: TaskId {
-                file: self.root.join("kizz.md"),
-                index: 0,
-            },
-            line: 3,
-            heading: Some("Build".to_owned()),
-            targets: vec!["ci".to_owned()],
-            program: ProgramHash::from_bytes([7; 32]),
-            parts: ProgramParts::default(),
-            dir: AbsolutePath::new(&self.root)?,
-        };
+        self.build_tasks(&[("Build", &[self.step(env)?])])
+    }
+
+    /// Run the given tasks together so their records share one build.
+    fn build_tasks(
+        &self,
+        tasks: &[(&str, &[StepSpec])],
+    ) -> TestResult {
         let store = Store::open(self.cache.path())?;
         let engine = Engine::new(
             &FakeTracer,
@@ -291,10 +289,25 @@ impl Fixture {
             None,
             &WorkerPool::new()?,
         );
-        let steps = engine.task_for(identity);
-        steps.execute(&self.step(env)?)?;
-        steps.finish(true)?;
-        drop(steps);
+        for (index, (heading, commands)) in tasks.iter().enumerate() {
+            let index = u32::try_from(index)?;
+            let steps = engine.task_for(TaskIdentity {
+                id: TaskId {
+                    file: self.root.join("kizz.md"),
+                    index,
+                },
+                line: index.saturating_mul(6).saturating_add(3),
+                heading: Some((*heading).to_owned()),
+                targets: vec!["ci".to_owned()],
+                program: ProgramHash::from_bytes([7; 32]),
+                parts: ProgramParts::default(),
+                dir: AbsolutePath::new(&self.root)?,
+            });
+            for command in *commands {
+                steps.execute(command)?;
+            }
+            steps.finish(true)?;
+        }
         drop(engine);
         store.close()?;
         Ok(())
@@ -364,6 +377,54 @@ fn why_prints_the_reasons_untracked_accesses_and_ignored_counts() -> TestResult 
 
     // The lock file is gone afterwards: the command took the lock and released it.
     assert!(!fixture.cache.path().join("kizz.lock").exists());
+    Ok(())
+}
+
+/// The filter selects whole tasks in the most recent build, including a task
+/// with both a command that ran and a command that was cached.
+#[test]
+fn why_filters_tasks_by_cache_status() -> TestResult {
+    let fixture = Fixture::new()?;
+    let reads_input = fixture.step(&[])?;
+    let cached = StepSpec {
+        argv: vec!["tool".to_owned(), "constant".to_owned()],
+        ..reads_input.clone()
+    };
+    let cached_only = StepSpec {
+        argv: vec!["tool".to_owned(), "other".to_owned()],
+        ..cached.clone()
+    };
+    let tasks: [(&str, &[StepSpec]); 3] = [
+        ("Mixed", &[reads_input, cached]),
+        ("Cached task", &[cached_only]),
+        ("Empty task", &[]),
+    ];
+    fixture.build_tasks(&tasks)?;
+    let no_matches = fixture.why(&[], &["--cached=true"])?;
+    assert_eq!(no_matches.status, Some(0), "{no_matches:?}");
+    assert_eq!(
+        no_matches.stdout,
+        "No tasks matched the filter in the most recent build under `.`.\n"
+    );
+
+    fixture.write("in.txt", "changed")?;
+    fixture.build_tasks(&tasks)?;
+
+    for (args, mixed, cached, empty) in [
+        (&[][..], true, true, true),
+        (&["--cached=false"][..], true, false, false),
+        (&["--cached=true", "kizz.md"][..], false, true, false),
+    ] {
+        let run = fixture.why(&[], args)?;
+        assert_eq!(run.status, Some(0), "{run:?}");
+        assert_eq!(run.stdout.contains("(Mixed)"), mixed, "{run:?}");
+        assert_eq!(run.stdout.contains("(Cached task)"), cached, "{run:?}");
+        assert_eq!(run.stdout.contains("(Empty task)"), empty, "{run:?}");
+        if mixed {
+            assert!(run.stdout.contains("step 2: `tool constant`"), "{run:?}");
+            assert!(run.stdout.contains("ran because:"), "{run:?}");
+        }
+    }
     Ok(())
 }
 

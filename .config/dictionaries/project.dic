@@ -12,6 +12,7 @@ chdir
 CLICOLOR
 CLOEXEC
 cmark
+cmdline
 codegen
 cowextsize
 cpus
@@ -202,12 +203,15 @@ getegid
 getenv
 geteuid
 GETEVENTMSG
+GETFL
 GETFMT
 getgroups
 getguardsize
 gethostname
+getpgid
 getpgrp
 getpid
+getppid
 getpwuid
 GETREGS
 getrlimit
@@ -232,6 +236,7 @@ ilog
 inotify
 interp
 iovec
+isdigit
 JSET
 kibibytes
 kizz
@@ -254,6 +259,7 @@ memlock
 memtable
 minicbor
 MINSIGSTKSZ
+mise
 mkdirat
 mkfifo
 mknod
@@ -278,6 +284,7 @@ NOCTTY
 nodata
 nofile
 NONBLOCK
+nonblocking
 NOTIF
 nsec
 NSYNC
@@ -287,6 +294,7 @@ opendir
 openpt
 osrelease
 pagable
+PDEATHSIG
 permalink
 phentsize
 phnum
@@ -324,12 +332,14 @@ rgignore
 Riker
 rlim
 rlimit
+rpartition
 rseq
 rsplit
 rtprio
 rttime
 rumdl
 RUSTDOCFLAGS
+RUSTFLAGS
 Ryzen
 Sakura
 sccache
@@ -341,6 +351,7 @@ sendmsg
 sendto
 setattr
 setext
+SETFL
 SETMASK
 setns
 SETOPTIONS
@@ -373,6 +384,7 @@ SIGTTIN
 SIGTTOU
 SIGURG
 SIGUSR
+sjbox
 sockaddr
 Starlark
 startswith
@@ -410,6 +422,7 @@ uncacheable
 uninit
 unlinkat
 unlockpt
+unreaped
 unrunnable
 untrackable
 uprobe

@@ -715,7 +715,7 @@ impl Output<'_> {
         for (key, why) in self.engine.not_cached()? {
             match why {
                 NotCachedReason::Incomplete { detail } => {
-                    if first_time(&self.incomplete_shown, key) {
+                    if !self.engine.was_untraced(&key)? && first_time(&self.incomplete_shown, key) {
                         self.warn(self.incomplete(&key, &detail));
                     }
                 },
@@ -745,7 +745,8 @@ impl Output<'_> {
         }
         for made in self.engine.connections()? {
             if first_time(&self.connections_shown, made.key) {
-                self.warn(self.connected(&made));
+                // Socket destinations can make this warning long. Print it only here.
+                ui::print_warning(&self.connected(&made));
             }
         }
         Ok(())
@@ -839,8 +840,7 @@ impl Output<'_> {
 
     /// The warning for the run `made`, which connected to the network or to Unix
     /// sockets: the command and each address or socket, that kizz cannot see what
-    /// came back, whether its result is still cached, and that `always = True` runs
-    /// a command on every build.
+    /// came back, whether its result is still cached, and how to acknowledge it.
     fn connected(
         &self,
         made: &StepConnections,
@@ -851,8 +851,8 @@ impl Output<'_> {
             "and its result was not cached for another reason"
         };
         format!(
-            "{} connected to {}; kizz cannot see what came back, {outcome}; `always = True` \
-             runs a command on every build",
+            "{} made socket calls targeting {}; kizz cannot see what came back, {outcome}; \
+             set `network = True` if this is expected",
             self.command(&made.key),
             connections_text(&made.connections, |path| {
                 format!("`{}`", self.render.path(path))

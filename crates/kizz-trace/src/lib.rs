@@ -1689,6 +1689,27 @@ pub trait Tracer: Send + Sync {
         cancel: &Cancellation,
     ) -> Result<RunResult, TraceError>;
 
+    /// Run a command without tracing its dependencies. The engine never reuses its
+    /// result. Implementations must preserve the request's environment, streams and
+    /// cancellation. The result must mark observation incomplete, including any
+    /// forced stream closure, and must not claim unobserved dependencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when untraced execution is unsupported or the command cannot
+    /// start.
+    fn run_untraced(
+        &self,
+        _request: &RunRequest,
+        _echo: &dyn EchoSink,
+        _cancel: &Cancellation,
+    ) -> Result<RunResult, TraceError> {
+        Err(TraceError::Tracer {
+            message: "this runner does not support untraced execution".to_owned(),
+            source: None,
+        })
+    }
+
     /// The extended attributes of `path`, each name with its value, sorted by name,
     /// following a final symbolic link when `follow` is set, or not when it is not.
     /// A file system that keeps no extended attributes has none.

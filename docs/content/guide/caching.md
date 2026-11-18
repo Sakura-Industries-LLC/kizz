@@ -12,6 +12,8 @@ A command runs anyway when kizz has no record for it, or when something it recor
 It also runs in every build that reaches it when its `run()` has `always = True`, when its task is marked `cache=never`,
 or under `kizz run --no-cache`.
 And a command whose previous result could not be cached, such as one that a signal killed, runs again.
+An explicit [`untraced = True`](@/reference/starlark.md#untraced) command also runs once per build,
+but its dependencies are not observed and its result is never reused across builds.
 Every time a command runs, kizz says why.
 
 ## What kizz records
@@ -53,7 +55,7 @@ Each step's record is stored under a *step key*, a hash of everything that is kn
 * the occurrence number, which counts identical commands earlier in the same task run.
 
 A change to any of these makes a new key, which has no record yet, so the step runs.
-`always`, `stream` and `expect` are not in the key: they change what kizz does with a step, not what the command does.
+`always`, `stream`, `expect` and `network` are not in the key: they change what kizz does with a step, not what the command does.
 Task options are not in it either.
 
 Keys use the absolute directory of each task, not the directory where kizz started.
@@ -246,8 +248,7 @@ nothing to remove: no cache entry is about a file that no longer exists
 
 Kizz says why it ran each command, so nobody has to guess why something keeps rebuilding.
 
-* `kizz build` prints a one-line reason for each command it runs, and `--explain` prints the full reasons,
-  for cached commands too.
+* `kizz build` prints a one-line reason for each command it runs, and `--explain` prints the full reasons, for cached commands too.
 * `--verbose` also lists the cached commands, and shows the values of changed environment variables.
 * `kizz why [path]` prints the reasons that the most recent build stored, for the tasks under the path.
   It also lists each step's untracked `/proc` and `/sys` accesses, its connections, its ignored accesses,

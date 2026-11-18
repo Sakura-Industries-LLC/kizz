@@ -136,8 +136,9 @@ fn tree_options(path: PathBuf) -> Options {
 /// command that runs because its task is marked `cache=never`, to step records and
 /// to the explanations of step positions. Version 19 adds the reason of a command
 /// that runs because `kizz run --no-cache` was given, to step records and to the
-/// explanations of step positions.
-pub const SCHEMA_VERSION: u32 = 19;
+/// explanations of step positions. Version 20 records explicit untraced execution
+/// and its explanation, with a distinct key and no reuse across builds.
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Why a store operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -970,12 +971,11 @@ mod tests {
         }
     }
 
-    /// Version 19 adds the reason of a command that runs because `kizz run
-    /// --no-cache` was given, one more than version 18, which added the reason of a
-    /// command whose task is marked `cache=never`.
+    /// Version 20 adds explicit untraced execution to step specifications and
+    /// explanations.
     #[test]
-    fn schema_version_19_records_the_run_no_cache_reason() {
-        assert_eq!(SCHEMA_VERSION, 19);
+    fn schema_version_20_records_untraced_execution() {
+        assert_eq!(SCHEMA_VERSION, 20);
     }
 
     /// The store's thresholds keep write pacing from running: `SurrealKV` paces a

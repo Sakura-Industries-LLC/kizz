@@ -288,6 +288,8 @@ impl Fixture {
             capture: CaptureMode::Split,
             stream: false,
             always: false,
+            untraced: false,
+            network: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,

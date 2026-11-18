@@ -138,8 +138,7 @@ fn script(
             },
             "list" => {
                 let _entries: Vec<fs::DirEntry> = fs::read_dir(&path)
-                    .map(|entries| entries.filter_map(Result::ok).collect())
-                    .unwrap_or_default();
+                    .map_or_default(|entries| entries.filter_map(Result::ok).collect());
                 record(path, AccessKind::List)?;
             },
             "interrupt" => {

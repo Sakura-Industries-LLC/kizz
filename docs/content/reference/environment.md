@@ -29,8 +29,8 @@ The caller's environment is the environment that kizz itself was started with.
   They read a copy that kizz takes once, before the first task program runs, not the process environment itself.
 * `kizz execute` gives the program kizz's whole environment, unchanged, whatever bytes it holds,
   and looks the program up in its `PATH`.
-* The variables that a task copies with `env.inherit`, or sets from a value of `env.caller`, are part of each command's
-  step key, so a change to one runs the commands that received it again.
+* The variables that a task copies with `env.inherit`, or sets from a value of `env.caller`, are part of each command's step key,
+  so a change to one runs the commands that received it again.
 
 [The kizz.md page](@/guide/kizz-md.md) explains the task environment.
 
@@ -41,8 +41,8 @@ When it is set and not empty, it must be an absolute path, and kizz uses that di
 A relative path is an error, `KIZZ_CACHE_DIR must be an absolute path`, and the command exits with 2.
 When it is unset or empty, kizz uses `$XDG_CACHE_HOME/kizz`, or else `~/.cache/kizz`.
 
-* `kizz build`, `kizz run`, `kizz why`, `kizz cache clean` and `kizz cache reset` read it, and create the directory when
-  it does not exist.
+* `kizz build`, `kizz run`, `kizz why`, `kizz cache clean` and `kizz cache reset` read it,
+  and create the directory when it does not exist.
 * `kizz list`, `kizz execute`, `kizz graph` and `kizz image` never use the cache, so they do not read it.
 * Two builds with different cache directories do not wait for each other, because each cache has its own lock.
 
