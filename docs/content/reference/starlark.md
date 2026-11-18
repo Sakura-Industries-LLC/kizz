@@ -71,7 +71,8 @@ result = run(
 )
 ```
 
-Runs one command, a *step* of the task, traces it, and returns its result.
+Runs one command, a *step* of the task, and returns its result.
+Commands are traced unless `untraced = True` is set.
 The positional arguments are the program and its arguments, and every other parameter is a keyword argument with a default.
 A positional argument can also be a list or tuple, which expands in place, as [`argv`](@/reference/starlark.md#argv) describes.
 `run()` works only in a task, not while a module loads.
@@ -89,9 +90,10 @@ Each call goes through these stages:
    `run()` returns the recorded exit status and output, and nothing runs.
    An `untraced` or `always` step, every step of a `cache=never` task and every step under `kizz run --no-cache` get no cache check,
    so each runs again in every build or `kizz run` that reaches it.
-5. Otherwise it looks the program up, runs it through the tracer, and records every path that the command's process tree touched,
+5. Otherwise it looks the program up and runs it.
+   Unless `untraced = True`, it traces the command and records every path that the command's process tree touched,
    with the state of each path when the command finished.
-   In a later pass of the same build, kizz returns the earlier result of an `always` step
+   In a later pass of the same build, kizz returns the earlier result of an `untraced` or `always` step
    or of a step of a `cache=never` task instead, without running the command; `kizz run` runs its task once, with no later pass.
    It also returns a result that was not cached again, while no path that its run touched has changed.
    Such a result comes back with `cached` set, and a command that could not start fails the task again with the same error.
@@ -272,7 +274,12 @@ The direct child determines the exit status and leads a private process group.
 Forwarded signals and cancellation reach that group; cancellation escalates to a kill after the normal grace period.
 Remaining group members are killed when the direct child ends.
 Commands must keep descendants in that group and wait for their work before exiting.
-The direct child dies if kizz dies, but descendants that escape the group cannot be supervised or guaranteed to die with kizz.
+Only the direct child is configured to die if kizz dies abruptly.
+Other descendants can survive, including those that stayed in the original group, because no group cleanup then runs.
+Cancellation escalation kills the original group and the direct child, even if it changed groups.
+After the direct child ends, stdin closes and output is drained for at most one second or until cancellation.
+Remaining open output pipes are closed, and the report marks output as possibly cut short.
+Explicitly disabling tracing produces no incomplete-trace warning; the report still records that tracing was disabled.
 Use this explicit exception only when tracing prevents a command from working.
 
 ### `ignore`

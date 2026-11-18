@@ -265,8 +265,8 @@ result = run(
     cwd = None,         # directory relative to the task directory; None means the task directory
     capture = "split",  # "split": stdout and stderr separately; "merged": one stream in exact order
     stream = False,     # also echo output live to the terminal
-    always = False,
-    untraced = False,     # run on every build, even when cached
+    always = False,     # run on every build, even when cached
+    untraced = False,   # disable dependency tracing; run once per build
     ignore = [],        # user exceptions: paths not recorded as dependencies of this step
     track = [],         # /proc and /sys files whose content counts as an input of this step
     timestamps = False, # also compare the timestamps of what the step read, ran, listed or checked
@@ -354,7 +354,12 @@ It leads a private process group, which receives forwarded signals, a cancellati
 and a kill after the cancellation grace period.
 Remaining group members are killed when the child exits.
 The group leader is kept unreaped until cleanup, so a reused ID cannot be signalled.
-The direct child dies if kizz dies; escaped descendants cannot be supervised or guaranteed to die with kizz in this mode.
+Only the direct child is configured to die if kizz dies abruptly.
+No cleanup then signals the group, so other descendants can survive, including those that stayed in the original group.
+Cancellation escalation kills both the original group and the direct child, even if it changed groups.
+After the direct child ends, stdin is closed and output is drained for at most one second or until cancellation.
+Any output pipes still open are closed, and the report marks output as possibly cut short.
+An explicit untraced step gets no incomplete-trace warning; its report still records the disabled tracing.
 Commands must keep their descendants in the group and wait for the work whose status matters.
 This mode is for explicit exceptions, not build commands whose dependencies need caching or automatic ordering.
 

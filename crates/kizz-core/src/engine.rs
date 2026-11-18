@@ -291,6 +291,8 @@ fn next_build() -> BuildId {
 struct NotCachedRun {
     /// Why it was not cached.
     why: NotCachedReason,
+    /// Whether tracing was deliberately disabled, rather than failing to observe a run.
+    untraced: bool,
     /// Every touched path that no ignore pattern matched, with its state.
     observations: Vec<Observation>,
     /// When the engine began recording the states, in nanoseconds since the Unix
@@ -785,6 +787,20 @@ impl<'a> Engine<'a> {
             .collect();
         steps.sort_by_key(|(key, _)| *key);
         Ok(steps)
+    }
+
+    /// Whether a result was explicitly untraced, so it needs no incomplete-trace warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lock error when the build's results stay locked.
+    pub fn was_untraced(
+        &self,
+        key: &StepKey,
+    ) -> Result<bool, LockError> {
+        Ok(lock(&self.not_cached, NOT_CACHED, self.lock_patience)?
+            .get(key)
+            .is_some_and(|run| run.untraced))
     }
 
     /// The step executor of one run of a task program whose hash is `program` and
@@ -1983,12 +1999,7 @@ impl TaskSteps<'_> {
                     .run_untraced(request, self.engine.echo, &self.engine.cancel);
             // The command may have written any path, including on failure.
             self.engine.states.clear();
-            result.map(|mut result| {
-                result.incomplete = Some(kizz_trace::IncompleteReason::Other {
-                    detail: "dependency tracing explicitly disabled with untraced=True".to_owned(),
-                });
-                result
-            })
+            result
         } else {
             self.engine
                 .tracer
@@ -2267,6 +2278,7 @@ impl TaskSteps<'_> {
         )?
         .insert(pending.key, NotCachedRun {
             why,
+            untraced: step.untraced,
             observations: record.observations,
             recorded_at_nanos: record.recorded_at_nanos,
             result,

@@ -203,10 +203,12 @@ getegid
 getenv
 geteuid
 GETEVENTMSG
+GETFL
 GETFMT
 getgroups
 getguardsize
 gethostname
+getpgid
 getpgrp
 getpid
 getppid
@@ -280,6 +282,7 @@ NOCTTY
 nodata
 nofile
 NONBLOCK
+nonblocking
 NOTIF
 nsec
 NSYNC
@@ -345,6 +348,7 @@ sendmsg
 sendto
 setattr
 setext
+SETFL
 SETMASK
 setns
 SETOPTIONS

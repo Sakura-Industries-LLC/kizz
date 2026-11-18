@@ -715,7 +715,7 @@ impl Output<'_> {
         for (key, why) in self.engine.not_cached()? {
             match why {
                 NotCachedReason::Incomplete { detail } => {
-                    if first_time(&self.incomplete_shown, key) {
+                    if !self.engine.was_untraced(&key)? && first_time(&self.incomplete_shown, key) {
                         self.warn(self.incomplete(&key, &detail));
                     }
                 },

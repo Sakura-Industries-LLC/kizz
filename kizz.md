@@ -20,7 +20,9 @@ Each task is named so it can also be run directly with `kizz run <name>`.
 | `tools` | Check the cspell and rumdl minimum versions. |
 
 The tasks use explicit environment variables through [build/common.star](build/common.star) and load the optional,
-ignored root `.env` for machine settings, just as the Justfile does.
+ignored root `.env` for machine settings.
+Values in `.env` replace inherited shell values; this is intentional.
+The Justfile also loads `.env`, but its default precedence favors the shell instead.
 For example, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` skips checks of system calls blocked by an outer seccomp filter.
 The committed [.config/build.env](.config/build.env) holds the exact cspell and rumdl installation versions;
 checks accept these versions or newer stable versions.
@@ -213,7 +215,8 @@ run("cargo", "deny", "check", "bans", "licenses", "sources", stream = True, expe
 ## Build release binaries
 
 Build all workspace release binaries into Cargo's target directory.
-To install the resulting kizz, run `./bootstrap.sh` again.
+`./bootstrap.sh` rebuilds and installs kizz with Cargo; it does not install this existing release artifact.
+Because `cargo install` is not locked, bootstrap may resolve newer dependencies than the release task used.
 
 ```starlark build ci name=release
 load("build/common.star", "cargo_ignores", "setup")

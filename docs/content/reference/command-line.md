@@ -237,7 +237,10 @@ and names the inputs that kept changing and who wrote them, the files that task 
 or else the tasks that kept running commands.
 
 On Ctrl-C, kizz starts nothing new, and the running command receives the interrupt once.
-Kizz kills whatever of the command still runs 2 seconds later, and the command's result is not cached.
+For a traced command, kizz kills whatever still runs 2 seconds later, and the command's result is not cached.
+For an untraced step, the interrupt and kill target its original process group and the direct child;
+descendants that escaped the group cannot be found or killed by kizz.
+Output draining stops on cancellation, so inherited pipes cannot prevent exit.
 Kizz then closes the cache, releases and deletes the lock file, and exits with 130.
 
 ### Exit statuses

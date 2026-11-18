@@ -1691,7 +1691,8 @@ pub trait Tracer: Send + Sync {
 
     /// Run a command without tracing its dependencies. The engine never reuses its
     /// result. Implementations must preserve the request's environment, streams and
-    /// cancellation.
+    /// cancellation. The result must mark observation incomplete, including any
+    /// forced stream closure, and must not claim unobserved dependencies.
     ///
     /// # Errors
     ///

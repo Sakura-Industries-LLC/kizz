@@ -5,7 +5,7 @@
 """Environment and tool version checks for kizz's own build tasks."""
 
 def setup():
-    """Use explicit caller settings, then optional machine settings from .env."""
+    """Load caller settings, then let .env override them intentionally."""
     env.inherit(
         "PATH", "HOME", "TMPDIR", "TERM", "NO_COLOR",
         "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_TARGET_DIR",

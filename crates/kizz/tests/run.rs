@@ -1128,6 +1128,7 @@ if result.stdout != "input" or result.stderr != "error" or result.rc != 7:
         let run = project.run("", &["build", "ci"])?;
         assert_eq!(run.status, Some(0), "{run:?}");
         assert_eq!(fs::read_to_string(project.root.join("counter"))?, expected);
+        assert!(!run.stderr.contains("traced incompletely"), "{run:?}");
     }
     let records = project.step_records()?;
     let [record] = records.as_slice() else {

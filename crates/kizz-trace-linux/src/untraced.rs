@@ -4,62 +4,74 @@
 
 //! Explicit untraced execution for commands that need to use ptrace themselves.
 //!
-//! The direct child determines the exit status. It leads a private process group;
-//! cancellation and cleanup signal that group. Descendants must not escape it.
-//! An unreaped child reserves the group ID until cleanup has finished, so signals
-//! cannot target a recycled ID. Unlike tracing, this mode cannot supervise escaped
-//! descendants or kill the whole tree when kizz itself is killed.
+//! The first process determines the exit status. Its unreaped ID reserves the
+//! original process group until cleanup. Pipes use nonblocking I/O, with bounded
+//! draining after exit, so escaped descendants cannot keep a run or its cache lock
+//! alive. Only the first process is set to die with kizz; other descendants may
+//! survive kizz's abrupt death, even when they stayed in the original group.
 
 use std::{
     collections::BTreeSet,
-    io, mem,
-    os::unix::process::CommandExt as _,
-    process::{Child, Command, Stdio},
-    ptr, thread,
-    time::Instant,
+    fs::File,
+    io::{self, Read as _, Write as _},
+    mem,
+    os::fd::AsRawFd as _,
+    thread,
+    time::{Duration, Instant},
 };
 
 use kizz_trace::{
-    Accesses, Cancellation, EchoSink, FirstReads, IncompleteReason, ProcessTree, RunRequest,
-    RunResult, Termination, TraceError,
+    Accesses, Cancellation, EchoSink, FirstReads, IncompleteReason, OutputStream, ProcessTree,
+    RunRequest, RunResult, Termination, TraceError,
 };
 
 use crate::{
-    CANCEL_GRACE_PERIOD, CANCEL_POLL_INTERVAL, capture, join, not_started, reader_thread,
-    signal_number, sys, tracer_error,
+    CANCEL_GRACE_PERIOD, CANCEL_POLL_INTERVAL, capture, signal_number, spawn, sys, tracer_error,
 };
 
-/// A child whose ID remains reserved until its process group has been cleaned up.
+/// Maximum time to drain output after the first process ends.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Maximum bytes read from each stream in one cancellation polling round.
+const CHUNK_SIZE: usize = 64 * 1024;
+
+/// A child whose ID remains reserved until its original group has been cleaned up.
 struct ChildGroup {
-    /// The direct child; no other code may reap it before this guard is dropped.
-    child: Child,
+    /// The unreaped first process; no other code may release this ID.
+    pid: libc::pid_t,
 }
 
 impl ChildGroup {
-    /// Signal the private process group while its leader's ID is still reserved.
+    /// Signal the original group and also the first process if it changed groups.
     fn signal(
         &self,
         signal: libc::c_int,
     ) -> io::Result<()> {
-        let pid = libc::pid_t::try_from(self.child.id()).map_err(io::Error::other)?;
-        let group = pid
+        let group = self
+            .pid
             .checked_neg()
-            .ok_or_else(|| io::Error::other("invalid process group ID"))?;
-        match sys::kill(group, signal) {
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-            result => result,
+            .ok_or_else(|| io::Error::other("invalid group ID"))?;
+        let sent = ignore_missing(sys::kill(group, signal));
+        // SAFETY: getpgid has no memory requirements; the unreaped child reserves pid.
+        let current = unsafe { libc::getpgid(self.pid) };
+        if current != self.pid || signal == libc::SIGKILL {
+            // Always kill the first process on escalation, even if its original group vanished.
+            let first = ignore_missing(sys::kill(self.pid, signal));
+            sent.and(first)
+        } else {
+            sent
         }
     }
 
-    /// Observe the child's exit without reaping it and releasing its ID.
+    /// Observe the first process's exit without reaping it and releasing its ID.
     fn termination(&self) -> io::Result<Option<Termination>> {
-        // SAFETY: siginfo_t is plain data and zero initializes its unused fields.
+        // SAFETY: siginfo_t is plain data, zeroed before waitid fills its fields.
         let mut info: libc::siginfo_t = unsafe { mem::zeroed() };
-        // SAFETY: info is writable, and this unreaped child belongs to this process.
+        let id = libc::id_t::try_from(self.pid).map_err(io::Error::other)?;
+        // SAFETY: info is writable and id names this process's unreaped child.
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
-                self.child.id(),
+                id,
                 &raw mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -72,7 +84,7 @@ impl ChildGroup {
                 Err(error)
             };
         }
-        // SAFETY: waitid initialized the SIGCHLD fields of info.
+        // SAFETY: info's SIGCHLD fields were initialized by waitid or zero initialization.
         let status = unsafe { info.si_status() };
         Ok(match info.si_code {
             libc::CLD_EXITED => Some(Termination::Exited(status)),
@@ -81,13 +93,16 @@ impl ChildGroup {
         })
     }
 
-    /// Wait for the direct child, forwarding signals and escalating cancellation.
+    /// Service streams while waiting, forwarding signals and escalating cancellation.
     fn wait(
         &self,
+        streams: &mut Streams<'_>,
+        echo: Option<&dyn EchoSink>,
         cancel: &Cancellation,
     ) -> io::Result<Termination> {
         let mut interrupted = None;
         loop {
+            streams.pump(echo)?;
             if let Some(termination) = self.termination()? {
                 return Ok(termination);
             }
@@ -112,74 +127,167 @@ impl ChildGroup {
 
 impl Drop for ChildGroup {
     fn drop(&mut self) {
-        // Keep the leader unreaped until the group has been signalled. Even when
-        // it has exited, its zombie reserves the ID against reuse.
+        // Signal both identities before collecting the child and releasing its ID.
         drop(self.signal(libc::SIGKILL));
-        drop(self.child.kill());
-        drop(self.child.wait());
+        drop(sys::wait_for(self.pid));
     }
 }
 
-/// Reset inherited signal state and arrange for the direct child to die with kizz.
-///
-/// # Safety
-///
-/// Only call after fork, before exec. Uses only async-signal-safe operations.
-unsafe fn prepare_child(parent: libc::pid_t) -> io::Result<()> {
-    // SAFETY: plain data, initialized by sigemptyset before use.
-    let mut mask: libc::sigset_t = unsafe { mem::zeroed() };
-    // SAFETY: every pointer is valid and the calls have no other memory requirements.
-    let no_new_privileges: libc::c_ulong = 1;
-    let failed = unsafe {
-        libc::sigemptyset(&raw mut mask) == -1
-            || libc::sigprocmask(libc::SIG_SETMASK, &raw const mask, ptr::null_mut()) == -1
-            || libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR
-            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, no_new_privileges, 0, 0, 0) == -1
-            || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1
-    };
-    if failed {
+/// An already absent process or process group needs no further signal.
+fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        other => other,
+    }
+}
+
+/// One nonblocking output reader and the bytes it has captured.
+struct Output {
+    /// Which output stream this pipe represents.
+    stream: OutputStream,
+    /// The pipe, until EOF or the drain deadline closes it.
+    pipe: Option<File>,
+    /// Bytes captured before EOF or forced closure.
+    bytes: Vec<u8>,
+}
+
+/// Nonblocking standard streams, owned by the supervising thread.
+struct Streams<'a> {
+    /// The input writer, closed when the input is sent or the first process ends.
+    stdin: Option<File>,
+    /// The input bytes supplied by the request.
+    input: &'a [u8],
+    /// How much input has been written.
+    written: usize,
+    /// Each output reader and its captured bytes.
+    outputs: Vec<Output>,
+    /// Reused read buffer, kept off the supervising thread's stack.
+    buffer: Vec<u8>,
+}
+
+impl<'a> Streams<'a> {
+    /// Prepare the parent ends without changing the blocking child ends.
+    fn new(
+        stdio: capture::TracerStdio,
+        input: &'a [u8],
+    ) -> io::Result<Self> {
+        if let Some(pipe) = &stdio.stdin {
+            nonblocking(pipe)?;
+        }
+        let outputs = stdio
+            .outputs
+            .into_iter()
+            .map(|(stream, pipe)| {
+                nonblocking(&pipe)?;
+                Ok(Output {
+                    stream,
+                    pipe: Some(pipe),
+                    bytes: Vec::new(),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
+            stdin: stdio.stdin,
+            input,
+            written: 0,
+            outputs,
+            buffer: vec![0; CHUNK_SIZE],
+        })
+    }
+
+    /// Make bounded progress on input and every output, without waiting on a pipe.
+    fn pump(
+        &mut self,
+        echo: Option<&dyn EchoSink>,
+    ) -> io::Result<()> {
+        if let Some(pipe) = &mut self.stdin {
+            let remaining = self.input.get(self.written..).unwrap_or_default();
+            if remaining.is_empty() {
+                self.stdin = None;
+            } else {
+                match pipe.write(remaining) {
+                    Ok(count) => self.written = self.written.saturating_add(count),
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => self.stdin = None,
+                    Err(error) if retry(&error) => {},
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        for output in &mut self.outputs {
+            let Some(pipe) = &mut output.pipe else {
+                continue;
+            };
+            match pipe.read(&mut self.buffer) {
+                Ok(0) => output.pipe = None,
+                Ok(count) => {
+                    let chunk = self.buffer.get(..count).unwrap_or_default();
+                    output.bytes.extend_from_slice(chunk);
+                    if let Some(echo) = echo {
+                        drop(echo.echo(output.stream, chunk));
+                    }
+                },
+                Err(error) if retry(&error) => {},
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Close stdin and drain output until EOF, cancellation or a bounded deadline.
+    /// Returns the reason open output pipes were closed before EOF, if any.
+    fn drain(
+        &mut self,
+        echo: Option<&dyn EchoSink>,
+        cancel: &Cancellation,
+    ) -> io::Result<Option<&'static str>> {
+        self.stdin = None;
+        let started = Instant::now();
+        loop {
+            self.pump(echo)?;
+            if self.outputs.iter().all(|output| output.pipe.is_none()) {
+                return Ok(None);
+            }
+            let stop = if cancel.is_cancelled() {
+                Some("cancellation")
+            } else if started.elapsed() >= DRAIN_TIMEOUT {
+                Some("drain deadline")
+            } else {
+                None
+            };
+            if let Some(reason) = stop {
+                for output in &mut self.outputs {
+                    output.pipe = None;
+                }
+                return Ok(Some(reason));
+            }
+            thread::sleep(CANCEL_POLL_INTERVAL);
+        }
+    }
+}
+
+/// Transient nonblocking I/O failures are retried in the next cancellation round.
+fn retry(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    )
+}
+
+/// Set nonblocking mode on a parent pipe; the child's opposite end is unaffected.
+fn nonblocking(pipe: &File) -> io::Result<()> {
+    // SAFETY: fcntl operates on this live descriptor and changes no memory.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: getppid has no requirements. Check the race with setting PDEATHSIG.
-    if unsafe { libc::getppid() } != parent {
-        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    // SAFETY: the descriptor and F_SETFL flag argument are valid.
+    if unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-/// The start error, with no claim that any file access was observed.
-fn start_error(
-    request: &RunRequest,
-    source: io::Error,
-) -> TraceError {
-    match source.raw_os_error() {
-        Some(libc::ENOENT | libc::ENOTDIR) => {
-            TraceError::ProgramNotFound {
-                program: request.program.clone(),
-                accesses: Accesses::new(),
-                tree: None,
-            }
-        },
-        Some(libc::EACCES | libc::ENOEXEC | libc::EISDIR) => {
-            TraceError::ProgramNotExecutable {
-                program: request.program.clone(),
-                source,
-                accesses: Accesses::new(),
-                tree: None,
-            }
-        },
-        _ => {
-            TraceError::StartFailed {
-                program: request.program.clone(),
-                source,
-                accesses: Accesses::new(),
-                tree: None,
-            }
-        },
-    }
-}
-
-/// Run without ptrace or a seccomp filter, preserving streams and exact environment.
+/// Run without tracing, using the traced runner's exact child setup and execve.
 pub(crate) fn run(
     request: &RunRequest,
     echo: &dyn EchoSink,
@@ -191,7 +299,15 @@ pub(crate) fn run(
             source: None,
         });
     }
-    let (child_stdio, tracer_stdio) = capture::pipes(request)
+    let program = spawn::Program::prepare(request).map_err(|error| {
+        TraceError::StartFailed {
+            program: request.program.clone(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, error),
+            accesses: Accesses::new(),
+            tree: None,
+        }
+    })?;
+    let (child_stdio, parent_stdio) = capture::pipes(request)
         .map_err(|error| tracer_error("could not create the standard streams", error))?;
     let Some(child_stdio) = child_stdio else {
         return Err(TraceError::Tracer {
@@ -199,86 +315,43 @@ pub(crate) fn run(
             source: None,
         });
     };
-    let mut command = Command::new(request.program.as_path());
-    if let Some(first) = request.args.first() {
-        command.arg0(first);
+    let mut streams = Streams::new(parent_stdio, request.stdin.as_deref().unwrap_or_default())
+        .map_err(|error| tracer_error("could not prepare nonblocking streams", error))?;
+    let (report_read, report_write) =
+        sys::pipe().map_err(|error| tracer_error("could not create the failure pipe", error))?;
+    let child = ChildGroup {
+        pid: spawn::start_untraced(request, &program, &child_stdio, report_write)?,
+    };
+    drop(child_stdio);
+    let echo = request.echo.then_some(echo);
+    let termination = child
+        .wait(&mut streams, echo, cancel)
+        .map_err(|error| tracer_error("could not wait for the untraced command", error))?;
+    // The first process remains unreaped while signalling, so no ID can be reused.
+    drop(child);
+    let cut_short = streams
+        .drain(echo, cancel)
+        .map_err(|error| tracer_error("could not drain untraced output", error))?;
+    if let Some(failure) = spawn::read_failure(report_read)
+        .map_err(|error| tracer_error("could not read the failure pipe", error))?
+    {
+        return Err(failure.into_error(request, Accesses::new(), None));
     }
-    command.args(request.args.iter().skip(1));
-    command
-        .env_clear()
-        .envs(&request.env)
-        .current_dir(request.cwd.as_path());
-    command.process_group(0);
-    command.stdin(Stdio::from(child_stdio.stdin));
-    let stdout = std::fs::File::from(child_stdio.stdout);
-    let stderr =
-        match child_stdio.stderr {
-            Some(stderr) => Stdio::from(stderr),
-            None => {
-                Stdio::from(stdout.try_clone().map_err(|error| {
-                    tracer_error("could not duplicate the merged stream", error)
-                })?)
-            },
-        };
-    command.stdout(Stdio::from(stdout)).stderr(stderr);
-    // SAFETY: getpid has no requirements and its result fits pid_t.
-    let parent = unsafe { libc::getpid() };
-    // SAFETY: the callback runs only async-signal-safe code on data prepared here.
-    unsafe { command.pre_exec(move || prepare_child(parent)) };
-    let (termination, streams) = thread::scope(move |scope| {
-        let feeder = tracer_stdio
-            .stdin
-            .map(|stdin| {
-                kizz_threads::spawn_scoped(
-                    scope,
-                    "kizz-feeder",
-                    "the thread that feeds stdin",
-                    move || capture::feed(stdin, request.stdin.as_deref().unwrap_or_default()),
-                )
-            })
-            .transpose()
-            .map_err(|error| not_started(&error))?;
-        let readers = tracer_stdio
-            .outputs
-            .into_iter()
-            .map(|(stream, pipe)| {
-                let (name, what) = reader_thread(stream);
-                kizz_threads::spawn_scoped(scope, name, what, move || {
-                    capture::collect(pipe, stream, request.echo.then_some(echo))
-                })
-                .map(|reader| (stream, reader))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| not_started(&error))?;
-        let spawned = command.spawn();
-        // Closing our copies is essential, including when spawn failed.
-        drop(command);
-        let child = ChildGroup {
-            child: spawned.map_err(|error| start_error(request, error))?,
-        };
-        let termination = child
-            .wait(cancel)
-            .map_err(|error| tracer_error("could not wait for the untraced command", error))?;
-        // Kill any remaining members before waiting for the output pipes to end.
-        drop(child);
-        let streams = readers
-            .into_iter()
-            .map(|(stream, reader)| {
-                join(reader, "that captures output").map(|bytes| (stream, bytes))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(feeder) = feeder {
-            join(feeder, "that feeds stdin")?;
-        }
-        Ok::<_, TraceError>((termination, streams))
-    })?;
+    let mut detail = "dependency tracing explicitly disabled with untraced=True".to_owned();
+    if let Some(reason) = cut_short {
+        detail.push_str("; output possibly cut short after ");
+        detail.push_str(reason);
+    }
+    let output = streams
+        .outputs
+        .into_iter()
+        .map(|output| (output.stream, output.bytes))
+        .collect();
     let mut result = RunResult {
         termination,
-        output: capture::assemble(request.capture, streams),
+        output: capture::assemble(request.capture, output),
         accesses: Accesses::new(),
-        incomplete: Some(IncompleteReason::Other {
-            detail: "dependency tracing explicitly disabled with untraced=True".to_owned(),
-        }),
+        incomplete: Some(IncompleteReason::Other { detail }),
         first_reads: FirstReads::new(),
         unknown_system_calls: BTreeSet::new(),
         connections: BTreeSet::new(),

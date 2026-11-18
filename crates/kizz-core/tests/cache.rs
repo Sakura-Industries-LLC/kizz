@@ -144,6 +144,21 @@ impl Tracer for FakeTracer {
         (self.script)(request)
     }
 
+    fn run_untraced(
+        &self,
+        request: &RunRequest,
+        echo: &dyn EchoSink,
+        cancel: &Cancellation,
+    ) -> Result<RunResult, TraceError> {
+        let mut result = self.run(request, echo, cancel)?;
+        result.accesses = Accesses::new();
+        result.first_reads = FirstReads::new();
+        result.incomplete = Some(IncompleteReason::Other {
+            detail: "intentional untraced test command".to_owned(),
+        });
+        Ok(result)
+    }
+
     fn extended_attributes(
         &self,
         path: &Path,
@@ -2474,5 +2489,54 @@ fn a_step_runs_again_when_an_extended_attribute_it_read_changes() -> TestResult 
         assert!(again.cached(index)?, "step {index}");
     }
     assert_eq!(tracer.runs(), 6);
+    Ok(())
+}
+
+/// Unobserved writes invalidate hashes before a later traced command reads them.
+#[test]
+fn an_untraced_write_is_visible_to_a_later_traced_step_in_the_same_build() -> TestResult {
+    let fixture = Fixture::new()?;
+    let source = fixture.write_old("source", "before")?;
+    let changed = source.clone();
+    let tracer = FakeTracer::new(move |request| {
+        if verb(request) == "write" {
+            fs::write(&changed, "after!").map_err(|error| tracer_failure(&error))?;
+        }
+        let bytes = fs::read(&changed).map_err(|error| tracer_failure(&error))?;
+        let mut result = finished(
+            request,
+            &[(changed.clone(), AccessKind::Read)],
+            Termination::Exited(0),
+        )?;
+        result.output = CapturedOutput::Split {
+            stdout: bytes,
+            stderr: Vec::new(),
+        };
+        Ok(result)
+    });
+    let store = fixture.store()?;
+    let pool = WorkerPool::new()?;
+    let engine = Engine::new(&tracer, &store, &NoEcho, Cancellation::new(), None, &pool);
+    let task = engine.task(PROGRAM, fixture.dir()?);
+    task.execute(&fixture.step(&["tool", "read"])?)?;
+    assert!(!engine.file_states().is_empty());
+    let mut write = fixture.step(&["tool", "write"])?;
+    write.untraced = true;
+    task.execute(&write)?;
+    assert!(
+        engine.file_states().is_empty(),
+        "unobserved writes left stale hashes"
+    );
+    let observed = task.execute(&fixture.step(&["tool", "read-again"])?)?;
+    assert_eq!(observed.output, CapturedOutput::Split {
+        stdout: b"after!".to_vec(),
+        stderr: Vec::new()
+    });
+    assert_eq!(engine.not_cached()?.len(), 1);
+    let key = step_key(PROGRAM, &write, 0)?;
+    assert!(engine.was_untraced(&key)?);
+    drop(task);
+    drop(engine);
+    store.close()?;
     Ok(())
 }

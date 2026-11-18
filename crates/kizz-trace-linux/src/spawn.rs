@@ -89,11 +89,13 @@ pub(crate) enum Step {
     Exec,
     /// Moving into a process group of its own.
     ProcessGroup,
+    /// Arranging for an untraced child to die with its parent.
+    ParentDeath,
 }
 
 impl Step {
     /// Every step, in the order of their codes.
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Stdio,
         Self::Signals,
         Self::WorkingDirectory,
@@ -103,6 +105,7 @@ impl Step {
         Self::Filter,
         Self::Exec,
         Self::ProcessGroup,
+        Self::ParentDeath,
     ];
 
     /// The code the child writes for this step.
@@ -117,6 +120,7 @@ impl Step {
             Self::Filter => 7,
             Self::Exec => 8,
             Self::ProcessGroup => 9,
+            Self::ParentDeath => 10,
         }
     }
 
@@ -137,6 +141,7 @@ impl Step {
             Self::Filter => "installing the seccomp-bpf filter",
             Self::Exec => "running the program",
             Self::ProcessGroup => "moving into a process group of its own",
+            Self::ParentDeath => "setting the parent-death signal",
         }
     }
 }
@@ -190,7 +195,8 @@ impl ChildFailure {
             | Step::TraceMe
             | Step::Stop
             | Step::Filter
-            | Step::ProcessGroup => {
+            | Step::ProcessGroup
+            | Step::ParentDeath => {
                 TraceError::Tracer {
                     message: format!(
                         "the child of {program} failed while {}",
@@ -290,6 +296,10 @@ struct ChildPlan {
     filter: *const sock_fprog,
     /// An empty signal set.
     empty_mask: *const libc::sigset_t,
+    /// Whether to install ptrace and seccomp, or directly exec an untraced child.
+    traced: bool,
+    /// The parent process ID used to check the parent-death setup race.
+    parent: pid_t,
 }
 
 /// Report the failure of `step` with the current `errno` and exit.
@@ -358,6 +368,23 @@ unsafe fn child(plan: &ChildPlan) -> ! {
         ) == -1
         {
             fail(plan.report, Step::NoNewPrivileges);
+        }
+        if !plan.traced {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL,
+                unused,
+                unused,
+                unused,
+            ) == -1
+            {
+                fail(plan.report, Step::ParentDeath);
+            }
+            if libc::getppid() != plan.parent {
+                libc::_exit(START_FAILED_EXIT_CODE);
+            }
+            libc::execve(plan.path, plan.argv, plan.envp);
+            fail(plan.report, Step::Exec);
         }
         if libc::ptrace(
             libc::PTRACE_TRACEME,
@@ -447,25 +474,15 @@ pub(crate) enum Started {
     Exited(pid_t),
 }
 
-/// Fork the child for `request`, bring it under `ptrace`, set the options, and
-/// resume it.
-///
-/// Must be called from the thread that will make every later `ptrace` request and
-/// wait for the traced processes. `stdio` holds the child's standard streams, or
-/// is `None` for a command that keeps the terminal. `report` is the write end of
-/// the failure pipe; it is closed in the tracer's process once the child has it.
-///
-/// # Errors
-///
-/// Returns a [`TraceError`] when the fork fails or the tracer cannot set its
-/// options.
-pub(crate) fn start(
+/// Fork with shared, step-tagged child setup and direct execve in both modes.
+fn fork_program(
     request: &RunRequest,
     program: &Program,
     filter: &[sock_filter],
     stdio: Option<&ChildStdio>,
     report: OwnedFd,
-) -> Result<Started, TraceError> {
+    traced: bool,
+) -> Result<pid_t, TraceError> {
     let argv = pointers(&program.args);
     let envp = pointers(&program.env);
     let filter_length = u16::try_from(filter.len()).map_err(|error| {
@@ -499,6 +516,9 @@ pub(crate) fn start(
         envp: envp.as_ptr(),
         filter: &raw const fprog,
         empty_mask: &raw const empty_mask,
+        traced,
+        // SAFETY: getpid has no requirements.
+        parent: unsafe { libc::getpid() },
     };
     // SAFETY: the child branch only runs `child`, which makes async-signal-safe
     // calls on `plan`, whose pointers stay valid in the child's copy of memory.
@@ -519,6 +539,39 @@ pub(crate) fn start(
                 .then(|| processes::failed_start(None, request, None)),
         });
     }
+    Ok(pid)
+}
+
+/// Start an untraced child, preserving the same setup errors and exec semantics.
+pub(crate) fn start_untraced(
+    request: &RunRequest,
+    program: &Program,
+    stdio: &ChildStdio,
+    report: OwnedFd,
+) -> Result<pid_t, TraceError> {
+    fork_program(request, program, &[], Some(stdio), report, false)
+}
+
+/// Fork the child for `request`, bring it under `ptrace`, set the options, and
+/// resume it.
+///
+/// Must be called from the thread that will make every later `ptrace` request and
+/// wait for the traced processes. `stdio` holds the child's standard streams, or
+/// is `None` for a command that keeps the terminal. `report` is the write end of
+/// the failure pipe; it is closed in the tracer's process once the child has it.
+///
+/// # Errors
+///
+/// Returns a [`TraceError`] when the fork fails or the tracer cannot set its
+/// options.
+pub(crate) fn start(
+    request: &RunRequest,
+    program: &Program,
+    filter: &[sock_filter],
+    stdio: Option<&ChildStdio>,
+    report: OwnedFd,
+) -> Result<Started, TraceError> {
+    let pid = fork_program(request, program, filter, stdio, report, true)?;
     let status = sys::wait_for(pid)
         .map_err(|error| tracer_error("could not wait for the child to stop", error))?;
     if !libc::WIFSTOPPED(status) {
