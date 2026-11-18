@@ -358,7 +358,7 @@ Build all workspace release binaries into Cargo's target directory.
 `./bootstrap.sh` rebuilds and installs kizz with Cargo; it does not install this existing release artifact.
 Because `cargo install` is not locked, bootstrap may resolve newer dependencies than the release task used.
 
-```starlark build ci name=release
+```starlark build ci name=build-release
 load("build/common.star", "cargo_ignores", "task_env")
 task_env(
     "PATH",
@@ -375,4 +375,28 @@ task_env(
     "PKG_CONFIG_PATH",
 )
 run("cargo", "build", "--workspace", "--release", ignore=cargo_ignores(), stream=True, expect=[0])
+```
+
+## Trigger a release
+
+`kizz run release` reads the `kizz` crate version, tags the committed checkout as `v<version>` and pushes that tag to `origin`.
+Commit tracked changes before running it and make sure Git can authenticate to `origin`.
+If the push fails, rerun the task from the same commit to retry the push.
+The tag triggers the [GitHub release workflow](.github/workflows/release.yml).
+
+```starlark name=release cache=never
+load("build/release.star", "publish_tag")
+publish_tag()
+```
+
+## Remove a failed release tag
+
+After a failed workflow, `kizz run unrelease` reads the same crate version and removes its tag from `origin` and the local checkout.
+Run it before changing the crate version.
+If the local and remote tags differ, the task stops so you can check which tag to keep.
+Once GitHub has published a release, its release entry and assets are managed separately from the tag.
+
+```starlark name=unrelease cache=never
+load("build/release.star", "remove_tag")
+remove_tag()
 ```
