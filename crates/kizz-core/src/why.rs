@@ -243,6 +243,11 @@ impl Render {
     ) -> String {
         let path = format!("`{}`", self.path(&report.path));
         if report.tasks.is_empty() {
+            if report.build.is_some() {
+                return format!(
+                    "No tasks matched the filter in the most recent build under {path}.\n"
+                );
+            }
             return format!("No build has recorded a task under {path}.\n");
         }
         let tasks = if report.tasks.len() == 1 {

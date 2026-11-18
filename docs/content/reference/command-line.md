@@ -345,10 +345,17 @@ error: parallel execution is not implemented yet; `kizz build` runs one task at 
 Prints the reasons that the most recent build recorded for each command of the tasks under a path.
 
 ```text
-kizz why [<path>]
+kizz why [--cached=<true|false>] [<path>]
 ```
 
 It runs no task, and it reads the cache under the cache lock, so it waits while a build runs, and says what it waits for.
+
+### `--cached`
+
+`--cached=false` shows tasks with at least one command that ran.
+`--cached=true` shows tasks with at least one command and every command served from cache.
+Each matching task includes all its steps.
+Omit the option to see every task, including tasks with no commands.
 
 ### `PATH`
 
@@ -362,7 +369,7 @@ Prints the help of `kizz why` and exits with 0.
 
 ### Output
 
-* `The most recent build ran`, the number of tasks recorded under the path, and the path.
+* `The most recent build ran`, the number of matching tasks under the path, and the path.
 * Each task with its targets, marked `(failed)` when it failed, or `no commands ran` when it ran none.
 * For each step: its command, why it ran or was cached, its untracked `/proc` and `/sys` accesses, and its connections.
 * The system calls that the step made and that the tracer does not know, when there are any.
@@ -371,6 +378,7 @@ Prints the help of `kizz why` and exits with 0.
 * A warning for each step that ran again in consecutive builds for a reason that it causes itself.
 
 When no build recorded a task under the path, it prints `No build has recorded a task under` and the path.
+When a build exists but the filter matches no tasks, it reports that separately.
 
 ### Exit statuses
 

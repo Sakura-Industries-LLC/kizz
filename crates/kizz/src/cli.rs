@@ -98,7 +98,7 @@ impl Cli {
                     },
                 })
             },
-            Command::Why { path } => crate::why::run(path.as_deref(), self.verbose),
+            Command::Why { path, cached } => crate::why::run(path.as_deref(), cached, self.verbose),
             Command::List { targets } => crate::list::run(targets.as_deref()),
             Command::Cache(CacheCommand::Clean) => crate::cache::clean(),
             Command::Cache(CacheCommand::Reset { all, yes, path }) => {
@@ -247,6 +247,10 @@ pub enum Command {
     /// Print why each command ran or was cached in the most recent build.
     #[bpaf(command)]
     Why {
+        /// Show only fully cached tasks (true) or tasks with a command that ran (false).
+        #[bpaf(long, argument("true|false"))]
+        cached: Option<bool>,
+
         /// Show tasks under this path; the current directory by default.
         #[bpaf(positional("PATH"))]
         path: Option<PathBuf>,
@@ -599,10 +603,11 @@ mod tests {
     #[test]
     fn parses_other_commands() {
         assert!(matches!(parse(&["why"]).command, Command::Why {
-            path: None
+            path: None,
+            cached: None,
         }));
         match parse(&["why", "sub/dir"]).command {
-            Command::Why { path } => assert_eq!(path, Some(PathBuf::from("sub/dir"))),
+            Command::Why { path, cached: None } => assert_eq!(path, Some(PathBuf::from("sub/dir"))),
             other => panic!("expected why, got {other:?}"),
         }
         match parse(&["list", "ci"]).command {

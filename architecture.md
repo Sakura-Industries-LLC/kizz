@@ -172,8 +172,10 @@ Version 1 implements these commands:
   (see [Exit codes and failure](#exit-codes-and-failure)).
   `--cache-unknown-syscalls` caches the results of commands that made a system call that the tracer does not know,
   which are not cached by default; kizz warns about them either way (see [The Linux tracer](#the-linux-tracer)).
-* `kizz why [path]` prints why each command ran or was cached in the most recent build, for tasks under `path`,
-  which defaults to the current directory.
+* `kizz why [--cached=<true|false>] [path]` prints why each command ran or was cached in the most recent build,
+  for tasks under `path`, which defaults to the current directory.
+  `--cached=true` selects tasks whose commands were all cached, and `--cached=false` selects tasks with any command that ran.
+  Tasks with no commands are shown when the filter is omitted.
 * `kizz list [targets]` lists discovered tasks with their file, line, heading, targets and options, plus any discovery warnings.
 * `kizz cache clean` removes stale entries from the shared cache, and `kizz cache reset` wipes the entries under a path,
   or the whole cache with `--all`, after confirmation (see [Cleaning up the cache](#cleaning-up-the-cache)).
