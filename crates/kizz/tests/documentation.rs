@@ -2133,13 +2133,16 @@ fn page_url(page: &str) -> String {
 }
 
 /// The pages that the templates rendered into `public`, each an `index.html`, by
-/// their addresses, sorted; Zola's own `404.html` is not one of them.
+/// their addresses, sorted. Static Rustdoc pages use their own templates.
 fn built_pages(public: &Path) -> io::Result<Vec<BuiltPage>> {
     let mut pages = Vec::new();
     let mut pending = vec![public.to_path_buf()];
     while let Some(current) = pending.pop() {
         for entry in fs::read_dir(&current)? {
             let path = entry?.path();
+            if path == public.join("rustdoc") {
+                continue;
+            }
             if path.is_dir() {
                 pending.push(path);
             } else if path.file_name().is_some_and(|name| name == "index.html") {
@@ -2776,7 +2779,7 @@ fn a_heading_added_later_appears_in_the_sidebar() -> io::Result<()> {
     let root = work.path().join("docs");
     fs::create_dir_all(&root)?;
     fs::copy(site.join("config.toml"), root.join("config.toml"))?;
-    for dir in ["content", "templates", "static"] {
+    for dir in ["content", "templates"] {
         copy_tree(&site.join(dir), &root.join(dir))?;
     }
     let command_line_path = root.join("content").join(COMMAND_LINE);

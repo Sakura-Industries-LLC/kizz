@@ -1,0 +1,11 @@
+{% extends "section.html" %}
+
+{% block content %}
+{{ super() }}
+{% set crates = ["kizz", "kizz-core", "kizz-store", "kizz-threads", "kizz-trace", "kizz-trace-linux"] %}
+<ul>
+    {% for crate in crates %}
+    <li><a href="{{ root.permalink }}rustdoc/{{ crate | replace(from="-", to="_") }}/">{{ crate }}</a></li>
+    {% endfor %}
+</ul>
+{% endblock content %}
