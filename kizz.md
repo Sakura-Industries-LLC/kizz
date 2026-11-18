@@ -14,12 +14,17 @@ Each task is named so it can also be run directly with `kizz run <name>`.
 | Target | Work |
 | --- | --- |
 | `fix` | Sort the dictionary and fix Rust, Markdown and Starlark formatting. |
-| `check` | Check formatting, lints, tests, spelling and documentation. |
-| `ci` | Sort the dictionary, run every check, check dependencies and build release binaries. |
+| `ci` | Check dictionary order and formatting, run lints and tests, build docs, check dependencies and build release binaries. |
 | `test` | Run the workspace tests. |
 | `docs` | Build the Rust documentation and Zola site. |
 | `build` | Build release binaries. |
 | `tools` | Check the cspell, rumdl and Ruff minimum versions. |
+
+Tasks tagged with both `fix` and `ci` use `task.selected` to choose their mode.
+It contains only the task's tags that match the requested targets.
+`kizz build ci` checks formatting and dictionary order.
+`kizz build fix+ci` uses fix mode for those shared tasks and runs the remaining CI checks.
+The formatters report failure if they cannot complete their work.
 
 Each task lists the environment variables its operation uses in its own `task_env(...)` call. [build/common.star](build/common.star)
 inherits only those names and reads matching overrides from the optional, ignored root `.env`.
@@ -97,7 +102,7 @@ run("mise", "install", "ruff", network=True, stream=True, expect=[0])
 `kizz run check-cspell` checks the minimum version independently of spelling.
 The spelling task repeats this guard so running it directly also checks the tool.
 
-```starlark tools check ci name=check-cspell
+```starlark tools ci name=check-cspell
 load("build/common.star", "mise_task_env", "mise_tool")
 mise_task_env()
 run(mise_tool("cspell"), "--version", expect=[0])
@@ -108,7 +113,7 @@ run(mise_tool("cspell"), "--version", expect=[0])
 `kizz run check-rumdl` checks the minimum version independently of Markdown checks.
 The Markdown tasks also check the version before using it.
 
-```starlark tools fix check ci name=check-rumdl
+```starlark tools fix ci name=check-rumdl
 load("build/common.star", "mise_task_env", "mise_tool")
 mise_task_env()
 run(mise_tool("rumdl"), "--version", expect=[0])
@@ -118,7 +123,7 @@ run(mise_tool("rumdl"), "--version", expect=[0])
 
 The standalone Starlark tasks and Markdown tasks also check this minimum before formatting or checking code.
 
-```starlark tools fix check ci name=check-ruff
+```starlark tools fix ci name=check-ruff
 load("build/common.star", "mise_task_env", "mise_tool")
 mise_task_env()
 run(mise_tool("ruff"), "--version", expect=[0])
@@ -126,46 +131,43 @@ run(mise_tool("ruff"), "--version", expect=[0])
 
 ## Sort the spelling dictionary
 
-Append words to the dictionary; this task sorts case-insensitively and removes duplicates.
-The `fix` and `ci` targets both include it.
+Append words to the dictionary.
+In fix mode, or with `kizz run sort-dictionary`, this task sorts the dictionary case-insensitively and removes duplicates.
+In CI alone, it fails if entries are out of order or duplicated.
 
 ```starlark fix ci name=sort-dictionary
 load("build/common.star", "task_env")
 task_env("PATH")
 env.set("LC_ALL", "C")
-run(
-    "sort",
-    "--ignore-case",
-    "--unique",
-    "--output",
-    ".config/dictionaries/project.dic",
-    ".config/dictionaries/project.dic",
-    expect=[0],
-)
+dictionary = ".config/dictionaries/project.dic"
+mode = ["--output", dictionary] if "fix" in task.selected or not task.selected else ["--check"]
+run("sort", "--ignore-case", "--unique", mode, dictionary, expect=[0])
 ```
 
-## Fix Rust formatting
+## Rust formatting
 
 Nightly rustfmt is needed for the repository's formatting options.
 
-```starlark fix name=fix-rustfmt
+```starlark fix ci name=rustfmt
 load("build/common.star", "task_env")
 task_env("PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME")
-run("cargo", "+nightly", "fmt", "--all", stream=True, expect=[0])
+mode = [] if "fix" in task.selected else ["--", "--check"]
+run("cargo", "+nightly", "fmt", "--all", mode, stream=True, expect=[0])
 ```
 
-## Fix Starlark modules
+## Starlark formatting
 
 Ruff recursively discovers `*.star` through [ruff.toml](ruff.toml), including `build/`, and excludes `target/` and `vendor/`.
 It treats Starlark as Python-compatible syntax and formats it without Python lint rules.
 
-```starlark fix name=fix-starlark
+```starlark fix ci name=format-starlark
 load("build/common.star", "mise_task_env", "mise_tool")
 mise_task_env()
-run(mise_tool("ruff"), "format", ".", stream=True, expect=[0])
+mode = [] if "fix" in task.selected else ["--check"]
+run(mise_tool("ruff"), "format", mode, ".", stream=True, expect=[0])
 ```
 
-## Fix Markdown
+## Markdown formatting
 
 [.rumdl.toml](.rumdl.toml) delegates `starlark` blocks to Ruff for both formatting and formatting checks.
 The same Ruff configuration formats standalone modules and Markdown code blocks.
@@ -173,37 +175,22 @@ Ruff is required; a missing formatter fails the Markdown check.
 The Markdown tasks ignore rumdl's disposable `.rumdl_cache/`, which it reads and rewrites during checks.
 Source files and configuration remain tracked.
 
-```starlark fix name=fix-markdown
+```starlark fix ci name=format-markdown
 load("build/common.star", "mise_task_env", "mise_tool")
 mise_task_env()
 rumdl = mise_tool("rumdl")
 ruff = mise_tool("ruff")
+mode = ["--fix"] if "fix" in task.selected else []
 run(
     rumdl,
     "check",
-    "--fix",
+    mode,
     ".",
     ignore=[".rumdl_cache", ".rumdl_cache/**"],
     stream=True,
     expect=[0],
     env={"PATH": ruff.rpartition("/")[0] + ":" + env.get("PATH")},
 )
-```
-
-## Check Rust formatting
-
-```starlark check ci name=check-rustfmt
-load("build/common.star", "task_env")
-task_env("PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME")
-run("cargo", "+nightly", "fmt", "--all", "--", "--check", stream=True, expect=[0])
-```
-
-## Check Starlark modules
-
-```starlark check ci name=check-starlark
-load("build/common.star", "mise_task_env", "mise_tool")
-mise_task_env()
-run(mise_tool("ruff"), "format", "--check", ".", stream=True, expect=[0])
 ```
 
 ## Lint Rust
@@ -213,7 +200,7 @@ Clippy and rustdoc rewrite that disposable compiler probe cache with different v
 tracking it makes them repeatedly invalidate each other.
 Source files and build artifacts remain tracked.
 
-```starlark check ci name=clippy
+```starlark ci name=clippy
 load("build/common.star", "cargo_ignores", "task_env")
 task_env(
     "PATH",
@@ -253,7 +240,7 @@ This command runs once per build and is never reused from another build; no test
 Kizz still captures output, checks the exit status, and cancels the command's process group.
 The report explicitly records that dependency tracing was disabled.
 
-```starlark test check ci name=test
+```starlark test ci name=test
 load("build/common.star", "task_env")
 task_env(
     "PATH",
@@ -276,7 +263,7 @@ run("cargo", "test", "--workspace", "--all-features", untraced=True, stream=True
 
 ## Build Rust documentation
 
-```starlark docs check ci name=rustdoc
+```starlark docs ci name=rustdoc
 load("build/common.star", "cargo_ignores", "task_env")
 task_env(
     "PATH",
@@ -296,27 +283,9 @@ env.set("RUSTDOCFLAGS", "-D warnings")
 run("cargo", "doc", "--workspace", "--no-deps", "--all-features", ignore=cargo_ignores(), stream=True, expect=[0])
 ```
 
-## Check Markdown
-
-```starlark check ci name=check-markdown
-load("build/common.star", "mise_task_env", "mise_tool")
-mise_task_env()
-rumdl = mise_tool("rumdl")
-ruff = mise_tool("ruff")
-run(
-    rumdl,
-    "check",
-    ".",
-    ignore=[".rumdl_cache", ".rumdl_cache/**"],
-    stream=True,
-    expect=[0],
-    env={"PATH": ruff.rpartition("/")[0] + ":" + env.get("PATH")},
-)
-```
-
 ## Check spelling
 
-```starlark check ci name=spelling
+```starlark ci name=spelling
 load("build/common.star", "mise_task_env", "mise_tool")
 mise_task_env()
 run(mise_tool("cspell"), "lint", "--config", "cspell.json", "--no-progress", ".", stream=True, expect=[0])
@@ -326,7 +295,7 @@ run(mise_tool("cspell"), "lint", "--config", "cspell.json", "--no-progress", "."
 
 Zola builds the site into the ignored `docs/public/` directory and checks its internal links.
 
-```starlark docs check ci name=site
+```starlark docs ci name=site
 load("build/common.star", "task_env")
 task_env("PATH")
 run("zola", "--root", "docs", "build", stream=True, expect=[0])

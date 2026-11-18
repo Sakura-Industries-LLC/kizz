@@ -1259,7 +1259,8 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
   Kizz's crates use fallible forms instead, and in them only the helper of `kizz-threads` calls `std::thread::Builder`.
 * Source files carry the same copyright and SPDX header as cbork, with `AGPL-3.0-only`.
 * Anyone adding spelling words, parallel subagents included, only appends lines to `.config/dictionaries/project.dic`.
-  The `fix` and `ci` targets sort the file case-insensitively and remove duplicates, so concurrent appends never conflict.
+  The `fix` target sorts the file case-insensitively and removes duplicates.
+  The `ci` target checks ordering and uniqueness.
   Case variants collapse into one entry, so add only the canonical form.
 * Tests never use the real cache: every test that runs the engine sets `KIZZ_CACHE_DIR` to a temporary directory.
 * `Cargo.lock` is committed, unlike in cbork, because kizz is a binary.
@@ -1278,10 +1279,11 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
 
 The [build tasks](kizz.md) define the quality gate, `kizz build fix+ci`.
 The target expression selects both sets of tasks and runs shared tasks once per pass.
+A shared task uses `"fix" in task.selected` to decide whether to fix or check.
 
 * `fix` sorts the dictionary and runs the automated fixers.
-* `check` checks formatting, lints, tests, spelling and builds the documentation, including the site in the ignored `docs/public/`.
-* `ci` sorts the dictionary, runs the checks, verifies licenses and other dependency policy, and builds the release binaries.
+* `ci` checks dictionary order and formatting, runs lints and tests, builds documentation,
+  verifies dependency policy and builds release binaries.
   Build commands let Cargo refresh `Cargo.lock` as needed.
   The advisory check reports findings without failing the gate, and `deny.toml` ignores no advisory.
   The dependency bans, licenses and source checks must pass.

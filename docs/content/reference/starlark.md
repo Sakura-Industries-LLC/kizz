@@ -877,7 +877,9 @@ It takes no parameters, tracks nothing and has no side effect.
 ### `task.selected`
 
 The requested targets that selected the task, as a list of strings, in the order of the target expression.
-For `kizz build ci+check`, a task with both targets has `["ci", "check"]`.
+This is the intersection of the requested targets and `task.targets`.
+For `kizz build fix+check+ci`, a task tagged `fix ci` sees `["fix", "ci"]` and a task tagged only `ci` sees `["ci"]`.
+A task that supports both modes can branch on `"fix" in task.selected`.
 Under `kizz run` it is an empty list, because no target selected the task.
 It takes no parameters, tracks nothing and has no side effect.
 
