@@ -236,6 +236,7 @@ ilog
 inotify
 interp
 iovec
+isdigit
 JSET
 kibibytes
 kizz
@@ -331,6 +332,7 @@ rgignore
 Riker
 rlim
 rlimit
+rpartition
 rseq
 rsplit
 rtprio

@@ -15,13 +15,28 @@ def task_env(*names):
                 env.set(name, overrides[name])
 
 
+def mise_task_env(*names):
+    """Use the same mise installation locations for install and lookup."""
+    task_env(
+        "PATH",
+        "HOME",
+        "MISE_DATA_DIR",
+        "MISE_CACHE_DIR",
+        "MISE_STATE_DIR",
+        "MISE_CONFIG_DIR",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        *names,
+    )
+
+
 def version_parts(version):
-    """Parse the three numeric components of a stable semantic version."""
-    if "-" in version:
-        fail("A stable tool version is required; got " + version)
+    """Return the numeric components of a stable version, or None."""
     parts = version.split("+")[0].split(".")
-    if len(parts) != 3:
-        fail("Expected a three-part tool version; got " + version)
+    if "-" in version.split("+")[0] or len(parts) != 3 or not all([part.isdigit() for part in parts]):
+        return None
     return [int(part) for part in parts]
 
 
@@ -30,25 +45,20 @@ def cargo_ignores():
     return [env.get("CARGO_TARGET_DIR", "target") + "/.rustc_info.json"]
 
 
-def require_tool(tool):
-    """Use mise.toml as the single source of minimum and installation versions."""
-    minimum = run(
-        "mise",
-        "config",
-        "get",
-        "--file",
-        "mise.toml",
-        "tools." + tool,
-        expect=[0],
-    ).stdout.strip()
-    result = run(tool, "--version", expect=[0])
-    installed = result.stdout.strip().split()[-1]
-    if version_parts(installed) < version_parts(minimum):
-        fail(
-            "{} {} is too old; need at least {}. Run `mise install {}` and activate mise.".format(
-                tool,
-                installed,
-                minimum,
-                tool,
-            )
-        )
+def mise_tool(tool):
+    """Use a suitable executable on PATH, or resolve the pinned mise install."""
+    pin = run("mise", "config", "get", "--file", "mise.toml", "tools." + tool, expect=[0]).stdout.strip()
+    minimum = version_parts(pin)
+    if minimum == None:
+        fail("Expected an exact stable version for {} in mise.toml, got {}".format(tool, pin))
+
+    found = run("sh", "-c", 'command -v "$1"', "sh", tool)
+    if found.rc == 0:
+        executable = found.stdout.strip()
+        version = run(executable, "--version")
+        words = version.stdout.split()
+        installed = version_parts(words[-1]) if words else None
+        if version.rc == 0 and installed != None and installed >= minimum:
+            return executable
+
+    return run("mise", "which", tool, "--tool=" + tool + "@" + pin, expect=[0]).stdout.strip()

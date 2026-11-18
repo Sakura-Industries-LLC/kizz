@@ -47,7 +47,8 @@ run("echo", "hello,", who, expect = [0])
 ````
 
 Kizz writes the lines of its commands to standard output, and its errors, warnings and questions to standard error.
-An error starts with `error:` and a warning with `warning:`, and the warnings are repeated in a summary at the end.
+An error starts with `error:` and a warning with `warning:`, and most warnings are repeated in a summary at the end.
+Socket activity warnings appear only once per step.
 A write that fails, such as one to a closed pipe, is dropped, and kizz goes on with the exit status that its work gives.
 
 Exit statuses that the commands share:
@@ -206,11 +207,11 @@ Prints the help of `kizz build` and exits with 0.
 ### Output
 
 * `ran`, then the command in backticks, its task, its step and its one-line reason, for each command that runs.
-* `cached`, the command, its task and its step, for each command that came from the cache, the first time the build
-  reaches it, with `--verbose` or `--explain`.
+* `cached`, the command, its task and its step, for each command that came from the cache, the first time the build reaches it,
+  with `--verbose` or `--explain`.
 * With `--explain`, the full reasons under each of those lines, instead of the one-line reason.
-* No line for a `run()` that fails before kizz records its step or asks the tracer to run it: a bare program name
-  without `PATH`, an invalid `ignore` or `track` pattern, a `~/` pattern without `HOME`, a failure of kizz's own state,
+* No line for a `run()` that fails before kizz records its step or asks the tracer to run it: a bare program name without `PATH`,
+  an invalid `ignore` or `track` pattern, a `~/` pattern without `HOME`, a failure of kizz's own state,
   such as a cache that it cannot read, or a step again after a tracer failure in an earlier pass, which counted it then;
   the summary counts such a call neither as a command that ran nor as a cached one.
 * A program that is not found or not executable, a command that cannot start, such as one whose `cwd` does not exist,
@@ -218,19 +219,19 @@ Prints the help of `kizz build` and exits with 0.
 * `pass` and its number at the start of each pass after the first, with what the pass before did: a command ran,
   a task program changed a file, or both.
 * What each task program prints with `print`, after its task's name, else its heading, else its `kizz.md` and line.
-* For a failed task, on standard error, `error:`, the task, the error, the captured output of the failing command and the
-  Starlark stack.
+* For a failed task, on standard error, `error:`, the task, the error,
+  the captured output of the failing command and the Starlark stack.
 * Loud warnings, on standard error: a command traced incompletely, with the reason;
   a file that something else changed while a command ran, after the command read it;
   a command that made system calls that the tracer does not know;
-  a command that connected to the network or to a Unix socket;
+  a command with observed network or Unix socket activity unless it sets `network = True`;
   and a step that runs again in consecutive builds for a reason that it causes itself.
 * Once the build settles, a warning for each unchecked exit in the results that stand, which names the task, the command,
   how it ended, and whether the result came from the cache.
 * When the build failed, `failed:` and each failed task, with the paths that it looked for and did not find.
 * A summary line: `build succeeded`, `build failed`, `build did not settle` or `build interrupted`, then the number of tasks,
   of failed tasks when any failed, of passes, and of the commands that ran and that came from the cache.
-* At the end, the number of warnings and each warning again, on standard error.
+* At the end, the count and text of warnings other than socket activity warnings, on standard error.
 
 When the build has not settled after one more pass than it has tasks, kizz stops, says what the last pass still did,
 and names the inputs that kept changing and who wrote them, the files that task programs kept changing,
@@ -570,8 +571,8 @@ Prints the help of `kizz cache reset` and exits with 0.
 ### Exit statuses
 
 * 0 when the reset finished, also when the answer declined it or there was nothing to remove.
-* 2 for a path with `--all`, for a missing terminal without `--yes`, for an answer that cannot be read, and for a cache
-  that cannot be located, locked, opened or changed.
+* 2 for a path with `--all`, for a missing terminal without `--yes`, for an answer that cannot be read,
+  and for a cache that cannot be located, locked, opened or changed.
 
 ### Examples
 
@@ -615,8 +616,9 @@ It never caches anything, so every run executes the program.
 * It keeps kizz's standard input, output and error, its process group and its session, so it keeps the terminal.
   Kizz prints no banner, writes nothing to standard output, and writes to standard error only its own errors,
   such as a program that could not start, a tracer that failed, or a report that could not be written.
-* Kizz waits for the whole process tree to end, then writes the report to a new hidden file in the directory of `<file>`
-  and renames it over `<file>`, so the program never sees the report.
+* Kizz waits for the whole process tree to end,
+  then writes the report to a new hidden file in the directory of `<file>` and renames it over `<file>`,
+  so the program never sees the report.
 * The report is written whatever happened: the program exited, was killed or could not start, or tracing failed.
   If kizz itself is killed, the traced processes die with it, and no report is written.
 
@@ -827,16 +829,16 @@ Prints the help of `kizz run` and exits with 0.
 * `run`, the command in backticks, its step and its one-line reason, as each command starts, then its output as it comes,
   as if every `run()` had `stream = True`.
 * `cached`, the command and its step, for each cache hit, then its stored output.
-* No line for a `run()` that fails before kizz records its step or asks the tracer to run it: a bare program name
-  without `PATH`, an invalid `ignore` or `track` pattern, a `~/` pattern without `HOME`, or a failure of kizz's own state,
+* No line for a `run()` that fails before kizz records its step or asks the tracer to run it: a bare program name without `PATH`,
+  an invalid `ignore` or `track` pattern, a `~/` pattern without `HOME`, or a failure of kizz's own state,
   such as a cache that it cannot read; the summary counts such a call neither as a command that ran nor as a cached one.
 * A program that is not found or not executable, a command that cannot start, such as one whose `cwd` does not exist,
   and a tracer failure get their `run` line and are counted as commands that ran.
-* With `split` capture, the default, a command's standard output goes to standard output and its standard error to
-  standard error; with `merged` capture, its one stream goes to standard output.
+* With `split` capture, the default, a command's standard output goes to standard output and its standard error to standard error;
+  with `merged` capture, its one stream goes to standard output.
 * What the task program prints, its failure and every warning, as in a build, and the warnings about unchecked exits after the run.
-* A summary line: `run succeeded`, `run failed` or `run interrupted`, the task, and the number of commands that ran and that
-  came from the cache.
+* A summary line: `run succeeded`, `run failed` or `run interrupted`, the task,
+  and the number of commands that ran and that came from the cache.
 
 On Ctrl-C, the run stops as a build does: nothing new starts, the running command receives the interrupt once,
 its result is not cached, and kizz exits with 130.

@@ -304,15 +304,15 @@ Retargeting, removing, or replacing such a link runs the step again.
 The regression tests are:
 
 * `observe::tests::kernel_paths_and_the_standard_links_into_them_reach_the_kernel`,
-  `observe::tests::links_that_lead_into_proc_or_sys_reach_the_kernel`,
-  `observe::tests::other_paths_do_not_reach_the_kernel`, and
-  `observe::tests::the_links_that_lead_into_proc_or_sys_are_listed` in `kizz-core`;
+  `observe::tests::links_that_lead_into_proc_or_sys_reach_the_kernel`, `observe::tests::other_paths_do_not_reach_the_kernel`,
+  and `observe::tests::the_links_that_lead_into_proc_or_sys_are_listed` in `kizz-core`;
 * `paths_that_links_lead_into_proc_or_sys_keep_only_their_links` in `crates/kizz-core/tests/engine.rs`;
-* `a_final_link_into_proc_stays_a_dependency` and `a_directory_link_into_proc_stays_a_dependency`
-  in `crates/kizz-core/tests/cache.rs`, with a fake tracer: a hit while a final link and a directory link into `/proc`
-  are unchanged, then a new run for each retarget, removal, and replacement;
-* `a_command_that_reads_dev_fd_paths_is_cached_on_the_next_build` and
-  `retargeting_or_replacing_a_link_into_proc_runs_the_command_again` in `crates/kizz/tests/build.rs`,
+* `a_final_link_into_proc_stays_a_dependency`
+  and `a_directory_link_into_proc_stays_a_dependency` in `crates/kizz-core/tests/cache.rs`, with a fake tracer:
+  a hit while a final link and a directory link into `/proc` are unchanged, then a new run for each retarget, removal,
+  and replacement;
+* `a_command_that_reads_dev_fd_paths_is_cached_on_the_next_build`
+  and `retargeting_or_replacing_a_link_into_proc_runs_the_command_again` in `crates/kizz/tests/build.rs`,
   which run the binary with the real tracer.
 
 With the fix, the second build of the Rust binding is a cache hit,

@@ -2248,7 +2248,7 @@ impl TaskSteps<'_> {
                 cached: why.is_none(),
             });
         }
-        if !record.connections.is_empty() {
+        if !step.network && !record.connections.is_empty() {
             step_lock(
                 &self.engine.connections,
                 CONNECTIONS,

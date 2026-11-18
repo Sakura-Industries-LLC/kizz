@@ -38,8 +38,8 @@ check-ci: sort-dictionary
     rumdl check .
     cspell lint --config cspell.json --no-progress .
     zola --root docs build
-    cargo deny check advisories || true
-    cargo deny check bans licenses sources
+    deny_bin="$(mise which cargo-deny --tool=cargo-deny)"; "$deny_bin" check advisories || true
+    "$(mise which cargo-deny --tool=cargo-deny)" check bans licenses sources
     cargo build --workspace --release
 
 # Run every fixer, then the CI gate. This is also the quality gate of the workspace agent workflow.

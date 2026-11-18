@@ -65,6 +65,7 @@ result = run(
     stream=False,
     always=False,
     untraced=False,
+    network=False,
     ignore=[],
     track=[],
     timestamps=False,
@@ -82,8 +83,8 @@ A positional argument can also be a list or tuple, which expands in place, as [`
 Each call goes through these stages:
 
 1. Kizz builds the step's specification from the arguments and the task environment.
-2. It derives the *step key*, a BLAKE3 hash of the task program's hash and of the values that each entry below marks as
-   part of the step key, plus the *occurrence number*: how many identical commands came earlier in the same run of the task.
+2. It derives the *step key*, a BLAKE3 hash of the task program's hash and of the values that each entry below marks
+   as part of the step key, plus the *occurrence number*: how many identical commands came earlier in the same run of the task.
 3. It checks the step's `ignore` and `track` patterns, and that a bare program name has a `PATH` in the step's environment.
    Either failure fails the task before kizz starts anything, in every pass, and the call counts as no command that ran.
    A step whose command met a tracer failure earlier in the same build fails again with that error, without a new run.
@@ -284,6 +285,17 @@ Remaining open output pipes are closed, and the report marks output as possibly 
 Explicitly disabling tracing produces no incomplete-trace warning; the report still records that tracing was disabled.
 Use this explicit exception only when tracing prevents a command from working.
 
+### `network`
+
+Acknowledge expected network or Unix socket activity, such as a tool downloading dependencies.
+
+* Type and default: a bool, `False` by default.
+* What it does: with `True`, suppresses the warning for observed socket activity.
+* Step key: not part of it.
+* Tracks: socket destinations still appear in observation reports and `kizz why`.
+* Side effects: the command and its caching behave as usual.
+  Use `always = True` if it must fetch fresh data on every build.
+
 ### `ignore`
 
 Paths that are not recorded as dependencies of this step.
@@ -297,8 +309,8 @@ Paths that are not recorded as dependencies of this step.
 * Patterns are matched against absolute paths:
     * A pattern that starts with `re:` is a regular expression, in the syntax of the Rust `regex` crate,
       which matches anywhere in the path unless it is anchored with `^` and `$`.
-    * Any other pattern with `*`, `?`, `[` or `{` is a glob: `*` and `?` stay within one path component,
-      `**` crosses components, `[...]` matches one character of a set, and `{a,b}` matches either alternative.
+    * Any other pattern with `*`, `?`, `[` or `{` is a glob: `*` and `?` stay within one path component, `**` crosses components,
+      `[...]` matches one character of a set, and `{a,b}` matches either alternative.
     * Every other pattern is a path, which matches exactly that path.
     * A relative path or glob is anchored at the task directory, and an absolute one stands for itself.
     * A leading `~/` means the caller's home directory, the absolute `HOME` that kizz was started with.
@@ -379,14 +391,13 @@ The parts of the machine state that count as an input of this step.
     * `memory`: the total and the available memory;
     * `filesystem`: the type and mount flags of the file system that holds the working directory;
     * `disk`: the size and free space of that file system.
-* Available memory and free space change on almost every build, so a step that names `memory` or `disk` runs on almost
-  every build.
+* Available memory and free space change on almost every build, so a step that names `memory` or `disk` runs on almost every build.
 * Step key: the names are part of it, sorted and without repeats, so their order does not matter.
 * Tracks: the named parts' values, which the record holds with the rest of the machine state.
   `kizz why` shows the parts that a step names, and every part with `--verbose`.
 * Side effects: none.
-* Errors: an unknown name fails the task, with
-  `run(): machine has no part "cpu"; the parts are kernel, limits, affinity, memory, filesystem and disk`.
+* Errors: an unknown name fails the task,
+  with `run(): machine has no part "cpu"; the parts are kernel, limits, affinity, memory, filesystem and disk`.
 
 The host name, the user's credentials, the umask, the machine architecture and the CPU model are not per step:
 they are the cache's identity, which the [caching guide](@/guide/caching.md#the-cache-identity) describes.
@@ -444,9 +455,8 @@ error: kizz.md:33 (Expect) failed:
 These fail the task at the `run()` call, with a Starlark error and the stack:
 
 * a call outside a task, while a module loads;
-* a positional argument, or a value inside one, that is neither a string nor a list or tuple,
-  a list or tuple that contains itself, or arguments that expand to more than 1,000,000 values,
-  each with the message that [`argv`](@/reference/starlark.md#argv) gives;
+* a positional argument, or a value inside one, that is neither a string nor a list or tuple, a list or tuple that contains itself,
+  or arguments that expand to more than 1,000,000 values, each with the message that [`argv`](@/reference/starlark.md#argv) gives;
 * a call without a program, an invalid `capture`, or an unknown `machine` part;
 * an invalid `ignore` or `track` pattern;
 * a bare program name without `PATH`;
@@ -490,8 +500,7 @@ Reading an attribute that the mode does not have is a Starlark error.
 
 * `dir()` lists the attributes, and `hasattr` and `getattr` work on them.
 * Two results are equal when their exit status, output and `cached` are equal.
-* `print()` and `str()` show every attribute, such as
-  `run_result(rc=0, signal=None, stdout="out\n", stderr="err\n", cached=False)`.
+* `print()` and `str()` show every attribute, such as `run_result(rc=0, signal=None, stdout="out\n", stderr="err\n", cached=False)`.
 * `json.encode()` and `fs.write_json()` encode a result as an object of its attributes, in the order above,
   such as `{"rc":0,"signal":null,"stdout":"out\n","stderr":"err\n","cached":false}`.
 * A result exists only while its task runs.
@@ -564,8 +573,9 @@ Reads the caller environment and dotenv files, and changes the task environment.
   Each `run()` passes it to its command, with the call's [`env`](@/reference/starlark.md#env) entries applied.
 * The command's exact environment is part of its step key, so every variable that reaches a command is tracked through it.
   Reading the caller environment is not recorded as an input of its own.
-* `env.read()` works while a module loads; every other `env` function works only in a task, and fails the task there
-  with an error such as `env.set() cannot be called while the module /path/lib.star is being loaded, outside any task`.
+* `env.read()` works while a module loads; every other `env` function works only in a task,
+  and fails the task there with an error such
+  as `env.set() cannot be called while the module /path/lib.star is being loaded, outside any task`.
 
 ```starlark
 env.inherit("PATH", "HOME")
@@ -599,8 +609,8 @@ or `default` when it is unset.
 `env.load_file(path, defaults = {}, required = True)` reads a dotenv file, fills in `defaults` for the variables it does not set,
 adds the result to the task environment, and returns it.
 
-* Parameters: `path`, a string, given positionally, relative to the task directory unless absolute;
-  `defaults`, a dict from strings to strings, empty by default; `required`, a bool, `True` by default.
+* Parameters: `path`, a string, given positionally, relative to the task directory unless absolute; `defaults`,
+  a dict from strings to strings, empty by default; `required`, a bool, `True` by default.
 * Returns: a dict of the variables that it added: the defaults, overridden by the file's variables.
 * A variable of the file replaces a default of the same name, and both replace a variable that the task environment already has.
 * With `required = False`, a missing file means that only the defaults apply.
@@ -808,8 +818,8 @@ This writes:
 * `*`, `?`, `[...]` and `{a,b}` stay within one component, and `**` matches any number of components.
   A backslash escapes the character after it.
   Names that start with `.` match like any other.
-* Files and directories both match, and symbolic links to directories are followed, without following a link back into
-  a directory that the search is in.
+* Files and directories both match, and symbolic links to directories are followed,
+  without following a link back into a directory that the search is in.
 * A pattern without glob characters checks its one path, and returns it when it exists.
 * A missing starting directory gives an empty list.
 * Tracks: a list of every directory that the search read, and a probe of every missing one;
@@ -920,8 +930,8 @@ It works in a task and while a module loads, tracks nothing, and has no side eff
 
 * Parameters: any number of values, given positionally.
   Each is converted as `str()` converts it, and they are joined with single spaces.
-* Kizz splits the text at each newline, and prints each line to its standard output with a prefix:
-  the task's name, else its heading, else its `kizz.md` and line, then `: `.
+* Kizz splits the text at each newline, and prints each line to its standard output with a prefix: the task's name,
+  else its heading, else its `kizz.md` and line, then `: `.
 * It works in a task and while a module loads, with the prefix of the task that loads the module.
 * The program runs in every pass, so its lines are printed again in every pass, also when every command is cached.
 * Tracks: nothing; printed lines are not stored.
@@ -937,8 +947,8 @@ See the [Starlark specification][starlark-print] for the standard function.
 
 `fail(value, ...)` fails the task.
 
-* Parameters: any number of values, given positionally, joined with spaces into the message:
-  strings as they are, other values as their `repr()`.
+* Parameters: any number of values, given positionally, joined with spaces into the message: strings as they are,
+  other values as their `repr()`.
 * The task fails at once, and kizz prints the message with the Starlark stack:
 
 ```text

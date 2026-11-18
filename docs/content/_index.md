@@ -55,14 +55,13 @@ kizz execute --output=report.txt -- sh -c 'cat notes.txt | wc -w'
 
 ## Where to read on
 
-* The [guide](@/guide/_index.md) explains [what kizz is](@/guide/what-is-kizz.md), how to
-  [get started](@/guide/getting-started.md), how to write [`kizz.md` files](@/guide/kizz-md.md),
-  and how [caching](@/guide/caching.md), [`kizz execute`](@/guide/execute.md) and [`kizz run`](@/guide/run.md) work.
+* The [guide](@/guide/_index.md) explains [what kizz is](@/guide/what-is-kizz.md), how to [get started](@/guide/getting-started.md),
+  how to write [`kizz.md` files](@/guide/kizz-md.md), and how [caching](@/guide/caching.md),
+  [`kizz execute`](@/guide/execute.md) and [`kizz run`](@/guide/run.md) work.
 * The [reference](@/reference/_index.md) describes the [command line](@/reference/command-line.md),
   the [environment variables](@/reference/environment.md), the [report format](@/reference/execute-report.md),
   the [`kizz.md` format](@/reference/kizz-md.md) and the [Starlark functions](@/reference/starlark.md) of kizz.
-* The [project](@/project/_index.md) section holds reports about kizz itself, such as its
-  [measurements](@/project/measurements.md).
+* The [project](@/project/_index.md) section holds reports about kizz itself, such as its [measurements](@/project/measurements.md).
 * [Planned features](@/guide/planned.md) lists what is planned but not built yet.
 
 [starlark-spec]: https://github.com/bazelbuild/starlark/blob/master/spec.md "The Starlark language specification"

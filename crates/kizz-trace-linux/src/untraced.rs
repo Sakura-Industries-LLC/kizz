@@ -54,7 +54,8 @@ impl ChildGroup {
         // SAFETY: getpgid has no memory requirements; the unreaped child reserves pid.
         let current = unsafe { libc::getpgid(self.pid) };
         if current != self.pid || signal == libc::SIGKILL {
-            // Always kill the first process on escalation, even if its original group vanished.
+            // Always kill the first process on escalation, even if its original group
+            // vanished.
             let first = ignore_missing(sys::kill(self.pid, signal));
             sent.and(first)
         } else {
@@ -84,7 +85,8 @@ impl ChildGroup {
                 Err(error)
             };
         }
-        // SAFETY: info's SIGCHLD fields were initialized by waitid or zero initialization.
+        // SAFETY: info's SIGCHLD fields were initialized by waitid or zero
+        // initialization.
         let status = unsafe { info.si_status() };
         Ok(match info.si_code {
             libc::CLD_EXITED => Some(Termination::Exited(status)),

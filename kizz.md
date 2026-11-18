@@ -23,24 +23,27 @@ Each task lists the environment variables its operation uses in its own `task_en
 inherits only those names and reads matching overrides from the optional, ignored root `.env`.
 Other `.env` entries never enter that task's command environment.
 For the listed names, values in `.env` replace inherited shell values; this is intentional.
-Markdown formatting, spelling, version checks, sorting and the site build inherit only `PATH`.
+Sorting and the site build inherit only `PATH`.
+Managed tool tasks also read mise installation locations.
 Rust formatting also declares the home directories needed by Cargo and its explicitly selected nightly toolchain.
 Cargo compilation tasks declare their toolchain and native build settings;
 only the test task accepts `TMPDIR` and `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS`.
-Mise storage settings belong only to installers, and proxy settings belong only to network operations.
+Proxy settings belong only to network operations.
 The Justfile also loads `.env`, but its default precedence favors the shell instead.
 For example, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` skips checks of system calls blocked by an outer seccomp filter.
-[mise.toml](mise.toml) is the single source of the cspell, rumdl and Ruff version pins.
-The build checks accept those versions or newer stable versions, including manually installed tools.
-Mise installs the exact pins; the checks read them with `mise config get --file mise.toml`.
+[mise.toml](mise.toml) is the single source of the cargo-deny, cspell, rumdl and Ruff version pins.
+Each managed tool task first checks the executable on its `PATH` against the minimum in that file.
+If the executable is missing or unsuitable, the task runs the pinned executable resolved by `mise which`.
+Markdown tasks put the selected Ruff directory first on rumdl's `PATH`.
 
 Install [mise](https://mise.jdx.dev/getting-started.html), then run `mise install`.
-Activate mise in your shell, or run `mise exec -- kizz build fix+ci` and `mise exec -- just fix-ci`.
+Run `kizz build fix+ci` directly.
+For the Justfile workflow, use `mise exec -- just fix-ci` or activate mise in your shell.
 The optional named installer tasks below install one tool at a time.
 Node.js and npm must be available for mise's cspell backend.
 No kizz build target installs tools automatically.
 
-Cargo, nightly rustfmt, cargo-deny and Zola must already be installed, as with the Justfile.
+Cargo, nightly rustfmt and Zola must already be installed, as with the Justfile.
 No project Cargo command requires an up-to-date lock file; Cargo may refresh `Cargo.lock`, which is committed.
 Commands whose exit status matters use `expect = [0]`; the advisory check deliberately only reports findings.
 
@@ -50,20 +53,9 @@ Commands whose exit status matters use `expect = [0]`; the advisory check delibe
 It is opt-in, runs on every invocation, and needs network access only when the tool is missing.
 
 ```starlark name=install-cspell cache=never
-load("build/common.star", "task_env")
-task_env(
-    "PATH",
-    "HOME",
-    "MISE_DATA_DIR",
-    "MISE_CACHE_DIR",
-    "MISE_STATE_DIR",
-    "MISE_CONFIG_DIR",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-)
-run("mise", "install", "cspell", stream=True, expect=[0])
+load("build/common.star", "mise_task_env")
+mise_task_env("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY")
+run("mise", "install", "cspell", network=True, stream=True, expect=[0])
 ```
 
 ## Install rumdl
@@ -72,20 +64,9 @@ run("mise", "install", "cspell", stream=True, expect=[0])
 It is opt-in, runs on every invocation, and needs network access only when the tool is missing.
 
 ```starlark name=install-rumdl cache=never
-load("build/common.star", "task_env")
-task_env(
-    "PATH",
-    "HOME",
-    "MISE_DATA_DIR",
-    "MISE_CACHE_DIR",
-    "MISE_STATE_DIR",
-    "MISE_CONFIG_DIR",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-)
-run("mise", "install", "rumdl", stream=True, expect=[0])
+load("build/common.star", "mise_task_env")
+mise_task_env("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY")
+run("mise", "install", "rumdl", network=True, stream=True, expect=[0])
 ```
 
 ## Install ruff
@@ -94,20 +75,9 @@ run("mise", "install", "rumdl", stream=True, expect=[0])
 It is opt-in, runs on every invocation, and needs network access only when the tool is missing.
 
 ```starlark name=install-ruff cache=never
-load("build/common.star", "task_env")
-task_env(
-    "PATH",
-    "HOME",
-    "MISE_DATA_DIR",
-    "MISE_CACHE_DIR",
-    "MISE_STATE_DIR",
-    "MISE_CONFIG_DIR",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-)
-run("mise", "install", "ruff", stream=True, expect=[0])
+load("build/common.star", "mise_task_env")
+mise_task_env("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY")
+run("mise", "install", "ruff", network=True, stream=True, expect=[0])
 ```
 
 ## Check cspell version
@@ -116,9 +86,9 @@ run("mise", "install", "ruff", stream=True, expect=[0])
 The spelling task repeats this guard so running it directly also checks the tool.
 
 ```starlark tools check ci name=check-cspell
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("cspell")
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+run(mise_tool("cspell"), "--version", expect=[0])
 ```
 
 ## Check rumdl version
@@ -127,9 +97,9 @@ require_tool("cspell")
 The Markdown tasks also check the version before using it.
 
 ```starlark tools fix check ci name=check-rumdl
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("rumdl")
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+run(mise_tool("rumdl"), "--version", expect=[0])
 ```
 
 ## Check Ruff version
@@ -137,9 +107,9 @@ require_tool("rumdl")
 The standalone Starlark tasks and Markdown tasks also check this minimum before formatting or checking code.
 
 ```starlark tools fix check ci name=check-ruff
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("ruff")
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+run(mise_tool("ruff"), "--version", expect=[0])
 ```
 
 ## Sort the spelling dictionary
@@ -178,10 +148,9 @@ Ruff recursively discovers `*.star` through [ruff.toml](ruff.toml), including `b
 It treats Starlark as Python-compatible syntax and formats it without Python lint rules.
 
 ```starlark fix name=fix-starlark
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("ruff")
-run("ruff", "format", ".", stream=True, expect=[0])
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+run(mise_tool("ruff"), "format", ".", stream=True, expect=[0])
 ```
 
 ## Fix Markdown
@@ -193,11 +162,20 @@ The Markdown tasks ignore rumdl's disposable `.rumdl_cache/`, which it reads and
 Source files and configuration remain tracked.
 
 ```starlark fix name=fix-markdown
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("rumdl")
-require_tool("ruff")
-run("rumdl", "check", "--fix", ".", ignore=[".rumdl_cache", ".rumdl_cache/**"], stream=True, expect=[0])
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+rumdl = mise_tool("rumdl")
+ruff = mise_tool("ruff")
+run(
+    rumdl,
+    "check",
+    "--fix",
+    ".",
+    ignore=[".rumdl_cache", ".rumdl_cache/**"],
+    stream=True,
+    expect=[0],
+    env={"PATH": ruff.rpartition("/")[0] + ":" + env.get("PATH")},
+)
 ```
 
 ## Check Rust formatting
@@ -211,10 +189,9 @@ run("cargo", "+nightly", "fmt", "--all", "--", "--check", stream=True, expect=[0
 ## Check Starlark modules
 
 ```starlark check ci name=check-starlark
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("ruff")
-run("ruff", "format", "--check", ".", stream=True, expect=[0])
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+run(mise_tool("ruff"), "format", "--check", ".", stream=True, expect=[0])
 ```
 
 ## Lint Rust
@@ -310,20 +287,27 @@ run("cargo", "doc", "--workspace", "--no-deps", "--all-features", ignore=cargo_i
 ## Check Markdown
 
 ```starlark check ci name=check-markdown
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("rumdl")
-require_tool("ruff")
-run("rumdl", "check", ".", ignore=[".rumdl_cache", ".rumdl_cache/**"], stream=True, expect=[0])
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+rumdl = mise_tool("rumdl")
+ruff = mise_tool("ruff")
+run(
+    rumdl,
+    "check",
+    ".",
+    ignore=[".rumdl_cache", ".rumdl_cache/**"],
+    stream=True,
+    expect=[0],
+    env={"PATH": ruff.rpartition("/")[0] + ":" + env.get("PATH")},
+)
 ```
 
 ## Check spelling
 
 ```starlark check ci name=spelling
-load("build/common.star", "require_tool", "task_env")
-task_env("PATH")
-require_tool("cspell")
-run("cspell", "lint", "--config", "cspell.json", "--no-progress", ".", stream=True, expect=[0])
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env()
+run(mise_tool("cspell"), "lint", "--config", "cspell.json", "--no-progress", ".", stream=True, expect=[0])
 ```
 
 ## Build the documentation site
@@ -336,16 +320,24 @@ task_env("PATH")
 run("zola", "--root", "docs", "build", stream=True, expect=[0])
 ```
 
+## Install cargo-deny
+
+`kizz run install-cargo-deny` installs the pinned version used by the dependency checks.
+
+```starlark name=install-cargo-deny cache=never
+load("build/common.star", "mise_task_env")
+mise_task_env("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY")
+run("mise", "install", "cargo-deny", network=True, stream=True, expect=[0])
+```
+
 ## Report dependency advisories
 
 As with `just check-ci`, advisory findings are informational and do not fail the build.
 Always fetch current advisories, since network responses are not tracked file dependencies.
 
 ```starlark ci name=advisories
-load("build/common.star", "task_env")
-task_env(
-    "PATH",
-    "HOME",
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env(
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
@@ -354,7 +346,7 @@ task_env(
     "ALL_PROXY",
     "NO_PROXY",
 )
-result = run("cargo", "deny", "check", "advisories", always=True, stream=True)
+result = run(mise_tool("cargo-deny"), "check", "advisories", always=True, network=True, stream=True)
 if result.rc != 0:
     print("Advisory check did not succeed; continuing as just check-ci does.")
 ```
@@ -364,15 +356,13 @@ if result.rc != 0:
 License, source and dependency bans are required checks.
 
 ```starlark ci name=licenses
-load("build/common.star", "task_env")
-task_env(
-    "PATH",
-    "HOME",
+load("build/common.star", "mise_task_env", "mise_tool")
+mise_task_env(
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
 )
-run("cargo", "deny", "check", "bans", "licenses", "sources", stream=True, expect=[0])
+run(mise_tool("cargo-deny"), "check", "bans", "licenses", "sources", stream=True, expect=[0])
 ```
 
 ## Build release binaries

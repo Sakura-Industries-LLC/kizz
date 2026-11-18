@@ -189,8 +189,8 @@ The exact environment of each command is part of its cache key.
 
 * `env.inherit("PATH", "HOME")` copies variables from the caller environment, the one kizz started with; unset ones are skipped.
 * `env.caller(name, default = None)` reads a caller variable without changing the task environment.
-* `env.set(name, value)`, `env.update(values)`, `env.unset(name)`, `env.get(name, default = None)` and `env.dict()`
-  work on the task environment, and `env.clear()` empties it.
+* `env.set(name, value)`, `env.update(values)`, `env.unset(name)`,
+  `env.get(name, default = None)` and `env.dict()` work on the task environment, and `env.clear()` empties it.
 * `env.load_file(path, defaults = {}, required = True)` reads a dotenv file, fills in `defaults` for variables it does not set,
   adds the result to the task environment and returns it as a dict.
   The file is a dependency of the task, and with `required = False` a missing file means that only the defaults apply.
@@ -207,8 +207,8 @@ Task programs read and write files directly, so a build can adapt to its own dat
 Paths are relative to the task directory, and absolute paths and paths outside the tree are allowed.
 
 * `fs.read(path)` returns text, and `fs.write(path, text)` writes text, creating parent directories.
-* `fs.read_json(path)` returns a Starlark value, and `fs.write_json(path, value, indent = 2)` writes stable JSON with a
-  trailing newline.
+* `fs.read_json(path)` returns a Starlark value,
+  and `fs.write_json(path, value, indent = 2)` writes stable JSON with a trailing newline.
 * `fs.exists(path)`, `fs.list(path = ".")` and `fs.glob(pattern)` inspect the file system, with sorted results.
 
 A write happens only when the content differs, so an unchanged file keeps its timestamps.
@@ -232,8 +232,8 @@ Planned: `kizz build --parallel`, to run independent tasks at once; today it is 
   A task whose recorded inputs changed runs again; one whose inputs did not change is a cache hit.
 * The build ends with a pass that runs nothing.
   The summary counts the passes that the build needed to settle, and not that final pass, which only confirms it.
-* A build that has not settled after one more pass than it has tasks stops with an error that names the paths that keep
-  changing and who writes them.
+* A build that has not settled after one more pass than it has tasks stops with an error that names the paths that keep changing
+  and who writes them.
 
 So a first build may need extra passes when tasks are in the wrong order, and later builds usually settle in one.
 In this file, "Package" reads the file that "Generate" writes, but comes first:
@@ -311,8 +311,8 @@ A build has no fail-fast and no `--keep-going`: it tries every task, even after 
 
 * Kizz cannot tell why a task failed.
   When a path that a failed task looked for and did not find appears, the task runs again, as "Package" did above.
-* A failed task whose missing paths are all still missing, and whose other inputs are unchanged, fails again from the
-  cache without running.
+* A failed task whose missing paths are all still missing, and whose other inputs are unchanged,
+  fails again from the cache without running.
 * A bare program name without `PATH` and an invalid `ignore` or `track` pattern fail their task before kizz starts anything.
   Kizz checks both before the cache check, so every pass fails such a call the same way, and it counts as no command that ran.
 * A tracer failure counts as a command that ran and leaves no record, and no later pass of the same build runs it again.

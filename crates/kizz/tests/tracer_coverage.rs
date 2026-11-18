@@ -1867,15 +1867,19 @@ fn the_tracer_records_every_access_of_the_coverage_program() -> TestResult {
     if run.status != Some(0) {
         problems.push("kizz build coverage-test failed".to_owned());
     }
-    problems.extend(warning_problems(&run, &[
-        "`./coverage`",
-        "connected to",
-        "127.0.0.1:47011",
-        "127.0.0.1:47012",
-        "Unix socket `out/core/stream.sock`",
-        "kizz cannot see what came back, and its result is still cached",
-        "`always = True` runs a command on every build",
-    ]));
+    problems.extend(warning_problems(
+        &run,
+        &[
+            "`./coverage`",
+            "made socket calls targeting",
+            "127.0.0.1:47011",
+            "127.0.0.1:47012",
+            "Unix socket `out/core/stream.sock`",
+            "kizz cannot see what came back, and its result is still cached",
+            "set `network = True` if this is expected",
+        ],
+        false,
+    ));
     runs.push(run);
 
     let task = TaskId {
@@ -2407,11 +2411,12 @@ fn number_problems(
 }
 
 /// The problems of the warnings of `run` that hold every one of `parts`: there must
-/// be exactly one, which starts with `warning: `, and the summary must repeat it
-/// once, indented by two spaces.
+/// be exactly one, which starts with `warning: `. When `summarize` is set, the
+/// summary must repeat it once, indented by two spaces.
 fn warning_problems(
     run: &Run,
     parts: &[&str],
+    summarize: bool,
 ) -> Vec<String> {
     let holds = |line: &str| parts.iter().all(|part| line.contains(part));
     let warned = run
@@ -2424,12 +2429,11 @@ fn warning_problems(
         .lines()
         .filter(|line| line.starts_with("  ") && holds(line))
         .count();
-    if (warned, repeated) == (1, 1) {
+    if (warned, repeated) == (1, usize::from(summarize)) {
         Vec::new()
     } else {
         vec![format!(
-            "kizz {} warned {warned} times and repeated it {repeated} times in its summary, not \
-             once each, about {parts:?}",
+            "kizz {} warned {warned} times and repeated it {repeated} times in its summary, with summary repetition expected: {summarize}, about {parts:?}",
             run.args.join(" ")
         )]
     }
@@ -2522,11 +2526,11 @@ impl IncompleteBuild {
             if has && seen {
                 let command = format!("incomplete-{}`", call.name);
                 let named = format!("`{}`", call.name);
-                problems.extend(warning_problems(run, &[
-                    command.as_str(),
-                    "was traced incompletely",
-                    named.as_str(),
-                ]));
+                problems.extend(warning_problems(
+                    run,
+                    &[command.as_str(), "was traced incompletely", named.as_str()],
+                    true,
+                ));
             }
         }
         problems
@@ -2615,11 +2619,15 @@ fn each_call_that_marks_a_run_and_each_unknown_number_leaves_its_result_uncached
             "made system call {number}, which the tracer does not know, so its result was not \
              cached and it runs again on the next build"
         );
-        problems.extend(warning_problems(run, &[
-            format!("unknown-{number}`").as_str(),
-            made.as_str(),
-            "`kizz build --cache-unknown-syscalls`",
-        ]));
+        problems.extend(warning_problems(
+            run,
+            &[
+                format!("unknown-{number}`").as_str(),
+                made.as_str(),
+                "`kizz build --cache-unknown-syscalls`",
+            ],
+            true,
+        ));
     }
     skips.write_notice(test)?;
     built.assert_no_problems(&problems)
@@ -2659,7 +2667,11 @@ fn with_the_option_the_steps_of_unknown_numbers_are_cached() -> TestResult {
              because `kizz build --cache-unknown-syscalls` was given"
         );
         let command = format!("unknown-{number}`");
-        problems.extend(warning_problems(run, &[command.as_str(), made.as_str()]));
+        problems.extend(warning_problems(
+            run,
+            &[command.as_str(), made.as_str()],
+            true,
+        ));
     }
 
     let again = built.run(&["build", "coverage-incomplete"])?;

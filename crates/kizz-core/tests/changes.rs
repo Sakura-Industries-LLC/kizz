@@ -251,6 +251,7 @@ impl Fixture {
             stream: false,
             always: false,
             untraced: false,
+            network: false,
             ignore: ignore.iter().map(|&pattern| pattern.to_owned()).collect(),
             track: Vec::new(),
             timestamps: false,

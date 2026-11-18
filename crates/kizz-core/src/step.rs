@@ -40,6 +40,8 @@ pub struct StepSpec {
     pub always: bool,
     /// Run without observing dependencies; implies one uncached execution per build.
     pub untraced: bool,
+    /// Whether socket activity is expected and needs no warning.
+    pub network: bool,
     /// The user exceptions: patterns of paths not recorded as dependencies.
     pub ignore: Vec<String>,
     /// The `/proc` and `/sys` files whose content counts as an input.

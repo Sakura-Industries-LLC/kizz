@@ -24,9 +24,9 @@
 //!
 //! The encoding is deterministic: one definite-length array of the twelve values,
 //! definite lengths throughout, and the environment as a map sorted by name. So the
-//! same step always produces the same key. `always`, `stream`, and `expect` are not
-//! in the key, because they change what kizz does with a step, not what the command
-//! does. `timestamps` is in the key, because a record made without it keeps the
+//! same step always produces the same key. `always`, `stream`, `expect`, and `network`
+//! are not in the key, because they change what kizz does with a step, not what the
+//! command does. `timestamps` is in the key, because a record made without it keeps the
 //! timestamps of its latest cache hit. The `machine` names are in the key, like the
 //! `track` patterns, because they decide what the cache check compares.
 
@@ -208,6 +208,7 @@ mod tests {
             stream: false,
             always: false,
             untraced: false,
+            network: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,

@@ -257,6 +257,7 @@ impl Fixture {
             stream: false,
             always: false,
             untraced: false,
+            network: false,
             ignore: vec!["*.tmp".to_owned()],
             track: Vec::new(),
             timestamps: false,

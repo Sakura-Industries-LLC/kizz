@@ -155,7 +155,8 @@ impl Escaped {
 }
 impl Drop for Escaped {
     fn drop(&mut self) {
-        // SAFETY: the owned pidfd keeps identifying only this helper; no siginfo is supplied.
+        // SAFETY: the owned pidfd keeps identifying only this helper; no siginfo is
+        // supplied.
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,

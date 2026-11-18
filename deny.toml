@@ -1,6 +1,6 @@
 # cargo-deny configuration for the kizz workspace.
 #
-# This file is consumed by `cargo deny check`, which the `check-ci` recipe
+# This file is consumed by `cargo-deny check`, which the `check-ci` recipe
 # of the Justfile runs. The canonical CI command is:
 #
 #     just fix-ci

@@ -74,8 +74,9 @@ The site source is in [docs](docs), a Zola site; `zola --root docs serve` shows 
 ## Development
 
 Tool versions are pinned in [mise.toml](mise.toml).
-Install [mise](https://mise.jdx.dev/getting-started.html), run `mise install`,
-then activate mise or prefix commands with `mise exec --`.
+Install [mise](https://mise.jdx.dev/getting-started.html) and run `mise install`.
+Kizz resolves the pinned tools when needed.
+Use `mise exec -- just fix-ci` for the Justfile workflow.
 Ruff formats Starlark modules and, through rumdl, Starlark code blocks in Markdown.
 The [kizz build tasks](kizz.md) document the self-hosted build.
 

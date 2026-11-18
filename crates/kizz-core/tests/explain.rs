@@ -332,6 +332,7 @@ impl Fixture {
             stream: false,
             always: false,
             untraced: false,
+            network: false,
             ignore: Vec::new(),
             track: Vec::new(),
             timestamps: false,

@@ -55,7 +55,7 @@ These decisions came out of the review of the original outline.
 | Directory listings | Directory listings are dependencies, including the order in which the file system returns the entries. |
 | Explanations | Kizz says exactly why it ran each command and which things changed. |
 | Hermeticity | Not a goal. The goal is fast, cacheable, reliable builds without hand-written dependency lists, which nobody can maintain accurately. |
-| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. A system call that the tracer does not know makes the result not cached unless `kizz build --cache-unknown-syscalls` is given, and kizz warns about it either way. Connections to the network and to Unix sockets are detected and warned about, and the result is still cached. Machine and process state is recorded with each step and counts as an input only for a step that names it. |
+| Untrackable behavior | Assumed absent. A user who knows a command breaks that assumption marks it to run on every build. Its dependencies are still tracked, and if it changes nothing other steps depend on, the cost is time, not a broken cache. A system call that the tracer does not know makes the result not cached unless `kizz build --cache-unknown-syscalls` is given, and kizz warns about it either way. Connections to the network and to Unix sockets are recorded. Kizz warns unless the step sets `network = True`, and the result is still cached. Machine and process state is recorded with each step and counts as an input only for a step that names it. |
 | Tool awareness | None. Tool caches are tracked at file level like any other files. A tool that makes itself uncacheable is uncacheable, and kizz reports exactly why, for example that a command keeps writing a file and consuming it as an input. Users may ignore a file, glob, or regular expression, or a set of them; kizz never adds such exceptions itself. Users drive exceptions, not dependencies. |
 | Inputs | Anything read during the build is an input. To exclude a file, stop the tool from reading it, or add an exception. Kizz itself stays oblivious. |
 | Change detection | Different size: changed. Same size and same metadata: unchanged. Same size but different metadata: maybe changed, so compare hashes. A different type, permission bits or owner is always a change, whatever the content. A command run with `timestamps = True` also counts a different timestamp as a change. |
@@ -172,8 +172,8 @@ Version 1 implements these commands:
   (see [Exit codes and failure](#exit-codes-and-failure)).
   `--cache-unknown-syscalls` caches the results of commands that made a system call that the tracer does not know,
   which are not cached by default; kizz warns about them either way (see [The Linux tracer](#the-linux-tracer)).
-* `kizz why [path]` prints why each command ran or was cached in the most recent build,
-  for tasks under `path`, which defaults to the current directory.
+* `kizz why [path]` prints why each command ran or was cached in the most recent build, for tasks under `path`,
+  which defaults to the current directory.
 * `kizz list [targets]` lists discovered tasks with their file, line, heading, targets and options, plus any discovery warnings.
 * `kizz cache clean` removes stale entries from the shared cache, and `kizz cache reset` wipes the entries under a path,
   or the whole cache with `--all`, after confirmation (see [Cleaning up the cache](#cleaning-up-the-cache)).
@@ -269,6 +269,7 @@ result = run(
     stream=False,  # also echo output live to the terminal
     always=False,  # run on every build, even when cached
     untraced=False,  # disable dependency tracing; run once per build
+    network=False,  # acknowledge expected socket activity
     ignore=[],  # user exceptions: paths not recorded as dependencies of this step
     track=[],  # /proc and /sys files whose content counts as an input of this step
     timestamps=False,  # also compare the timestamps of what the step read, ran, listed or checked
@@ -294,8 +295,8 @@ result = run(
   If the task environment has no `PATH`, a bare program name is an error that says to set or inherit `PATH`.
 * Output is always captured; `capture` decides how.
   `merged` sends both streams through one pipe, so the order is exact.
-* The result has `rc` (the exit code, or `None` when a signal killed the process), `signal`,
-  `stdout` and `stderr` (with `split`), `output` (with `merged`), and `cached` (whether the result came from the cache).
+* The result has `rc` (the exit code, or `None` when a signal killed the process), `signal`, `stdout` and `stderr`
+  (with `split`), `output` (with `merged`), and `cached` (whether the result came from the cache).
 * Output is decoded as UTF-8 for the program, with invalid bytes replaced; the cache stores the raw bytes.
 * With `timestamps = True`, a new timestamp of a file or directory that the step used runs it again,
   even when the content is the same, for tools such as `tar` and `zip` that store timestamps.
@@ -378,8 +379,8 @@ The exact environment passed to each command is part of that step's cache key, s
   The file is recorded as a dependency of the task.
   With `required = False`, a missing file means only the defaults apply.
 * `env.read(path)` reads a dotenv file into a dict without changing the task environment.
-* `env.set(name, value)`, `env.update(values)`, `env.unset(name)`, `env.get(name, default = None)` and `env.dict()`
-  work on the task environment.
+* `env.set(name, value)`, `env.update(values)`, `env.unset(name)`,
+  `env.get(name, default = None)` and `env.dict()` work on the task environment.
 * `env.clear()` empties the task environment.
 
 Dotenv files use `NAME=value` lines, `#` comments, an optional `export` prefix, and single or double quotes;
@@ -392,8 +393,8 @@ Task programs read and write files directly, so a build can adapt to its own dat
 Paths are relative to the task directory; absolute paths and paths outside the tree are allowed.
 
 * `fs.read(path)` returns text, and `fs.write(path, text)` writes text, creating parent directories.
-* `fs.read_json(path)` returns a Starlark value, and `fs.write_json(path, value, indent = 2)` writes stable JSON
-  with a trailing newline.
+* `fs.read_json(path)` returns a Starlark value,
+  and `fs.write_json(path, value, indent = 2)` writes stable JSON with a trailing newline.
 * `fs.exists(path)`, `fs.list(path = ".")` (sorted names) and `fs.glob(pattern)` (sorted matches) inspect the file system.
 * Writes happen only when the content differs, so unchanged files keep their timestamps.
   A write that changes a file counts as work in its pass, as a command that runs does, so another pass follows.
@@ -493,8 +494,8 @@ Nothing in the core changes when the tracer does.
   The filter stops the process only for system calls that touch the file system or that the tracer does not know,
   and lets everything else run at full speed.
   Seccomp alone cannot read path arguments or see results, so `ptrace` reads the path at entry and the result at exit.
-* It follows the whole process tree, including threads, forks and `exec`,
-  and the traced processes are killed if kizz dies (`PTRACE_O_EXITKILL`).
+* It follows the whole process tree, including threads, forks and `exec`, and the traced processes are killed
+  if kizz dies (`PTRACE_O_EXITKILL`).
 * A command of a build runs in a process group of its own, with pipes or `/dev/null` as its standard streams.
   A terminal's Ctrl-C then reaches only kizz, which interrupts the command exactly once.
 * A command that keeps the terminal, as `kizz execute` runs it, uses kizz's standard input, output and error directly.
@@ -508,8 +509,8 @@ Nothing in the core changes when the tracer does.
   and the loader that an ELF executable names in its `PT_INTERP` program header.
   A relative interpreter path is resolved against the working directory, as the kernel resolves it.
   These paths get the exec kind when the `exec` succeeds, and a probe when it fails.
-* A program that runs although the tracer cannot read it, or that is neither a `#!` script nor an ELF executable
-  for the machine, marks the run as incompletely traced, since a handler such as `binfmt_misc` may run it.
+* A program that runs although the tracer cannot read it, or that is neither a `#!` script nor an ELF executable for the machine,
+  marks the run as incompletely traced, since a handler such as `binfmt_misc` may run it.
 * It resolves relative paths against the calling thread's working directory or the directory descriptor the call used.
 * It records successful and failed calls alike; a lookup that fails with `ENOENT` is a dependency.
 * An `openat2` with `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` and without `O_NONBLOCK` that fails with `EAGAIN` records nothing.
@@ -518,8 +519,8 @@ Nothing in the core changes when the tracer does.
   With `O_NONBLOCK`, the error can also mean that a lease refused a file that the lookup found, so it is recorded as usual.
 * `io_uring_setup` fails with `ENOSYS`, so programs fall back to ordinary system calls,
   because `io_uring` operations would bypass the filter.
-* System calls made through a non-native interface (32-bit `int 0x80` or x32) mark the run as incompletely traced:
-  the result is not cached and kizz warns loudly.
+* System calls made through a non-native interface
+  (32-bit `int 0x80` or x32) mark the run as incompletely traced: the result is not cached and kizz warns loudly.
 * Paths are reported as absolute paths with `.` components and repeated separators removed.
   `..` components are kept, because collapsing them is wrong when part of the path is a symbolic link.
 * x86_64 comes first; aarch64 is a later extension.
@@ -534,18 +535,16 @@ Tracked system calls, by x86_64 name:
   `file_getattr` and `name_to_handle_at`
 * file systems: `statfs`, and `fstatfs` on the file system behind a descriptor
 * watches: `inotify_add_watch` and `fanotify_mark`
-* extended attributes: `getxattr`, `lgetxattr`, `fgetxattr`, `getxattrat`, `listxattr`, `llistxattr`, `flistxattr`,
-  `listxattrat`, `setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat`, `removexattr`, `lremovexattr`, `fremovexattr`
-  and `removexattrat`, those on a descriptor resolved to the path behind it
+* extended attributes: `getxattr`, `lgetxattr`, `fgetxattr`, `getxattrat`, `listxattr`, `llistxattr`, `flistxattr`, `listxattrat`,
+  `setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat`, `removexattr`, `lremovexattr`, `fremovexattr` and `removexattrat`,
+  those on a descriptor resolved to the path behind it
 * links: `readlink`, `readlinkat`, `link`, `linkat`, `symlink` and `symlinkat`
 * directory listings: `getdents` and `getdents64`
 * programs: `execve` and `execveat`
 * working directory: `chdir` and `fchdir`
-* changes: `rename`, `renameat`, `renameat2`, `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`, `mknod`, `mknodat`,
-  `truncate`, `chmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`, `fchownat`, `utime`, `utimes`,
-  `utimensat`, `futimesat` and `file_setattr`
-* descriptor-based changes: `ftruncate`, `fchmod`, `fchown` and `fallocate`,
-  resolved to the path behind the descriptor
+* changes: `rename`, `renameat`, `renameat2`, `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`, `mknod`, `mknodat`, `truncate`,
+  `chmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`, `fchownat`, `utime`, `utimes`, `utimensat`, `futimesat` and `file_setattr`
+* descriptor-based changes: `ftruncate`, `fchmod`, `fchown` and `fallocate`, resolved to the path behind the descriptor
 * sockets: `bind`, `connect`, `sendto`, `sendmsg` and `sendmmsg`
 
 Reading or listing extended attributes records the xattr kind, also when the call fails
@@ -647,8 +646,8 @@ Directory listings are compared by their final state only.
 ### Path states
 
 * Absent.
-* Regular file that was read, including a program that was run: size, modification and change times in nanoseconds,
-  inode, device, mode (its type and permission bits) and owner (user and group), plus a BLAKE3 hash of its content.
+* Regular file that was read, including a program that was run: size, modification and change times in nanoseconds, inode, device,
+  mode (its type and permission bits) and owner (user and group), plus a BLAKE3 hash of its content.
 * Any other regular file, such as one that was only checked or only written: that the command touched it, and the same metadata.
   Kizz never hashes it.
 * Directory: its mode, owner, and modification and change times.
@@ -706,7 +705,10 @@ If it does not change anything another step depends on, the cost is time, not co
 find nothing changed, and stay cached.
 
 Kizz detects connections to the network and to Unix sockets, because what comes back is an input it cannot see.
-It warns loudly about each connection, naming the address or socket, and repeats the warning in the summary.
+It warns once per step when it sees unexpected socket activity, naming the destinations supplied to the system calls.
+An IP destination can appear even when a call fails or only selects a route, including when its supplied port is zero.
+`network = True` acknowledges expected network and Unix socket activity and suppresses this warning.
+The option affects only diagnostics and does not change the step key.
 The result is still cached, and `kizz why` lists the step's connections.
 Kizz warns when the command runs, not on a later cache hit.
 Kizz also assumes that a command has no effect outside the files it writes.
@@ -732,8 +734,8 @@ Kizz never adds exceptions of its own.
 * One cache serves every build on the machine, wherever it starts.
 * Cache keys use the absolute directory of each task, not the directory kizz was started in.
   Running `kizz build ci` deep in a tree and then again four directories up reuses the results already built below.
-* Moving a project to a new path means building it again;
-  keys that survive a move need output restoration, which is a later extension.
+* Moving a project to a new path means building it again; keys that survive a move need output restoration,
+  which is a later extension.
 * The cache only grows during builds; `kizz cache` cleans it up, as described in [Cleaning up the cache](#cleaning-up-the-cache).
 
 ### Cache identity
@@ -809,7 +811,8 @@ A step's key is a BLAKE3 hash, derived with a versioned context string, of a CBO
 The encoding is deterministic: definite lengths, fields in a fixed order and maps sorted by key,
 so the same step always produces the same key.
 
-`always`, `stream` and `expect` are not in the key, because they change what kizz does with a step, not what the command does.
+`always`, `stream`, `expect` and `network` are not in the key, because they change what kizz does with a step,
+not what the command does.
 `timestamps` is in the key, because a record made without it keeps the timestamps of its latest cache hit.
 
 ### Cache check
@@ -828,8 +831,8 @@ A regular file that was read is compared like this:
 * Same size and same metadata (modification and change times, inode, device, mode and owner): unchanged.
 * Same size, mode and owner, but different times, inode or device: maybe changed, so kizz hashes the file.
   If the hashes match, the file is unchanged, and kizz stores the new metadata so the next check takes the fast path.
-* If the recorded modification time is within two seconds of when the record was written,
-  metadata cannot prove the file unchanged, so kizz hashes it, as git does for racily clean files.
+* If the recorded modification time is within two seconds of when the record was written, metadata cannot prove the file unchanged,
+  so kizz hashes it, as git does for racily clean files.
 
 A regular file that was not read has no hash, so its metadata is the whole dependency:
 any difference in size or metadata is a change.
@@ -904,12 +907,12 @@ They change cache entries only, never project files.
   Dependencies on files that did not exist when they were recorded are kept, because they are still valid.
   It asks for no confirmation, because it removes only entries for files that are gone; the worst case is a rebuild.
 * `kizz cache reset --all` wipes the whole cache, also one that kizz refuses to use because of its identity.
-* `kizz cache reset [path]` wipes every entry for tasks under the path, which defaults to the current directory:
-  their step records, step positions, task records and learned order, and the last-writer entries for paths under it.
+* `kizz cache reset [path]` wipes every entry for tasks under the path, which defaults to the current directory: their step records,
+  step positions, task records and learned order, and the last-writer entries for paths under it.
 * Both resets show what they will remove, such as the number of tasks and records, and ask for confirmation first.
   `--yes` skips the question, and without a terminal a reset refuses to run unless `--yes` is given.
-* Every cache command takes the cache lock, so none runs during a build,
-  and a waiting command says what it is waiting for, as a waiting build does.
+* Every cache command takes the cache lock, so none runs during a build, and a waiting command says what it is waiting for,
+  as a waiting build does.
 
 ## Explaining decisions
 
@@ -920,14 +923,13 @@ These are the reasons:
 * never run: there is no record for this step
 * the task program changed: its block, or a named loaded module
 * the arguments changed: old and new, word by word
-* the environment changed: which variables were added, removed or changed,
-  with values shown only with `--verbose`, because values can be secrets
+* the environment changed: which variables were added, removed or changed, with values shown only with `--verbose`,
+  because values can be secrets
 * the working directory, `stdin`, capture mode, ignore patterns, `track` patterns, `timestamps` or `machine` changed
 * inputs changed: every changed path, what changed about it
-  (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, extended attributes,
-  directory entries, entry order or link target changed),
-  and who last wrote it: this command on its previous run, another task's command or program in this build,
-  a command or task program of an earlier build, or something outside kizz
+  (it appeared or disappeared, or its content, size, type, permissions, owner, timestamps, extended attributes, directory entries,
+  entry order or link target changed), and who last wrote it: this command on its previous run,
+  another task's command or program in this build, a command or task program of an earlier build, or something outside kizz
 * the machine state that the step names changed: each changed value, old and new
 * the command is marked `always`
 * its task is marked `cache=never`
@@ -968,8 +970,8 @@ It also lists the system calls that a step made and that the tracer does not kno
   After such a pass, the final pass, which runs nothing, only confirms the build and is not counted.
   A first build may take extra passes to settle; later builds usually settle in one, because the order has been learned.
   A command marked `always` runs at most once per build, when a pass first reaches it; later passes reuse its result.
-* If the build has not settled after a fixed number of passes (one more than the number of tasks),
-  kizz stops and names the paths that keep changing and who writes them.
+* If the build has not settled after a fixed number of passes
+  (one more than the number of tasks), kizz stops and names the paths that keep changing and who writes them.
 * A missing file is a dependency, never a scheduling signal: kizz never pauses a process to wait for a file to appear.
 
 ## Failure and interruption
@@ -981,8 +983,7 @@ This is the first version of the rule, to be refined later.
   or runs a command whose program cannot be found or started.
   With `--fail-unchecked`, a task also fails when it leaves a non-zero exit unchecked.
   Kizz prints the error, the Starlark stack and the captured output of the failing command.
-* A failed task does not stop the build:
-  the pass continues with every other task, including tasks that may consume its outputs.
+* A failed task does not stop the build: the pass continues with every other task, including tasks that may consume its outputs.
 * Kizz cannot tell why a task failed.
   If any of its commands looked for a path and did not find it (`ENOENT`), the task may have failed because that path was missing,
   or it may be failing for another reason.
@@ -1173,8 +1174,8 @@ A process has these fields, in this order:
 * `id`: its number, unique in the report and counting from 1 across every command
 * `pid`: its process ID, or `null` when kizz started no process
 * `parent`: the number of the process that created it, or `null`
-* `exit`: how it ended, or `null` if the tracer did not see it end
-  It is an object whose `kind` is `exited`, with `code`, or `signaled`, with `signal`.
+* `exit`: how it ended, or `null` if the tracer did not see it end It is an object whose `kind` is `exited`, with `code`,
+  or `signaled`, with `signal`.
 * `programs`: its programs, in order
 
 A program has `path`, `args`, `inherited`, `observations` and `connections`.
@@ -1237,16 +1238,18 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
 * Cargo builds the workspace.
   A Justfile holds the commands, written out directly.
   Kizz also builds itself with the documented tasks in `kizz.md`; the Justfile remains available.
-  `mise.toml` pins cspell, rumdl and Ruff, installed with `mise install`.
-  Tool version checks read the mise pins as minimums; normal kizz targets never install tools.
+  `mise.toml` pins cargo-deny, cspell, rumdl and Ruff, installed with `mise install`.
+  Kizz uses the executable on the task's `PATH` when it meets the pinned minimum,
+  and otherwise resolves the pinned install with `mise which`.
+  Only the installer tasks install tools.
   Ruff formats `*.star` recursively through `ruff.toml`, excluding build output and vendored code.
   Rumdl delegates Starlark fenced blocks to Ruff for formatting and checks through `.rumdl.toml`.
   Only formatting is applied; Python lint rules do not apply to Starlark.
   Each task declares its environment names; only matching `.env` values override them.
   Moon is not used.
 * These settings are copied from cbork:
-    * the `[workspace.lints]` tables in `Cargo.toml`: Clippy pedantic as errors; errors for `unwrap`, `expect`, `panic`,
-      indexing, unchecked arithmetic and missing documentation, private items included; and the rustdoc lints
+    * the `[workspace.lints]` tables in `Cargo.toml`: Clippy pedantic as errors; errors for `unwrap`, `expect`, `panic`, indexing,
+      unchecked arithmetic and missing documentation, private items included; and the rustdoc lints
     * `clippy.toml`, with its allowances for tests and `msrv = "1.100"`
     * `rustfmt.toml`, which uses nightly rustfmt options
     * `.rumdl.toml`, adding `starlark` to the custom code-block languages
@@ -1315,8 +1318,8 @@ check-ci: sort-dictionary
     rumdl check .
     cspell lint --config cspell.json --no-progress .
     zola --root docs build
-    cargo deny check advisories || true
-    cargo deny check bans licenses sources
+    deny_bin="$(mise which cargo-deny --tool=cargo-deny)"; "$deny_bin" check advisories || true
+    "$(mise which cargo-deny --tool=cargo-deny)" check bans licenses sources
     cargo build --workspace --release
 
 # Run every fixer, then the CI gate. This is also the quality gate of the workspace agent workflow.
@@ -1328,9 +1331,9 @@ fix-ci: fix check-ci
 * `check-ci` checks and builds: it sorts the dictionary, as decided, runs the checks, checks licenses,
   and builds the release binaries.
   No recipe passes `--locked`, so Cargo creates and refreshes `Cargo.lock` as needed.
-  `cargo deny check advisories` reports the advisories that apply to the dependencies, for information only.
+  `cargo-deny check advisories` reports the advisories that apply to the dependencies, for information only.
   No finding of that check, of any kind, ever fails `check-ci` or `fix-ci`, and `deny.toml` ignores no advisory.
-  `cargo deny check bans licenses sources` comes next, and any finding of those three checks fails the recipe.
+  `cargo-deny check bans licenses sources` comes next, and any finding of those three checks fails the recipe.
 * `fix-ci` runs `fix` and then `check-ci`.
   It is also the quality gate the workspace agent workflow runs.
 
@@ -1346,8 +1349,8 @@ Phase 8 depends only on phase 5, so it can be built alongside phases 6 and 7.
 * The `rumdl`, `cspell` and `cargo-deny` configuration, with `README.md` and this plan passing the Markdown and spelling checks.
 * The `kizz` binary with every subcommand parsed; every subcommand prints a scaffold message in the cbork stub style.
 * The complete tracer interface in `kizz-trace`: the run request, the result, access kinds, errors and the tracer trait.
-* `kizz build` accepts `--sequential`, the default, and rejects `--parallel`
-  with an error saying that parallel execution is not implemented yet.
+* `kizz build` accepts `--sequential`, the default,
+  and rejects `--parallel` with an error saying that parallel execution is not implemented yet.
 
 Acceptance: `kizz --help` lists every subcommand, each subcommand prints its stub message,
 `kizz build --parallel` fails with the not-implemented error, and `just fix-ci` passes.
@@ -1356,8 +1359,8 @@ Acceptance: `kizz --help` lists every subcommand, each subcommand prints its stu
 
 Depends on phase 0.
 
-* Process start with `ptrace`, `PR_SET_NO_NEW_PRIVS` and the seccomp-bpf filter,
-  with tracer options that follow forks, clones and `exec` and kill the traced processes if kizz dies.
+* Process start with `ptrace`, `PR_SET_NO_NEW_PRIVS` and the seccomp-bpf filter, with tracer options that follow forks,
+  clones and `exec` and kill the traced processes if kizz dies.
 * Decoding of the tracked system calls, resolution of relative paths, and reading results at system-call exit.
 * `ENOSYS` for `io_uring_setup`, and incomplete-trace reporting for non-native system-call interfaces.
 * Feeding `stdin`, split and merged capture, live echo of output, and cancellation.
@@ -1378,8 +1381,7 @@ Depends on phase 0.
 * The cache location from `KIZZ_CACHE_DIR`, `XDG_CACHE_HOME` and `HOME`.
 * The lock file: exclusive `flock`, the holder's details, the waiting message and its updates, deletion on exit,
   takeover after a crash, and the inode check.
-* The SurrealKV store with typed CBOR records encoded with `minicbor`,
-  prefix scans, multi-record transactions and a schema version.
+* The SurrealKV store with typed CBOR records encoded with `minicbor`, prefix scans, multi-record transactions and a schema version.
 
 Acceptance:
 
@@ -1478,10 +1480,10 @@ Acceptance, end to end with the real tracer and a temporary cache:
 
 Depends on phase 5.
 
-* `kizz cache clean`: a concurrent scan of every recorded path, and removal of the entries described in
-  [Cleaning up the cache](#cleaning-up-the-cache).
-* `kizz cache reset [path]` and `kizz cache reset --all`, with a confirmation that shows what will be removed,
-  `--yes` to skip it, and a refusal to run without a terminal unless `--yes` is given.
+* `kizz cache clean`: a concurrent scan of every recorded path,
+  and removal of the entries described in [Cleaning up the cache](#cleaning-up-the-cache).
+* `kizz cache reset [path]` and `kizz cache reset --all`, with a confirmation that shows what will be removed, `--yes` to skip it,
+  and a refusal to run without a terminal unless `--yes` is given.
 * The cache lock for every cache command.
 
 Acceptance, with a temporary cache:

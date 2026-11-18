@@ -1,5 +1,6 @@
 # Tool installation pins; kizz's version checks use these as minimum versions.
 [tools]
+cargo-deny = "0.21.0"
 cspell = "10.4.1"
 rumdl = "0.3.4"
 ruff = "0.17.4"
