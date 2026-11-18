@@ -32,7 +32,7 @@ env:
   ZOLA_VERSION: "v0.23.6"
   ZOLA_SHA256: "8f5132b3522412d04e395e0b25f6d68613ad272a873e54a2b3ebf664873024a4"
   CARGO_TERM_COLOR: always
-  # The workspace denies all warnings; lint enforcement belongs to `just fix-ci`,
+  # The workspace denies all warnings; lint enforcement belongs to `kizz build fix+ci`,
   # not the release build, so a new compiler lint cannot block a tagged release.
   RUSTFLAGS: --cap-lints=warn
 

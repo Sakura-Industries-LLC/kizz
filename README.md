@@ -74,20 +74,12 @@ The site source is in [docs](docs), a Zola site; `zola --root docs serve` shows 
 ## Development
 
 Tool versions are pinned in [mise.toml](mise.toml).
-Install [mise](https://mise.jdx.dev/getting-started.html) and run `mise install`.
-Kizz resolves the pinned tools when needed.
-Use `mise exec -- just fix-ci` for the Justfile workflow.
+Install [mise](https://mise.jdx.dev/getting-started.html), then run `./bootstrap.sh` to build kizz and install the pinned tools.
 Ruff formats Starlark modules and, through rumdl, Starlark code blocks in Markdown.
-The [kizz build tasks](kizz.md) document the self-hosted build.
+Run `kizz build fix+ci` for the quality gate.
+The [build tasks](kizz.md) list the individual checks and fixers.
 
-The Justfile holds every command:
-
-* `just fix` runs the formatters and every other automated fixer.
-* `just check` checks formatting, lints, tests, docs, Markdown, spelling and the documentation site, and changes no tracked file.
-* `just check-ci` sorts the spelling dictionary, runs the checks, checks licenses, and builds the release binaries.
-* `just fix-ci` runs `fix` and then `check-ci`.
-
-The Justfile loads a `.env` file beside it if there is one; it holds one machine's settings, and Git ignores it.
+Tasks read machine-specific settings from an optional root `.env`, which Git ignores.
 If a seccomp filter refuses calls before kizz's tracer sees them, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` there skips their checks.
 
 ## Vendored SurrealKV

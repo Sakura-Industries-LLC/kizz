@@ -66,7 +66,7 @@ These decisions came out of the review of the original outline.
 | Language | Rust, not Go. |
 | Command line and output | The same libraries as the cbork CLI. One command, `kizz`, with subcommands; possible future subcommands are stubbed. |
 | Quality gates | Clippy and the other Rust lints copied from cbork, plus Markdown linting and spell checking. |
-| Build tooling | Cargo and a Justfile with the commands written out directly. `fix` fixes: it runs every automated fixer, the formatters and anything else that can be fixed automatically. `check` checks and changes nothing. `check-ci` checks and builds. `fix-ci` runs `fix` and then `check-ci`. No moon, because kizz will eventually build itself. |
+| Build tooling | Cargo bootstraps kizz. The tasks in `kizz.md` define its self-hosted build. `kizz build fix+ci` is the quality gate. |
 | Spelling dictionary | Subagents only append words to the dictionary. The CI recipe sorts it and removes duplicates, so appends from several agents never conflict. |
 
 The open questions of earlier drafts were answered as follows:
@@ -1236,8 +1236,8 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
 ## Development workflow
 
 * Cargo builds the workspace.
-  A Justfile holds the commands, written out directly.
-  Kizz also builds itself with the documented tasks in `kizz.md`; the Justfile remains available.
+  Kizz builds itself with the documented tasks in `kizz.md`.
+  Bootstrap installs kizz and uses it to install the pinned tools.
   `mise.toml` pins cargo-deny, cspell, rumdl and Ruff, installed with `mise install`.
   Kizz uses the executable on the task's `PATH` when it meets the pinned minimum,
   and otherwise resolves the pinned install with `mise which`.
@@ -1259,7 +1259,7 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
   Kizz's crates use fallible forms instead, and in them only the helper of `kizz-threads` calls `std::thread::Builder`.
 * Source files carry the same copyright and SPDX header as cbork, with `AGPL-3.0-only`.
 * Anyone adding spelling words, parallel subagents included, only appends lines to `.config/dictionaries/project.dic`.
-  `fix` and `check-ci` sort the file case-insensitively and remove duplicates, so concurrent appends never conflict.
+  The `fix` and `ci` targets sort the file case-insensitively and remove duplicates, so concurrent appends never conflict.
   Case variants collapse into one entry, so add only the canonical form.
 * Tests never use the real cache: every test that runs the engine sets `KIZZ_CACHE_DIR` to a temporary directory.
 * `Cargo.lock` is committed, unlike in cbork, because kizz is a binary.
@@ -1276,76 +1276,25 @@ File locking uses `std::fs::File::lock`, which is `flock` on Linux.
   The workspace excludes it, and the format, Markdown and spelling checks skip it.
   Only the changes that `vendor/surrealkv/KIZZ-PATCHES.md` lists may differ from the published crate.
 
-The planned Justfile:
+The [build tasks](kizz.md) define the quality gate, `kizz build fix+ci`.
+The target expression selects both sets of tasks and runs shared tasks once per pass.
 
-```text
-set shell := ["bash", "-euo", "pipefail", "-c"]
-
-spelling_dictionary := ".config/dictionaries/project.dic"
-
-# List the recipes.
-default:
-    @just --list
-
-# Sort the spelling dictionary case-insensitively and remove duplicate words.
-sort-dictionary:
-    LC_ALL=C sort --ignore-case --unique --output {{spelling_dictionary}} {{spelling_dictionary}}
-
-# Run every automated fixer: formatters and anything else that can be fixed automatically.
-fix: sort-dictionary
-    cargo +nightly fmt --all
-    ruff format .
-    rumdl check --fix .
-
-# Check formatting, lints, tests, docs, Markdown, spelling and the documentation site. Changes no tracked file.
-check:
-    cargo +nightly fmt --all -- --check
-    ruff format --check .
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
-    cargo test --workspace --all-features
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-    rumdl check .
-    cspell lint --config cspell.json --no-progress .
-    zola --root docs build
-
-# CI: sort the dictionary, run the checks, check licenses, then build.
-check-ci: sort-dictionary
-    cargo +nightly fmt --all -- --check
-    ruff format --check .
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
-    cargo test --workspace --all-features
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-    rumdl check .
-    cspell lint --config cspell.json --no-progress .
-    zola --root docs build
-    deny_bin="$(mise which cargo-deny --tool=cargo-deny)"; "$deny_bin" check advisories || true
-    "$(mise which cargo-deny --tool=cargo-deny)" check bans licenses sources
-    cargo build --workspace --release
-
-# Run every fixer, then the CI gate. This is also the quality gate of the workspace agent workflow.
-fix-ci: fix check-ci
-```
-
-* `fix` fixes: it runs every automated fixer, the formatters and anything else that can be fixed automatically.
-* `check` checks and changes no tracked file; it builds the documentation site into the ignored `docs/public/`.
-* `check-ci` checks and builds: it sorts the dictionary, as decided, runs the checks, checks licenses,
-  and builds the release binaries.
-  No recipe passes `--locked`, so Cargo creates and refreshes `Cargo.lock` as needed.
-  `cargo-deny check advisories` reports the advisories that apply to the dependencies, for information only.
-  No finding of that check, of any kind, ever fails `check-ci` or `fix-ci`, and `deny.toml` ignores no advisory.
-  `cargo-deny check bans licenses sources` comes next, and any finding of those three checks fails the recipe.
-* `fix-ci` runs `fix` and then `check-ci`.
-  It is also the quality gate the workspace agent workflow runs.
+* `fix` sorts the dictionary and runs the automated fixers.
+* `check` checks formatting, lints, tests, spelling and builds the documentation, including the site in the ignored `docs/public/`.
+* `ci` sorts the dictionary, runs the checks, verifies licenses and other dependency policy, and builds the release binaries.
+  Build commands let Cargo refresh `Cargo.lock` as needed.
+  The advisory check reports findings without failing the gate, and `deny.toml` ignores no advisory.
+  The dependency bans, licenses and source checks must pass.
 
 ## Implementation plan
 
-Each phase ends with `just fix-ci` passing in the task worktree.
+Run `kizz build fix+ci` in the task worktree to validate changes to the current implementation.
 Phases 1, 2 and 3 depend only on phase 0, so separate implementers can build them in parallel.
 Phase 8 depends only on phase 5, so it can be built alongside phases 6 and 7.
 
 ### Phase 0: workspace scaffold
 
-* The Cargo workspace with the five crates, the lint and formatting settings copied from cbork, and the Justfile.
+* The Cargo workspace with the five crates, and the lint and formatting settings copied from cbork.
 * The `rumdl`, `cspell` and `cargo-deny` configuration, with `README.md` and this plan passing the Markdown and spelling checks.
 * The `kizz` binary with every subcommand parsed; every subcommand prints a scaffold message in the cbork stub style.
 * The complete tracer interface in `kizz-trace`: the run request, the result, access kinds, errors and the tracer trait.
@@ -1353,7 +1302,7 @@ Phase 8 depends only on phase 5, so it can be built alongside phases 6 and 7.
   and rejects `--parallel` with an error saying that parallel execution is not implemented yet.
 
 Acceptance: `kizz --help` lists every subcommand, each subcommand prints its stub message,
-`kizz build --parallel` fails with the not-implemented error, and `just fix-ci` passes.
+`kizz build --parallel` fails with the not-implemented error.
 
 ### Phase 1: Linux tracer
 

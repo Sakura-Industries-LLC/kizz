@@ -1,9 +1,7 @@
 # cargo-deny configuration for the kizz workspace.
 #
-# This file is consumed by `cargo-deny check`, which the `check-ci` recipe
-# of the Justfile runs. The canonical CI command is:
-#
-#     just fix-ci
+# The advisory and dependency policy tasks in kizz.md use this file.
+# The quality gate is `kizz build fix+ci`.
 #
 # Workspace license policy: every kizz crate is AGPL-3.0-only.
 #

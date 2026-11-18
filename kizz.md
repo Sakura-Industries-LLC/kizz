@@ -1,12 +1,14 @@
 # Build kizz with kizz
 
 Run `./bootstrap.sh` from a checkout to build and install kizz with Cargo.
-It needs Rust 1.100 or later and forwards arguments to `cargo install`, such as `--root "$HOME/.local"`.
+It needs Rust 1.100 or later, mise, Node.js and npm.
+It forwards arguments to `cargo install`, such as `--root "$HOME/.local"`.
+The install root defaults to `CARGO_INSTALL_ROOT`, then `CARGO_HOME`, then `$HOME/.cargo`.
+The installed binary runs `kizz run install-tools` to install the mise pins and verify that kizz can run a task.
 Put the installation's `bin` directory on `PATH` before running these tasks.
-The bootstrap only installs kizz; it does not install the other development tools.
 
-`kizz build fix+ci` runs the same fixes, checks, tests, documentation builds, license checks and release build as `just fix-ci`.
-The Justfile remains available.
+`kizz build fix+ci` is the quality gate.
+It runs fixes, checks, tests, documentation builds, dependency checks and the release build.
 Each task is named so it can also be run directly with `kizz run <name>`.
 
 | Target | Work |
@@ -29,23 +31,33 @@ Rust formatting also declares the home directories needed by Cargo and its expli
 Cargo compilation tasks declare their toolchain and native build settings;
 only the test task accepts `TMPDIR` and `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS`.
 Proxy settings belong only to network operations.
-The Justfile also loads `.env`, but its default precedence favors the shell instead.
 For example, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` skips checks of system calls blocked by an outer seccomp filter.
 [mise.toml](mise.toml) is the single source of the cargo-deny, cspell, rumdl and Ruff version pins.
 Each managed tool task first checks the executable on its `PATH` against the minimum in that file.
 If the executable is missing or unsuitable, the task runs the pinned executable resolved by `mise which`.
 Markdown tasks put the selected Ruff directory first on rumdl's `PATH`.
 
-Install [mise](https://mise.jdx.dev/getting-started.html), then run `mise install`.
+Install [mise](https://mise.jdx.dev/getting-started.html) before bootstrapping.
+If kizz is already installed, run `kizz run install-tools` or `mise install` to install the pinned tools.
 Run `kizz build fix+ci` directly.
-For the Justfile workflow, use `mise exec -- just fix-ci` or activate mise in your shell.
-The optional named installer tasks below install one tool at a time.
+You can also install each pinned tool with its named task.
 Node.js and npm must be available for mise's cspell backend.
 No kizz build target installs tools automatically.
 
-Cargo, nightly rustfmt and Zola must already be installed, as with the Justfile.
+Cargo, nightly rustfmt and Zola must already be installed.
 No project Cargo command requires an up-to-date lock file; Cargo may refresh `Cargo.lock`, which is committed.
 Commands whose exit status matters use `expect = [0]`; the advisory check deliberately only reports findings.
+
+## Install all pinned tools
+
+`kizz run install-tools` installs every tool in `mise.toml`.
+Bootstrap runs this task using the binary it just installed.
+
+```starlark name=install-tools cache=never
+load("build/common.star", "mise_task_env")
+mise_task_env("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY")
+run("mise", "install", network=True, stream=True, expect=[0])
+```
 
 ## Install cspell
 
@@ -115,7 +127,7 @@ run(mise_tool("ruff"), "--version", expect=[0])
 ## Sort the spelling dictionary
 
 Append words to the dictionary; this task sorts case-insensitively and removes duplicates.
-CI includes it, matching `just check-ci`.
+The `fix` and `ci` targets both include it.
 
 ```starlark fix ci name=sort-dictionary
 load("build/common.star", "task_env")
@@ -332,7 +344,7 @@ run("mise", "install", "cargo-deny", network=True, stream=True, expect=[0])
 
 ## Report dependency advisories
 
-As with `just check-ci`, advisory findings are informational and do not fail the build.
+Advisory findings are informational and do not fail the build.
 Always fetch current advisories, since network responses are not tracked file dependencies.
 
 ```starlark ci name=advisories
@@ -348,7 +360,7 @@ mise_task_env(
 )
 result = run(mise_tool("cargo-deny"), "check", "advisories", always=True, network=True, stream=True)
 if result.rc != 0:
-    print("Advisory check did not succeed; continuing as just check-ci does.")
+    print("Advisory check did not succeed. Continuing with the required checks.")
 ```
 
 ## Check dependency policy
