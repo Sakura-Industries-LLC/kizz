@@ -1,6 +1,7 @@
 ACCMODE
 allocative
 arrayref
+ASKPASS
 bavail
 binfmt
 binprm
@@ -76,6 +77,7 @@ ELIBBAD
 ELIBEXEC
 ELIBMAX
 ELIBSCN
+elif
 ELNRNG
 ELOOP
 EMEDIUMTYPE
@@ -423,6 +425,7 @@ uninit
 unlinkat
 unlockpt
 unreaped
+unrelease
 unrunnable
 untrackable
 uprobe
