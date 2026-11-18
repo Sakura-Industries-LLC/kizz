@@ -1,5 +1,7 @@
 # kizz
 
+![kizz](branding/kizz-readme-banner.png)
+
 [![Release build](https://github.com/Sakura-Industries-LLC/kizz/actions/workflows/release.yml/badge.svg)](https://github.com/Sakura-Industries-LLC/kizz/actions/workflows/release.yml)
 [![Latest release](https://img.shields.io/github/v/release/Sakura-Industries-LLC/kizz)](https://github.com/Sakura-Industries-LLC/kizz/releases/latest)
 [![Documentation](https://img.shields.io/badge/docs-online-blue)](https://sakura-industries-llc.github.io/kizz/)
@@ -69,11 +71,14 @@ kizz build ci
 The design and the version 1 plan are in [architecture.md](architecture.md).
 Read the [published documentation](https://sakura-industries-llc.github.io/kizz/)
 or follow the [documentation build](https://github.com/Sakura-Industries-LLC/kizz/actions/workflows/release.yml).
-The site source is in [docs](docs), a Zola site; `zola --root docs serve` shows it locally.
+The site source is in [docs](docs).
+Run `kizz build docs` to build the site and its Rust API appendix.
+After the build, `zola --root docs serve` previews the complete site locally.
 
 ## Development
 
 Tool versions are pinned in [mise.toml](mise.toml).
+Git LFS supplies the binary branding assets in a checkout.
 Install [mise](https://mise.jdx.dev/getting-started.html), then run `./bootstrap.sh` to build kizz and install the pinned tools.
 Ruff formats Starlark modules and, through rumdl, Starlark code blocks in Markdown.
 Run `kizz build fix+ci` for the quality gate.

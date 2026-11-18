@@ -5,12 +5,17 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="{{ config.description }}">
+    <meta property="og:image" content="{{ root.permalink }}branding/kizz-social-preview.png">
     <title>{% block title %}{{ config.title }}{% endblock title %}</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="{{ root.permalink }}branding/kizz-favicon-32.png">
+    <link rel="icon" type="image/svg+xml" href="{{ root.permalink }}branding/kizz-favicon.svg">
     <link rel="stylesheet" href="{{ root.permalink }}style.css">
 </head>
 <body>
     <header class="site-header">
-        <a class="site-title" href="{{ root.permalink }}">{{ config.title }}</a>
+        <a class="site-title" href="{{ root.permalink }}">
+            <img src="{{ root.permalink }}branding/kizz-logo.svg" alt="{{ config.title }}">
+        </a>
     </header>
     <div class="layout">
         <nav class="site-nav">

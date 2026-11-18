@@ -263,24 +263,11 @@ run("cargo", "test", "--workspace", "--all-features", untraced=True, stream=True
 
 ## Build Rust documentation
 
+Cargo generates the workspace API reference and the task exposes it to Zola under `docs/static/rustdoc`.
+
 ```starlark docs ci name=rustdoc
-load("build/common.star", "cargo_ignores", "task_env")
-task_env(
-    "PATH",
-    "HOME",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "RUSTUP_TOOLCHAIN",
-    "CARGO_TARGET_DIR",
-    "CARGO_BUILD_JOBS",
-    "CARGO_NET_OFFLINE",
-    "RUSTFLAGS",
-    "CC",
-    "AR",
-    "PKG_CONFIG_PATH",
-)
-env.set("RUSTDOCFLAGS", "-D warnings")
-run("cargo", "doc", "--workspace", "--no-deps", "--all-features", ignore=cargo_ignores(), stream=True, expect=[0])
+load("build/docs.star", "build_rustdoc")
+build_rustdoc()
 ```
 
 ## Check spelling
@@ -294,11 +281,17 @@ run(mise_tool("cspell"), "lint", "--config", "cspell.json", "--no-progress", "."
 ## Build the documentation site
 
 Zola builds the site into the ignored `docs/public/` directory and checks its internal links.
+It includes the workspace Rustdoc output under `rustdoc/`, linked from the Rust API appendix.
+`kizz run site` builds Rustdoc too when the site task is run on its own.
 GitHub sets `ZOLA_BASE_URL` to the Pages URL for release builds.
 Local builds default to the URL in [docs/config.toml](docs/config.toml).
 
 ```starlark docs ci name=site
 load("build/common.star", "task_env")
+load("build/docs.star", "build_rustdoc")
+if not task.selected:
+    build_rustdoc()
+    env.clear()
 task_env("PATH", "ZOLA_BASE_URL")
 base_url = env.get("ZOLA_BASE_URL")
 url_args = ["--base-url", base_url] if base_url else []
