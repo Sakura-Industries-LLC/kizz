@@ -78,6 +78,7 @@ Install [mise](https://mise.jdx.dev/getting-started.html), then run `./bootstrap
 Ruff formats Starlark modules and, through rumdl, Starlark code blocks in Markdown.
 Run `kizz build fix+ci` for the quality gate.
 The [build tasks](kizz.md) list the individual checks and fixers.
+For release tags, GitHub runs `./bootstrap.sh` and `kizz build ci` and publishes the resulting executable and documentation site.
 
 Tasks read machine-specific settings from an optional root `.env`, which Git ignores.
 If a seccomp filter refuses calls before kizz's tracer sees them, `KIZZ_TEST_SKIP_BLOCKED_SYSCALLS=1` there skips their checks.

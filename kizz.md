@@ -30,7 +30,7 @@ Each task lists the environment variables its operation uses in its own `task_en
 inherits only those names and reads matching overrides from the optional, ignored root `.env`.
 Other `.env` entries never enter that task's command environment.
 For the listed names, values in `.env` replace inherited shell values; this is intentional.
-Sorting and the site build inherit only `PATH`.
+Sorting inherits only `PATH`.
 Managed tool tasks also read mise installation locations.
 Rust formatting also declares the home directories needed by Cargo and its explicitly selected nightly toolchain.
 Cargo compilation tasks declare their toolchain and native build settings;
@@ -294,11 +294,15 @@ run(mise_tool("cspell"), "lint", "--config", "cspell.json", "--no-progress", "."
 ## Build the documentation site
 
 Zola builds the site into the ignored `docs/public/` directory and checks its internal links.
+GitHub sets `ZOLA_BASE_URL` to the Pages URL for release builds.
+Local builds default to the URL in [docs/config.toml](docs/config.toml).
 
 ```starlark docs ci name=site
 load("build/common.star", "task_env")
-task_env("PATH")
-run("zola", "--root", "docs", "build", stream=True, expect=[0])
+task_env("PATH", "ZOLA_BASE_URL")
+base_url = env.get("ZOLA_BASE_URL")
+url_args = ["--base-url", base_url] if base_url else []
+run("zola", "--root", "docs", "build", url_args, stream=True, expect=[0])
 ```
 
 ## Install cargo-deny
